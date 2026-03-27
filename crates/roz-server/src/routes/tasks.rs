@@ -64,7 +64,7 @@ pub async fn create(
 
     // Start Restate workflow (fire-and-forget -- workflow manages its own lifecycle).
     // The workflow must be registered before NATS publish so the worker can signal back.
-    let workflow_input = roz_server::restate::task_workflow::TaskInput {
+    let workflow_input = crate::restate::task_workflow::TaskInput {
         task_id: task.id,
         environment_id: task.environment_id,
         prompt: task.prompt.clone(),
@@ -119,7 +119,7 @@ pub async fn approve(
     State(state): State<AppState>,
     Extension(auth): Extension<AuthIdentity>,
     Path(task_id): Path<Uuid>,
-    Json(body): Json<roz_server::restate::task_workflow::ToolApproval>,
+    Json(body): Json<crate::restate::task_workflow::ToolApproval>,
 ) -> Result<StatusCode, AppError> {
     // Verify tenant ownership
     let tenant_id = *auth.tenant_id().as_uuid();

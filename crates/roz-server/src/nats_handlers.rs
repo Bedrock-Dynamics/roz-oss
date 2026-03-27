@@ -94,7 +94,7 @@ async fn spawn_task_handler(nats: NatsClient, pool: PgPool, restate_ingress_url:
         };
 
         // Fire-and-forget Restate workflow start (mirrors routes/tasks.rs pattern).
-        let workflow_input = roz_server::restate::task_workflow::TaskInput {
+        let workflow_input = crate::restate::task_workflow::TaskInput {
             task_id: task.id,
             environment_id: task.environment_id,
             prompt: task.prompt.clone(),
