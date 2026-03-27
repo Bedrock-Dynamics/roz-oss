@@ -40,7 +40,7 @@ pub enum AgentEvent {
 pub enum Provider {
     /// Direct to api.anthropic.com (BYOK).
     Anthropic,
-    /// Roz Cloud gRPC (roz-api.fly.dev (override with ROZ_API_URL)).
+    /// Roz Cloud gRPC (override with `ROZ_API_URL`).
     Cloud,
     /// Local Ollama-compatible API.
     Ollama,
