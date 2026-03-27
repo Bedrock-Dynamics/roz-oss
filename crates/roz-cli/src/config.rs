@@ -17,7 +17,7 @@ impl CliConfig {
     /// the `"default"` profile is used.
     #[allow(clippy::unnecessary_wraps)]
     pub fn load(profile: Option<&str>) -> anyhow::Result<Self> {
-        let api_url = std::env::var("ROZ_API_URL").unwrap_or_else(|_| "http://localhost:8080".into());
+        let api_url = std::env::var("ROZ_API_URL").unwrap_or_else(|_| "https://roz-api.fly.dev".into());
         let profile_name = profile.unwrap_or("default").to_string();
         let access_token = Self::load_global_api_key(&profile_name);
 
