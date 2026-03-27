@@ -158,7 +158,7 @@ pub async fn complete_auth(
     Form(body): Form<CompleteRequest>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
-    let auth = crate::auth::extract_auth(&state, auth_header)
+    let auth = crate::auth::extract_auth(&state.auth, &state.pool, auth_header)
         .await
         .map_err(|e| (StatusCode::UNAUTHORIZED, Json(json!({"error": e.0}))))?;
 
