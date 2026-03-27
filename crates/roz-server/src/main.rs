@@ -1,24 +1,12 @@
 use axum::Router;
-use axum::routing::{delete, get, patch, post};
 use std::convert::Infallible;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use tower::Service;
-use tower_http::trace::TraceLayer;
 
-mod auth;
-mod config;
-mod error;
-mod middleware;
-mod nats_handlers;
-mod response;
-mod routes;
-mod state;
-#[allow(dead_code)]
-mod triggers;
-mod ws;
-
-use state::AppState;
+use roz_server::middleware;
+use roz_server::nats_handlers;
+use roz_server::state::{AppState, ModelConfig};
 
 /// Routes requests by content-type: `application/grpc` → tonic, everything else → axum REST.
 #[derive(Clone)]
@@ -53,104 +41,7 @@ impl Service<axum::extract::Request> for MultiplexService {
 }
 
 fn app(state: AppState) -> Router {
-    Router::new()
-        .route("/v1/health", get(routes::health::health))
-        .route("/v1/ready", get(routes::health::ready))
-        .route("/healthz", get(routes::health::healthz))
-        .route("/readyz", get(routes::health::readyz))
-        .route("/startupz", get(routes::health::startupz))
-        .route("/v1/auth/keys", post(routes::auth_keys::create_key))
-        .route("/v1/auth/keys", get(routes::auth_keys::list_keys))
-        .route("/v1/auth/keys/{id}", delete(routes::auth_keys::revoke_key))
-        .route("/v1/auth/keys/{id}/rotate", post(routes::auth_keys::rotate_key))
-        .route(
-            "/v1/environments",
-            get(routes::environments::list).post(routes::environments::create),
-        )
-        .route(
-            "/v1/environments/{id}",
-            get(routes::environments::get)
-                .put(routes::environments::update)
-                .delete(routes::environments::delete),
-        )
-        // Host CRUD + status
-        .route("/v1/hosts", get(routes::hosts::list).post(routes::hosts::create))
-        .route(
-            "/v1/hosts/{id}",
-            get(routes::hosts::get)
-                .put(routes::hosts::update)
-                .delete(routes::hosts::delete),
-        )
-        .route("/v1/hosts/{id}/status", patch(routes::hosts::update_status))
-        // Task CRUD
-        .route("/v1/tasks", get(routes::tasks::list).post(routes::tasks::create))
-        .route("/v1/tasks/{id}", get(routes::tasks::get).delete(routes::tasks::delete))
-        .route("/v1/tasks/{id}/approve", post(routes::tasks::approve))
-        // Trigger CRUD + toggle
-        .route(
-            "/v1/triggers",
-            get(routes::triggers::list).post(routes::triggers::create),
-        )
-        .route(
-            "/v1/triggers/{id}",
-            get(routes::triggers::get)
-                .put(routes::triggers::update)
-                .delete(routes::triggers::delete),
-        )
-        .route("/v1/triggers/{id}/toggle", post(routes::triggers::toggle))
-        // Stream CRUD
-        .route("/v1/streams", get(routes::streams::list).post(routes::streams::create))
-        .route(
-            "/v1/streams/{id}",
-            get(routes::streams::get)
-                .put(routes::streams::update)
-                .delete(routes::streams::delete),
-        )
-        // Command routes + state transition
-        .route(
-            "/v1/commands",
-            get(routes::commands::list).post(routes::commands::create),
-        )
-        .route(
-            "/v1/commands/{id}",
-            get(routes::commands::get).delete(routes::commands::delete),
-        )
-        .route("/v1/commands/{id}/transition", post(routes::commands::transition))
-        // Lease acquire/release
-        .route("/v1/leases", get(routes::leases::list).post(routes::leases::create))
-        .route("/v1/leases/{id}", get(routes::leases::get))
-        .route("/v1/leases/{id}/release", post(routes::leases::release))
-        // Safety policy CRUD
-        .route(
-            "/v1/safety-policies",
-            get(routes::safety_policies::list).post(routes::safety_policies::create),
-        )
-        .route(
-            "/v1/safety-policies/{id}",
-            get(routes::safety_policies::get)
-                .put(routes::safety_policies::update)
-                .delete(routes::safety_policies::delete),
-        )
-        // Metrics
-        .route("/v1/metrics/tasks", get(routes::metrics::task_metrics))
-        .route("/v1/metrics/hosts", get(routes::metrics::host_metrics))
-        // WebSocket
-        .route("/v1/ws", get(ws::handler::ws_upgrade))
-        .route("/v1/auth/device/code", post(routes::device_auth::request_code))
-        .route("/v1/auth/device/token", post(routes::device_auth::poll_token))
-        .route("/v1/auth/device/complete", post(routes::device_auth::complete_auth))
-        // Webhook routes can be added here for custom integrations.
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            middleware::tenant::auth_middleware,
-        ))
-        .layer(axum::middleware::from_fn(middleware::request_id::request_id_middleware))
-        .with_state(state)
-        .layer(
-            TraceLayer::new_for_http().make_span_with(|_req: &axum::http::Request<axum::body::Body>| {
-                tracing::info_span!("http_request", request_id = tracing::field::Empty)
-            }),
-        )
+    roz_server::build_router(state)
 }
 
 // ---------------------------------------------------------------------------
@@ -322,7 +213,7 @@ async fn main() {
         None
     };
 
-    let model_config = state::ModelConfig {
+    let model_config = ModelConfig {
         gateway_url: std::env::var("ROZ_GATEWAY_URL").unwrap_or_else(|_| "https://gateway-us.pydantic.dev".into()),
         api_key: std::env::var("ROZ_GATEWAY_API_KEY").unwrap_or_default(),
         default_model: std::env::var("ROZ_DEFAULT_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".into()),
@@ -402,7 +293,7 @@ mod tests {
             http_client: reqwest::Client::new(),
             operator_seed,
             nats_client: None,
-            model_config: state::ModelConfig {
+            model_config: ModelConfig {
                 gateway_url: "http://test-gateway".to_string(),
                 api_key: "test-key".to_string(),
                 default_model: "test-model".to_string(),
