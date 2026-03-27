@@ -242,6 +242,7 @@ async fn main() {
         operator_seed,
         nats_client,
         model_config,
+        auth: Arc::new(roz_server::auth::ApiKeyAuth),
     };
 
     // Spawn internal NATS request-reply handlers (e.g. spawn_worker tool bypass).
@@ -301,6 +302,7 @@ mod tests {
                 anthropic_provider: "anthropic".to_string(),
                 direct_api_key: None,
             },
+            auth: Arc::new(roz_server::auth::ApiKeyAuth),
         }
     }
 

@@ -49,7 +49,7 @@ pub async fn auth_middleware(
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
-    match crate::auth::extract_auth(&state, auth_header.as_deref()).await {
+    match crate::auth::extract_auth(&state.auth, &state.pool, auth_header.as_deref()).await {
         Ok(identity) => {
             req.extensions_mut().insert(identity);
             next.run(req).await

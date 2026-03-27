@@ -1,3 +1,4 @@
+use crate::auth::RestAuth;
 use crate::middleware::rate_limit::KeyedRateLimiter;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -39,4 +40,6 @@ pub struct AppState {
     pub nats_client: Option<async_nats::Client>,
     /// Model provider config for creating LLM model instances in gRPC sessions.
     pub model_config: ModelConfig,
+    /// Pluggable REST auth provider. OSS uses `ApiKeyAuth`, cloud injects Clerk JWT support.
+    pub auth: Arc<dyn RestAuth>,
 }

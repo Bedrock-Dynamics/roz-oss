@@ -20,7 +20,7 @@ pub async fn create_key(
     Json(body): Json<CreateKeyRequest>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
-    let auth = crate::auth::extract_auth(&state, auth_header)
+    let auth = crate::auth::extract_auth(&state.auth, &state.pool, auth_header)
         .await
         .map_err(|e| (StatusCode::UNAUTHORIZED, Json(json!({ "error": e.0 }))))?;
 
@@ -60,7 +60,7 @@ pub async fn list_keys(
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
-    let auth = crate::auth::extract_auth(&state, auth_header)
+    let auth = crate::auth::extract_auth(&state.auth, &state.pool, auth_header)
         .await
         .map_err(|e| (StatusCode::UNAUTHORIZED, Json(json!({ "error": e.0 }))))?;
 
@@ -98,7 +98,7 @@ pub async fn revoke_key(
     Path(key_id): Path<Uuid>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
     let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
-    let auth = crate::auth::extract_auth(&state, auth_header)
+    let auth = crate::auth::extract_auth(&state.auth, &state.pool, auth_header)
         .await
         .map_err(|e| (StatusCode::UNAUTHORIZED, Json(json!({ "error": e.0 }))))?;
 
@@ -127,7 +127,7 @@ pub async fn rotate_key(
     Path(key_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
-    let auth = crate::auth::extract_auth(&state, auth_header)
+    let auth = crate::auth::extract_auth(&state.auth, &state.pool, auth_header)
         .await
         .map_err(|e| (StatusCode::UNAUTHORIZED, Json(json!({ "error": e.0 }))))?;
 
