@@ -39,11 +39,15 @@ impl CliConfig {
     /// Resolve an API key or access token from all credential sources.
     ///
     /// Priority:
-    /// 1. `ROZ_API_KEY` env var
-    /// 2. `ANTHROPIC_API_KEY` env var
-    /// 3. System keyring (`roz` / profile)
-    /// 4. `~/.roz/credentials.toml` → `api_key` field
-    /// 5. `~/.roz/credentials.toml` → `access_token` field
+    /// 1. `ROZ_API_KEY` env var (explicit override)
+    /// 2. System keyring (`roz` / profile) — `roz auth login` stores here
+    /// 3. `~/.roz/credentials.toml` → `api_key` field
+    /// 4. `~/.roz/credentials.toml` → `access_token` field
+    /// 5. `ANTHROPIC_API_KEY` env var (BYOK fallback)
+    ///
+    /// Roz Cloud credentials (from `roz auth login`) always take priority
+    /// over `ANTHROPIC_API_KEY`, which is only a fallback for users who
+    /// haven't logged in but have a direct Anthropic key.
     pub fn load_global_api_key(profile: &str) -> Option<String> {
         // 1. ROZ_API_KEY env var
         if let Ok(key) = std::env::var("ROZ_API_KEY")
@@ -52,14 +56,7 @@ impl CliConfig {
             return Some(key);
         }
 
-        // 2. ANTHROPIC_API_KEY env var
-        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY")
-            && !key.is_empty()
-        {
-            return Some(key);
-        }
-
-        // 3. System keyring
+        // 2. System keyring
         if let Some(key) = keyring::Entry::new("roz", profile)
             .ok()
             .and_then(|e| e.get_password().ok())
@@ -67,8 +64,19 @@ impl CliConfig {
             return Some(key);
         }
 
-        // 4-5. ~/.roz/credentials.toml
-        Self::load_credentials_file(profile)
+        // 3-4. ~/.roz/credentials.toml
+        if let Some(key) = Self::load_credentials_file(profile) {
+            return Some(key);
+        }
+
+        // 5. ANTHROPIC_API_KEY env var (BYOK fallback)
+        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY")
+            && !key.is_empty()
+        {
+            return Some(key);
+        }
+
+        None
     }
 
     /// Read `api_key` or `access_token` from `~/.roz/credentials.toml`.
