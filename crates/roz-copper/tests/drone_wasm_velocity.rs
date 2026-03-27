@@ -25,8 +25,8 @@ use arc_swap::ArcSwap;
 
 use roz_copper::channels::ControllerCommand;
 use roz_copper::io::ActuatorSink;
-use roz_copper::io_grpc::proto::{FlightCommand, FlightCommandRequest};
 use roz_copper::io_grpc::proto::control_service_client::ControlServiceClient;
+use roz_copper::io_grpc::proto::{FlightCommand, FlightCommandRequest};
 use roz_copper::io_grpc::{GrpcActuatorSink, GrpcSensorSource};
 use roz_copper::io_log::{LogActuatorSink, TeeActuatorSink};
 use roz_core::channels::ChannelManifest;
@@ -44,11 +44,7 @@ const DRONE_VZ_WAT: &str = r#"
 "#;
 
 /// Send a flight command via gRPC. Returns true on success.
-async fn send_flight_cmd(
-    channel: tonic::transport::Channel,
-    cmd: FlightCommand,
-    mode: &str,
-) -> bool {
+async fn send_flight_cmd(channel: tonic::transport::Channel, cmd: FlightCommand, mode: &str) -> bool {
     let mut client = ControlServiceClient::new(channel);
     let req = FlightCommandRequest {
         command: cmd.into(),
@@ -59,7 +55,10 @@ async fn send_flight_cmd(
     match client.send_flight_command(req).await {
         Ok(r) => {
             let inner = r.into_inner();
-            println!("FlightCommand {label}: success={}, result={}", inner.success, inner.result);
+            println!(
+                "FlightCommand {label}: success={}, result={}",
+                inner.success, inner.result
+            );
             inner.success
         }
         Err(e) => {
@@ -105,9 +104,7 @@ async fn drone_wasm_velocity_through_bridge() {
     // PX4 requires setpoints BEFORE switching to OFFBOARD mode.
     let (tx, rx) = std::sync::mpsc::sync_channel(64);
     let (_emergency_tx, emergency_rx) = std::sync::mpsc::sync_channel(1);
-    let state = Arc::new(ArcSwap::from_pointee(
-        roz_copper::channels::ControllerState::default(),
-    ));
+    let state = Arc::new(ArcSwap::from_pointee(roz_copper::channels::ControllerState::default()));
     let shutdown = Arc::new(AtomicBool::new(false));
 
     let s = Arc::clone(&state);
@@ -156,12 +153,7 @@ async fn drone_wasm_velocity_through_bridge() {
     // Wait for setpoints to stream before switching to OFFBOARD.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let offboard_ok = send_flight_cmd(
-        grpc_channel.clone(),
-        FlightCommand::SetMode,
-        "OFFBOARD",
-    )
-    .await;
+    let offboard_ok = send_flight_cmd(grpc_channel.clone(), FlightCommand::SetMode, "OFFBOARD").await;
     if !offboard_ok {
         println!("WARNING: OFFBOARD mode switch failed — PX4 may not accept velocity setpoints");
     }
@@ -171,10 +163,7 @@ async fn drone_wasm_velocity_through_bridge() {
 
     // 6. Check results.
     let current = state.load();
-    println!(
-        "Controller: tick={}, running={}",
-        current.last_tick, current.running
-    );
+    println!("Controller: tick={}, running={}", current.last_tick, current.running);
     assert!(current.running, "controller should be running");
 
     let cmds = log_sink.commands();
