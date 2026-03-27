@@ -1,5 +1,12 @@
 use crate::config::CliConfig;
 
+const DEFAULT_CLOUD_URL: &str = "https://roz-api.fly.dev";
+
+/// Resolve the Cloud API URL: `ROZ_API_URL` env var, or the default cloud endpoint.
+pub fn cloud_api_url() -> String {
+    std::env::var("ROZ_API_URL").unwrap_or_else(|_| DEFAULT_CLOUD_URL.to_string())
+}
+
 /// A streaming event from any agent backend.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Variants wired incrementally across providers.
@@ -110,7 +117,7 @@ impl ProviderConfig {
                     provider: Provider::Cloud,
                     model: model_name.to_string(),
                     api_key: Some(key.to_string()),
-                    api_url: "https://roz-api.fly.dev".to_string(),
+                    api_url: cloud_api_url(),
                 };
             }
             // Any other key → Anthropic
@@ -154,7 +161,7 @@ impl ProviderConfig {
     fn for_provider_and_model(provider: Provider, model: &str, api_key: Option<&str>) -> Self {
         let (api_url, key) = match provider {
             Provider::Anthropic => ("https://api.anthropic.com".to_string(), api_key.map(String::from)),
-            Provider::Cloud => ("https://roz-api.fly.dev".to_string(), api_key.map(String::from)),
+            Provider::Cloud => (cloud_api_url(), api_key.map(String::from)),
             Provider::Ollama => (
                 std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string()),
                 None,

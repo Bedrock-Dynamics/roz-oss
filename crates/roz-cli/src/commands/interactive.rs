@@ -77,7 +77,7 @@ async fn onboard(config: &CliConfig, provider_config: &mut ProviderConfig) -> an
             if let Some(key) = CliConfig::load_global_api_key(&config.profile) {
                 provider_config.api_key = Some(key);
                 provider_config.provider = Provider::Cloud;
-                provider_config.api_url = "https://roz-api.fly.dev".to_string();
+                provider_config.api_url = crate::tui::provider::cloud_api_url();
             }
         }
         // Anthropic API key — password input
