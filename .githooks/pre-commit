@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Running cargo fmt --check..."
+if ! cargo fmt --check; then
+  echo ""
+  echo "Formatting issues found. Run 'cargo fmt' to fix, then re-stage and commit."
+  exit 1
+fi
+
+echo "cargo fmt check passed."

@@ -1,0 +1,7 @@
+[alias]
+c     = "clippy --workspace -- -D warnings"
+t     = "test --workspace -j1"
+b     = "build --workspace"
+fmt-c = "fmt --check"
+dev   = "build --profile fastdev"
+e2e   = "test -p roz-server --test e2e_live --test smoke -- --ignored --test-threads=1"

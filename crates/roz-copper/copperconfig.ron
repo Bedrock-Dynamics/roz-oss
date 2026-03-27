@@ -1,0 +1,21 @@
+(
+    tasks: [
+        (
+            id: "heartbeat",
+            type: "HeartbeatSource",
+            run_in_sim: true,
+        ),
+        (
+            id: "log",
+            type: "LogSink",
+            run_in_sim: true,
+        ),
+    ],
+    cnx: [
+        (
+            src: "heartbeat",
+            dst: "log",
+            msg: "u64",
+        ),
+    ],
+)

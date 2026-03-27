@@ -1,0 +1,32 @@
+[package]
+name = "roz-core"
+version = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Phase 4 — Skills, Sim-to-Real, DeviceTrust
+regex = { workspace = true }
+nalgebra = { workspace = true }
+ed25519-dalek = { workspace = true }
+crc32fast = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+crc32fast = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[lints]
+workspace = true

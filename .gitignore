@@ -1,0 +1,9 @@
+/target/
+.worktrees/
+.env
+.env.test
+*.swp
+.infisical.json
+.claude/
+.mcp.json
+CLAUDE.md

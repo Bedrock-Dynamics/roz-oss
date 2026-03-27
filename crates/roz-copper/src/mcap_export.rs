@@ -1,0 +1,333 @@
+//! Convert Copper unified binary logs to MCAP format.
+//!
+//! Bridges Copper's recording system with roz's existing MCAP
+//! infrastructure (substrate-ide viewer, roz sim2real pipeline).
+//!
+//! # Current implementation
+//!
+//! Copper's unified log uses a mmap-backed, multi-slab binary format with
+//! bincode-encoded `CopperList` entries (see `cu29-unifiedlog`). Deserializing
+//! those entries requires the concrete `CopperList` type parameter that is
+//! generated per-application by the `#[copper_runtime]` macro, making a
+//! fully generic reader impractical at this layer.
+//!
+//! This module therefore provides two entry points:
+//!
+//! 1. [`export_records_to_mcap`] -- takes pre-deserialized [`CopperLogRecord`]
+//!    values and writes a valid MCAP file.  This is the workhorse that the
+//!    rest of the pipeline calls once records have been extracted.
+//!
+//! 2. [`export_to_mcap`] -- the "from file" entry point.  It currently
+//!    validates that the source file exists, opens a reader via
+//!    `cu29_unifiedlog::UnifiedLoggerRead`, and extracts raw section bytes.
+//!    Full `CopperList` deserialization is left as future work (it depends on
+//!    the concrete application type).
+
+use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::BufWriter;
+use std::path::Path;
+
+use cu29_unifiedlog::UnifiedLogRead as _;
+use mcap::Writer;
+use mcap::records::MessageHeader;
+use serde::{Deserialize, Serialize};
+
+/// A single log record extracted from a Copper unified log.
+///
+/// This is an intermediate representation that decouples the Copper binary
+/// format from MCAP serialization.  Upstream code (or a future
+/// `CopperList`-aware reader) populates these records; this module writes
+/// them into MCAP.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CopperLogRecord {
+    /// Monotonic timestamp in nanoseconds (maps to MCAP `log_time`).
+    pub timestamp_ns: u64,
+    /// Logical channel / topic name (e.g. `"/joint_state"`, `"/imu"`).
+    pub channel: String,
+    /// Serialized payload bytes.  Encoding is declared per-channel via
+    /// [`McapExportOptions::message_encoding`].
+    pub data: Vec<u8>,
+}
+
+/// Options for MCAP export.
+#[derive(Debug, Clone)]
+pub struct McapExportOptions {
+    /// MCAP message encoding string (default `"json"`).
+    pub message_encoding: String,
+    /// Optional channel filter -- only records whose channel is in this
+    /// set will be written.  `None` means write everything.
+    pub channel_filter: Option<Vec<String>>,
+}
+
+impl Default for McapExportOptions {
+    fn default() -> Self {
+        Self {
+            message_encoding: "json".to_string(),
+            channel_filter: None,
+        }
+    }
+}
+
+/// Write pre-deserialized Copper log records into an MCAP file.
+///
+/// Returns the number of messages written.
+///
+/// # Errors
+///
+/// Returns an error if the output file cannot be created or the MCAP
+/// writer encounters an I/O error.
+pub fn export_records_to_mcap(
+    records: &[CopperLogRecord],
+    output: &Path,
+    options: &McapExportOptions,
+) -> anyhow::Result<u64> {
+    let file = File::create(output)?;
+    let buf = BufWriter::new(file);
+    let mut writer = Writer::new(buf)?;
+
+    // Track channel_name -> mcap channel_id so we register each topic once.
+    let mut channel_ids: BTreeMap<String, u16> = BTreeMap::new();
+    let mut sequence: u32 = 0;
+    let mut written: u64 = 0;
+
+    for record in records {
+        // Apply channel filter if configured.
+        if let Some(ref filter) = options.channel_filter
+            && !filter.iter().any(|f| f == &record.channel)
+        {
+            continue;
+        }
+
+        // Register channel on first encounter.
+        let channel_id = if let Some(&id) = channel_ids.get(&record.channel) {
+            id
+        } else {
+            let id = writer.add_channel(
+                0, // schema_id 0 = no schema
+                &record.channel,
+                &options.message_encoding,
+                &BTreeMap::new(),
+            )?;
+            channel_ids.insert(record.channel.clone(), id);
+            id
+        };
+
+        let header = MessageHeader {
+            channel_id,
+            sequence,
+            log_time: record.timestamp_ns,
+            publish_time: record.timestamp_ns,
+        };
+
+        writer.write_to_known_channel(&header, &record.data)?;
+        sequence = sequence.wrapping_add(1);
+        written += 1;
+    }
+
+    writer.finish()?;
+    Ok(written)
+}
+
+/// Convert a Copper unified log file to MCAP format.
+///
+/// This is the high-level "file to file" entry point.  It validates that the
+/// source exists and is readable, then extracts raw section data from the
+/// Copper unified log.
+///
+/// **Current limitation:** The Copper unified log stores `CopperList` entries
+/// encoded with `bincode`.  Deserializing them requires the concrete
+/// `CopperList` type generated by the application's `#[copper_runtime]`
+/// macro.  This function extracts raw section bytes but cannot yet decode
+/// them into [`CopperLogRecord`] values.  Callers that need full conversion
+/// should deserialize at the application layer and call
+/// [`export_records_to_mcap`] directly.
+///
+/// # Errors
+///
+/// Returns an error if the source file does not exist, is not a valid
+/// Copper log, or if the output file cannot be written.
+pub fn export_to_mcap(copper_log: &Path, mcap_output: &Path, channels: Option<&[&str]>) -> anyhow::Result<()> {
+    if !copper_log.exists() {
+        anyhow::bail!("Copper log file does not exist: {}", copper_log.display());
+    }
+
+    // Attempt to open as a Copper unified log to validate the file format.
+    // We use the builder in read mode (write=false, create=false).
+    let logger = cu29_unifiedlog::UnifiedLoggerBuilder::new()
+        .file_base_name(copper_log)
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to open Copper log: {e}"))?;
+
+    let cu29_unifiedlog::UnifiedLogger::Read(mut reader) = logger else {
+        anyhow::bail!("Expected read mode for Copper log");
+    };
+
+    // Extract raw section bytes from CopperList sections.
+    // These are bincode-encoded CopperList entries whose concrete type
+    // is application-specific.  For now we wrap the raw bytes as
+    // CopperLogRecord entries with a synthetic channel.
+    let mut records = Vec::new();
+    let mut section_idx: u64 = 0;
+
+    while let Ok(Some(section_bytes)) = reader.read_next_section_type(cu29::UnifiedLogType::CopperList) {
+        records.push(CopperLogRecord {
+            timestamp_ns: section_idx * 1_000_000, // synthetic 1ms spacing
+            channel: "/copper/raw_section".to_string(),
+            data: section_bytes,
+        });
+        section_idx += 1;
+    }
+
+    let options = McapExportOptions {
+        channel_filter: channels.map(|ch| ch.iter().map(|&s| s.to_string()).collect()),
+        ..McapExportOptions::default()
+    };
+
+    let written = export_records_to_mcap(&records, mcap_output, &options)?;
+    tracing::info!(
+        written,
+        source = %copper_log.display(),
+        output = %mcap_output.display(),
+        "Exported Copper log to MCAP"
+    );
+
+    Ok(())
+}
+
+/// Validate that a byte buffer is a valid MCAP file by reading its messages.
+///
+/// Returns the number of messages found.  Used in tests.
+pub fn validate_mcap(data: &[u8]) -> anyhow::Result<u64> {
+    let mut count = 0u64;
+    for msg in mcap::MessageStream::new(data)? {
+        let _ = msg?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn export_nonexistent_file_returns_error() {
+        let dir = TempDir::new().unwrap();
+        let result = export_to_mcap(
+            &dir.path().join("nonexistent.copper"),
+            &dir.path().join("output.mcap"),
+            None,
+        );
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("does not exist"),
+            "expected 'does not exist' in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn export_records_empty_produces_valid_mcap() {
+        let dir = TempDir::new().unwrap();
+        let output = dir.path().join("empty.mcap");
+
+        let written = export_records_to_mcap(&[], &output, &McapExportOptions::default()).unwrap();
+        assert_eq!(written, 0);
+
+        // The output should be a valid MCAP file (header + footer, no messages).
+        let data = std::fs::read(&output).unwrap();
+        let count = validate_mcap(&data).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn export_records_writes_messages() {
+        let dir = TempDir::new().unwrap();
+        let output = dir.path().join("test.mcap");
+
+        let records = vec![
+            CopperLogRecord {
+                timestamp_ns: 1_000_000,
+                channel: "/joint_state".to_string(),
+                data: b"hello".to_vec(),
+            },
+            CopperLogRecord {
+                timestamp_ns: 2_000_000,
+                channel: "/imu".to_string(),
+                data: b"world".to_vec(),
+            },
+            CopperLogRecord {
+                timestamp_ns: 3_000_000,
+                channel: "/joint_state".to_string(),
+                data: b"again".to_vec(),
+            },
+        ];
+
+        let written = export_records_to_mcap(&records, &output, &McapExportOptions::default()).unwrap();
+        assert_eq!(written, 3);
+
+        let data = std::fs::read(&output).unwrap();
+        let count = validate_mcap(&data).unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn export_records_channel_filter() {
+        let dir = TempDir::new().unwrap();
+        let output = dir.path().join("filtered.mcap");
+
+        let records = vec![
+            CopperLogRecord {
+                timestamp_ns: 1_000_000,
+                channel: "/joint_state".to_string(),
+                data: b"keep".to_vec(),
+            },
+            CopperLogRecord {
+                timestamp_ns: 2_000_000,
+                channel: "/imu".to_string(),
+                data: b"skip".to_vec(),
+            },
+        ];
+
+        let options = McapExportOptions {
+            channel_filter: Some(vec!["/joint_state".to_string()]),
+            ..McapExportOptions::default()
+        };
+
+        let written = export_records_to_mcap(&records, &output, &options).unwrap();
+        assert_eq!(written, 1);
+
+        let data = std::fs::read(&output).unwrap();
+        let count = validate_mcap(&data).unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn mcap_messages_roundtrip_content() {
+        let dir = TempDir::new().unwrap();
+        let output = dir.path().join("roundtrip.mcap");
+
+        let payload = b"{\"angle\": 1.57}";
+        let records = vec![CopperLogRecord {
+            timestamp_ns: 42_000_000,
+            channel: "/joint_state".to_string(),
+            data: payload.to_vec(),
+        }];
+
+        export_records_to_mcap(&records, &output, &McapExportOptions::default()).unwrap();
+
+        let data = std::fs::read(&output).unwrap();
+        let mut messages: Vec<_> = mcap::MessageStream::new(&data)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(messages.len(), 1);
+        let msg = messages.remove(0);
+        assert_eq!(msg.channel.topic, "/joint_state");
+        assert_eq!(msg.log_time, 42_000_000);
+        assert_eq!(msg.data.as_ref(), payload);
+    }
+}

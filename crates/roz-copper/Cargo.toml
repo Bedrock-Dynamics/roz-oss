@@ -1,0 +1,57 @@
+[package]
+name = "roz-copper"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+# Enable the copper_runtime macro-generated app and CI modules.
+copper-runtime = []
+# Enable AOT (ahead-of-time) WASM compilation via Module::deserialize.
+aot = []
+# Enable Gazebo simulation bridge (PoseV → EntityState conversion).
+gazebo = ["gz-transport-rs"]
+
+[dependencies]
+gz-transport-rs = { version = "0.1", optional = true }
+arc-swap = "1"
+cu29 = "0.14"
+cu29-derive = "0.14"
+cu29-helpers = "0.14"
+cu29-unifiedlog = "0.14"
+mcap.workspace = true
+prost = "0.13"
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+tonic = { workspace = true, features = ["channel", "transport"] }
+tokio-stream = "0.1"
+uuid.workspace = true
+roz-nats = { path = "../roz-nats" }
+roz-core = { path = "../roz-core" }
+parking_lot.workspace = true
+tokio = { workspace = true, features = ["full"] }
+anyhow.workspace = true
+tracing.workspace = true
+wasmtime = "43"
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+tonic-build = { workspace = true }
+
+# Feature-gate the Gazebo Docker integration test so it only compiles with --features gazebo.
+[[test]]
+name = "gazebo_docker_integration"
+required-features = ["gazebo"]
+
+[[test]]
+name = "gazebo_grpc_integration"
+required-features = ["gazebo"]
+
+[lints]
+workspace = true

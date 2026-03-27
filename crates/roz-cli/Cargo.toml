@@ -1,0 +1,65 @@
+[package]
+name = "roz-cli"
+version = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+
+[lib]
+name = "roz_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "roz"
+path = "src/main.rs"
+
+[dependencies]
+roz-core = { path = "../roz-core" }
+roz-agent = { path = "../roz-agent" }
+roz-local = { path = "../roz-local" }
+clap = { workspace = true, features = ["env"] }
+tokio = { workspace = true, features = ["full"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+anyhow.workspace = true
+reqwest.workspace = true
+tabled.workspace = true
+owo-colors.workspace = true
+indicatif.workspace = true
+tokio-tungstenite.workspace = true
+futures = "0.3"
+keyring.workspace = true
+directories.workspace = true
+webbrowser.workspace = true
+rand.workspace = true
+base64.workspace = true
+uuid.workspace = true
+toml.workspace = true
+sha2 = "0.10"
+hostname = "0.4"
+iocraft = "0.7"
+smol = "2"
+unicode-width = "0.1"
+dialoguer = "0.11"
+regex = { workspace = true }
+crossterm = "0.28"
+async-channel = "2"
+async-trait.workspace = true
+reqwest-eventsource.workspace = true
+futures-core.workspace = true
+tonic = { workspace = true, features = ["channel", "transport", "tls-ring", "tls-native-roots"] }
+prost.workspace = true
+prost-types.workspace = true
+tokio-stream.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+roz-copper = { path = "../roz-copper", default-features = false }
+
+[lints]
+workspace = true

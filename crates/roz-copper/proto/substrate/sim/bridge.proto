@@ -1,0 +1,566 @@
+syntax = "proto3";
+package substrate.sim;
+
+// Scene graph service - called once on connect, then streams updates
+service SceneService {
+  // Get full scene graph (models, meshes, materials)
+  // DEPRECATED: Use StreamScene for large scenes (>256MB)
+  rpc GetScene(GetSceneRequest) returns (SceneGraph);
+  // Stream scene in chunks (supports large scenes with zero-copy GPU upload)
+  rpc StreamScene(StreamSceneRequest) returns (stream SceneChunk);
+  // Stream pose updates at 60Hz
+  rpc StreamPoses(StreamPosesRequest) returns (stream PoseBatch);
+  // Stream scene changes (model added/removed)
+  rpc StreamSceneChanges(StreamChangesRequest) returns (stream SceneChange);
+}
+
+// Telemetry service - high-rate fused data
+service TelemetryService {
+  // Stream fused telemetry at 50Hz
+  rpc StreamTelemetry(StreamTelemetryRequest) returns (stream TelemetryFrame);
+  // Get current state (one-shot)
+  rpc GetState(GetStateRequest) returns (TelemetryFrame);
+}
+
+// Infrastructure service - environment and resource status
+service InfraService {
+  // Get infrastructure status (render tier, resource availability)
+  rpc GetInfraStatus(GetInfraStatusRequest) returns (InfraStatus);
+}
+
+// Control service - commands to simulation
+service ControlService {
+  // Spawn a model in the world
+  rpc SpawnModel(SpawnModelRequest) returns (SpawnModelResponse);
+  // Remove a model from the world
+  rpc RemoveModel(RemoveModelRequest) returns (RemoveModelResponse);
+  // Control simulation (pause/resume/step/reset)
+  rpc ControlSim(ControlSimRequest) returns (ControlSimResponse);
+  // Set simulation speed
+  rpc SetSpeed(SetSpeedRequest) returns (SetSpeedResponse);
+  // Send MAVLink flight command (arm, takeoff, land, RTL, set_mode)
+  rpc SendFlightCommand(FlightCommandRequest) returns (FlightCommandResponse);
+  // Set entity pose (teleport model in world)
+  rpc SetEntityPose(SetEntityPoseRequest) returns (SetEntityPoseResponse);
+  // Send direct joint position/velocity command (for WASM 100Hz controllers)
+  rpc SendJointCommand(JointCommandRequest) returns (JointCommandResponse);
+}
+
+// ============================================================================
+// Common Types
+// ============================================================================
+
+message Vector3 {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+}
+
+message Quaternion {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+  double w = 4;
+}
+
+message Transform3D {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+  double qx = 4;
+  double qy = 5;
+  double qz = 6;
+  double qw = 7;
+  // Mesh geometry scale (default 1,1,1).
+  // Matches SDF <mesh><scale> / Gazebo SetLocalScale.
+  double sx = 8;
+  double sy = 9;
+  double sz = 10;
+}
+
+message Material {
+  repeated float ambient = 1;   // RGBA [0-1]
+  repeated float diffuse = 2;   // RGBA [0-1]
+  repeated float specular = 3;  // RGBA [0-1]
+  repeated float emissive = 4;  // RGBA [0-1]
+  TextureData albedo_texture = 5;  // Loaded albedo/diffuse texture (optional)
+  float metallic = 6;           // PBR metallic factor [0-1]
+  float roughness = 7;          // PBR roughness factor [0-1]
+  TextureData normal_map = 8;   // Loaded normal map texture (optional)
+}
+
+// Texture data streamed with scene graph (loaded from PBR material)
+message TextureData {
+  bytes rgba = 1;               // Raw RGBA pixel data (4 bytes per pixel)
+  uint32 width = 2;             // Image width in pixels
+  uint32 height = 3;            // Image height in pixels
+}
+
+// ============================================================================
+// Scene Service Messages
+// ============================================================================
+
+message GetSceneRequest {
+  string world_name = 1;
+}
+
+// Chunked streaming request (replaces GetScene for large scenes)
+message StreamSceneRequest {
+  string world_name = 1;
+  // Optional: Resume from specific chunk index (for reconnection)
+  uint32 resume_from_chunk = 2;
+}
+
+// A single chunk of scene data (structure, mesh, or texture)
+// Uses rkyv-serialized binary payloads for zero-copy GPU upload
+message SceneChunk {
+  // Session ID (16 bytes UUID) - prevents stale chunks from previous connections
+  bytes session_id = 1;
+  // Total number of chunks in this scene
+  uint32 total_chunks = 2;
+  // This chunk's index (0-based)
+  uint32 chunk_index = 3;
+  // CRC32 checksum of payload for integrity validation
+  uint32 checksum = 4;
+
+  oneof payload {
+    // Scene structure (first chunk) - rkyv-serialized SceneStructureChunk
+    // Contains node hierarchy with mesh/texture URI references (no bulk data)
+    bytes scene_structure = 5;
+    // Mesh geometry - rkyv-serialized MeshChunk (16-byte aligned for GPU)
+    bytes mesh_chunk = 6;
+    // Texture data - rkyv-serialized TextureChunk
+    bytes texture_chunk = 7;
+    // Completion marker (all chunks sent)
+    bool complete = 8;
+  }
+}
+
+message SceneGraph {
+  repeated SceneNode nodes = 1;
+  string world_name = 2;
+  double sim_time = 3;
+  // Scene-level ambient light [r,g,b,a].
+  // Gazebo populates from <scene><ambient>;
+  // other backends use their own convention.
+  repeated float ambient = 4;
+  // Scene background color [r,g,b,a]
+  repeated float background = 5;
+  // Sky environment data (IBL zenith)
+  SceneSky sky = 6;
+  // Fog data (future Phase 4)
+  SceneFog fog = 7;
+}
+
+message SceneSky {
+  string cubemap_uri = 1;
+  repeated float cloud_ambient = 2; // [r,g,b,a]
+  double time = 3;
+  double sunrise = 4;
+  double sunset = 5;
+}
+
+message SceneFog {
+  uint32 fog_type = 1; // 0=None, 1=Linear, 2=Exp, 3=Exp2
+  repeated float color = 2; // [r,g,b,a]
+  float density = 3;
+  float start = 4;
+  float end = 5;
+}
+
+message SceneNode {
+  string path = 1;          // Hierarchical path (e.g., "world/drone/base_link")
+  string parent_path = 2;   // Parent node path
+  uint32 entity_id = 3;     // Gazebo entity ID for pose updates
+
+  oneof content {
+    TransformNode transform = 4;
+    MeshNode mesh = 5;
+    BoxNode box = 6;
+    SphereNode sphere = 7;
+    CylinderNode cylinder = 8;
+    LightNode light = 9;
+    ModelNode model = 10;
+    LinkNode link = 11;
+    JointNode joint = 12;
+    SensorNode sensor = 13;
+    CollisionNode collision = 14;
+  }
+}
+
+message TransformNode {
+  Transform3D local_transform = 1;
+}
+
+message MeshNode {
+  string uri = 1;             // Original URI (fuel://, model://, file://)
+  bytes vertices = 2;         // Packed f32 [x,y,z, x,y,z, ...]
+  bytes normals = 3;          // Packed f32 [nx,ny,nz, ...]
+  bytes indices = 4;          // Packed u32 triangle indices
+  bytes uvs = 5;              // Packed f32 [u,v, u,v, ...]
+  Material material = 6;
+  Transform3D local_transform = 7;
+  bytes vertex_colors = 8;    // Packed f32 [r,g,b,a, r,g,b,a, ...] per-vertex colors (optional)
+}
+
+message BoxNode {
+  repeated float size = 1;    // [x, y, z] half-extents
+  Material material = 2;
+  Transform3D local_transform = 3;
+}
+
+message SphereNode {
+  float radius = 1;
+  Material material = 2;
+  Transform3D local_transform = 3;
+}
+
+message CylinderNode {
+  float radius = 1;
+  float length = 2;
+  Material material = 3;
+  Transform3D local_transform = 4;
+}
+
+enum LightType {
+  LIGHT_TYPE_UNSPECIFIED = 0;
+  POINT = 1;
+  SPOT = 2;
+  DIRECTIONAL = 3;
+}
+
+message LightNode {
+  LightType light_type = 1;
+  repeated float color = 2;     // RGBA [0-1]
+  float intensity = 3;
+  Vector3 direction = 4;        // For directional/spot
+  float range = 5;
+  bool cast_shadows = 6;
+  float spot_inner_angle = 7;   // Radians
+  float spot_outer_angle = 8;   // Radians
+  Transform3D local_transform = 9;
+}
+
+// Model node (physics and hierarchy metadata)
+message ModelNode {
+  bool is_static = 1;
+  bool self_collide = 2;
+  Transform3D local_transform = 3;
+}
+
+// Link node (physics properties from Gazebo ECM)
+message LinkNode {
+  bool gravity = 1;           // Gravity enabled
+  bool kinematic = 2;         // Kinematic flag
+  bool self_collide = 3;      // Self-collision enabled
+  InertialData inertial = 4;  // Mass and inertia (optional)
+  Transform3D local_transform = 5;
+}
+
+// Inertial properties (mass, center of mass, inertia tensor)
+message InertialData {
+  double mass = 1;            // Mass in kg
+  Transform3D center_of_mass = 2;  // CoM pose relative to link
+  double ixx = 3;
+  double ixy = 4;
+  double ixz = 5;
+  double iyy = 6;
+  double iyz = 7;
+  double izz = 8;
+}
+
+// Joint node (articulation between links)
+message JointNode {
+  JointType joint_type = 1;
+  string parent_link = 2;     // Parent link name
+  string child_link = 3;      // Child link name
+  JointAxisData axis1 = 4;    // Primary axis
+  JointAxisData axis2 = 5;    // Secondary axis (revolute2, universal)
+  Transform3D local_transform = 6;
+}
+
+enum JointType {
+  JOINT_TYPE_UNSPECIFIED = 0;
+  REVOLUTE = 1;
+  REVOLUTE2 = 2;
+  PRISMATIC = 3;
+  UNIVERSAL = 4;
+  BALL = 5;
+  SCREW = 6;
+  GEARBOX = 7;
+  JOINT_FIXED = 8;
+  CONTINUOUS = 9;
+}
+
+message JointAxisData {
+  double x = 1;               // Axis direction X
+  double y = 2;               // Axis direction Y
+  double z = 3;               // Axis direction Z
+  double lower_limit = 4;     // Lower position limit (rad or m)
+  double upper_limit = 5;     // Upper position limit (rad or m)
+  double effort_limit = 6;    // Max force/torque (N or Nm)
+  double velocity_limit = 7;  // Max velocity (rad/s or m/s)
+  double damping = 8;
+  double friction = 9;
+}
+
+// Sensor node (metadata from Gazebo ECM)
+message SensorNode {
+  string sensor_type = 1;     // "camera", "imu", "gps", "lidar", etc.
+  double update_rate = 2;     // Hz
+  string topic = 3;           // Publish topic
+  bool always_on = 4;
+  Transform3D local_transform = 5;
+}
+
+// Collision geometry node (from link.collision)
+message CollisionNode {
+  oneof shape {
+    BoxNode box = 1;
+    SphereNode sphere = 2;
+    CylinderNode cylinder = 3;
+    MeshNode mesh = 4;
+  }
+  Transform3D local_transform = 5;
+}
+
+message StreamPosesRequest {
+  string world_name = 1;
+  repeated string entity_filter = 2;  // Empty = all entities
+}
+
+message PoseBatch {
+  repeated EntityPose poses = 1;
+  double sim_time = 2;
+}
+
+message EntityPose {
+  uint32 entity_id = 1;
+  string path = 2;            // Entity path for UI display
+  Transform3D transform = 3;
+}
+
+message StreamChangesRequest {
+  string world_name = 1;
+}
+
+message SceneChange {
+  oneof change {
+    SceneNode added = 1;
+    string removed_path = 2;
+  }
+  double sim_time = 3;
+}
+
+// ============================================================================
+// Telemetry Service Messages
+// ============================================================================
+
+message StreamTelemetryRequest {
+  string entity_id = 1;       // Entity to track (empty = primary vehicle)
+  uint32 rate_hz = 2;         // Desired rate (0 = max available)
+}
+
+message GetStateRequest {
+  string entity_id = 1;
+}
+
+message TelemetryFrame {
+  string entity_id = 1;
+  Transform3D pose = 2;           // World pose (ENU frame)
+  Vector3 velocity = 3;           // Linear velocity (ENU, m/s)
+  Vector3 angular_velocity = 4;   // Angular velocity (body frame, rad/s)
+  double sim_time = 5;
+  DataAuthority authority = 6;
+
+  // Optional extended state
+  bool armed = 7;
+  string flight_mode = 8;
+  float battery_voltage = 9;
+  float battery_percent = 10;
+
+  // Phase 6: Readiness signals from MAVLink (HEARTBEAT, GPS_RAW_INT, ESTIMATOR_STATUS)
+  ReadinessState readiness = 20;
+}
+
+// MAVLink readiness signals for computing simulation readiness state
+// Populated by MAVLink listener from HEARTBEAT (0), GPS_RAW_INT (24), ESTIMATOR_STATUS (230)
+message ReadinessState {
+  // Heartbeat tracking
+  bool heartbeat_alive = 1;       // Heartbeat received within timeout (5s)
+  uint64 heartbeat_age_ms = 2;    // Milliseconds since last heartbeat
+  bool armed = 3;                 // Vehicle armed state from HEARTBEAT
+  uint32 system_status = 4;       // MAV_STATE (0=UNINIT, 3=STANDBY, 4=ACTIVE, etc.)
+
+  // GPS tracking (from GPS_RAW_INT msg_id 24)
+  uint32 gps_fix_type = 5;        // Fix type (0=none, 2=2D, 3=3D, 4=DGPS, 5=RTK float, 6=RTK fixed)
+  bool has_gps_fix = 6;           // fix_type >= 3 (3D fix or better)
+
+  // EKF tracking (from ESTIMATOR_STATUS msg_id 230)
+  uint32 ekf_flags = 7;           // EKF flags bitfield (bits 0-5 = essential estimates)
+  bool ekf_converged = 8;         // (flags & 0x3F) == 0x3F (all essential bits set)
+
+  // Computed readiness levels
+  bool ready_to_arm = 9;          // heartbeat + GPS + EKF all valid
+  bool fully_operational = 10;    // ready + system STANDBY/ACTIVE
+}
+
+enum DataAuthority {
+  DATA_AUTHORITY_UNSPECIFIED = 0;
+  GROUND_TRUTH = 1;           // Gazebo physics (perfect)
+  FILTERED_ESTIMATE = 2;      // EKF output (ArduPilot)
+  RAW_SENSOR = 3;             // Unfiltered sensor data
+}
+
+// ============================================================================
+// Control Service Messages
+// ============================================================================
+
+message SpawnModelRequest {
+  string model_id = 1;        // From registry (e.g., "fuel:x3-uav")
+  string entity_name = 2;     // Unique name in world
+  Transform3D spawn_pose = 3;
+  string world_name = 4;
+}
+
+message SpawnModelResponse {
+  bool success = 1;
+  string entity_id = 2;       // Assigned entity ID
+  string error = 3;
+}
+
+message RemoveModelRequest {
+  string entity_id = 1;
+  string world_name = 2;
+}
+
+message RemoveModelResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message ControlSimRequest {
+  SimCommand command = 1;
+  string world_name = 2;
+}
+
+enum SimCommand {
+  SIM_COMMAND_UNSPECIFIED = 0;
+  PAUSE = 1;
+  RESUME = 2;
+  STEP = 3;                   // Single physics step
+  RESET = 4;                  // Reset to initial state
+}
+
+message ControlSimResponse {
+  bool success = 1;
+  string error = 2;
+  SimState state = 3;
+}
+
+enum SimState {
+  SIM_STATE_UNSPECIFIED = 0;
+  RUNNING = 1;
+  PAUSED = 2;
+  STEPPING = 3;
+}
+
+message SetSpeedRequest {
+  double real_time_factor = 1;  // 1.0 = real-time, 0.0 = max speed
+  string world_name = 2;
+}
+
+message SetSpeedResponse {
+  bool success = 1;
+  double actual_rtf = 2;        // Achieved RTF
+  string error = 3;
+}
+
+// ============================================================================
+// Flight Command (Phase 4 - AI flight control via MAVLink COMMAND_LONG)
+// ============================================================================
+
+enum FlightCommand {
+  FLIGHT_COMMAND_UNSPECIFIED = 0;
+  ARM = 1;
+  DISARM = 2;
+  TAKEOFF = 3;
+  LAND = 4;
+  RTL = 5;         // Return to launch
+  SET_MODE = 6;
+  GOTO = 7;        // Navigate to waypoint
+}
+
+message FlightCommandRequest {
+  FlightCommand command = 1;
+  // Command-specific parameters:
+  // TAKEOFF: altitude_m = target altitude (meters AGL)
+  double altitude_m = 2;
+  // GOTO: target position (ENU meters relative to home)
+  double goto_x = 3;
+  double goto_y = 4;
+  double goto_z = 5;
+  // SET_MODE: mode string ("GUIDED", "LOITER", "RTL", "LAND", "STABILIZE")
+  string mode = 6;
+  // Multi-vehicle: index of target vehicle (0-based, default 0)
+  uint32 vehicle_index = 7;
+}
+
+message FlightCommandResponse {
+  bool success = 1;
+  // MAV_RESULT name (ACCEPTED, DENIED, FAILED, etc.)
+  string result = 2;
+  string error = 3;
+}
+
+// ============================================================================
+// Set Entity Pose (Phase 10B - teleport model in simulation)
+// ============================================================================
+
+message SetEntityPoseRequest {
+  string entity_name = 1;   // Entity path like "x500_0"
+  Transform3D pose = 2;     // Position + orientation
+  string world_name = 3;    // Target world
+}
+
+message SetEntityPoseResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+// ============================================================================
+// Joint Command (for WASM 100Hz controller output)
+// ============================================================================
+
+enum JointCommandMode {
+  JOINT_COMMAND_MODE_UNSPECIFIED = 0;
+  JOINT_POSITION = 1;             // Target positions (rad)
+  JOINT_VELOCITY = 2;             // Target velocities (rad/s)
+}
+
+message JointCommandRequest {
+  JointCommandMode mode = 1;
+  repeated string joint_names = 2;  // Channel names from manifest
+  repeated double values = 3;       // Channel values in manifest order
+  string world_name = 4;           // Target world (empty = default)
+  string robot_class = 5;          // "manipulator", "drone", "mobile" — determines routing
+}
+
+message JointCommandResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+// ============================================================================
+// Infrastructure Service Messages
+// ============================================================================
+
+message GetInfraStatusRequest {}
+
+// Infrastructure status (render tier, resource availability)
+message InfraStatus {
+  // Render tier: 0=host display, 1=EGL GPU, 2=Xvfb software
+  int32 render_tier = 1;
+  // Human-readable render description
+  string render_description = 2;
+}

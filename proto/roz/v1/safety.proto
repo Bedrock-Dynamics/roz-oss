@@ -1,0 +1,33 @@
+syntax = "proto3";
+package roz.v1;
+
+service SafetyService {
+  rpc GetSafetyStatus(GetSafetyStatusRequest) returns (SafetyStatus);
+  rpc TriggerEstop(TriggerEstopRequest) returns (TriggerEstopResponse);
+  rpc ClearEstop(ClearEstopRequest) returns (ClearEstopResponse);
+}
+
+message GetSafetyStatusRequest {
+  string environment_id = 1;
+}
+
+message SafetyStatus {
+  string environment_id = 1;
+  bool estop_active = 2;
+  string level = 3;
+  repeated string active_guards = 4;
+}
+
+message TriggerEstopRequest {
+  string environment_id = 1;
+  string reason = 2;
+}
+
+message TriggerEstopResponse {}
+
+message ClearEstopRequest {
+  string environment_id = 1;
+  string reason = 2;
+}
+
+message ClearEstopResponse {}

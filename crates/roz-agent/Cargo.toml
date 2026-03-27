@@ -1,0 +1,43 @@
+[package]
+name = "roz-agent"
+version = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+
+[dependencies]
+roz-core = { path = "../roz-core" }
+roz-copper = { path = "../roz-copper", default-features = false }
+roz-nats = { path = "../roz-nats" }
+async-trait.workspace = true
+async-nats.workspace = true
+tokio = { workspace = true, features = ["full"] }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+sha2.workspace = true
+hex.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+reqwest = { workspace = true }
+reqwest-eventsource.workspace = true
+eventsource-stream = "0.2"
+thiserror.workspace = true
+futures.workspace = true
+futures-core.workspace = true
+async-stream.workspace = true
+tokio-stream.workspace = true
+schemars.workspace = true
+
+[dev-dependencies]
+crc32fast = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+roz-local = { path = "../roz-local" }
+roz-copper = { path = "../roz-copper", default-features = false }
+roz-test = { path = "../roz-test" }
+
+[lints]
+workspace = true

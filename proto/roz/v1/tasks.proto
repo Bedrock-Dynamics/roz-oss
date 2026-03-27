@@ -1,0 +1,68 @@
+syntax = "proto3";
+package roz.v1;
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+service TaskService {
+  rpc CreateTask(CreateTaskRequest) returns (Task);
+  rpc GetTask(GetTaskRequest) returns (Task);
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+  rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
+  rpc ApproveToolUse(ApproveToolUseRequest) returns (Task);
+  rpc StreamTaskStatus(StreamTaskStatusRequest) returns (stream TaskStatusUpdate);
+}
+
+message CreateTaskRequest {
+  string prompt = 1;
+  string environment_id = 2;
+  optional string host_id = 3;
+  optional uint32 timeout_secs = 4;
+}
+
+message GetTaskRequest {
+  string id = 1;
+}
+
+message ListTasksRequest {
+  int64 limit = 1;
+  int64 offset = 2;
+}
+
+message ListTasksResponse {
+  repeated Task data = 1;
+}
+
+message CancelTaskRequest {
+  string id = 1;
+}
+
+message CancelTaskResponse {}
+
+message ApproveToolUseRequest {
+  string task_id = 1;
+  string tool_call_id = 2;
+  bool approved = 3;
+  optional google.protobuf.Struct modifier = 4;
+}
+
+message StreamTaskStatusRequest {
+  string task_id = 1;
+}
+
+message Task {
+  string id = 1;
+  string prompt = 2;
+  string environment_id = 3;
+  string status = 4;
+  optional string host_id = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp updated_at = 7;
+}
+
+message TaskStatusUpdate {
+  string task_id = 1;
+  string status = 2;
+  optional string detail = 3;
+  google.protobuf.Timestamp timestamp = 4;
+}

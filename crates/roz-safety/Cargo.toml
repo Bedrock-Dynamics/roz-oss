@@ -1,0 +1,33 @@
+[package]
+name = "roz-safety"
+version = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+
+[[bin]]
+name = "roz-safety"
+path = "src/main.rs"
+
+[dependencies]
+roz-core = { path = "../roz-core" }
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true }
+logfire.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+parking_lot.workspace = true
+async-nats.workspace = true
+anyhow.workspace = true
+futures = "0.3"
+bytes = "1"
+
+[dev-dependencies]
+tempfile = "3"
+roz-test = { path = "../roz-test" }
+
+[lints]
+workspace = true

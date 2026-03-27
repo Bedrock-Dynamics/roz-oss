@@ -1,0 +1,47 @@
+syntax = "proto3";
+package roz.v1;
+
+import "google/protobuf/timestamp.proto";
+
+service HostService {
+  rpc RegisterHost(RegisterHostRequest) returns (Host);
+  rpc GetHost(GetHostRequest) returns (Host);
+  rpc ListHosts(ListHostsRequest) returns (ListHostsResponse);
+  rpc DeregisterHost(DeregisterHostRequest) returns (DeregisterHostResponse);
+}
+
+message RegisterHostRequest {
+  string name = 1;
+  string environment_id = 2;
+  map<string, string> capabilities = 3;
+}
+
+message GetHostRequest {
+  string id = 1;
+}
+
+message ListHostsRequest {
+  string environment_id = 1;
+  int64 limit = 2;
+  int64 offset = 3;
+}
+
+message ListHostsResponse {
+  repeated Host data = 1;
+}
+
+message DeregisterHostRequest {
+  string id = 1;
+}
+
+message DeregisterHostResponse {}
+
+message Host {
+  string id = 1;
+  string name = 2;
+  string environment_id = 3;
+  string status = 4;
+  map<string, string> capabilities = 5;
+  google.protobuf.Timestamp created_at = 6;
+  google.protobuf.Timestamp last_heartbeat = 7;
+}

@@ -1,0 +1,331 @@
+syntax = "proto3";
+
+package roz.v1;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+
+service AgentService {
+  // Bidirectional streaming RPC for interactive agent sessions.
+  // Client sends prompts and tool results. Server sends deltas and tool requests.
+  rpc StreamSession(stream SessionRequest) returns (stream SessionResponse);
+
+  // WatchTeam streams TeamEvent messages for all workers under a parent task.
+  rpc WatchTeam(WatchTeamRequest) returns (stream TeamEvent);
+}
+
+// --- Client → Server ---
+
+message SessionRequest {
+  oneof request {
+    StartSession start = 1;
+    UserMessage user_message = 2;
+    ToolResult tool_result = 3;
+    CancelTurn cancel_turn = 4;
+    CancelSession cancel_session = 5;
+    Ping ping = 6;
+    MessageFeedback feedback = 7;
+    // D2: IDE sends user's Deny/Allow decision for a Roz-authoritative approval.
+    PermissionDecision permission_decision = 8;
+    // D3: IDE registers / unregisters dynamic tool sets (e.g. MCP sim tools).
+    RegisterTools register_tools = 9;
+  }
+}
+
+message StartSession {
+  string environment_id = 1;
+  optional string host_id = 2;
+  optional string model = 3;
+  repeated ToolSchema tools = 4;
+  repeated ConversationMessage history = 5;
+  repeated string project_context = 6;
+  optional uint32 max_context_tokens = 7;
+}
+
+message ConversationMessage {
+  string role = 1;
+  repeated ContentPart parts = 2;
+}
+
+message ContentPart {
+  oneof part {
+    TextContent text = 1;
+    ToolUseContent tool_use = 2;
+    ToolResultContent tool_result = 3;
+    ThinkingContent thinking = 4;
+    ImageContent image = 5;
+  }
+}
+
+message TextContent {
+  string text = 1;
+}
+
+message ToolUseContent {
+  string id = 1;
+  string name = 2;
+  google.protobuf.Struct input = 3;
+}
+
+message ToolResultContent {
+  string tool_use_id = 1;
+  string name = 2;
+  string content = 3;
+  bool is_error = 4;
+}
+
+message ThinkingContent {
+  string thinking = 1;
+  string signature = 2;
+}
+
+message ImageContent {
+  string media_type = 1;
+  bytes data = 2;
+}
+
+message UserMessage {
+  string content = 1;
+  repeated ContentBlock context = 2;
+  optional string ai_mode = 3;
+  // Client-generated message ID echoed back in all response chunks
+  // (TextDelta, ThinkingDelta, TurnComplete). If omitted, server generates one.
+  optional string message_id = 4;
+  // D3b: Complete tool snapshot for this turn. When present, Roz uses these
+  // instead of session-accumulated tools (RegisterTools / StartSession.tools).
+  // IDE should send the full current MCP tool set on every UserMessage.
+  repeated ToolSchema tools = 5;
+  // D3b: Workflow context for this turn (replaces RegisterTools.system_context).
+  // Injected as a system block prepended to this turn only.
+  optional string system_context = 6;
+}
+
+message ContentBlock {
+  oneof block {
+    string text = 1;
+    BinaryContent binary = 2;
+  }
+  optional string label = 3;
+}
+
+message BinaryContent {
+  string mime_type = 1;
+  bytes data = 2;
+}
+
+message ToolResult {
+  string tool_call_id = 1;
+  bool success = 2;
+  string result = 3;
+  // Structured metadata from tool execution (added in D1).
+  // exit_code: shell exit code (0 = success, non-zero = failure).
+  // truncated: output was cut off due to size limits.
+  // duration_ms: wall-clock execution time in milliseconds.
+  optional int32 exit_code = 4;
+  bool truncated = 5;
+  optional int64 duration_ms = 6;
+}
+
+message CancelTurn {
+  string reason = 1;
+}
+
+message CancelSession {
+  string reason = 1;
+}
+
+message Ping {}
+
+message MessageFeedback {
+  string session_id = 1;
+  string message_id = 2;
+  string rating = 3; // "up" or "down"
+}
+
+// D2: IDE response to a Roz-authoritative tool approval request.
+// Sent when the user clicks Deny/Allow in the IDE popover.
+message PermissionDecision {
+  // The tool_call_id from the ActivityUpdate("waiting_approval") that triggered
+  // the popover. Roz uses this to unblock the waiting agent turn.
+  string tool_call_id = 1;
+  bool approved = 2;
+}
+
+// D3: Dynamically register or unregister a named set of tools mid-session.
+//
+// Typical use: IDE proxy connects to a Docker sim container's MCP server,
+// fetches its tool manifest, then sends RegisterTools to add those tools
+// to the running Roz session.  When the container stops, the IDE sends
+// RegisterTools with tools=[] and the same source to unregister them.
+//
+// source  — identifies the tool set owner (e.g. a container short ID).
+//           All previously-registered tools whose name starts with
+//           "{source}__" are removed before the new list is appended.
+// tools   — replacement list for this source.  Empty list = unregister.
+// system_context — optional workflow guidance for this source (MCP Prompt
+//           "substrate:workflow").  Injected as a system block on the next
+//           UserMessage turn.
+message RegisterTools {
+  optional string source = 1;
+  repeated ToolSchema tools = 2;
+  optional string system_context = 3;
+}
+
+// --- Server → Client ---
+
+message SessionResponse {
+  oneof response {
+    SessionStarted session_started = 1;
+    TextDelta text_delta = 2;
+    ThinkingDelta thinking_delta = 3;
+    ToolRequest tool_request = 4;
+    TurnComplete turn_complete = 5;
+    SessionError error = 6;
+    Keepalive keepalive = 7;
+    Pong pong = 8;
+    ContextCompacted context_compacted = 9;
+    PresenceHint presence_hint = 10;
+    ActivityUpdate activity_update = 11;
+  }
+}
+
+message ContextCompacted {
+  string level = 1;
+  uint32 messages_before = 2;
+  uint32 messages_after = 3;
+  uint32 tokens_before = 4;
+  uint32 tokens_after = 5;
+  optional string summary = 6;
+}
+
+message SessionStarted {
+  string session_id = 1;
+  string model = 2;
+  repeated PermissionRule permissions = 3;
+}
+
+message PermissionRule {
+  string tool_pattern = 1;
+  string policy = 2;
+  optional string category = 3;
+  optional string reason = 4;
+}
+
+message TextDelta {
+  string message_id = 1;
+  string content = 2;
+}
+
+message ThinkingDelta {
+  string message_id = 1;
+  string content = 2;
+}
+
+message ToolRequest {
+  string tool_call_id = 1;
+  string tool_name = 2;
+  google.protobuf.Struct parameters = 3;
+  uint32 timeout_ms = 4;
+}
+
+message TurnComplete {
+  string message_id = 1;
+  TokenUsage usage = 2;
+  string stop_reason = 3;
+}
+
+message SessionError {
+  string code = 1;
+  string message = 2;
+  bool retryable = 3;
+}
+
+message Keepalive {
+  optional uint32 tokens_used = 1;
+  optional uint32 tokens_max = 2;
+}
+
+message Pong {}
+
+message PresenceHint {
+  string level = 1;       // "full", "mini", "hidden"
+  string reason = 2;
+}
+
+message ActivityUpdate {
+  string state = 1;       // "thinking", "calling_tool", "idle", "waiting_approval"
+  string detail = 2;
+  optional float progress = 3;
+}
+
+message TokenUsage {
+  uint32 input_tokens = 1;
+  uint32 output_tokens = 2;
+  uint32 cache_read_tokens = 3;
+  uint32 cache_creation_tokens = 4;
+}
+
+// Categorises a tool for UI presence decisions.
+enum ToolCategoryHint {
+  TOOL_CATEGORY_UNSPECIFIED = 0;
+  TOOL_CATEGORY_PHYSICAL = 1;
+  TOOL_CATEGORY_PURE = 2;
+}
+
+message ToolSchema {
+  string name = 1;
+  string description = 2;
+  google.protobuf.Struct parameters_schema = 3;
+  uint32 timeout_ms = 4;
+  ToolCategoryHint category = 5;
+}
+
+// --- WatchTeam RPC ---
+
+message WatchTeamRequest {
+  string task_id = 1;
+}
+
+// TeamEvent is the server-streaming response for WatchTeam.
+// Each event describes a worker lifecycle transition.
+message TeamEvent {
+  oneof event {
+    WorkerStarted worker_started = 1;
+    WorkerPhase worker_phase = 2;
+    WorkerToolCall worker_tool_call = 3;
+    WorkerCompleted worker_completed = 4;
+    WorkerFailed worker_failed = 5;
+    WorkerExited worker_exited = 6;
+  }
+}
+
+message WorkerStarted {
+  string worker_id = 1;
+  string host_id = 2;
+}
+
+message WorkerPhase {
+  string worker_id = 1;
+  uint32 phase = 2;
+  string mode = 3; // "react" or "ooda_re_act"
+}
+
+message WorkerToolCall {
+  string worker_id = 1;
+  string tool = 2;
+}
+
+message WorkerCompleted {
+  string worker_id = 1;
+  string result = 2;
+}
+
+message WorkerFailed {
+  string worker_id = 1;
+  string reason = 2; // "e_stop" | "timeout" | "model_error" | "safety_violation"
+}
+
+message WorkerExited {
+  string worker_id = 1;
+  string parent_task_id = 2;
+}
