@@ -90,7 +90,7 @@ mod tests {
             provider: Provider::Cloud,
             model: "claude-sonnet-4-6".into(),
             api_key: Some("roz_sk_test".into()),
-            api_url: "http://localhost:8080".into(),
+            api_url: "https://roz-api.fly.dev".into(),
         };
         let lines = info_lines(&config);
         assert_eq!(lines[0], format!("roz v{}", env!("CARGO_PKG_VERSION")));

@@ -33,7 +33,7 @@ pub enum AgentEvent {
 pub enum Provider {
     /// Direct to api.anthropic.com (BYOK).
     Anthropic,
-    /// Roz Cloud gRPC (localhost:8080 (or set ROZ_API_URL)).
+    /// Roz Cloud gRPC (roz-api.fly.dev (override with ROZ_API_URL)).
     Cloud,
     /// Local Ollama-compatible API.
     Ollama,
@@ -110,7 +110,7 @@ impl ProviderConfig {
                     provider: Provider::Cloud,
                     model: model_name.to_string(),
                     api_key: Some(key.to_string()),
-                    api_url: "http://localhost:8080".to_string(),
+                    api_url: "https://roz-api.fly.dev".to_string(),
                 };
             }
             // Any other key → Anthropic
@@ -154,7 +154,7 @@ impl ProviderConfig {
     fn for_provider_and_model(provider: Provider, model: &str, api_key: Option<&str>) -> Self {
         let (api_url, key) = match provider {
             Provider::Anthropic => ("https://api.anthropic.com".to_string(), api_key.map(String::from)),
-            Provider::Cloud => ("http://localhost:8080".to_string(), api_key.map(String::from)),
+            Provider::Cloud => ("https://roz-api.fly.dev".to_string(), api_key.map(String::from)),
             Provider::Ollama => (
                 std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string()),
                 None,
@@ -366,7 +366,7 @@ mod tests {
             provider: Provider::Cloud,
             model: "claude-sonnet-4-6".into(),
             api_key: Some("roz_sk_test".into()),
-            api_url: "http://localhost:8080".into(),
+            api_url: "https://roz-api.fly.dev".into(),
         };
         let err = ProviderError::classify(401, "invalid key", &config);
         match err {
@@ -420,7 +420,7 @@ mod tests {
             provider: Provider::Cloud,
             model: "claude-sonnet-4-6".into(),
             api_key: Some("roz_sk_test".into()),
-            api_url: "http://localhost:8080".into(),
+            api_url: "https://roz-api.fly.dev".into(),
         };
         let result = classify_error_message("some random error", &config);
         assert_eq!(result, "some random error");

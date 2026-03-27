@@ -96,7 +96,7 @@ fn detect_bare_model_with_roz_sk_routes_to_cloud() {
     );
     assert_eq!(config.model, "claude-sonnet-4-6");
     assert_eq!(config.api_key.as_deref(), Some("roz_sk_test_key_abc123"));
-    assert_eq!(config.api_url, "http://localhost:8080");
+    assert_eq!(config.api_url, "https://roz-api.fly.dev");
 }
 
 #[test]
