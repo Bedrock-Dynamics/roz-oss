@@ -1203,7 +1203,24 @@ async fn handle_start(
 
     let tenant_id = auth_identity.tenant_id().0;
 
-    let Ok(env_id) = uuid::Uuid::parse_str(&start.environment_id) else {
+    // Auto-resolve environment: if empty, use tenant's first environment or create "default".
+    let env_id = if start.environment_id.is_empty() {
+        match roz_db::environments::list(pool, tenant_id, 1, 0).await {
+            Ok(envs) if !envs.is_empty() => envs[0].id,
+            _ => match roz_db::environments::create(pool, tenant_id, "default", "development", &serde_json::json!({}))
+                .await
+            {
+                Ok(env) => env.id,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to create default environment");
+                    send_error(tx, "internal", "failed to create default environment", true).await;
+                    return false;
+                }
+            },
+        }
+    } else if let Ok(id) = uuid::Uuid::parse_str(&start.environment_id) {
+        id
+    } else {
         send_error(tx, "invalid_argument", "invalid environment_id", false).await;
         return false;
     };

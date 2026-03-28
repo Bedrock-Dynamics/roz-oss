@@ -42,7 +42,7 @@ pub async fn stream_session(
     req_tx
         .send(SessionRequest {
             request: Some(session_request::Request::Start(StartSession {
-                environment_id: "default".to_string(),
+                environment_id: String::new(),
                 model: Some(config.model.clone()),
                 ..Default::default()
             })),
