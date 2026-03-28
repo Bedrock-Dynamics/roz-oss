@@ -77,6 +77,11 @@ impl Subjects {
         validate_token("worker_id", worker_id)?;
         Ok(format!("invoke.{worker_id}.>"))
     }
+
+    /// E-stop subject for a worker: `safety.estop.{worker_id}`.
+    pub fn estop(worker_id: &str) -> String {
+        format!("safety.estop.{worker_id}")
+    }
 }
 
 #[cfg(test)]
@@ -158,5 +163,11 @@ mod tests {
     fn invoke_wildcard_valid() {
         let subject = Subjects::invoke_wildcard("worker-1").unwrap();
         assert_eq!(subject, "invoke.worker-1.>");
+    }
+
+    #[test]
+    fn estop_subject() {
+        let subject = Subjects::estop("robot-arm-1");
+        assert_eq!(subject, "safety.estop.robot-arm-1");
     }
 }

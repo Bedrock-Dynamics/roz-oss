@@ -176,6 +176,11 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Subscribe to e-stop events
+    let estop_sub = roz_worker::estop::subscribe_estop(&nats, &config.worker_id).await?;
+    let estop_rx = roz_worker::estop::spawn_estop_listener(estop_sub);
+    tracing::info!(worker_id = %config.worker_id, "e-stop listener active");
+
     // Subscribe to task invocations
     let worker_id = &config.worker_id;
     let subject = format!("invoke.{worker_id}.>");
@@ -185,6 +190,11 @@ async fn main() -> Result<()> {
     let restate_url = config.restate_url.clone();
 
     while let Some(msg) = sub.next().await {
+        if *estop_rx.borrow() {
+            tracing::error!("E-STOP active — rejecting task invocation");
+            continue;
+        }
+
         tracing::info!(
             subject = %msg.subject,
             bytes = msg.payload.len(),

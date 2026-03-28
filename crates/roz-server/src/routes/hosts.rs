@@ -4,7 +4,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use roz_core::auth::AuthIdentity;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -148,4 +148,47 @@ pub async fn delete(
     }
     roz_db::hosts::delete(&state.pool, id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /v1/hosts/:id/estop — trigger emergency stop on a host via NATS.
+pub async fn estop(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthIdentity>,
+    Path(id): Path<Uuid>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let tenant_id = *auth.tenant_id().as_uuid();
+
+    // Get host to find its name (used as worker_id in NATS)
+    let host = roz_db::hosts::get_by_id(&state.pool, id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error": "host not found"}))))?;
+
+    if host.tenant_id != tenant_id {
+        return Err((StatusCode::NOT_FOUND, Json(json!({"error": "host not found"}))));
+    }
+
+    let Some(nats) = &state.nats_client else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "NATS not connected"})),
+        ));
+    };
+
+    let subject = roz_nats::subjects::Subjects::estop(&host.name);
+    nats.publish(subject, bytes::Bytes::from_static(b"{}"))
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, host_id = %id, "failed to publish e-stop");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "failed to publish e-stop"})),
+            )
+        })?;
+
+    tracing::warn!(host_id = %id, host_name = %host.name, "E-STOP published");
+    Ok((
+        StatusCode::OK,
+        Json(json!({"status": "estop_sent", "host_id": id, "host_name": host.name})),
+    ))
 }

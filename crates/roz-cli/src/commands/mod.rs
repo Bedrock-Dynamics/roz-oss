@@ -2,6 +2,7 @@ pub mod auth;
 pub mod config;
 pub mod doctor;
 pub mod env;
+pub mod estop;
 pub mod host;
 pub mod interactive;
 pub mod non_interactive;

@@ -47,9 +47,7 @@ async fn main() -> anyhow::Result<()> {
             cli::Commands::Trust(args) => commands::trust::execute(&args.command, &config).await,
             cli::Commands::Config(args) => commands::config::execute(&args.command, &config).await,
             cli::Commands::Doctor => commands::doctor::execute(&config).await,
-            cli::Commands::Estop { .. } => {
-                anyhow::bail!("estop command not yet implemented")
-            }
+            cli::Commands::Estop { host } => commands::estop::execute(&config, &host).await,
         },
     }
 }
