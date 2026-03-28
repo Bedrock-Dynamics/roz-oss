@@ -103,14 +103,15 @@ impl ProviderConfig {
         // 2. Parse ref into (provider_prefix, model_name)
         let (provider_prefix, model_name) = parse_model_ref(model_ref);
 
-        // 3. If provider is explicit in the ref, use it directly
-        if let Some(prefix) = provider_prefix
+        // 3. If EXPLICIT CLI FLAG has a provider prefix, use it (user intent)
+        if explicit_model.is_some()
+            && let Some(prefix) = provider_prefix
             && let Ok(provider) = prefix.parse::<Provider>()
         {
             return Self::for_provider_and_model(provider, model_name, api_key);
         }
 
-        // 4. Auto-detect from credential prefix
+        // 4. Auto-detect provider from credential prefix (credentials determine provider)
         if let Some(key) = api_key {
             if key.starts_with("roz_sk_") {
                 return Self {
@@ -149,7 +150,14 @@ impl ProviderConfig {
             };
         }
 
-        // 7. No credentials — disconnected fallback
+        // 7. If roz_toml had a provider prefix (no credentials), use it as hint
+        if let Some(prefix) = provider_prefix
+            && let Ok(provider) = prefix.parse::<Provider>()
+        {
+            return Self::for_provider_and_model(provider, model_name, api_key);
+        }
+
+        // 8. No credentials — disconnected fallback
         Self {
             provider: Provider::Anthropic,
             model: model_name.to_string(),
@@ -431,5 +439,19 @@ mod tests {
         };
         let result = classify_error_message("some random error", &config);
         assert_eq!(result, "some random error");
+    }
+
+    #[test]
+    fn detect_roz_toml_provider_prefix_ignored_when_roz_sk() {
+        let config = ProviderConfig::detect(None, Some("roz_sk_test_key"), Some("anthropic/claude-sonnet-4-6"));
+        assert_eq!(config.provider, Provider::Cloud);
+        assert_eq!(config.model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn detect_explicit_model_flag_still_overrides() {
+        let config = ProviderConfig::detect(Some("anthropic/claude-opus-4-6"), Some("roz_sk_test_key"), None);
+        assert_eq!(config.provider, Provider::Anthropic);
+        assert_eq!(config.model, "claude-opus-4-6");
     }
 }
