@@ -1,0 +1,7 @@
+pub mod source;
+
+// These will be added in subsequent tasks:
+// pub mod encoder;
+// pub mod stream_hub;
+// pub mod hotplug;
+// pub mod adaptive;
