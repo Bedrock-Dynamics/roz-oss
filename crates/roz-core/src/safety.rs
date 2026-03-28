@@ -97,6 +97,32 @@ pub struct OperationalDesignDomain {
 }
 
 // ---------------------------------------------------------------------------
+// ControlMode
+// ---------------------------------------------------------------------------
+
+/// Control mode for robot sessions.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlMode {
+    /// Agent executes freely within safety bounds.
+    #[default]
+    Autonomous,
+    /// Agent executes, user monitors, can pause/stop. Default for remote sessions.
+    Supervised,
+    /// Agent suggests each step, user approves before execution.
+    Collaborative,
+    /// Direct teleop, no agent.
+    Manual,
+}
+
+impl ControlMode {
+    /// Default mode for remote sessions (`host_id` is set).
+    pub const fn for_remote() -> Self {
+        Self::Supervised
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -243,5 +269,48 @@ mod tests {
 
         let constraint_false = OddConstraint::Boolean { required: false };
         assert!(!constraint_false.check_bool(true));
+    }
+
+    // -----------------------------------------------------------------------
+    // ControlMode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn control_mode_default_is_autonomous() {
+        assert_eq!(ControlMode::default(), ControlMode::Autonomous);
+    }
+
+    #[test]
+    fn control_mode_for_remote_is_supervised() {
+        assert_eq!(ControlMode::for_remote(), ControlMode::Supervised);
+    }
+
+    #[test]
+    fn control_mode_serde_roundtrip() {
+        for mode in [
+            ControlMode::Autonomous,
+            ControlMode::Supervised,
+            ControlMode::Collaborative,
+            ControlMode::Manual,
+        ] {
+            let serialized = serde_json::to_string(&mode).unwrap();
+            let deserialized: ControlMode = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(mode, deserialized);
+        }
+    }
+
+    #[test]
+    fn control_mode_uses_snake_case() {
+        let json = serde_json::to_value(ControlMode::Autonomous).unwrap();
+        assert_eq!(json, json!("autonomous"));
+
+        let json = serde_json::to_value(ControlMode::Supervised).unwrap();
+        assert_eq!(json, json!("supervised"));
+
+        let json = serde_json::to_value(ControlMode::Collaborative).unwrap();
+        assert_eq!(json, json!("collaborative"));
+
+        let json = serde_json::to_value(ControlMode::Manual).unwrap();
+        assert_eq!(json, json!("manual"));
     }
 }

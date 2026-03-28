@@ -1,4 +1,5 @@
 pub mod adapter;
+pub mod command_watchdog;
 pub mod config;
 pub mod copper_handle;
 pub mod degradation;
@@ -9,6 +10,8 @@ pub mod recording;
 pub mod recording_reader;
 pub mod recovery;
 pub mod registration;
+pub mod safety_guards;
+pub mod session_heartbeat;
 pub mod session_relay;
 pub mod spatial_bridge;
 pub mod telemetry;

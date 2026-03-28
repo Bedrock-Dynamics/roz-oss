@@ -33,6 +33,7 @@ ed25519-dalek.workspace = true
 reqwest.workspace = true
 roz-copper = { path = "../roz-copper", default-features = false }
 roz-local = { path = "../roz-local" }
+tokio-util.workspace = true
 futures = "0.3"
 bytes = "1"
 

@@ -14,6 +14,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use roz_agent::agent_loop::{AgentInput, AgentLoop, AgentLoopMode};
 use roz_agent::constitution::build_constitution;
@@ -23,6 +24,7 @@ use roz_agent::spatial_provider::MockSpatialContextProvider;
 use roz_nats::subjects::Subjects;
 
 use crate::config::WorkerConfig;
+use crate::session_heartbeat::run_session_heartbeat;
 
 /// JSON envelope used for session messages over NATS.
 ///
@@ -120,6 +122,15 @@ async fn handle_edge_session(
         .await?;
 
     tracing::info!(session_id, model = %config.model_name, "edge session started");
+
+    // Spawn session heartbeat — cancelled when session ends.
+    let heartbeat_cancel = CancellationToken::new();
+    tokio::spawn(run_session_heartbeat(
+        nats.clone(),
+        worker_id.to_string(),
+        session_id.to_string(),
+        heartbeat_cancel.clone(),
+    ));
 
     // Build the agent model (same pattern as task execution in main.rs).
     let primary = roz_agent::model::create_model(
@@ -239,6 +250,7 @@ async fn handle_edge_session(
         }
     }
 
+    heartbeat_cancel.cancel();
     tracing::info!(session_id, "edge session ended");
     Ok(())
 }
