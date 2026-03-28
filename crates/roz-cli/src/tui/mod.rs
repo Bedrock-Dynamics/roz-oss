@@ -325,8 +325,15 @@ fn RozRepl(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let display_model = truncate_to_width_with_ellipsis(&model_name, model_budget);
     let status_left = format!(" {display_model} \u{00b7} {tok_display} \u{00b7} {cost_display}{session_label}");
 
+    // Explicit width gives taffy a constraint so Overflow::Hidden actually clips.
+    // Without it, NoWrap text expands the layout to content width, the status bar
+    // wraps in narrow terminals, the component renders 3 lines instead of 2, and
+    // iocraft's cursor-rewind math breaks — every keystroke appears as a new line.
+    #[allow(clippy::cast_possible_truncation)]
+    let term_w = term_width as u32;
+
     element! {
-        View(flex_direction: FlexDirection::Column) {
+        View(flex_direction: FlexDirection::Column, width: term_w) {
             View(height: 1u32, position: Position::Relative) {
                 Text(content: "> ".to_string(), color: Color::Rgb { r: 233, g: 196, b: 106 }, weight: Weight::Bold)
                 Text(content: input_text.clone(), color: Color::White)
@@ -341,7 +348,7 @@ fn RozRepl(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                     Text(content: cursor_char.clone(), color: Color::Black)
                 }
             }
-            View(height: 1u32, flex_direction: FlexDirection::Row, overflow: Overflow::Hidden) {
+            View(height: 1u32, flex_direction: FlexDirection::Row, overflow: Overflow::Hidden, width: term_w) {
                 Text(
                     content: mode_label,
                     color: Color::Rgb { r: 233, g: 196, b: 106 },
