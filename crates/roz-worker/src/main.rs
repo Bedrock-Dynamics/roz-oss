@@ -181,6 +181,14 @@ async fn main() -> Result<()> {
     let estop_rx = roz_worker::estop::spawn_estop_listener(estop_sub);
     tracing::info!(worker_id = %config.worker_id, "e-stop listener active");
 
+    // Register with server
+    if !config.api_key.is_empty() {
+        match roz_worker::registration::register_host(&config.api_url, &config.api_key, &config.worker_id).await {
+            Ok(host_id) => tracing::info!(host_id = %host_id, "registered with server"),
+            Err(e) => tracing::warn!(error = %e, "host registration failed"),
+        }
+    }
+
     // Subscribe to task invocations
     let worker_id = &config.worker_id;
     let subject = format!("invoke.{worker_id}.>");
