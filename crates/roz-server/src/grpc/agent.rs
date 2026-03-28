@@ -1150,6 +1150,10 @@ async fn run_session_loop(
                     "agent_session.register_tools"
                 );
             }
+            // Phase 1b stub: WebRTC signaling will be wired in Phase 2.
+            Some(session_request::Request::WebrtcAnswer(_)) => {
+                tracing::debug!("WebRTC answer received (not yet wired)");
+            }
             None => {}
         }
     }

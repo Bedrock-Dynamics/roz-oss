@@ -78,6 +78,45 @@ impl Subjects {
         Ok(format!("invoke.{worker_id}.>"))
     }
 
+    /// Build a telemetry state subject: `telemetry.{worker_id}.state`.
+    pub fn telemetry_state(worker_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        Ok(format!("telemetry.{worker_id}.state"))
+    }
+
+    /// Build a telemetry sensors subject: `telemetry.{worker_id}.sensors`.
+    pub fn telemetry_sensors(worker_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        Ok(format!("telemetry.{worker_id}.sensors"))
+    }
+
+    /// Build a capabilities subject: `capabilities.{worker_id}`.
+    pub fn capabilities(worker_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        Ok(format!("capabilities.{worker_id}"))
+    }
+
+    /// Build a session request subject: `session.{worker_id}.{session_id}.request`.
+    pub fn session_request(worker_id: &str, session_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        validate_token("session_id", session_id)?;
+        Ok(format!("session.{worker_id}.{session_id}.request"))
+    }
+
+    /// Build a session response subject: `session.{worker_id}.{session_id}.response`.
+    pub fn session_response(worker_id: &str, session_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        validate_token("session_id", session_id)?;
+        Ok(format!("session.{worker_id}.{session_id}.response"))
+    }
+
+    /// Build a session control subject: `session.{worker_id}.{session_id}.control`.
+    pub fn session_control(worker_id: &str, session_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        validate_token("session_id", session_id)?;
+        Ok(format!("session.{worker_id}.{session_id}.control"))
+    }
+
     /// E-stop subject for a worker: `safety.estop.{worker_id}`.
     pub fn estop(worker_id: &str) -> String {
         format!("safety.estop.{worker_id}")
@@ -169,5 +208,47 @@ mod tests {
     fn estop_subject() {
         let subject = Subjects::estop("robot-arm-1");
         assert_eq!(subject, "safety.estop.robot-arm-1");
+    }
+
+    #[test]
+    fn telemetry_state_subject() {
+        assert_eq!(Subjects::telemetry_state("robot1").unwrap(), "telemetry.robot1.state");
+    }
+
+    #[test]
+    fn telemetry_sensors_subject() {
+        assert_eq!(
+            Subjects::telemetry_sensors("robot1").unwrap(),
+            "telemetry.robot1.sensors"
+        );
+    }
+
+    #[test]
+    fn session_request_subject() {
+        assert_eq!(
+            Subjects::session_request("robot1", "sess-123").unwrap(),
+            "session.robot1.sess-123.request"
+        );
+    }
+
+    #[test]
+    fn session_response_subject() {
+        assert_eq!(
+            Subjects::session_response("robot1", "sess-123").unwrap(),
+            "session.robot1.sess-123.response"
+        );
+    }
+
+    #[test]
+    fn session_control_subject() {
+        assert_eq!(
+            Subjects::session_control("robot1", "sess-123").unwrap(),
+            "session.robot1.sess-123.control"
+        );
+    }
+
+    #[test]
+    fn capabilities_subject() {
+        assert_eq!(Subjects::capabilities("robot1").unwrap(), "capabilities.robot1");
     }
 }

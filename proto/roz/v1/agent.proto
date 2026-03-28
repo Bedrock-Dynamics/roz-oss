@@ -29,6 +29,7 @@ message SessionRequest {
     PermissionDecision permission_decision = 8;
     // D3: IDE registers / unregisters dynamic tool sets (e.g. MCP sim tools).
     RegisterTools register_tools = 9;
+    WebRtcAnswer webrtc_answer = 14;
   }
 }
 
@@ -193,6 +194,9 @@ message SessionResponse {
     ContextCompacted context_compacted = 9;
     PresenceHint presence_hint = 10;
     ActivityUpdate activity_update = 11;
+    TelemetryUpdate telemetry = 14;
+    TaskProgress task_progress = 15;
+    WebRtcOffer webrtc_offer = 16;
   }
 }
 
@@ -285,6 +289,50 @@ message ToolSchema {
   google.protobuf.Struct parameters_schema = 3;
   uint32 timeout_ms = 4;
   ToolCategoryHint category = 5;
+}
+
+message JointState {
+  string name = 1;
+  double position = 2;
+  double velocity = 3;
+  double effort = 4;
+}
+
+message Pose {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+  double qx = 4;
+  double qy = 5;
+  double qz = 6;
+  double qw = 7;
+}
+
+message TelemetryUpdate {
+  string host_id = 1;
+  double timestamp = 2;
+  repeated JointState joint_states = 3;
+  optional Pose end_effector_pose = 4;
+  map<string, double> sensor_readings = 5;
+}
+
+message TaskProgress {
+  string task_id = 1;
+  string phase = 2;
+  float progress = 3;
+  string description = 4;
+}
+
+message WebRtcOffer {
+  string host_id = 1;
+  string sdp = 2;
+  repeated string ice_candidates = 3;
+}
+
+message WebRtcAnswer {
+  string host_id = 1;
+  string sdp = 2;
+  repeated string ice_candidates = 3;
 }
 
 // --- WatchTeam RPC ---
