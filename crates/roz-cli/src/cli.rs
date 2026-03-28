@@ -17,6 +17,7 @@ pub struct Cli {
 
 /// Options that apply to every subcommand.
 #[derive(Debug, clap::Args)]
+#[allow(clippy::struct_excessive_bools)] // CLI flag structs naturally have many booleans.
 pub struct GlobalOpts {
     /// Output format.
     #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Auto)]
@@ -61,6 +62,18 @@ pub struct GlobalOpts {
     /// Task prompt for non-interactive mode.
     #[arg(long, global = true)]
     pub task: Option<String>,
+
+    /// Target a specific robot host by name
+    #[arg(long)]
+    pub host: Option<String>,
+
+    /// Force cloud agent (server-side reasoning)
+    #[arg(long, conflicts_with = "edge")]
+    pub cloud: bool,
+
+    /// Force edge agent (robot-side reasoning)
+    #[arg(long, conflicts_with = "cloud")]
+    pub edge: bool,
 }
 
 impl GlobalOpts {
@@ -127,6 +140,12 @@ pub enum Commands {
     Config(commands::config::ConfigArgs),
     /// Run diagnostics.
     Doctor,
+    /// Emergency stop a robot host
+    #[command(name = "estop")]
+    Estop {
+        /// Host name or ID to e-stop
+        host: String,
+    },
 }
 
 #[cfg(test)]

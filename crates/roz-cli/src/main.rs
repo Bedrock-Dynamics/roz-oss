@@ -18,7 +18,7 @@ async fn main() -> anyhow::Result<()> {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--task is required in --non-interactive mode"))?;
         let model_flag = cli.global.model.as_deref().or(cli.global.provider.as_deref());
-        return commands::non_interactive::execute(&config, model_flag, task).await;
+        return commands::non_interactive::execute(&config, model_flag, task, cli.global.host.as_deref()).await;
     }
 
     match cli.command {
@@ -30,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
                 model_flag,
                 cli.global.resume,
                 cli.global.resume_session.as_deref(),
+                cli.global.host.as_deref(),
             )
             .await
         }
@@ -46,6 +47,9 @@ async fn main() -> anyhow::Result<()> {
             cli::Commands::Trust(args) => commands::trust::execute(&args.command, &config).await,
             cli::Commands::Config(args) => commands::config::execute(&args.command, &config).await,
             cli::Commands::Doctor => commands::doctor::execute(&config).await,
+            cli::Commands::Estop { .. } => {
+                anyhow::bail!("estop command not yet implemented")
+            }
         },
     }
 }

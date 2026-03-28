@@ -88,6 +88,7 @@ pub struct ProviderConfig {
     pub model: String,
     pub api_key: Option<String>,
     pub api_url: String,
+    pub host: Option<String>,
 }
 
 impl ProviderConfig {
@@ -119,6 +120,7 @@ impl ProviderConfig {
                     model: model_name.to_string(),
                     api_key: Some(key.to_string()),
                     api_url: cloud_api_url(),
+                    host: None,
                 };
             }
             // Any other key → Anthropic
@@ -127,6 +129,7 @@ impl ProviderConfig {
                 model: model_name.to_string(),
                 api_key: Some(key.to_string()),
                 api_url: "https://api.anthropic.com".to_string(),
+                host: None,
             };
         }
 
@@ -137,6 +140,7 @@ impl ProviderConfig {
                 model: model_name.to_string(),
                 api_key: Some(token),
                 api_url: "https://api.openai.com".to_string(),
+                host: None,
             };
         }
 
@@ -147,6 +151,7 @@ impl ProviderConfig {
                 model: model_name.to_string(),
                 api_key: None,
                 api_url: host,
+                host: None,
             };
         }
 
@@ -163,6 +168,7 @@ impl ProviderConfig {
             model: model_name.to_string(),
             api_key: None,
             api_url: "https://api.anthropic.com".to_string(),
+            host: None,
         }
     }
 
@@ -181,6 +187,7 @@ impl ProviderConfig {
             model: model.to_string(),
             api_key: key,
             api_url,
+            host: None,
         }
     }
 }
@@ -353,6 +360,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             api_key: Some("roz_sk_test".into()),
             api_url: "https://api.anthropic.com".into(),
+            host: None,
         };
         let err = ProviderError::classify(401, "invalid x-api-key", &config);
         match err {
@@ -370,6 +378,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             api_key: Some("sk-ant-test".into()),
             api_url: "https://api.anthropic.com".into(),
+            host: None,
         };
         let err = ProviderError::classify(429, "rate limited", &config);
         assert!(matches!(err, ProviderError::RateLimited { .. }));
@@ -382,6 +391,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             api_key: Some("roz_sk_test".into()),
             api_url: "https://roz-api.fly.dev".into(),
+            host: None,
         };
         let err = ProviderError::classify(401, "invalid key", &config);
         match err {
@@ -424,6 +434,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             api_key: Some("roz_sk_test".into()),
             api_url: "https://api.anthropic.com".into(),
+            host: None,
         };
         let result = classify_error_message("401 Unauthorized: invalid x-api-key", &config);
         assert!(result.contains("cloud"), "should suggest cloud provider: {result}");
@@ -436,6 +447,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             api_key: Some("roz_sk_test".into()),
             api_url: "https://roz-api.fly.dev".into(),
+            host: None,
         };
         let result = classify_error_message("some random error", &config);
         assert_eq!(result, "some random error");
