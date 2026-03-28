@@ -9,6 +9,7 @@ pub mod recording;
 pub mod recording_reader;
 pub mod recovery;
 pub mod registration;
+pub mod session_relay;
 pub mod spatial_bridge;
 pub mod telemetry;
 pub mod trust;

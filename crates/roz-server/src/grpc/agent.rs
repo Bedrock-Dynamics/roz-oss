@@ -90,6 +90,8 @@ struct Session {
     pending_system_context: Option<String>,
     #[allow(dead_code)]
     pub host_id: Option<String>,
+    /// Whether this session runs on the edge worker (true) or cloud server (false).
+    is_edge: bool,
 }
 
 /// State for an active agent turn, shared between the session loop and relay tasks.
@@ -502,6 +504,45 @@ async fn run_session_loop(
                         && let Some(nats) = nats_client
                     {
                         spawn_telemetry_relay(pool, nats, host_id_str, tx).await;
+                    }
+
+                    // Edge mode: relay the entire session to the worker via NATS
+                    // instead of running the agent loop on the server.
+                    if sess.is_edge {
+                        let (Some(host_id_str), Some(nats)) = (&sess.host_id, nats_client) else {
+                            send_error(
+                                tx,
+                                "invalid_argument",
+                                "edge placement requires host_id and NATS",
+                                false,
+                            )
+                            .await;
+                            return;
+                        };
+                        let Ok(host_uuid) = uuid::Uuid::parse_str(host_id_str) else {
+                            send_error(tx, "invalid_argument", "host_id is not a valid UUID", false).await;
+                            return;
+                        };
+                        match roz_db::hosts::get_by_id(pool, host_uuid).await {
+                            Ok(Some(host)) => {
+                                tracing::info!(
+                                    session_id = %sess.id,
+                                    host_name = %host.name,
+                                    "routing session to edge worker"
+                                );
+                                run_edge_relay(tx, nats, &host.name, &sess.id.to_string(), inbound).await;
+                                return; // session done
+                            }
+                            Ok(None) => {
+                                send_error(tx, "not_found", "host not found for edge placement", false).await;
+                                return;
+                            }
+                            Err(e) => {
+                                tracing::error!(error = %e, "failed to look up host for edge relay");
+                                send_error(tx, "internal", "failed to resolve edge host", true).await;
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -1273,6 +1314,10 @@ async fn spawn_telemetry_relay(
 
 /// Handle the `StartSession` message. Returns `true` to continue the loop,
 /// `false` to break (fatal error or auth failure).
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential session initialization with auth + DB + placement"
+)]
 async fn handle_start(
     tx: &mpsc::Sender<Result<SessionResponse, Status>>,
     pool: &PgPool,
@@ -1387,6 +1432,8 @@ async fn handle_start(
         return false; // client disconnected
     }
 
+    let is_edge = resolve_placement(start.agent_placement.unwrap_or(0), start.host_id.is_some());
+
     *session = Some(Session {
         id: session_id,
         tenant_id,
@@ -1402,6 +1449,7 @@ async fn handle_start(
         active_permissions: base_permissions,
         pending_system_context: None,
         host_id: start.host_id,
+        is_edge,
     });
 
     true
@@ -1591,6 +1639,157 @@ fn plan_mode_permissions(base: &[roz_v1::PermissionRule]) -> Vec<roz_v1::Permiss
             }
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Edge agent relay
+// ---------------------------------------------------------------------------
+
+/// Resolves the effective agent placement from the proto enum value.
+///
+/// - `AGENT_PLACEMENT_EDGE` (2) -> `true` (run on worker)
+/// - `AGENT_PLACEMENT_CLOUD` (1) -> `false` (run on server)
+/// - `AGENT_PLACEMENT_AUTO` (0) or unknown -> `false` (default to cloud)
+///
+/// AUTO defaults to Cloud for now. `OodaReAct` -> Edge auto-selection
+/// will come when robot-type metadata is available.
+const fn resolve_placement(placement: i32, _has_host: bool) -> bool {
+    placement == 2 // AGENT_PLACEMENT_EDGE
+}
+
+/// Relays a gRPC session to an edge worker via NATS.
+///
+/// Subscribes to the worker's response subject and forwards responses back
+/// on the gRPC stream. Forwards all subsequent gRPC requests to NATS.
+/// Returns when the client disconnects or the worker session ends.
+#[expect(clippy::too_many_lines, reason = "bidirectional relay with message type mapping")]
+async fn run_edge_relay(
+    tx: &mpsc::Sender<Result<SessionResponse, Status>>,
+    nats: &async_nats::Client,
+    worker_id: &str,
+    session_id: &str,
+    stream: &mut Streaming<SessionRequest>,
+) {
+    let req_subject = match roz_nats::subjects::Subjects::session_request(worker_id, session_id) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to build session request subject");
+            return;
+        }
+    };
+    let resp_subject = match roz_nats::subjects::Subjects::session_response(worker_id, session_id) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to build session response subject");
+            return;
+        }
+    };
+
+    // Subscribe to worker responses.
+    let mut worker_resp = match nats.subscribe(resp_subject).await {
+        Ok(sub) => sub,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to subscribe to worker responses");
+            return;
+        }
+    };
+
+    // Publish StartSession to the worker.
+    let start_envelope = serde_json::json!({"type": "start_session"});
+    if let Ok(payload) = serde_json::to_vec(&start_envelope)
+        && let Err(e) = nats.publish(req_subject.clone(), payload.into()).await
+    {
+        tracing::error!(error = %e, "failed to publish start_session to worker");
+        return;
+    }
+
+    // Spawn response relay: worker NATS -> gRPC client.
+    let tx_clone = tx.clone();
+    let resp_relay = tokio::spawn(async move {
+        while let Some(msg) = worker_resp.next().await {
+            let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(&msg.payload) else {
+                continue;
+            };
+
+            let msg_type = envelope["type"].as_str().unwrap_or("");
+            let response = match msg_type {
+                "session_started" => {
+                    let sid = envelope["session_id"].as_str().unwrap_or("").to_string();
+                    let model = envelope["model"].as_str().unwrap_or("").to_string();
+                    Some(session_response::Response::SessionStarted(roz_v1::SessionStarted {
+                        session_id: sid,
+                        model,
+                        permissions: vec![],
+                    }))
+                }
+                "text_delta" => {
+                    let text = envelope["text"].as_str().unwrap_or("").to_string();
+                    Some(session_response::Response::TextDelta(roz_v1::TextDelta {
+                        message_id: String::new(),
+                        content: text,
+                    }))
+                }
+                "turn_complete" => {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let input_tokens = envelope["input_tokens"].as_u64().unwrap_or(0) as u32;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let output_tokens = envelope["output_tokens"].as_u64().unwrap_or(0) as u32;
+                    let stop_reason = envelope["stop_reason"].as_str().unwrap_or("end_turn").to_string();
+                    Some(session_response::Response::TurnComplete(roz_v1::TurnComplete {
+                        message_id: String::new(),
+                        usage: Some(roz_v1::TokenUsage {
+                            input_tokens,
+                            output_tokens,
+                            cache_read_tokens: 0,
+                            cache_creation_tokens: 0,
+                        }),
+                        stop_reason,
+                    }))
+                }
+                "error" => {
+                    let message = envelope["message"].as_str().unwrap_or("unknown error").to_string();
+                    Some(session_response::Response::Error(roz_v1::SessionError {
+                        code: "agent_error".to_string(),
+                        message,
+                        retryable: false,
+                    }))
+                }
+                _ => None,
+            };
+
+            if let Some(resp) = response {
+                let sr = SessionResponse { response: Some(resp) };
+                if tx_clone.send(Ok(sr)).await.is_err() {
+                    break; // client disconnected
+                }
+            }
+        }
+    });
+
+    // Forward gRPC requests -> NATS (runs until client disconnects).
+    while let Ok(Some(req)) = stream.message().await {
+        if let Some(request) = req.request {
+            let envelope = match request {
+                session_request::Request::UserMessage(um) => {
+                    serde_json::json!({"type": "user_message", "text": um.content})
+                }
+                session_request::Request::CancelSession(_) => {
+                    serde_json::json!({"type": "cancel_session"})
+                }
+                session_request::Request::CancelTurn(_) => {
+                    serde_json::json!({"type": "cancel_turn"})
+                }
+                _ => continue,
+            };
+
+            if let Ok(payload) = serde_json::to_vec(&envelope) {
+                let _ = nats.publish(req_subject.clone(), payload.into()).await;
+            }
+        }
+    }
+
+    resp_relay.abort();
+    tracing::info!(session_id, worker_id, "edge relay ended");
 }
 
 // ---------------------------------------------------------------------------
@@ -1901,5 +2100,29 @@ mod tests {
             }
             other => panic!("expected WorkerCompleted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_placement_edge() {
+        assert!(resolve_placement(2, true));
+        assert!(resolve_placement(2, false));
+    }
+
+    #[test]
+    fn resolve_placement_cloud() {
+        assert!(!resolve_placement(1, true));
+        assert!(!resolve_placement(1, false));
+    }
+
+    #[test]
+    fn resolve_placement_auto_defaults_to_cloud() {
+        assert!(!resolve_placement(0, true));
+        assert!(!resolve_placement(0, false));
+    }
+
+    #[test]
+    fn resolve_placement_unknown_defaults_to_cloud() {
+        assert!(!resolve_placement(99, true));
+        assert!(!resolve_placement(-1, false));
     }
 }

@@ -229,6 +229,17 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Spawn edge agent session relay (handles gRPC sessions relayed via NATS).
+    let relay_nats = nats.clone();
+    let relay_worker_id = config.worker_id.clone();
+    let relay_config = config.clone();
+    tokio::spawn(async move {
+        if let Err(e) = roz_worker::session_relay::spawn_session_relay(relay_nats, relay_worker_id, relay_config).await
+        {
+            tracing::error!(error = %e, "session relay exited");
+        }
+    });
+
     // Subscribe to task invocations
     let worker_id = &config.worker_id;
     let subject = format!("invoke.{worker_id}.>");
