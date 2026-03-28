@@ -18,3 +18,4 @@ pub mod spatial_bridge;
 pub mod telemetry;
 pub mod trust;
 pub mod wal;
+pub mod webrtc;
