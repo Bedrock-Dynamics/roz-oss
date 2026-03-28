@@ -1210,6 +1210,13 @@ async fn run_session_loop(
             Some(session_request::Request::WebrtcAnswer(_)) => {
                 tracing::debug!("WebRTC answer received (not yet wired)");
             }
+            // Phase 4 stubs: camera signaling will be wired in later tasks.
+            Some(session_request::Request::IceCandidate(_)) => {
+                tracing::debug!("ICE candidate received (not yet wired)");
+            }
+            Some(session_request::Request::CameraRequest(_)) => {
+                tracing::debug!("camera request received (not yet wired)");
+            }
             None => {}
         }
     }

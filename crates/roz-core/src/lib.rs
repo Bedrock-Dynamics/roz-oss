@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod auth;
 pub mod bt;
+pub mod camera;
 pub mod capabilities;
 pub mod channels;
 pub mod command;

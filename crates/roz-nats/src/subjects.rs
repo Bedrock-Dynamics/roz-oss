@@ -121,6 +121,46 @@ impl Subjects {
     pub fn estop(worker_id: &str) -> String {
         format!("safety.estop.{worker_id}")
     }
+
+    /// Build a WebRTC offer subject: `webrtc.{worker_id}.{peer_id}.offer`.
+    pub fn webrtc_offer(worker_id: &str, peer_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        validate_token("peer_id", peer_id)?;
+        Ok(format!("webrtc.{worker_id}.{peer_id}.offer"))
+    }
+
+    /// Build a WebRTC answer subject: `webrtc.{worker_id}.{peer_id}.answer`.
+    pub fn webrtc_answer(worker_id: &str, peer_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        validate_token("peer_id", peer_id)?;
+        Ok(format!("webrtc.{worker_id}.{peer_id}.answer"))
+    }
+
+    /// Build a local ICE candidate subject: `webrtc.{worker_id}.{peer_id}.ice.local`.
+    pub fn webrtc_ice_local(worker_id: &str, peer_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        validate_token("peer_id", peer_id)?;
+        Ok(format!("webrtc.{worker_id}.{peer_id}.ice.local"))
+    }
+
+    /// Build a remote ICE candidate subject: `webrtc.{worker_id}.{peer_id}.ice.remote`.
+    pub fn webrtc_ice_remote(worker_id: &str, peer_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        validate_token("peer_id", peer_id)?;
+        Ok(format!("webrtc.{worker_id}.{peer_id}.ice.remote"))
+    }
+
+    /// Build a wildcard WebRTC subject: `webrtc.{worker_id}.>`.
+    pub fn webrtc_wildcard(worker_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        Ok(format!("webrtc.{worker_id}.>"))
+    }
+
+    /// Build a camera event subject: `camera.{worker_id}.event`.
+    pub fn camera_event(worker_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        Ok(format!("camera.{worker_id}.event"))
+    }
 }
 
 #[cfg(test)]
@@ -250,5 +290,43 @@ mod tests {
     #[test]
     fn capabilities_subject() {
         assert_eq!(Subjects::capabilities("robot1").unwrap(), "capabilities.robot1");
+    }
+
+    #[test]
+    fn webrtc_offer_subject() {
+        assert_eq!(
+            Subjects::webrtc_offer("robot1", "peer-abc").unwrap(),
+            "webrtc.robot1.peer-abc.offer"
+        );
+    }
+
+    #[test]
+    fn webrtc_answer_subject() {
+        assert_eq!(
+            Subjects::webrtc_answer("robot1", "peer-abc").unwrap(),
+            "webrtc.robot1.peer-abc.answer"
+        );
+    }
+
+    #[test]
+    fn webrtc_ice_subjects() {
+        assert_eq!(
+            Subjects::webrtc_ice_local("robot1", "peer-abc").unwrap(),
+            "webrtc.robot1.peer-abc.ice.local"
+        );
+        assert_eq!(
+            Subjects::webrtc_ice_remote("robot1", "peer-abc").unwrap(),
+            "webrtc.robot1.peer-abc.ice.remote"
+        );
+    }
+
+    #[test]
+    fn webrtc_wildcard_subject() {
+        assert_eq!(Subjects::webrtc_wildcard("robot1").unwrap(), "webrtc.robot1.>");
+    }
+
+    #[test]
+    fn camera_event_subject() {
+        assert_eq!(Subjects::camera_event("robot1").unwrap(), "camera.robot1.event");
     }
 }

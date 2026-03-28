@@ -20,6 +20,12 @@ pub struct WorkspaceBounds {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameraCapability {
     pub id: String,
+    /// Human-readable label (e.g., "USB Webcam")
+    #[serde(default)]
+    pub label: String,
     pub resolution: [u32; 2],
     pub fps: u32,
+    /// Whether hardware encoding is available for this camera
+    #[serde(default)]
+    pub hw_encoder: bool,
 }
