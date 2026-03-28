@@ -140,20 +140,13 @@ fn read_roz_toml() -> RozTomlConfig {
         };
     }
 
-    // Legacy fallback: combine [model] provider + model/name
-    let provider = model_section
-        .and_then(|m| m.get("provider"))
-        .and_then(toml::Value::as_str);
+    // Legacy fallback: [model] provider field is IGNORED (provider comes from credentials).
+    // Only read the model/name field.
     let model = model_section
         .and_then(|m| m.get("model").or_else(|| m.get("name")))
         .and_then(toml::Value::as_str);
 
-    let model_ref = match (provider, model) {
-        (Some(p), Some(m)) => Some(format!("{p}/{m}")),
-        (Some(p), None) => Some(p.to_string()),
-        (None, Some(m)) => Some(m.to_string()),
-        (None, None) => None,
-    };
-
-    RozTomlConfig { model_ref }
+    RozTomlConfig {
+        model_ref: model.map(String::from),
+    }
 }

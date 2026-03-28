@@ -9,7 +9,7 @@ pub mod markdown;
 mod pricing;
 mod proto;
 pub mod provider;
-mod providers;
+pub(crate) mod providers;
 #[allow(dead_code)] // State variants/modes used as backends mature.
 pub mod session;
 #[allow(dead_code)] // Team event formatter wired when gRPC streaming lands.
