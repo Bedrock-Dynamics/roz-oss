@@ -183,6 +183,7 @@ impl AgentService for AgentServiceImpl {
         let anthropic_provider = self.anthropic_provider.clone();
         let direct_api_key = self.direct_api_key.clone();
         let fallback_model_name = self.fallback_model_name.clone();
+        let nats_client = self.nats_client.clone();
 
         // Extract auth header from gRPC metadata before consuming the request.
         let auth_header = request
@@ -210,6 +211,7 @@ impl AgentService for AgentServiceImpl {
                 &model_config,
                 auth_header.as_deref(),
                 &mut inbound,
+                nats_client.as_ref(),
             )
             .await;
         });
@@ -363,12 +365,16 @@ struct ModelConfig {
 
 #[tracing::instrument(
     name = "agent_session.stream",
-    skip(tx, pool, auth, model_config, inbound),
+    skip(tx, pool, auth, model_config, inbound, nats_client),
     fields(session_id = tracing::field::Empty, tenant_id = tracing::field::Empty, environment_id = tracing::field::Empty, model = %default_model)
 )]
 #[expect(
     clippy::too_many_lines,
     reason = "session loop is inherently sequential with many arms"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "session loop needs all its dependencies passed in"
 )]
 async fn run_session_loop(
     tx: &mpsc::Sender<Result<SessionResponse, Status>>,
@@ -378,6 +384,7 @@ async fn run_session_loop(
     model_config: &ModelConfig,
     auth_header: Option<&str>,
     inbound: &mut Streaming<SessionRequest>,
+    nats_client: Option<&async_nats::Client>,
 ) {
     let mut session: Option<Session> = None;
     let mut cancelled = false;
@@ -488,6 +495,14 @@ async fn run_session_loop(
                         project_context_count = sess.project_context.len(),
                         "agent_session.started"
                     );
+
+                    // Spawn telemetry relay: subscribe to NATS telemetry for the
+                    // session's host and forward updates on the gRPC stream.
+                    if let Some(ref host_id_str) = sess.host_id
+                        && let Some(nats) = nats_client
+                    {
+                        spawn_telemetry_relay(pool, nats, host_id_str, tx).await;
+                    }
                 }
             }
             Some(session_request::Request::UserMessage(msg)) => {
@@ -1180,6 +1195,80 @@ async fn run_session_loop(
     {
         tracing::warn!(session_id = %s.id, error = %e, "failed to complete session");
     }
+}
+
+/// Subscribe to NATS telemetry for a host and relay `TelemetryUpdate` messages
+/// on the gRPC response stream.
+///
+/// Resolves `host_id` (UUID string) to the host's `name` (= `worker_id`) via Postgres,
+/// then subscribes to `telemetry.{host_name}.>`. Each received NATS message is
+/// converted to a `TelemetryUpdate` proto and forwarded on `tx`.
+async fn spawn_telemetry_relay(
+    pool: &PgPool,
+    nats: &async_nats::Client,
+    host_id_str: &str,
+    tx: &mpsc::Sender<Result<SessionResponse, Status>>,
+) {
+    let host_uuid = match uuid::Uuid::parse_str(host_id_str) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::debug!(host_id = %host_id_str, error = %e, "invalid host_id UUID, skipping telemetry relay");
+            return;
+        }
+    };
+
+    let host = match roz_db::hosts::get_by_id(pool, host_uuid).await {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            tracing::debug!(host_id = %host_id_str, "host not found, skipping telemetry relay");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(host_id = %host_id_str, error = %e, "failed to look up host for telemetry relay");
+            return;
+        }
+    };
+
+    let telem_subject = match roz_nats::subjects::Subjects::telemetry_wildcard(&host.name) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(host_name = %host.name, error = %e, "invalid host name for telemetry subject");
+            return;
+        }
+    };
+
+    let telem_sub = match nats.subscribe(telem_subject.clone()).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(subject = %telem_subject, error = %e, "failed to subscribe to telemetry");
+            return;
+        }
+    };
+
+    tracing::info!(subject = %telem_subject, host_id = %host_id_str, "telemetry relay started");
+
+    let telem_tx = tx.clone();
+    let host_id_owned = host_id_str.to_string();
+    tokio::spawn(async move {
+        let mut sub = telem_sub;
+        while let Some(msg) = sub.next().await {
+            if let Ok(data) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
+                let update = roz_v1::TelemetryUpdate {
+                    host_id: host_id_owned.clone(),
+                    timestamp: data["timestamp"].as_f64().unwrap_or(0.0),
+                    joint_states: vec![],
+                    end_effector_pose: None,
+                    sensor_readings: std::collections::HashMap::new(),
+                };
+                let resp = SessionResponse {
+                    response: Some(session_response::Response::Telemetry(update)),
+                };
+                if telem_tx.send(Ok(resp)).await.is_err() {
+                    break; // client disconnected
+                }
+            }
+        }
+    });
 }
 
 /// Handle the `StartSession` message. Returns `true` to continue the loop,

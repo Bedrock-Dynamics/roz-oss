@@ -967,3 +967,164 @@ async fn model_tier_names_resolve_to_actual_models() {
         })
         .await;
 }
+
+// ---------------------------------------------------------------------------
+// Telemetry relay test
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires Docker for testcontainers (Postgres + NATS)"]
+async fn session_with_host_receives_telemetry() {
+    // 1. Setup Postgres via testcontainer.
+    let pg_url = roz_test::pg_url().await;
+    let pool = roz_db::create_pool(pg_url).await.expect("create pool");
+    roz_db::run_migrations(&pool).await.expect("run migrations");
+
+    // 2. Setup NATS via testcontainer.
+    let nats_url = roz_test::nats_url().await;
+    let nats = async_nats::connect(nats_url).await.expect("connect to NATS");
+
+    // 3. Create tenant, environment, host, API key.
+    let slug = format!("telem-test-{}", uuid::Uuid::new_v4());
+    let tenant = roz_db::tenant::create_tenant(&pool, "Telemetry Test Tenant", &slug, "personal")
+        .await
+        .expect("create tenant");
+    let env = roz_db::environments::create(&pool, tenant.id, "test-env", "simulation", &serde_json::json!({}))
+        .await
+        .expect("create env");
+    let host = roz_db::hosts::create(
+        &pool,
+        tenant.id,
+        "telem-test-host",
+        "robot",
+        &[],
+        &serde_json::json!({}),
+    )
+    .await
+    .expect("create host");
+    let api_key_result = roz_db::api_keys::create_api_key(&pool, tenant.id, "test-key", &["admin".into()], "test")
+        .await
+        .expect("create api key");
+
+    // 4. Start mock Anthropic gateway.
+    let responses = Arc::new(Mutex::new(vec![simple_text_sse("hello")]));
+    let gateway_url = mock_gateway(responses).await;
+
+    // 5. Start gRPC server with a real NATS client.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind grpc server");
+    let addr = listener.local_addr().expect("grpc server addr");
+    let agent_svc = AgentServiceImpl::new(
+        pool.clone(),
+        reqwest::Client::new(),
+        "http://localhost:9080".into(),
+        Some(nats.clone()), // real NATS client
+        Arc::new(TestAuth),
+        "claude-sonnet-4-6".into(),
+        gateway_url,
+        "test-api-key".into(),
+        30,
+        "anthropic".into(),
+        None,
+        None,
+    );
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(AgentServiceServer::new(agent_svc))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .expect("grpc server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // 6. Connect gRPC client.
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+        .expect("parse channel uri")
+        .connect()
+        .await
+        .expect("connect to grpc server");
+    let mut client = AgentServiceClient::new(channel);
+
+    let (req_tx, req_rx) = tokio::sync::mpsc::channel::<SessionRequest>(16);
+    let stream = tokio_stream::wrappers::ReceiverStream::new(req_rx);
+    let mut request = tonic::Request::new(stream);
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", api_key_result.full_key)
+            .parse()
+            .expect("parse auth metadata"),
+    );
+    let response = client.stream_session(request).await.expect("stream connect");
+    let mut resp_stream = response.into_inner();
+
+    // 7. Send StartSession with host_id.
+    req_tx
+        .send(SessionRequest {
+            request: Some(session_request::Request::Start(roz_v1::StartSession {
+                environment_id: env.id.to_string(),
+                host_id: Some(host.id.to_string()),
+                model: Some("claude-sonnet-4-6".into()),
+                tools: vec![],
+                history: vec![],
+                project_context: vec![],
+                max_context_tokens: None,
+                agent_placement: None,
+            })),
+        })
+        .await
+        .expect("send StartSession");
+
+    // Wait for SessionStarted.
+    let started_msgs = collect_until(
+        &mut resp_stream,
+        |r| matches!(r, session_response::Response::SessionStarted(_)),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        started_msgs
+            .iter()
+            .any(|r| matches!(r, session_response::Response::SessionStarted(_))),
+        "expected SessionStarted"
+    );
+
+    // 8. Publish telemetry to NATS on the host's subject.
+    let telem_subject = roz_nats::subjects::Subjects::telemetry_state("telem-test-host").expect("valid subject");
+    let telem_data = serde_json::json!({
+        "timestamp": 1_234_567_890.0,
+        "joints": [],
+        "sensors": {}
+    });
+    nats.publish(telem_subject, serde_json::to_vec(&telem_data).unwrap().into())
+        .await
+        .expect("publish telemetry to NATS");
+    nats.flush().await.expect("flush NATS");
+
+    // 9. Receive TelemetryUpdate on gRPC stream.
+    let telem_msgs = collect_until(
+        &mut resp_stream,
+        |r| matches!(r, session_response::Response::Telemetry(_)),
+        Duration::from_secs(5),
+    )
+    .await;
+    let telem = telem_msgs
+        .iter()
+        .find_map(|r| match r {
+            session_response::Response::Telemetry(t) => Some(t),
+            _ => None,
+        })
+        .expect("expected TelemetryUpdate response");
+
+    assert_eq!(telem.host_id, host.id.to_string());
+    assert!((telem.timestamp - 1_234_567_890.0).abs() < f64::EPSILON);
+
+    // Cleanup.
+    let _ = req_tx
+        .send(SessionRequest {
+            request: Some(session_request::Request::CancelSession(roz_v1::CancelSession {
+                reason: "telemetry test done".into(),
+            })),
+        })
+        .await;
+}

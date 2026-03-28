@@ -139,6 +139,10 @@ async fn execute_task(
 }
 
 #[tokio::main]
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential startup with telemetry + capabilities + task loop"
+)]
 async fn main() -> Result<()> {
     let logfire = logfire::configure()
         .with_service_name("roz-worker")
@@ -175,6 +179,42 @@ async fn main() -> Result<()> {
             }
         }
     });
+
+    // Spawn telemetry publisher (10 Hz)
+    let telem_nats = nats.clone();
+    let telem_worker_id = config.worker_id.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            interval.tick().await;
+            let state = serde_json::json!({
+                "timestamp": chrono::Utc::now().timestamp_millis(),
+                "joints": [],
+                "sensors": {}
+            });
+            if let Err(e) = roz_worker::telemetry::publish_state(&telem_nats, &telem_worker_id, &state).await {
+                tracing::trace!(error = %e, "telemetry publish failed");
+            }
+        }
+    });
+
+    // Publish capabilities on startup
+    let caps = roz_core::capabilities::RobotCapabilities {
+        robot_type: "generic".to_string(),
+        joints: vec![],
+        control_modes: vec!["position".to_string(), "velocity".to_string()],
+        workspace_bounds: None,
+        sensors: vec![],
+        max_velocity: config.max_velocity.unwrap_or(1.5),
+        cameras: vec![],
+    };
+    let caps_subject =
+        roz_nats::subjects::Subjects::capabilities(&config.worker_id).expect("valid worker_id for capabilities");
+    if let Ok(payload) = serde_json::to_vec(&caps)
+        && let Err(e) = nats.publish(caps_subject, payload.into()).await
+    {
+        tracing::warn!(error = %e, "failed to publish capabilities");
+    }
 
     // Subscribe to e-stop events
     let estop_sub = roz_worker::estop::subscribe_estop(&nats, &config.worker_id).await?;
