@@ -40,6 +40,13 @@ message StartSession {
   repeated ConversationMessage history = 5;
   repeated string project_context = 6;
   optional uint32 max_context_tokens = 7;
+  optional AgentPlacement agent_placement = 8;
+}
+
+enum AgentPlacement {
+  AGENT_PLACEMENT_AUTO = 0;
+  AGENT_PLACEMENT_CLOUD = 1;
+  AGENT_PLACEMENT_EDGE = 2;
 }
 
 message ConversationMessage {
