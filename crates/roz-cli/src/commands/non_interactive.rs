@@ -1,5 +1,5 @@
 use crate::config::CliConfig;
-use crate::tui::provider::{Provider, ProviderConfig};
+use crate::tui::provider::{AgentEvent, Provider, ProviderConfig};
 
 /// Run a single prompt without the TUI and output JSON to stdout.
 ///
@@ -13,9 +13,77 @@ pub async fn execute(config: &CliConfig, model_flag: Option<&str>, task: &str) -
         anyhow::bail!("No credentials configured. Run `roz auth login` or set ANTHROPIC_API_KEY.");
     }
 
-    // For Cloud provider, fall back to BYOK-style execution for now.
-    // TODO: implement cloud non-interactive via gRPC StreamSession.
-    execute_byok(&provider_config, task).await
+    if provider_config.provider == Provider::Cloud {
+        execute_cloud(&provider_config, task).await
+    } else {
+        execute_byok(&provider_config, task).await
+    }
+}
+
+async fn execute_cloud(config: &ProviderConfig, task: &str) -> anyhow::Result<()> {
+    let (event_tx, event_rx) = async_channel::unbounded();
+    let (text_tx, text_rx) = async_channel::unbounded::<String>();
+
+    // Send the task as a single message
+    text_tx.send(task.to_string()).await?;
+    text_tx.close();
+
+    // Spawn gRPC session in background
+    let config_clone = config.clone();
+    let session =
+        tokio::spawn(
+            async move { crate::tui::providers::cloud::stream_session(&config_clone, text_rx, event_tx).await },
+        );
+
+    // Collect streaming response
+    let mut response = String::new();
+    let mut input_tokens = 0u64;
+    let mut output_tokens = 0u64;
+    let mut cycles = 0u32;
+
+    while let Ok(event) = event_rx.recv().await {
+        match event {
+            AgentEvent::TextDelta(text) => {
+                response.push_str(&text);
+            }
+            AgentEvent::TurnComplete {
+                input_tokens: inp,
+                output_tokens: out,
+                ..
+            } => {
+                input_tokens += u64::from(inp);
+                output_tokens += u64::from(out);
+                cycles += 1;
+            }
+            AgentEvent::Error(e) => {
+                let json = serde_json::json!({
+                    "status": "error",
+                    "error": e,
+                });
+                println!("{}", serde_json::to_string_pretty(&json)?);
+                std::process::exit(1);
+            }
+            _ => {}
+        }
+    }
+
+    // Wait for session to finish
+    if let Err(e) = session.await? {
+        anyhow::bail!("Cloud session error: {e}");
+    }
+
+    let json = serde_json::json!({
+        "status": "success",
+        "response": response,
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        },
+        "cycles": cycles,
+    });
+    println!("{}", serde_json::to_string_pretty(&json)?);
+
+    Ok(())
 }
 
 async fn execute_byok(config: &ProviderConfig, task: &str) -> anyhow::Result<()> {
