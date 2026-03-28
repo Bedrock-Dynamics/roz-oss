@@ -88,6 +88,8 @@ struct Session {
     active_permissions: Vec<roz_v1::PermissionRule>,
     /// Workflow context injected on the next `UserMessage` turn (from `RegisterTools`).
     pending_system_context: Option<String>,
+    #[allow(dead_code)]
+    pub host_id: Option<String>,
 }
 
 /// State for an active agent turn, shared between the session loop and relay tasks.
@@ -1306,6 +1308,7 @@ async fn handle_start(
         base_permissions: base_permissions.clone(),
         active_permissions: base_permissions,
         pending_system_context: None,
+        host_id: start.host_id,
     });
 
     true
