@@ -296,6 +296,7 @@ async fn full_agent_session_lifecycle() {
                 history: vec![],
                 project_context: vec![],
                 max_context_tokens: None,
+                agent_placement: None,
             })),
         })
         .await
@@ -593,6 +594,7 @@ async fn project_context_included_in_system_prompt() {
                     "# rules/safety.md\nNever delete files without confirmation.".into(),
                 ],
                 max_context_tokens: None,
+                agent_placement: None,
             })),
         })
         .await
@@ -720,6 +722,142 @@ async fn project_context_included_in_system_prompt() {
 }
 
 // ---------------------------------------------------------------------------
+// Test: StartSession with host_id stores host_id in session
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires Docker for testcontainers"]
+async fn start_session_with_host_id_stores_in_session() {
+    // 1. Setup Postgres.
+    let pg_url = roz_test::pg_url().await;
+    let pool = roz_db::create_pool(pg_url).await.expect("create pool");
+    roz_db::run_migrations(&pool).await.expect("run migrations");
+
+    // 2. Create tenant + environment + API key.
+    let slug = format!("host-test-{}", uuid::Uuid::new_v4());
+    let tenant = roz_db::tenant::create_tenant(&pool, "Host Test Tenant", &slug, "personal")
+        .await
+        .expect("create tenant");
+    let env = roz_db::environments::create(&pool, tenant.id, "host-env", "simulation", &serde_json::json!({}))
+        .await
+        .expect("create env");
+    let api_key_result = roz_db::api_keys::create_api_key(&pool, tenant.id, "host-key", &["admin".into()], "test")
+        .await
+        .expect("create api key");
+
+    // 3. Mock gateway.
+    let responses = Arc::new(Mutex::new(vec![text_sse("ok")]));
+    let gateway_url = mock_gateway(responses).await;
+
+    // 4. Start gRPC server.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind grpc");
+    let addr = listener.local_addr().expect("addr");
+    let agent_svc = AgentServiceImpl::new(
+        pool.clone(),
+        reqwest::Client::new(),
+        "http://localhost:9080".into(),
+        None,
+        Arc::new(TestAuth),
+        "claude-sonnet-4-6".into(),
+        gateway_url,
+        "test-api-key".into(),
+        30,
+        "anthropic".into(),
+        None, // direct_api_key
+        None, // fallback_model_name
+    );
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(AgentServiceServer::new(agent_svc))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .expect("grpc server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // 5. Connect client.
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+        .expect("channel")
+        .connect()
+        .await
+        .expect("connect");
+    let mut client = AgentServiceClient::new(channel);
+
+    let (req_tx, req_rx) = tokio::sync::mpsc::channel::<SessionRequest>(16);
+    let stream = tokio_stream::wrappers::ReceiverStream::new(req_rx);
+    let mut request = tonic::Request::new(stream);
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", api_key_result.full_key).parse().expect("auth"),
+    );
+    let response = client.stream_session(request).await.expect("stream");
+    let mut resp_stream = response.into_inner();
+
+    // 6. StartSession WITH host_id.
+    req_tx
+        .send(SessionRequest {
+            request: Some(session_request::Request::Start(roz_v1::StartSession {
+                environment_id: env.id.to_string(),
+                host_id: Some("test-robot-host".to_string()),
+                model: Some("claude-sonnet-4-6".into()),
+                tools: vec![],
+                history: vec![],
+                project_context: vec![],
+                max_context_tokens: None,
+                agent_placement: None,
+            })),
+        })
+        .await
+        .expect("send StartSession");
+
+    // 7. Receive SessionStarted.
+    let started_msgs = collect_until(
+        &mut resp_stream,
+        |r| matches!(r, session_response::Response::SessionStarted(_)),
+        Duration::from_secs(10),
+    )
+    .await;
+    let session_started = started_msgs
+        .iter()
+        .find_map(|r| match r {
+            session_response::Response::SessionStarted(s) => Some(s),
+            _ => None,
+        })
+        .expect("expected SessionStarted");
+    assert!(!session_started.session_id.is_empty(), "session_id should not be empty");
+    let session_id: uuid::Uuid = session_started
+        .session_id
+        .parse()
+        .expect("session_id should be a valid UUID");
+
+    // 8. Verify the session row exists in Postgres.
+    // host_id is stored in the in-memory Session struct, not in the DB schema.
+    // We verify the DB session was created correctly for the right tenant/env.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let session_row =
+        sqlx::query_as::<_, roz_db::agent_sessions::AgentSessionRow>("SELECT * FROM roz_agent_sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_optional(&pool)
+            .await
+            .expect("query agent session");
+
+    let session_row = session_row.expect("session should exist in DB");
+    assert_eq!(session_row.tenant_id, tenant.id);
+    assert_eq!(session_row.environment_id, env.id);
+    assert_eq!(session_row.model_name, "claude-sonnet-4-6");
+
+    // Cleanup.
+    let _ = req_tx
+        .send(SessionRequest {
+            request: Some(session_request::Request::CancelSession(roz_v1::CancelSession {
+                reason: "test done".into(),
+            })),
+        })
+        .await;
+}
+
+// ---------------------------------------------------------------------------
 // Test: model tier names resolve correctly
 // ---------------------------------------------------------------------------
 
@@ -797,6 +935,7 @@ async fn model_tier_names_resolve_to_actual_models() {
                 history: vec![],
                 project_context: vec![],
                 max_context_tokens: None,
+                agent_placement: None,
             })),
         })
         .await

@@ -1943,4 +1943,101 @@ mod tests {
             "stream_session should accept connection: {response:?}"
         );
     }
+
+    // -- E-stop endpoint tests ------------------------------------------------
+
+    fn test_state_with_nats(pool: sqlx::PgPool, nats_client: async_nats::Client) -> AppState {
+        AppState {
+            pool,
+            rate_limiter: middleware::rate_limit::create_rate_limiter(&middleware::rate_limit::RateLimitConfig {
+                requests_per_second: NonZeroU32::new(100).expect("non-zero"),
+                burst_size: NonZeroU32::new(200).expect("non-zero"),
+            }),
+            base_url: "http://localhost:8080".to_string(),
+            restate_ingress_url: "http://localhost:9080".to_string(),
+            http_client: reqwest::Client::new(),
+            operator_seed: None,
+            nats_client: Some(nats_client),
+            model_config: ModelConfig {
+                gateway_url: "http://test-gateway".to_string(),
+                api_key: "test-key".to_string(),
+                default_model: "test-model".to_string(),
+                timeout_secs: 10,
+                anthropic_provider: "anthropic".to_string(),
+                direct_api_key: None,
+            },
+            auth: Arc::new(roz_server::auth::ApiKeyAuth),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker for testcontainers"]
+    async fn estop_endpoint_publishes_to_nats() {
+        use futures::StreamExt;
+
+        // 1. Setup Postgres.
+        let url = roz_test::pg_url().await;
+        let pool = roz_db::create_pool(url).await.expect("pool");
+        roz_db::run_migrations(&pool).await.expect("migrations");
+
+        // 2. Create tenant + host + API key.
+        let slug = format!("estop-test-{}", uuid::Uuid::new_v4());
+        let tenant = roz_db::tenant::create_tenant(&pool, "Estop Test", &slug, "personal")
+            .await
+            .expect("create tenant");
+        let host = roz_db::hosts::create(
+            &pool,
+            tenant.id,
+            "estop-test-host",
+            "edge",
+            &["gpio".to_string()],
+            &serde_json::json!({}),
+        )
+        .await
+        .expect("create host");
+        let key = roz_db::api_keys::create_api_key(&pool, tenant.id, "estop-key", &["admin".into()], "test")
+            .await
+            .expect("create api key");
+
+        // 3. Start NATS testcontainer and connect.
+        let nats_guard = roz_test::nats_container().await;
+        let nats_client = async_nats::connect(nats_guard.url()).await.expect("connect NATS");
+
+        // 4. Subscribe to estop subject BEFORE sending the request.
+        let estop_subject = format!("safety.estop.{}", host.name);
+        let mut sub = nats_client
+            .subscribe(estop_subject.clone())
+            .await
+            .expect("subscribe to estop subject");
+
+        // 5. Build app with real NATS client.
+        let router = app(test_state_with_nats(pool, nats_client));
+
+        // 6. POST /v1/hosts/{host_id}/estop
+        let req = Request::builder()
+            .uri(format!("/v1/hosts/{}/estop", host.id))
+            .method("POST")
+            .header("authorization", format!("Bearer {}", key.full_key))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+
+        // 7. Assert 200 response.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "estop_sent");
+
+        // 8. Assert NATS subscriber receives the message within 5 seconds.
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), sub.next())
+            .await
+            .expect("timed out waiting for estop message on NATS")
+            .expect("NATS subscription closed unexpectedly");
+
+        assert_eq!(
+            msg.subject.as_str(),
+            estop_subject,
+            "estop message should arrive on the correct subject"
+        );
+    }
 }
