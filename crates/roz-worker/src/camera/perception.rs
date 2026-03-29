@@ -68,19 +68,15 @@ impl TypedToolExecutor for CaptureFrameTool {
             return Ok(ToolResult::error(format!("camera '{camera_id}' not found")));
         };
 
-        let width = input.width.unwrap_or(camera.supported_resolutions[0].0);
-        let height = input.height.unwrap_or(camera.supported_resolutions[0].1);
+        let _width = input.width.unwrap_or(camera.supported_resolutions[0].0);
+        let _height = input.height.unwrap_or(camera.supported_resolutions[0].1);
 
-        // For now, return camera metadata as the frame is not yet wired through
-        // the streaming pipeline to a synchronous capture API.
-        Ok(ToolResult::success(serde_json::json!({
-            "status": "captured",
-            "camera_id": camera_id,
-            "width": width,
-            "height": height,
-            "format": "image/jpeg",
-            "note": "Frame capture pipeline pending full CameraManager integration.",
-        })))
+        // Frame capture through the CameraManager is not yet wired to a
+        // synchronous capture API. Return an honest error so the agent
+        // does not hallucinate that it received image data.
+        Ok(ToolResult::error(format!(
+            "Camera '{camera_id}' found but synchronous frame capture is not yet available — streaming pipeline integration pending"
+        )))
     }
 }
 
@@ -204,17 +200,12 @@ impl TypedToolExecutor for WatchConditionTool {
 
     async fn execute(
         &self,
-        input: Self::Input,
+        _input: Self::Input,
         _ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(ToolResult::success(serde_json::json!({
-            "status": "watching",
-            "condition": input.condition,
-            "camera_id": input.camera_id,
-            "check_interval_secs": input.check_interval_secs.unwrap_or(5),
-            "timeout_secs": input.timeout_secs.unwrap_or(300),
-            "note": "Condition monitoring active. You will be notified when the condition is met.",
-        })))
+        Ok(ToolResult::error(
+            "Condition monitoring not yet available — feature in development".to_string(),
+        ))
     }
 }
 
@@ -301,7 +292,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watch_condition_returns_watching_status() {
+    async fn watch_condition_returns_error_not_implemented() {
         let tool = WatchConditionTool;
         let ctx = test_ctx();
         let input = WatchConditionInput {
@@ -311,10 +302,10 @@ mod tests {
             timeout_secs: Some(60),
         };
         let result = TypedToolExecutor::execute(&tool, input, &ctx).await.unwrap();
-        assert!(result.is_success());
-        assert_eq!(result.output["status"], "watching");
-        assert_eq!(result.output["condition"], "robot arm stops moving");
-        assert_eq!(result.output["check_interval_secs"], 10);
-        assert_eq!(result.output["timeout_secs"], 60);
+        assert!(result.is_error());
+        assert!(
+            result.error.as_deref().unwrap().contains("not yet available"),
+            "error should indicate feature is not yet available"
+        );
     }
 }

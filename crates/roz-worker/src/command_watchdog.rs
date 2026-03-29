@@ -2,6 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use tokio_util::sync::CancellationToken;
+
 /// Watchdog that fires if no command arrives within the deadline.
 pub struct CommandWatchdog {
     last_pet_ms: Arc<AtomicU64>,
@@ -30,18 +32,23 @@ impl CommandWatchdog {
         elapsed > self.deadline
     }
 
-    /// Run the watchdog loop. Returns when expired.
-    pub async fn run(&self) {
+    /// Run the watchdog loop. Cancels `cancel` and returns when the deadline
+    /// expires without a `pet()`, triggering a safe-stop of the owning task.
+    pub async fn run(&self, cancel: CancellationToken) {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
-            interval.tick().await;
-            if self.is_expired() {
-                tracing::error!(
-                    deadline_secs = self.deadline.as_secs(),
-                    "command watchdog expired — no commands received within deadline"
-                );
-                // In a real implementation, this would trigger safe-stop.
-                // For now, log and continue checking.
+            tokio::select! {
+                _ = interval.tick() => {
+                    if self.is_expired() {
+                        tracing::error!(
+                            deadline_secs = self.deadline.as_secs(),
+                            "command watchdog expired — triggering safe-stop"
+                        );
+                        cancel.cancel();
+                        return;
+                    }
+                }
+                () = cancel.cancelled() => return,
             }
         }
     }

@@ -1328,12 +1328,35 @@ async fn spawn_telemetry_relay(
         let mut sub = telem_sub;
         while let Some(msg) = sub.next().await {
             if let Ok(data) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
+                // Parse joint states from the worker telemetry JSON.
+                let joint_states: Vec<roz_v1::JointState> = data["joints"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|j| {
+                                Some(roz_v1::JointState {
+                                    name: j["name"].as_str()?.to_string(),
+                                    position: j["position"].as_f64().unwrap_or(0.0),
+                                    velocity: j["velocity"].as_f64().unwrap_or(0.0),
+                                    effort: j["effort"].as_f64().unwrap_or(0.0),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                // Parse sensor readings from the worker telemetry JSON.
+                let sensor_readings: std::collections::HashMap<String, f64> = data["sensors"]
+                    .as_object()
+                    .map(|obj| obj.iter().filter_map(|(k, v)| Some((k.clone(), v.as_f64()?))).collect())
+                    .unwrap_or_default();
+
                 let update = roz_v1::TelemetryUpdate {
                     host_id: host_id_owned.clone(),
                     timestamp: data["timestamp"].as_f64().unwrap_or(0.0),
-                    joint_states: vec![],
+                    joint_states,
                     end_effector_pose: None,
-                    sensor_readings: std::collections::HashMap::new(),
+                    sensor_readings,
                 };
                 let resp = SessionResponse {
                     response: Some(session_response::Response::Telemetry(update)),
@@ -1700,19 +1723,22 @@ async fn handle_start(
     // Derive permission rules from tool schemas.
     let base_permissions = derive_permissions(&tools);
 
-    // Send SessionStarted acknowledgement.
-    let started = SessionResponse {
-        response: Some(session_response::Response::SessionStarted(roz_v1::SessionStarted {
-            session_id: session_id.to_string(),
-            model: model_name.clone(),
-            permissions: base_permissions.clone(),
-        })),
-    };
-    if tx.send(Ok(started)).await.is_err() {
-        return false; // client disconnected
-    }
-
     let is_edge = resolve_placement(start.agent_placement.unwrap_or(0), start.host_id.is_some());
+
+    // Send SessionStarted acknowledgement only for cloud sessions.
+    // For edge sessions, the worker sends its own SessionStarted via the relay.
+    if !is_edge {
+        let started = SessionResponse {
+            response: Some(session_response::Response::SessionStarted(roz_v1::SessionStarted {
+                session_id: session_id.to_string(),
+                model: model_name.clone(),
+                permissions: base_permissions.clone(),
+            })),
+        };
+        if tx.send(Ok(started)).await.is_err() {
+            return false; // client disconnected
+        }
+    }
 
     *session = Some(Session {
         id: session_id,
@@ -1925,17 +1951,8 @@ fn plan_mode_permissions(base: &[roz_v1::PermissionRule]) -> Vec<roz_v1::Permiss
 // Edge agent relay
 // ---------------------------------------------------------------------------
 
-/// Resolves the effective agent placement from the proto enum value.
-///
-/// - `AGENT_PLACEMENT_EDGE` (2) -> `true` (run on worker)
-/// - `AGENT_PLACEMENT_CLOUD` (1) -> `false` (run on server)
-/// - `AGENT_PLACEMENT_AUTO` (0) or unknown -> `false` (default to cloud)
-///
-/// AUTO defaults to Cloud for now. `OodaReAct` -> Edge auto-selection
-/// will come when robot-type metadata is available.
-const fn resolve_placement(placement: i32, _has_host: bool) -> bool {
-    placement == 2 // AGENT_PLACEMENT_EDGE
-}
+/// Re-export from roz-core — shared with worker session relay.
+use roz_core::edge::resolve_placement;
 
 /// Relays a gRPC session to an edge worker via NATS.
 ///
@@ -1984,9 +2001,29 @@ async fn run_edge_relay(
     }
 
     // Spawn response relay: worker NATS -> gRPC client.
+    // Timeout after 30s of silence from worker — handles worker crash.
     let tx_clone = tx.clone();
+    let relay_session_id = session_id.to_string();
     let resp_relay = tokio::spawn(async move {
-        while let Some(msg) = worker_resp.next().await {
+        loop {
+            let msg = match tokio::time::timeout(Duration::from_secs(30), worker_resp.next()).await {
+                Ok(Some(msg)) => msg,
+                Ok(None) => break, // subscription closed
+                Err(_) => {
+                    // 30s with no message from worker — assume worker crash.
+                    tracing::error!(session_id = %relay_session_id, "edge relay timeout — no response from worker in 30s");
+                    let err_resp = SessionResponse {
+                        response: Some(session_response::Response::Error(roz_v1::SessionError {
+                            code: "worker_timeout".to_string(),
+                            message: "No response from edge worker within 30 seconds — worker may have crashed"
+                                .to_string(),
+                            retryable: true,
+                        })),
+                    };
+                    let _ = tx_clone.send(Ok(err_resp)).await;
+                    break;
+                }
+            };
             let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(&msg.payload) else {
                 continue;
             };

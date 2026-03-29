@@ -117,6 +117,10 @@ impl CameraSource for TestPatternSource {
         height: u32,
         fps: u32,
     ) -> anyhow::Result<tokio::sync::mpsc::Receiver<RawFrame>> {
+        const MAX_RESOLUTION: u32 = 4096;
+        if width == 0 || height == 0 || width > MAX_RESOLUTION || height > MAX_RESOLUTION {
+            anyhow::bail!("invalid resolution {width}x{height} (max {MAX_RESOLUTION}x{MAX_RESOLUTION})");
+        }
         if self.active {
             anyhow::bail!("test pattern already active");
         }

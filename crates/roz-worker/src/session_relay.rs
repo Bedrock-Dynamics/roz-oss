@@ -20,7 +20,6 @@ use roz_agent::agent_loop::{AgentInput, AgentLoop, AgentLoopMode};
 use roz_agent::constitution::build_constitution;
 use roz_agent::dispatch::ToolDispatcher;
 use roz_agent::safety::SafetyStack;
-use roz_agent::spatial_provider::MockSpatialContextProvider;
 use roz_nats::subjects::Subjects;
 
 use crate::config::WorkerConfig;
@@ -46,6 +45,7 @@ pub async fn spawn_session_relay(
     nats: async_nats::Client,
     worker_id: String,
     config: WorkerConfig,
+    estop_rx: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let subject = format!("session.{worker_id}.*.request");
     let mut sub = nats.subscribe(subject.clone()).await?;
@@ -77,10 +77,18 @@ pub async fn spawn_session_relay(
             let session_id_clone = session_id.clone();
             let config_clone = config.clone();
             let sessions_ref = sessions.clone();
+            let estop_rx_clone = estop_rx.clone();
 
             let handle = tokio::spawn(async move {
-                if let Err(e) =
-                    handle_edge_session(nats_clone, &worker_id_clone, &session_id_clone, &config_clone, envelope).await
+                if let Err(e) = handle_edge_session(
+                    nats_clone,
+                    &worker_id_clone,
+                    &session_id_clone,
+                    &config_clone,
+                    envelope,
+                    estop_rx_clone,
+                )
+                .await
                 {
                     tracing::error!(error = %e, session_id = %session_id_clone, "edge session failed");
                 }
@@ -105,6 +113,7 @@ async fn handle_edge_session(
     session_id: &str,
     config: &WorkerConfig,
     start_msg: serde_json::Value,
+    estop_rx: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let response_subject = Subjects::session_response(worker_id, session_id)?;
 
@@ -132,41 +141,16 @@ async fn handle_edge_session(
         heartbeat_cancel.clone(),
     ));
 
-    // Build the agent model (same pattern as task execution in main.rs).
-    let primary = roz_agent::model::create_model(
-        &config.model_name,
-        &config.gateway_url,
-        &config.gateway_api_key,
-        config.model_timeout_secs,
-        &config.anthropic_provider,
-        config.anthropic_api_key.as_deref(),
-    )?;
-
-    let model: Box<dyn roz_agent::model::types::Model> = if let Some(ref fallback_name) = config.fallback_model {
-        match roz_agent::model::create_model(
-            fallback_name,
-            &config.gateway_url,
-            &config.gateway_api_key,
-            config.model_timeout_secs,
-            &config.anthropic_provider,
-            config.anthropic_api_key.as_deref(),
-        ) {
-            Ok(fallback) => {
-                tracing::info!(fallback_model = %fallback_name, "edge session: fallback model configured");
-                Box::new(roz_agent::model::FallbackModel::new(primary, fallback))
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "edge session: failed to create fallback model, proceeding without");
-                primary
-            }
-        }
-    } else {
-        primary
-    };
+    // Build the agent model using shared factory.
+    let model = crate::model_factory::build_model(config)?;
 
     let dispatcher = ToolDispatcher::new(Duration::from_secs(30));
-    let safety = SafetyStack::new(vec![]);
-    let spatial = Box::new(MockSpatialContextProvider::empty());
+    let guards: Vec<Box<dyn roz_agent::safety::SafetyGuard>> = vec![Box::new(
+        roz_agent::safety::guards::VelocityLimiter::new(config.max_velocity.unwrap_or(1.5)),
+    )];
+    let safety = SafetyStack::new(guards);
+    let spatial: Box<dyn roz_agent::spatial_provider::SpatialContextProvider> =
+        Box::new(crate::camera::snapshot::CameraSpatialProvider::new());
     let mut agent = AgentLoop::new(model, dispatcher, safety, spatial);
 
     let constitution = build_constitution(AgentLoopMode::React);
@@ -180,6 +164,15 @@ async fn handle_edge_session(
 
     // Process subsequent messages on this session's dedicated subscription.
     while let Some(msg) = session_sub.next().await {
+        if *estop_rx.borrow() {
+            tracing::error!(session_id, "E-STOP received — terminating edge session");
+            let error = serde_json::json!({"type": "error", "message": "E-STOP activated"});
+            if let Ok(payload) = serde_json::to_vec(&error) {
+                let _ = nats.publish(response_subject.clone(), payload.into()).await;
+            }
+            break;
+        }
+
         let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(&msg.payload) else {
             tracing::warn!(session_id, "edge session: failed to deserialize message");
             continue;
@@ -286,28 +279,17 @@ mod tests {
 
     #[test]
     fn resolve_placement_returns_correct_values() {
+        use roz_core::edge::resolve_placement;
         // AGENT_PLACEMENT_EDGE = 2
-        assert!(super::resolve_placement(2, true));
-        assert!(super::resolve_placement(2, false));
+        assert!(resolve_placement(2, true));
+        assert!(resolve_placement(2, false));
         // AGENT_PLACEMENT_CLOUD = 1
-        assert!(!super::resolve_placement(1, true));
-        assert!(!super::resolve_placement(1, false));
+        assert!(!resolve_placement(1, true));
+        assert!(!resolve_placement(1, false));
         // AGENT_PLACEMENT_AUTO = 0 (defaults to cloud)
-        assert!(!super::resolve_placement(0, true));
-        assert!(!super::resolve_placement(0, false));
+        assert!(!resolve_placement(0, true));
+        assert!(!resolve_placement(0, false));
         // Unknown values default to cloud
-        assert!(!super::resolve_placement(99, true));
+        assert!(!resolve_placement(99, true));
     }
-}
-
-/// Resolves the effective agent placement from the proto enum value.
-///
-/// - `AGENT_PLACEMENT_EDGE` (2) -> `true` (run on worker)
-/// - `AGENT_PLACEMENT_CLOUD` (1) -> `false` (run on server)
-/// - `AGENT_PLACEMENT_AUTO` (0) or unknown -> `false` (default to cloud)
-///
-/// AUTO defaults to Cloud for now. `OodaReAct` -> Edge auto-selection
-/// will come when robot-type metadata is available.
-pub const fn resolve_placement(placement: i32, _has_host: bool) -> bool {
-    placement == 2 // AGENT_PLACEMENT_EDGE
 }

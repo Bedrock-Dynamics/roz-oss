@@ -8,40 +8,6 @@ use roz_nats::dispatch::TaskInvocation;
 use tracing::Instrument;
 use uuid::Uuid;
 
-/// Build the agent model from worker config, wrapping in `FallbackModel` when configured.
-fn build_model(config: &roz_worker::config::WorkerConfig) -> anyhow::Result<Box<dyn roz_agent::model::Model>> {
-    let primary = roz_agent::model::create_model(
-        &config.model_name,
-        &config.gateway_url,
-        &config.gateway_api_key,
-        config.model_timeout_secs,
-        &config.anthropic_provider,
-        config.anthropic_api_key.as_deref(),
-    )?;
-
-    if let Some(ref fallback_name) = config.fallback_model {
-        match roz_agent::model::create_model(
-            fallback_name,
-            &config.gateway_url,
-            &config.gateway_api_key,
-            config.model_timeout_secs,
-            &config.anthropic_provider,
-            config.anthropic_api_key.as_deref(),
-        ) {
-            Ok(fallback) => {
-                tracing::info!(fallback_model = %fallback_name, "model fallback configured");
-                Ok(Box::new(roz_agent::model::FallbackModel::new(primary, fallback)))
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to create fallback model, proceeding without");
-                Ok(primary)
-            }
-        }
-    } else {
-        Ok(primary)
-    }
-}
-
 /// Run the agent loop for a single task, publish `WorkerExited` to the parent's team stream
 /// if this is a child task, then signal the result back to Restate.
 async fn execute_task(
@@ -55,7 +21,7 @@ async fn execute_task(
     tracing::info!("starting task execution");
 
     let agent_input = roz_worker::dispatch::build_agent_input(&invocation);
-    let model = match build_model(&task_config) {
+    let model = match roz_worker::model_factory::build_model(&task_config) {
         Ok(m) => m,
         Err(e) => {
             tracing::error!(error = %e, "failed to build model for task, aborting");
@@ -71,7 +37,10 @@ async fn execute_task(
     };
 
     let mut dispatcher = roz_agent::dispatch::ToolDispatcher::new(Duration::from_secs(30));
-    let safety = roz_agent::safety::SafetyStack::new(vec![]);
+    let guards: Vec<Box<dyn roz_agent::safety::SafetyGuard>> = vec![Box::new(
+        roz_agent::safety::guards::VelocityLimiter::new(task_config.max_velocity.unwrap_or(1.5)),
+    )];
+    let safety = roz_agent::safety::SafetyStack::new(guards);
 
     // Spawn Copper controller for OodaReAct mode.
     let copper_handle = match invocation.mode {
@@ -264,8 +233,11 @@ async fn main() -> Result<()> {
     let relay_nats = nats.clone();
     let relay_worker_id = config.worker_id.clone();
     let relay_config = config.clone();
+    let relay_estop_rx = estop_rx.clone();
     tokio::spawn(async move {
-        if let Err(e) = roz_worker::session_relay::spawn_session_relay(relay_nats, relay_worker_id, relay_config).await
+        if let Err(e) =
+            roz_worker::session_relay::spawn_session_relay(relay_nats, relay_worker_id, relay_config, relay_estop_rx)
+                .await
         {
             tracing::error!(error = %e, "session relay exited");
         }

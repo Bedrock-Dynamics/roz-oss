@@ -6,6 +6,7 @@ pub mod copper_handle;
 pub mod degradation;
 pub mod dispatch;
 pub mod estop;
+pub mod model_factory;
 pub mod provisioning;
 pub mod recording;
 pub mod recording_reader;
