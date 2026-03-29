@@ -4,6 +4,7 @@ use futures::StreamExt;
 use std::time::Duration;
 
 #[tokio::test]
+#[ignore = "requires Docker for NATS testcontainer"]
 async fn worker_receives_task_invocation_via_nats() {
     // Setup NATS
     let nats_guard = roz_test::nats_container().await;

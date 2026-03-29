@@ -15,10 +15,19 @@ use super::source::RawFrame;
 ///
 /// Returns the JPEG bytes.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub fn i420_to_jpeg(raw: &RawFrame, target_width: u32, target_height: u32, quality: u8) -> Vec<u8> {
+pub fn i420_to_jpeg(raw: &RawFrame, target_width: u32, target_height: u32, quality: u8) -> anyhow::Result<Vec<u8>> {
     let width = raw.width as usize;
     let height = raw.height as usize;
     let y_size = width * height;
+    let uv_size = (width / 2) * (height / 2);
+    let expected_len = y_size + 2 * uv_size;
+
+    anyhow::ensure!(
+        raw.data.len() >= expected_len,
+        "I420 buffer too small: expected at least {expected_len} bytes, got {}",
+        raw.data.len()
+    );
+
     let uv_stride = width / 2;
 
     // Convert I420 to RGB using BT.601 coefficients
@@ -45,12 +54,14 @@ pub fn i420_to_jpeg(raw: &RawFrame, target_width: u32, target_height: u32, quali
     }
 
     // Build an image buffer and resize if needed
-    let img = image::RgbImage::from_raw(raw.width, raw.height, rgb).expect("RGB buffer size mismatch");
+    let img = image::RgbImage::from_raw(raw.width, raw.height, rgb)
+        .ok_or_else(|| anyhow::anyhow!("RGB buffer size mismatch"))?;
 
     let resized = if raw.width != target_width || raw.height != target_height {
         image::imageops::resize(&img, target_width, target_height, image::imageops::FilterType::Triangle)
     } else {
-        image::ImageBuffer::from_raw(target_width, target_height, img.into_raw()).expect("buffer size mismatch")
+        image::ImageBuffer::from_raw(target_width, target_height, img.into_raw())
+            .ok_or_else(|| anyhow::anyhow!("resize buffer size mismatch"))?
     };
 
     // Encode to JPEG
@@ -63,9 +74,9 @@ pub fn i420_to_jpeg(raw: &RawFrame, target_width: u32, target_height: u32, quali
         target_height,
         image::ExtendedColorType::Rgb8,
     )
-    .expect("JPEG encoding failed");
+    .map_err(|e| anyhow::anyhow!("JPEG encoding failed: {e}"))?;
 
-    jpeg_buf.into_inner()
+    Ok(jpeg_buf.into_inner())
 }
 
 #[cfg(test)]
@@ -86,7 +97,7 @@ mod tests {
             seq: 0,
         };
 
-        let jpeg = i420_to_jpeg(&frame, 320, 240, 80);
+        let jpeg = i420_to_jpeg(&frame, 320, 240, 80).expect("conversion should succeed");
 
         // JPEG magic bytes
         assert!(jpeg.len() > 2, "JPEG too small");
@@ -106,13 +117,13 @@ mod tests {
             seq: 0,
         };
 
-        let jpeg = i420_to_jpeg(&frame, 160, 120, 60);
+        let jpeg = i420_to_jpeg(&frame, 160, 120, 60).expect("conversion should succeed");
 
         // Verify it produced valid JPEG (resize happened internally)
         assert_eq!(jpeg[0], 0xFF);
         assert_eq!(jpeg[1], 0xD8);
         // Resized JPEG should be smaller than full-resolution
-        let full_jpeg = i420_to_jpeg(&frame, 640, 480, 60);
+        let full_jpeg = i420_to_jpeg(&frame, 640, 480, 60).expect("conversion should succeed");
         assert!(jpeg.len() < full_jpeg.len(), "resized should be smaller");
     }
 }

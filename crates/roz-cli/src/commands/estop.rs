@@ -21,18 +21,39 @@ pub async fn resolve_host_id(client: &reqwest::Client, api_url: &str, host: &str
     if uuid::Uuid::parse_str(host).is_ok() {
         return Ok(host.to_string());
     }
-    let url = format!("{api_url}/v1/hosts");
-    let resp = client.get(&url).send().await?;
-    let body: serde_json::Value = resp.json().await?;
-    let hosts = body["data"]
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("unexpected response format"))?;
-    for h in hosts {
-        if h["name"].as_str() == Some(host)
-            && let Some(id) = h["id"].as_str()
-        {
-            return Ok(id.to_string());
+
+    let mut offset: u64 = 0;
+    let limit: u64 = 50;
+
+    loop {
+        let url = format!("{api_url}/v1/hosts?limit={limit}&offset={offset}");
+        let resp = client.get(&url).send().await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("GET /v1/hosts failed ({status}): {body}");
         }
+
+        let body: serde_json::Value = resp.json().await?;
+        let hosts = body["data"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("unexpected response format from /v1/hosts"))?;
+
+        for h in hosts {
+            if h["name"].as_str() == Some(host)
+                && let Some(id) = h["id"].as_str()
+            {
+                return Ok(id.to_string());
+            }
+        }
+
+        // If we got fewer results than the limit, we've exhausted all pages.
+        if hosts.len() < usize::try_from(limit).unwrap_or(usize::MAX) {
+            break;
+        }
+        offset += limit;
     }
+
     anyhow::bail!("host '{host}' not found. Run `roz host list` to see available hosts.")
 }

@@ -274,15 +274,19 @@ impl TypedToolExecutor for SetVisionStrategyTool {
             }
         };
 
+        // Validate all inputs before acquiring the write lock to avoid partial state updates.
+        if let Some(rate) = input.keyframe_rate_hz
+            && !(0.01..=10.0).contains(&rate)
+        {
+            return Ok(ToolResult::error(format!(
+                "keyframe_rate_hz must be between 0.01 and 10.0, got {rate}"
+            )));
+        }
+
         let mut cfg = config.write().await;
         cfg.strategy = strategy;
 
         if let Some(rate) = input.keyframe_rate_hz {
-            if !(0.01..=10.0).contains(&rate) {
-                return Ok(ToolResult::error(format!(
-                    "keyframe_rate_hz must be between 0.01 and 10.0, got {rate}"
-                )));
-            }
             cfg.keyframe_rate_hz = rate;
         }
 

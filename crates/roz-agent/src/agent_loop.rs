@@ -873,8 +873,15 @@ impl AgentLoop {
                 .await;
 
             // Act: dispatch tool calls through safety stack
-            self.dispatch_tool_calls(&tool_calls, &spatial_ctx, &tool_ctx, &mut messages, &presence_tx)
-                .await;
+            self.dispatch_tool_calls(
+                &tool_calls,
+                &spatial_ctx,
+                &tool_ctx,
+                &mut messages,
+                &presence_tx,
+                input.cancellation_token.as_ref(),
+            )
+            .await;
 
             // Circuit breaker: abort if all tool calls have failed in several consecutive turns.
             consecutive_error_turns = Self::check_circuit_breaker(&messages, consecutive_error_turns)?;
@@ -917,6 +924,10 @@ impl AgentLoop {
     /// Suspends the current turn waiting for IDE approval of a `NeedsHuman` tool call.
     /// Notifies the IDE via `presence_tx`, registers a oneshot channel, then waits up to
     /// `timeout_secs`. Returns the dispatch result if approved, or a denied `ToolResult`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "cancellation_token is essential for session lifecycle"
+    )]
     async fn wait_for_human_approval(
         &self,
         call: &roz_core::tools::ToolCall,
@@ -925,6 +936,7 @@ impl AgentLoop {
         approvals: &crate::dispatch::remote::PendingApprovals,
         presence_tx: &mpsc::Sender<PresenceSignal>,
         tool_ctx: &ToolContext,
+        cancellation_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> roz_core::tools::ToolResult {
         tracing::info!(
             tool = %call.tool,
@@ -946,19 +958,47 @@ impl AgentLoop {
             map.insert(call.id.clone(), tx);
         }
 
-        let approved = match tokio::time::timeout(tokio::time::Duration::from_secs(timeout_secs), rx).await {
-            Ok(Ok(v)) => v,
-            Ok(Err(_)) => {
-                tracing::warn!(tool_call_id = %call.id, "approval channel closed unexpectedly");
-                false
+        let timed_rx = tokio::time::timeout(tokio::time::Duration::from_secs(timeout_secs), rx);
+
+        // Race the approval wait against the session cancellation token so that
+        // a cancelled session does not hang until the approval timeout expires.
+        let approved = if let Some(token) = cancellation_token {
+            tokio::select! {
+                result = timed_rx => {
+                    match result {
+                        Ok(Ok(v)) => v,
+                        Ok(Err(_)) => {
+                            tracing::warn!(tool_call_id = %call.id, "approval channel closed unexpectedly");
+                            false
+                        }
+                        Err(_) => {
+                            tracing::warn!(tool_call_id = %call.id, timeout_secs, "approval timed out");
+                            approvals.lock().expect("pending approvals mutex poisoned").remove(&call.id);
+                            false
+                        }
+                    }
+                }
+                () = token.cancelled() => {
+                    tracing::info!(tool_call_id = %call.id, "approval wait cancelled by session");
+                    approvals.lock().expect("pending approvals mutex poisoned").remove(&call.id);
+                    false
+                }
             }
-            Err(_) => {
-                tracing::warn!(tool_call_id = %call.id, timeout_secs, "approval timed out");
-                approvals
-                    .lock()
-                    .expect("pending approvals mutex poisoned")
-                    .remove(&call.id);
-                false
+        } else {
+            match timed_rx.await {
+                Ok(Ok(v)) => v,
+                Ok(Err(_)) => {
+                    tracing::warn!(tool_call_id = %call.id, "approval channel closed unexpectedly");
+                    false
+                }
+                Err(_) => {
+                    tracing::warn!(tool_call_id = %call.id, timeout_secs, "approval timed out");
+                    approvals
+                        .lock()
+                        .expect("pending approvals mutex poisoned")
+                        .remove(&call.id);
+                    false
+                }
             }
         };
 
@@ -979,6 +1019,7 @@ impl AgentLoop {
         tool_ctx: &ToolContext,
         messages: &mut Vec<Message>,
         presence_tx: &mpsc::Sender<PresenceSignal>,
+        cancellation_token: Option<&tokio_util::sync::CancellationToken>,
     ) {
         use roz_core::tools::ToolCategory;
 
@@ -1011,8 +1052,16 @@ impl AgentLoop {
                 }
                 SafetyResult::NeedsHuman { reason, timeout_secs } => {
                     if let Some(ref approvals) = self.pending_approvals {
-                        self.wait_for_human_approval(call, &reason, timeout_secs, approvals, presence_tx, tool_ctx)
-                            .await
+                        self.wait_for_human_approval(
+                            call,
+                            &reason,
+                            timeout_secs,
+                            approvals,
+                            presence_tx,
+                            tool_ctx,
+                            cancellation_token,
+                        )
+                        .await
                     } else {
                         // No approval map wired — fall back to auto-deny (legacy behavior).
                         roz_core::tools::ToolResult::error(format!("Requires human approval: {reason}"))
@@ -1357,8 +1406,15 @@ impl AgentLoop {
             }
 
             // Act: dispatch tool calls through safety stack
-            self.dispatch_tool_calls(&tool_calls, &spatial_ctx, &tool_ctx, &mut messages, &noop_presence_tx)
-                .await;
+            self.dispatch_tool_calls(
+                &tool_calls,
+                &spatial_ctx,
+                &tool_ctx,
+                &mut messages,
+                &noop_presence_tx,
+                input.cancellation_token.as_ref(),
+            )
+            .await;
 
             // Circuit breaker: abort if all tool calls have failed in several consecutive turns.
             // One failing tool is a transient glitch; N consecutive all-error turns is systemic.

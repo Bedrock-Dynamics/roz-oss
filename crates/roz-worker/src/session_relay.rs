@@ -177,13 +177,6 @@ async fn handle_edge_session(
 
     tracing::info!(session_id, ?session_mode, "edge session mode resolved");
 
-    // Extract model name from start_msg for potential per-session override.
-    let session_model = start_msg["model"]
-        .as_str()
-        .filter(|m| !m.is_empty())
-        .unwrap_or(&config.model_name);
-    tracing::debug!(session_id, model = %session_model, "edge session using model");
-
     // Process subsequent messages on this session's dedicated subscription.
     while let Some(msg) = session_sub.next().await {
         if *estop_rx.borrow() {

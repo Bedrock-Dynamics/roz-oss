@@ -187,7 +187,10 @@ impl TaskService for TaskServiceImpl {
                 traceparent: roz_nats::dispatch::current_traceparent(),
                 phases: vec![],
             };
-            let subject = format!("invoke.{}.{}", host.name, task.id);
+            let subject = roz_nats::subjects::Subjects::invoke(&host.name, &task.id.to_string()).map_err(|e| {
+                tracing::error!(error = %e, "invalid host name or task id for NATS subject");
+                Status::invalid_argument(format!("invalid NATS subject: {e}"))
+            })?;
             if let Ok(payload) = serde_json::to_vec(&invocation)
                 && let Err(e) = nats.publish(subject, payload.into()).await
             {

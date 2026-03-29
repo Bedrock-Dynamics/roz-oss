@@ -161,7 +161,13 @@ pub async fn estop(
     // Get host to find its name (used as worker_id in NATS)
     let host = roz_db::hosts::get_by_id(&state.pool, id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .map_err(|e| {
+            tracing::error!(error = %e, host_id = %id, "failed to load host for estop");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "failed to load host"})),
+            )
+        })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error": "host not found"}))))?;
 
     if host.tenant_id != tenant_id {

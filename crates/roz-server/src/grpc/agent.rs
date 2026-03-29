@@ -508,7 +508,8 @@ async fn run_session_loop(
                     if let Some(ref worker_name) = sess.worker_name
                         && let Some(nats) = nats_client
                     {
-                        spawn_telemetry_relay(nats, worker_name, tx, relay_cancel.clone()).await;
+                        let host_id_for_telem = sess.host_id.clone().unwrap_or_else(|| worker_name.clone());
+                        spawn_telemetry_relay(nats, worker_name, &host_id_for_telem, tx, relay_cancel.clone()).await;
                         spawn_webrtc_signaling_relay(nats, worker_name, tx, relay_cancel.clone()).await;
                     }
 
@@ -523,10 +524,12 @@ async fn run_session_loop(
                                 false,
                             )
                             .await;
+                            relay_cancel.cancel();
                             return;
                         };
                         let Ok(host_uuid) = uuid::Uuid::parse_str(host_id_str) else {
                             send_error(tx, "invalid_argument", "host_id is not a valid UUID", false).await;
+                            relay_cancel.cancel();
                             return;
                         };
                         match roz_db::hosts::get_by_id(pool, host_uuid).await {
@@ -536,16 +539,20 @@ async fn run_session_loop(
                                     host_name = %host.name,
                                     "routing session to edge worker"
                                 );
-                                run_edge_relay(tx, nats, &host.name, &sess.id.to_string(), inbound).await;
+                                run_edge_relay(tx, nats, &host.name, &sess.id.to_string(), &sess.model_name, inbound)
+                                    .await;
+                                relay_cancel.cancel();
                                 return; // session done
                             }
                             Ok(None) => {
                                 send_error(tx, "not_found", "host not found for edge placement", false).await;
+                                relay_cancel.cancel();
                                 return;
                             }
                             Err(e) => {
                                 tracing::error!(error = %e, "failed to look up host for edge relay");
                                 send_error(tx, "internal", "failed to resolve edge host", true).await;
+                                relay_cancel.cancel();
                                 return;
                             }
                         }
@@ -1290,6 +1297,7 @@ async fn run_session_loop(
 async fn spawn_telemetry_relay(
     nats: &async_nats::Client,
     worker_name: &str,
+    host_id: &str,
     tx: &mpsc::Sender<Result<SessionResponse, Status>>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
@@ -1312,7 +1320,7 @@ async fn spawn_telemetry_relay(
     tracing::info!(subject = %telem_subject, worker_name = %worker_name, "telemetry relay started");
 
     let telem_tx = tx.clone();
-    let worker_name_owned = worker_name.to_string();
+    let host_id_owned = host_id.to_string();
     tokio::spawn(async move {
         let mut sub = telem_sub;
         loop {
@@ -1348,7 +1356,7 @@ async fn spawn_telemetry_relay(
                     .unwrap_or_default();
 
                 let update = roz_v1::TelemetryUpdate {
-                    host_id: worker_name_owned.clone(),
+                    host_id: host_id_owned.clone(),
                     timestamp: data["timestamp"].as_f64().unwrap_or(0.0),
                     joint_states,
                     end_effector_pose: None,
@@ -1943,6 +1951,7 @@ async fn run_edge_relay(
     nats: &async_nats::Client,
     worker_id: &str,
     session_id: &str,
+    model_name: &str,
     stream: &mut Streaming<SessionRequest>,
 ) {
     let req_subject = match roz_nats::subjects::Subjects::session_request(worker_id, session_id) {
@@ -1969,8 +1978,9 @@ async fn run_edge_relay(
         }
     };
 
-    // Publish StartSession to the worker.
-    let start_envelope = serde_json::json!({"type": "start_session"});
+    // Publish StartSession to the worker, including the resolved model name
+    // so the worker can use the client's model selection.
+    let start_envelope = serde_json::json!({"type": "start_session", "model": model_name});
     if let Ok(payload) = serde_json::to_vec(&start_envelope)
         && let Err(e) = nats.publish(req_subject.clone(), payload.into()).await
     {

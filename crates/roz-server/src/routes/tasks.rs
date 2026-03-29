@@ -110,7 +110,8 @@ pub async fn create(
             traceparent: roz_nats::dispatch::current_traceparent(),
             phases: body.phases.clone(),
         };
-        let subject = format!("invoke.{}.{}", host.name, task.id);
+        let subject = roz_nats::subjects::Subjects::invoke(&host.name, &task.id.to_string())
+            .map_err(|e| AppError::bad_request(format!("invalid NATS subject: {e}")))?;
         if let Ok(payload) = serde_json::to_vec(&invocation)
             && let Err(e) = nats.publish(subject, payload.into()).await
         {

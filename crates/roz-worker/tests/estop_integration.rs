@@ -4,6 +4,7 @@ use std::time::Duration;
 /// Verifies that the estop listener flips the watch channel to `true`
 /// when an e-stop message is received on the correct NATS subject.
 #[tokio::test]
+#[ignore = "requires Docker for NATS testcontainer"]
 async fn estop_listener_flips_on_nats_message() {
     let guard = roz_test::nats_container().await;
     let client = async_nats::connect(guard.url()).await.expect("connect to NATS");
@@ -42,6 +43,7 @@ async fn estop_listener_flips_on_nats_message() {
 /// the subscription stream to return `None` — the same signal as a
 /// connection loss. The estop listener must treat this as an e-stop.
 #[tokio::test]
+#[ignore = "requires Docker for NATS testcontainer"]
 async fn estop_listener_triggers_on_nats_disconnect() {
     let guard = roz_test::nats_container().await;
     let client = async_nats::connect(guard.url()).await.expect("connect to NATS");
@@ -182,6 +184,7 @@ async fn command_watchdog_pet_prevents_firing() {
 /// channel and interrupts a `tokio::select!` loop — the same pattern used
 /// in the worker's production code.
 #[tokio::test]
+#[ignore = "requires Docker for NATS testcontainer"]
 async fn estop_via_nats_interrupts_select_pattern() {
     let guard = roz_test::nats_container().await;
     let client = async_nats::connect(guard.url()).await.expect("connect");

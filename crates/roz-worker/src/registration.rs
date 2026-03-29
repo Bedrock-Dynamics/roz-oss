@@ -44,12 +44,27 @@ pub async fn register_host(api_url: &str, api_key: &str, worker_id: &str) -> Res
             .json(&create_body)
             .send()
             .await
-            .context("POST /v1/hosts request failed")?
-            .error_for_status()
-            .context("POST /v1/hosts returned error status")?;
+            .context("POST /v1/hosts request failed")?;
 
-        let body: serde_json::Value = resp.json().await.context("failed to parse POST /v1/hosts response")?;
-        parse_host_id(&body).context("POST /v1/hosts response missing host id")?
+        // Handle 409 Conflict: another worker registered the same name concurrently.
+        if resp.status() == reqwest::StatusCode::CONFLICT {
+            let retry_resp = client
+                .get(format!("{base}/v1/hosts"))
+                .bearer_auth(api_key)
+                .send()
+                .await
+                .context("GET /v1/hosts retry request failed")?
+                .error_for_status()
+                .context("GET /v1/hosts retry returned error status")?;
+            let retry_body: serde_json::Value = retry_resp.json().await.context("failed to parse retry response")?;
+            find_host_by_name(&retry_body, worker_id).context("host not found after conflict retry")?
+        } else {
+            let resp = resp
+                .error_for_status()
+                .context("POST /v1/hosts returned error status")?;
+            let body: serde_json::Value = resp.json().await.context("failed to parse POST /v1/hosts response")?;
+            parse_host_id(&body).context("POST /v1/hosts response missing host id")?
+        }
     };
 
     // Set status to online

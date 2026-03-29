@@ -122,7 +122,13 @@ pub fn spawn_snapshot_feeder(
                     }
                     last_capture = tokio::time::Instant::now();
 
-                    let jpeg = super::frame_convert::i420_to_jpeg(&frame, tw, th, 80);
+                    let jpeg = match super::frame_convert::i420_to_jpeg(&frame, tw, th, 80) {
+                        Ok(j) => j,
+                        Err(e) => {
+                            tracing::warn!(camera = %frame.camera_id, error = %e, "failed to convert frame to JPEG");
+                            continue;
+                        }
+                    };
                     provider.update_snapshot(&frame.camera_id.0, &jpeg).await;
 
                     tracing::trace!(
