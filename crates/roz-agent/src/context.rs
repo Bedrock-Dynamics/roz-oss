@@ -394,6 +394,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 100,
                     output_tokens: 50,
+                    ..Default::default()
                 },
                 stop_reason: StopReason::EndTurn,
             })

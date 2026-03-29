@@ -63,6 +63,10 @@ pub struct TaskInvocation {
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    #[serde(default)]
+    pub cache_read_tokens: u32,
+    #[serde(default)]
+    pub cache_creation_tokens: u32,
 }
 
 /// Sent from worker back to Restate when a task completes.
@@ -134,6 +138,7 @@ mod tests {
             token_usage: TokenUsage {
                 input_tokens: 1200,
                 output_tokens: 350,
+                ..Default::default()
             },
         };
 

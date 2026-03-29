@@ -275,6 +275,8 @@ struct StreamAssembler {
     block_kind: StreamBlockKind,
     input_tokens: u32,
     output_tokens: u32,
+    cache_read_tokens: u32,
+    cache_creation_tokens: u32,
     stop_reason: StopReason,
 }
 
@@ -290,6 +292,8 @@ impl StreamAssembler {
             block_kind: StreamBlockKind::None,
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             stop_reason: StopReason::EndTurn,
         }
     }
@@ -301,6 +305,8 @@ impl StreamAssembler {
         match event {
             StreamEvent::MessageStart { message } => {
                 self.input_tokens = message.usage.input_tokens;
+                self.cache_read_tokens = message.usage.cache_read_input_tokens;
+                self.cache_creation_tokens = message.usage.cache_creation_input_tokens;
             }
             StreamEvent::ContentBlockStart { content_block, .. } => match content_block {
                 ContentBlock::ToolUse { id, name, .. } => {
@@ -400,6 +406,8 @@ impl StreamAssembler {
                     usage: TokenUsage {
                         input_tokens: self.input_tokens,
                         output_tokens: self.output_tokens,
+                        cache_read_tokens: self.cache_read_tokens,
+                        cache_creation_tokens: self.cache_creation_tokens,
                     },
                 }));
             }
@@ -593,6 +601,8 @@ impl AnthropicProvider {
             usage: TokenUsage {
                 input_tokens: resp.usage.input_tokens,
                 output_tokens: resp.usage.output_tokens,
+                cache_read_tokens: resp.usage.cache_read_input_tokens,
+                cache_creation_tokens: resp.usage.cache_creation_input_tokens,
             },
         }
     }

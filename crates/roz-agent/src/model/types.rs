@@ -265,6 +265,8 @@ pub enum StopReason {
 pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    pub cache_read_tokens: u32,
+    pub cache_creation_tokens: u32,
 }
 
 /// A chunk emitted during streaming model completion.
@@ -858,6 +860,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    ..Default::default()
                 },
             },
             CompletionResponse {
@@ -950,6 +953,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                ..Default::default()
             },
         }];
         let model = MockModel::new(vec![ModelCapability::TextReasoning], responses);

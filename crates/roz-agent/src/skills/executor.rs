@@ -211,6 +211,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 20,
                 output_tokens: 10,
+                ..Default::default()
             },
         }];
 
@@ -257,6 +258,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 30,
                     output_tokens: 15,
+                    ..Default::default()
                 },
             },
             CompletionResponse {
@@ -267,6 +269,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 50,
                     output_tokens: 20,
+                    ..Default::default()
                 },
             },
         ];

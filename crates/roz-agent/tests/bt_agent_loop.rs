@@ -71,6 +71,7 @@ async fn bt_execution_through_agent_loop() {
             usage: TokenUsage {
                 input_tokens: 100,
                 output_tokens: 50,
+                ..Default::default()
             },
         },
         CompletionResponse {
@@ -81,6 +82,7 @@ async fn bt_execution_through_agent_loop() {
             usage: TokenUsage {
                 input_tokens: 200,
                 output_tokens: 30,
+                ..Default::default()
             },
         },
     ];

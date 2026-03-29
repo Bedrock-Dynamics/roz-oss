@@ -101,6 +101,8 @@ pub fn build_task_result(task_id: Uuid, output: Result<AgentOutput, AgentError>)
             token_usage: TokenUsage {
                 input_tokens: agent_output.total_usage.input_tokens,
                 output_tokens: agent_output.total_usage.output_tokens,
+                cache_read_tokens: agent_output.total_usage.cache_read_tokens,
+                cache_creation_tokens: agent_output.total_usage.cache_creation_tokens,
             },
         },
         Err(err) => TaskResult {
@@ -184,6 +186,7 @@ mod tests {
             total_usage: AgentTokenUsage {
                 input_tokens: 100,
                 output_tokens: 50,
+                ..Default::default()
             },
             messages: vec![],
         };
@@ -215,6 +218,7 @@ mod tests {
             total_usage: AgentTokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                ..Default::default()
             },
             messages: vec![],
         };

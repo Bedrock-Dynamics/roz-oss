@@ -69,6 +69,7 @@ async fn agent_generates_code_and_wasm_executes() {
             usage: TokenUsage {
                 input_tokens: 100,
                 output_tokens: 50,
+                ..Default::default()
             },
         },
         // Turn 2: Agent sees verified result, responds to user
@@ -80,6 +81,7 @@ async fn agent_generates_code_and_wasm_executes() {
             usage: TokenUsage {
                 input_tokens: 200,
                 output_tokens: 30,
+                ..Default::default()
             },
         },
     ];
@@ -130,6 +132,7 @@ async fn agent_handles_wasm_compilation_failure() {
             usage: TokenUsage {
                 input_tokens: 100,
                 output_tokens: 50,
+                ..Default::default()
             },
         },
         CompletionResponse {
@@ -140,6 +143,7 @@ async fn agent_handles_wasm_compilation_failure() {
             usage: TokenUsage {
                 input_tokens: 200,
                 output_tokens: 30,
+                ..Default::default()
             },
         },
     ];

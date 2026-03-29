@@ -690,6 +690,8 @@ impl AgentLoop {
                     messages.push(Message::assistant_parts(resp.parts.clone()));
                     total_usage.input_tokens += resp.usage.input_tokens;
                     total_usage.output_tokens += resp.usage.output_tokens;
+                    total_usage.cache_read_tokens += resp.usage.cache_read_tokens;
+                    total_usage.cache_creation_tokens += resp.usage.cache_creation_tokens;
                 }
                 break;
             }
@@ -823,6 +825,8 @@ impl AgentLoop {
             cycles += 1;
             total_usage.input_tokens += resp.usage.input_tokens;
             total_usage.output_tokens += resp.usage.output_tokens;
+            total_usage.cache_read_tokens += resp.usage.cache_read_tokens;
+            total_usage.cache_creation_tokens += resp.usage.cache_creation_tokens;
 
             messages.push(Message::assistant_parts(resp.parts.clone()));
             if let Some(text) = resp.text() {
@@ -1246,6 +1250,8 @@ impl AgentLoop {
                     messages.push(Message::assistant_parts(resp.parts.clone()));
                     total_usage.input_tokens += resp.usage.input_tokens;
                     total_usage.output_tokens += resp.usage.output_tokens;
+                    total_usage.cache_read_tokens += resp.usage.cache_read_tokens;
+                    total_usage.cache_creation_tokens += resp.usage.cache_creation_tokens;
                 }
                 break;
             }
@@ -1372,6 +1378,8 @@ impl AgentLoop {
             cycles += 1;
             total_usage.input_tokens += resp.usage.input_tokens;
             total_usage.output_tokens += resp.usage.output_tokens;
+            total_usage.cache_read_tokens += resp.usage.cache_read_tokens;
+            total_usage.cache_creation_tokens += resp.usage.cache_creation_tokens;
 
             messages.push(Message::assistant_parts(resp.parts.clone()));
             if let Some(text) = resp.text() {
@@ -1521,6 +1529,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 50,
                     output_tokens: 20,
+                    ..Default::default()
                 },
             },
             CompletionResponse {
@@ -1531,6 +1540,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 80,
                     output_tokens: 30,
+                    ..Default::default()
                 },
             },
         ];
@@ -1592,6 +1602,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    ..Default::default()
                 },
             })
             .collect();
@@ -1667,6 +1678,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 20,
                     output_tokens: 10,
+                    ..Default::default()
                 },
             },
             CompletionResponse {
@@ -1679,6 +1691,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 40,
                     output_tokens: 15,
+                    ..Default::default()
                 },
             },
             CompletionResponse {
@@ -1689,6 +1702,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 60,
                     output_tokens: 20,
+                    ..Default::default()
                 },
             },
         ];
@@ -1745,6 +1759,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 20,
                     output_tokens: 10,
+                    ..Default::default()
                 },
             },
             CompletionResponse {
@@ -1755,6 +1770,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 40,
                     output_tokens: 15,
+                    ..Default::default()
                 },
             },
         ];
@@ -1811,6 +1827,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                ..Default::default()
             },
         }];
 
@@ -1880,6 +1897,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                ..Default::default()
             },
         }];
 
@@ -2000,6 +2018,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                ..Default::default()
             },
         }];
 
@@ -2120,6 +2139,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                ..Default::default()
             },
         }];
 
@@ -2368,6 +2388,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                ..Default::default()
             },
         };
 
@@ -2520,6 +2541,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    ..Default::default()
                 },
             },
             // Cycle 1: tool use
@@ -2533,6 +2555,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 50,
                     output_tokens: 20,
+                    ..Default::default()
                 },
             },
             // Cycle 2: end turn (level 3 does not fire, 80% < 85%)
@@ -2542,6 +2565,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 30,
                     output_tokens: 10,
+                    ..Default::default()
                 },
             },
         ];
@@ -2678,6 +2702,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 20,
                     output_tokens: 15,
+                    ..Default::default()
                 },
             },
             // Cycle 2: model responds with final text
@@ -2689,6 +2714,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 40,
                     output_tokens: 10,
+                    ..Default::default()
                 },
             },
         ];
@@ -2818,6 +2844,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                ..Default::default()
             },
         }];
 
@@ -3173,6 +3200,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 20,
                 output_tokens: 15,
+                ..Default::default()
             },
         }];
 
@@ -3270,6 +3298,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 20,
                 output_tokens: 15,
+                ..Default::default()
             },
         }];
 
@@ -3338,6 +3367,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 30,
                 output_tokens: 20,
+                ..Default::default()
             },
         }];
 
@@ -3488,6 +3518,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    ..Default::default()
                 },
             }]
         };
@@ -3593,6 +3624,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 50,
                     output_tokens: 20,
+                    ..Default::default()
                 },
             }),
         ];
@@ -3607,6 +3639,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 80,
                     output_tokens: 30,
+                    ..Default::default()
                 },
             }),
         ];
@@ -3674,6 +3707,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 25,
                     output_tokens: 12,
+                    ..Default::default()
                 },
             }),
         ];
@@ -3691,6 +3725,7 @@ mod tests {
                         usage: TokenUsage {
                             input_tokens: 40,
                             output_tokens: 8,
+                            ..Default::default()
                         },
                     }),
                 ],
@@ -3747,6 +3782,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 15,
                     output_tokens: 10,
+                    ..Default::default()
                 },
             }),
         ];
@@ -3877,6 +3913,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 30,
                     output_tokens: 15,
+                    ..Default::default()
                 },
             },
             CompletionResponse {
@@ -3887,6 +3924,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 60,
                     output_tokens: 10,
+                    ..Default::default()
                 },
             },
         ];
@@ -4033,6 +4071,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 30,
                     output_tokens: 15,
+                    ..Default::default()
                 },
             },
             CompletionResponse {
@@ -4041,6 +4080,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 60,
                     output_tokens: 10,
+                    ..Default::default()
                 },
             },
         ];
@@ -4192,6 +4232,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 20,
                     output_tokens: 10,
+                    ..Default::default()
                 },
             },
             CompletionResponse {
@@ -4202,6 +4243,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 40,
                     output_tokens: 10,
+                    ..Default::default()
                 },
             },
         ];
@@ -4348,6 +4390,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 20,
                     output_tokens: 10,
+                    ..Default::default()
                 },
             },
             CompletionResponse {
@@ -4358,6 +4401,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 40,
                     output_tokens: 10,
+                    ..Default::default()
                 },
             },
         ];
@@ -4423,6 +4467,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 30,
                         output_tokens: 10,
+                        ..Default::default()
                     },
                 }),
             ],
@@ -4436,6 +4481,7 @@ mod tests {
                     usage: TokenUsage {
                         input_tokens: 50,
                         output_tokens: 15,
+                        ..Default::default()
                     },
                 }),
             ],
@@ -4505,6 +4551,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 20,
                 output_tokens: 10,
+                ..Default::default()
             },
         };
 
@@ -4597,6 +4644,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 15,
                 output_tokens: 8,
+                ..Default::default()
             },
         }];
 
@@ -4673,6 +4721,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 30,
                 output_tokens: 10,
+                ..Default::default()
             },
         }];
 
@@ -4771,6 +4820,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 50,
                     output_tokens: 20,
+                    ..Default::default()
                 },
             },
             CompletionResponse {
@@ -4781,6 +4831,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 80,
                     output_tokens: 10,
+                    ..Default::default()
                 },
             },
         ];
@@ -4876,6 +4927,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 5,
                 output_tokens: 3,
+                ..Default::default()
             },
         };
 
@@ -4998,6 +5050,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    ..Default::default()
                 },
             })
             .collect();
@@ -5060,6 +5113,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    ..Default::default()
                 },
             },
             // Turn 2: single tool call → all-error (count=2)
@@ -5073,6 +5127,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    ..Default::default()
                 },
             },
             // Turn 3: two tool calls — good_tool succeeds, bad_tool fails.
@@ -5094,6 +5149,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    ..Default::default()
                 },
             },
             // Turns 4-6: single bad tool each (counter goes 1, 2, 3 → trips on turn 6)
@@ -5107,6 +5163,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    ..Default::default()
                 },
             },
             CompletionResponse {
@@ -5119,6 +5176,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    ..Default::default()
                 },
             },
             CompletionResponse {
@@ -5131,6 +5189,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    ..Default::default()
                 },
             },
         ];
@@ -5190,6 +5249,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    ..Default::default()
                 },
             },
             CompletionResponse {
@@ -5198,6 +5258,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 20,
                     output_tokens: 5,
+                    ..Default::default()
                 },
             },
         ];
@@ -5318,6 +5379,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 20,
                     output_tokens: 10,
+                    ..Default::default()
                 },
             },
             CompletionResponse {
@@ -5328,6 +5390,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 40,
                     output_tokens: 15,
+                    ..Default::default()
                 },
             },
         ];
@@ -5386,6 +5449,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 20,
                     output_tokens: 10,
+                    ..Default::default()
                 },
             },
             CompletionResponse {
@@ -5396,6 +5460,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 40,
                     output_tokens: 15,
+                    ..Default::default()
                 },
             },
         ];
@@ -5454,6 +5519,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 20,
                     output_tokens: 10,
+                    ..Default::default()
                 },
             },
             CompletionResponse {
@@ -5464,6 +5530,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 40,
                     output_tokens: 15,
+                    ..Default::default()
                 },
             },
         ];
@@ -5508,6 +5575,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 20,
                     output_tokens: 10,
+                    ..Default::default()
                 },
             },
             CompletionResponse {
@@ -5518,6 +5586,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 40,
                     output_tokens: 15,
+                    ..Default::default()
                 },
             },
         ];
@@ -5664,6 +5733,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    ..Default::default()
                 },
             },
             // Cycle 2: model ends turn (phase 1, React after transition)
@@ -5675,6 +5745,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 20,
                     output_tokens: 8,
+                    ..Default::default()
                 },
             },
         ];
@@ -5772,6 +5843,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 5,
                 output_tokens: 3,
+                ..Default::default()
             },
         }];
 
@@ -5857,6 +5929,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 5,
                 output_tokens: 3,
+                ..Default::default()
             },
         }];
 
@@ -5944,6 +6017,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    ..Default::default()
                 },
             },
             // Cycle 2 (phase 0): tool call → loop continues; phase_cycle_count → 2.
@@ -5957,6 +6031,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    ..Default::default()
                 },
             },
             // Cycle 3 start: phase check fires (phase_cycle_count=2 >= 2)
@@ -5970,6 +6045,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    ..Default::default()
                 },
             },
         ];
@@ -6078,6 +6154,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 5,
                 output_tokens: 3,
+                ..Default::default()
             },
         }];
 
@@ -6187,6 +6264,7 @@ mod tests {
             usage: TokenUsage {
                 input_tokens: 5,
                 output_tokens: 3,
+                ..Default::default()
             },
         }];
 
@@ -6276,6 +6354,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 5,
                     output_tokens: 3,
+                    ..Default::default()
                 },
             },
             // Cycle 2: tool call → loop continues, phase stays at 0.
@@ -6289,6 +6368,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 5,
                     output_tokens: 3,
+                    ..Default::default()
                 },
             },
             // Cycle 3: EndTurn → loop exits; advance_phase was never called.
@@ -6300,6 +6380,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 5,
                     output_tokens: 3,
+                    ..Default::default()
                 },
             },
         ];

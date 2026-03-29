@@ -800,8 +800,8 @@ async fn run_session_loop(
                                         usage: Some(roz_v1::TokenUsage {
                                             input_tokens: output.total_usage.input_tokens,
                                             output_tokens: output.total_usage.output_tokens,
-                                            cache_read_tokens: 0,
-                                            cache_creation_tokens: 0,
+                                            cache_read_tokens: output.total_usage.cache_read_tokens,
+                                            cache_creation_tokens: output.total_usage.cache_creation_tokens,
                                         }),
                                         stop_reason: "end_turn".into(),
                                     })),

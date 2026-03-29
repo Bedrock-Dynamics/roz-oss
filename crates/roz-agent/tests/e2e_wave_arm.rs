@@ -55,6 +55,7 @@ async fn agent_deploys_sin_controller_and_arm_oscillates() {
             usage: TokenUsage {
                 input_tokens: 150,
                 output_tokens: 60,
+                ..Default::default()
             },
         },
         // Turn 2: Agent confirms deployment.
@@ -66,6 +67,7 @@ async fn agent_deploys_sin_controller_and_arm_oscillates() {
             usage: TokenUsage {
                 input_tokens: 250,
                 output_tokens: 25,
+                ..Default::default()
             },
         },
     ];

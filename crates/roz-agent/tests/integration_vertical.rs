@@ -17,6 +17,7 @@ fn simple_response(text: &str) -> CompletionResponse {
         usage: TokenUsage {
             input_tokens: 50,
             output_tokens: 20,
+            ..Default::default()
         },
     }
 }
@@ -142,6 +143,7 @@ async fn max_cycles_exceeded_returns_error() {
             usage: TokenUsage {
                 input_tokens: 10,
                 output_tokens: 5,
+                ..Default::default()
             },
         })
         .collect();

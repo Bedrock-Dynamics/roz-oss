@@ -173,6 +173,7 @@ mod tests {
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 20,
+                    ..Default::default()
                 },
             })
         }
