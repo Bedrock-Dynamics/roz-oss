@@ -22,6 +22,7 @@ use roz_agent::dispatch::ToolDispatcher;
 use roz_agent::safety::SafetyStack;
 use roz_nats::subjects::Subjects;
 
+use crate::camera::CameraManager;
 use crate::config::WorkerConfig;
 
 /// JSON envelope used for session messages over NATS.
@@ -45,6 +46,7 @@ pub async fn spawn_session_relay(
     worker_id: String,
     config: WorkerConfig,
     estop_rx: tokio::sync::watch::Receiver<bool>,
+    camera_manager: Option<Arc<CameraManager>>,
 ) -> anyhow::Result<()> {
     let subject = format!("session.{worker_id}.*.request");
     let mut sub = nats.subscribe(subject.clone()).await?;
@@ -77,6 +79,7 @@ pub async fn spawn_session_relay(
             let config_clone = config.clone();
             let sessions_ref = sessions.clone();
             let estop_rx_clone = estop_rx.clone();
+            let cam_mgr_clone = camera_manager.clone();
 
             let handle = tokio::spawn(async move {
                 if let Err(e) = handle_edge_session(
@@ -86,6 +89,7 @@ pub async fn spawn_session_relay(
                     &config_clone,
                     envelope,
                     estop_rx_clone,
+                    cam_mgr_clone,
                 )
                 .await
                 {
@@ -113,6 +117,7 @@ async fn handle_edge_session(
     config: &WorkerConfig,
     start_msg: serde_json::Value,
     estop_rx: tokio::sync::watch::Receiver<bool>,
+    camera_manager: Option<Arc<CameraManager>>,
 ) -> anyhow::Result<()> {
     let response_subject = Subjects::session_response(worker_id, session_id)?;
 
@@ -134,16 +139,43 @@ async fn handle_edge_session(
     // Build the agent model using shared factory.
     let model = crate::model_factory::build_model(config)?;
 
-    let dispatcher = ToolDispatcher::new(Duration::from_secs(30));
+    let mut dispatcher = ToolDispatcher::new(Duration::from_secs(30));
+    let mut extensions = roz_agent::dispatch::Extensions::new();
+
+    // Register camera perception tools when cameras are available.
+    if let Some(ref cam_mgr) = camera_manager {
+        extensions.insert(cam_mgr.clone());
+        let shared_vision_config = Arc::new(tokio::sync::RwLock::new(roz_core::edge::vision::VisionConfig::default()));
+        extensions.insert(shared_vision_config);
+        dispatcher.register_with_category(
+            Box::new(crate::camera::perception::CaptureFrameTool),
+            roz_core::tools::ToolCategory::Pure,
+        );
+        dispatcher.register_with_category(
+            Box::new(crate::camera::perception::ListCamerasTool),
+            roz_core::tools::ToolCategory::Pure,
+        );
+        dispatcher.register_with_category(
+            Box::new(crate::camera::perception::SetVisionStrategyTool),
+            roz_core::tools::ToolCategory::Pure,
+        );
+        tracing::info!(session_id, "camera perception tools registered for edge session");
+    }
+
     let guards: Vec<Box<dyn roz_agent::safety::SafetyGuard>> = vec![Box::new(
         roz_agent::safety::guards::VelocityLimiter::new(config.max_velocity.unwrap_or(1.5)),
     )];
     let safety = SafetyStack::new(guards);
     let spatial: Box<dyn roz_agent::spatial_provider::SpatialContextProvider> =
         Box::new(crate::camera::snapshot::CameraSpatialProvider::new());
-    let mut agent = AgentLoop::new(model, dispatcher, safety, spatial);
+    let mut agent = AgentLoop::new(model, dispatcher, safety, spatial).with_extensions(extensions);
 
-    let constitution = build_constitution(AgentLoopMode::React);
+    // Parse execution mode from start_msg (E8: use extracted function).
+    // Default to OodaReAct for edge sessions (workers with physical capabilities).
+    let session_mode = parse_edge_session_mode(&start_msg, config.max_velocity.is_some());
+    let constitution = build_constitution(session_mode);
+
+    tracing::info!(session_id, ?session_mode, "edge session mode resolved");
 
     // Extract model name from start_msg for potential per-session override.
     let session_model = start_msg["model"]
@@ -183,7 +215,7 @@ async fn handle_edge_session(
                     max_cycles: 20,
                     max_tokens: 8192,
                     max_context_tokens: 200_000,
-                    mode: AgentLoopMode::React,
+                    mode: session_mode,
                     tool_choice: None,
                     response_schema: None,
                     streaming: false,
@@ -282,6 +314,25 @@ async fn handle_edge_session(
     Ok(())
 }
 
+/// Parse the agent loop mode from a `start_session` message.
+///
+/// Explicit `"mode"` field takes precedence. When absent, defaults to
+/// `OodaReAct` if the worker has physical capabilities (`has_physical`),
+/// otherwise `React`.
+fn parse_edge_session_mode(start_msg: &serde_json::Value, has_physical: bool) -> AgentLoopMode {
+    match start_msg["mode"].as_str() {
+        Some("react") => AgentLoopMode::React,
+        Some("ooda_react") => AgentLoopMode::OodaReAct,
+        _ => {
+            if has_physical {
+                AgentLoopMode::OodaReAct
+            } else {
+                AgentLoopMode::React
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +360,34 @@ mod tests {
         assert_eq!(msg.session_id, "sess-456");
         assert_eq!(msg.payload["type"], "user_message");
         assert_eq!(msg.payload["text"], "hello");
+    }
+
+    #[test]
+    fn parse_edge_session_mode_explicit_react() {
+        let msg = serde_json::json!({"type": "start_session", "mode": "react"});
+        assert_eq!(parse_edge_session_mode(&msg, true), AgentLoopMode::React);
+        assert_eq!(parse_edge_session_mode(&msg, false), AgentLoopMode::React);
+    }
+
+    #[test]
+    fn parse_edge_session_mode_explicit_ooda() {
+        let msg = serde_json::json!({"type": "start_session", "mode": "ooda_react"});
+        assert_eq!(parse_edge_session_mode(&msg, false), AgentLoopMode::OodaReAct);
+    }
+
+    #[test]
+    fn parse_edge_session_mode_absent_defaults_by_physical() {
+        let msg = serde_json::json!({"type": "start_session"});
+        // Physical worker defaults to OodaReAct
+        assert_eq!(parse_edge_session_mode(&msg, true), AgentLoopMode::OodaReAct);
+        // Non-physical worker defaults to React
+        assert_eq!(parse_edge_session_mode(&msg, false), AgentLoopMode::React);
+    }
+
+    #[test]
+    fn parse_edge_session_mode_unknown_value_treated_as_absent() {
+        let msg = serde_json::json!({"type": "start_session", "mode": "turbo"});
+        assert_eq!(parse_edge_session_mode(&msg, true), AgentLoopMode::OodaReAct);
+        assert_eq!(parse_edge_session_mode(&msg, false), AgentLoopMode::React);
     }
 }

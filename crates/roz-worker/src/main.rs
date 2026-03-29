@@ -11,6 +11,11 @@ use uuid::Uuid;
 
 /// Run the agent loop for a single task, publish `WorkerExited` to the parent's team stream
 /// if this is a child task, then signal the result back to Restate.
+#[expect(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "sequential task lifecycle with model + tools + safety"
+)]
 async fn execute_task(
     invocation: TaskInvocation,
     task_id: Uuid,
@@ -19,6 +24,7 @@ async fn execute_task(
     task_http: reqwest::Client,
     restate_url: String,
     mut estop_rx: tokio::sync::watch::Receiver<bool>,
+    camera_manager: Option<Arc<roz_worker::camera::CameraManager>>,
 ) {
     tracing::info!("starting task execution");
 
@@ -75,6 +81,26 @@ async fn execute_task(
             Box::new(roz_local::tools::deploy_controller::DeployControllerTool),
             roz_core::tools::ToolCategory::Physical,
         );
+    }
+
+    // Register camera perception tools when cameras are available.
+    if let Some(ref cam_mgr) = camera_manager {
+        extensions.insert(cam_mgr.clone());
+        let shared_vision_config = Arc::new(tokio::sync::RwLock::new(roz_core::edge::vision::VisionConfig::default()));
+        extensions.insert(shared_vision_config);
+        dispatcher.register_with_category(
+            Box::new(roz_worker::camera::perception::CaptureFrameTool),
+            roz_core::tools::ToolCategory::Pure,
+        );
+        dispatcher.register_with_category(
+            Box::new(roz_worker::camera::perception::ListCamerasTool),
+            roz_core::tools::ToolCategory::Pure,
+        );
+        dispatcher.register_with_category(
+            Box::new(roz_worker::camera::perception::SetVisionStrategyTool),
+            roz_core::tools::ToolCategory::Pure,
+        );
+        tracing::info!("camera perception tools registered");
     }
 
     let mut agent =
@@ -200,18 +226,19 @@ async fn main() -> Result<()> {
     });
 
     // Initialize camera system
-    let camera_manager = if config.camera.enabled || config.camera.test_pattern {
-        let hub = roz_worker::camera::stream_hub::StreamHub::new();
-        let mut manager = roz_worker::camera::CameraManager::new(hub);
-        if config.camera.test_pattern {
-            let cam_info = manager.add_test_pattern().await;
-            tracing::info!(camera = %cam_info.id, "test pattern camera registered");
-        }
-        Some(manager)
-    } else {
-        tracing::info!("camera system disabled");
-        None
-    };
+    let camera_manager: Option<Arc<roz_worker::camera::CameraManager>> =
+        if config.camera.enabled || config.camera.test_pattern {
+            let hub = roz_worker::camera::stream_hub::StreamHub::new();
+            let mut manager = roz_worker::camera::CameraManager::new(hub);
+            if config.camera.test_pattern {
+                let cam_info = manager.add_test_pattern().await;
+                tracing::info!(camera = %cam_info.id, "test pattern camera registered");
+            }
+            Some(Arc::new(manager))
+        } else {
+            tracing::info!("camera system disabled");
+            None
+        };
 
     // Publish capabilities on startup
     let mut caps = roz_core::capabilities::RobotCapabilities {
@@ -276,10 +303,16 @@ async fn main() -> Result<()> {
     let relay_worker_id = config.worker_id.clone();
     let relay_config = config.clone();
     let relay_estop_rx = estop_rx.clone();
+    let relay_camera_mgr = camera_manager.clone();
     tokio::spawn(async move {
-        if let Err(e) =
-            roz_worker::session_relay::spawn_session_relay(relay_nats, relay_worker_id, relay_config, relay_estop_rx)
-                .await
+        if let Err(e) = roz_worker::session_relay::spawn_session_relay(
+            relay_nats,
+            relay_worker_id,
+            relay_config,
+            relay_estop_rx,
+            relay_camera_mgr,
+        )
+        .await
         {
             tracing::error!(error = %e, "session relay exited");
         }
@@ -331,6 +364,7 @@ async fn main() -> Result<()> {
         let task_id = invocation.task_id;
         let task_config = config.clone();
         let task_js = js.clone();
+        let task_camera_mgr = camera_manager.clone();
 
         let task_estop_rx = estop_rx.clone();
         let span = tracing::info_span!("worker.execute_task", task_id = %task_id);
@@ -343,6 +377,7 @@ async fn main() -> Result<()> {
                 task_http,
                 restate_url,
                 task_estop_rx,
+                task_camera_mgr,
             )
             .instrument(span),
         );

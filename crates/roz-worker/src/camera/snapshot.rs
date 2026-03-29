@@ -4,11 +4,15 @@
 //! agent loop can inject into its spatial observation step. Each camera's latest
 //! frame is cached and served on demand via the `SpatialContextProvider` trait.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use base64::Engine;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use roz_agent::spatial_provider::SpatialContextProvider;
+use roz_core::edge::vision::VisionConfig;
 use roz_core::spatial::{SimScreenshot, SpatialContext};
 
 /// Provides camera snapshots as `SpatialContext` for agent perception.
@@ -68,6 +72,68 @@ impl SpatialContextProvider for CameraSpatialProvider {
     async fn snapshot(&self, _task_id: &str) -> SpatialContext {
         self.last_context.read().await.clone()
     }
+}
+
+/// Spawns a background task that reads raw frames from a camera source,
+/// converts them to JPEG at the configured keyframe resolution and rate,
+/// and updates the `CameraSpatialProvider`.
+///
+/// Rate-limits to `config.keyframe_rate_hz` (default 0.2 Hz = one every 5s).
+/// Reads the shared `VisionConfig` each cycle so runtime changes via
+/// `SetVisionStrategyTool` take effect immediately.
+/// Respects the cancellation token for clean shutdown.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn spawn_snapshot_feeder(
+    mut rx: tokio::sync::mpsc::Receiver<super::source::RawFrame>,
+    provider: Arc<CameraSpatialProvider>,
+    config: Arc<RwLock<VisionConfig>>,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Allow an immediate first capture by setting last_capture far in the past.
+        let mut last_capture = tokio::time::Instant::now() - tokio::time::Duration::from_secs(3600);
+
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => {
+                    tracing::debug!("snapshot feeder cancelled");
+                    break;
+                }
+                frame = rx.recv() => {
+                    let Some(frame) = frame else {
+                        tracing::debug!("snapshot feeder: frame channel closed");
+                        break;
+                    };
+
+                    // Read current config each cycle (allows runtime changes via SetVisionStrategyTool).
+                    let cfg = config.read().await;
+                    let interval_ms = if cfg.keyframe_rate_hz > 0.0 {
+                        (1000.0 / cfg.keyframe_rate_hz) as u64
+                    } else {
+                        5000 // default 0.2 Hz
+                    };
+                    let (tw, th) = cfg.keyframe_resolution;
+                    drop(cfg); // release read lock before potentially slow JPEG encode
+
+                    // Rate-limit: skip frames until the interval has elapsed.
+                    let elapsed_ms = last_capture.elapsed().as_millis() as u64;
+                    if elapsed_ms < interval_ms {
+                        continue;
+                    }
+                    last_capture = tokio::time::Instant::now();
+
+                    let jpeg = super::frame_convert::i420_to_jpeg(&frame, tw, th, 80);
+                    provider.update_snapshot(&frame.camera_id.0, &jpeg).await;
+
+                    tracing::trace!(
+                        camera = %frame.camera_id,
+                        jpeg_bytes = jpeg.len(),
+                        "snapshot feeder: updated spatial context"
+                    );
+                }
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -159,5 +225,37 @@ mod tests {
         let provider = CameraSpatialProvider::default();
         let ctx = provider.snapshot("test").await;
         assert!(ctx.screenshots.is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshot_feeder_populates_provider() {
+        use crate::camera::source::{CameraSource, TestPatternSource};
+
+        let provider = Arc::new(CameraSpatialProvider::new());
+        let config = Arc::new(RwLock::new(VisionConfig {
+            keyframe_rate_hz: 100.0, // fast for testing
+            keyframe_resolution: (160, 120),
+            ..Default::default()
+        }));
+        let cancel = CancellationToken::new();
+
+        // Start a test pattern source
+        let mut source = TestPatternSource::new("test-feeder");
+        let rx = source.start(320, 240, 30).await.unwrap();
+
+        // Spawn feeder
+        let handle = spawn_snapshot_feeder(rx, provider.clone(), config, cancel.clone());
+
+        // Wait for at least one snapshot to be populated
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        assert!(
+            provider.snapshot_count().await > 0,
+            "feeder should have populated at least one snapshot"
+        );
+
+        cancel.cancel();
+        source.stop().await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
     }
 }

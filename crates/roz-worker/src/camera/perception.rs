@@ -3,6 +3,8 @@
 //! These tools are registered with the agent's `ToolDispatcher` and allow the
 //! LLM to interact with camera hardware through the standard tool interface.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -52,7 +54,7 @@ impl TypedToolExecutor for CaptureFrameTool {
         input: Self::Input,
         ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
-        let Some(mgr) = ctx.extensions.get::<CameraManager>() else {
+        let Some(mgr) = ctx.extensions.get::<Arc<CameraManager>>() else {
             return Ok(ToolResult::error("no camera available on this worker".to_string()));
         };
 
@@ -133,7 +135,7 @@ impl TypedToolExecutor for ListCamerasTool {
         }
 
         // Fall back to CameraManager.
-        if let Some(mgr) = ctx.extensions.get::<CameraManager>() {
+        if let Some(mgr) = ctx.extensions.get::<Arc<CameraManager>>() {
             let cameras: Vec<serde_json::Value> = mgr
                 .cameras()
                 .iter()
@@ -206,6 +208,88 @@ impl TypedToolExecutor for WatchConditionTool {
         Ok(ToolResult::error(
             "Condition monitoring not yet available — feature in development".to_string(),
         ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// set_vision_strategy
+// ---------------------------------------------------------------------------
+
+/// Input parameters for the `set_vision_strategy` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetVisionStrategyInput {
+    /// Vision processing strategy: `edge_detection`, `compressed_keyframes`,
+    /// `hybrid`, or `local_only`.
+    pub strategy: String,
+    /// Optional keyframe capture rate in Hz. Must be between 0.01 and 10.0.
+    pub keyframe_rate_hz: Option<f64>,
+}
+
+/// Allows the agent to change the vision processing strategy at runtime.
+///
+/// The tool writes to a shared `Arc<RwLock<VisionConfig>>` that the snapshot
+/// feeder checks each cycle. Changes take effect on the next frame capture.
+pub struct SetVisionStrategyTool;
+
+#[async_trait]
+impl TypedToolExecutor for SetVisionStrategyTool {
+    type Input = SetVisionStrategyInput;
+
+    fn name(&self) -> &'static str {
+        "set_vision_strategy"
+    }
+
+    fn description(&self) -> &'static str {
+        "Change the vision processing strategy at runtime. Strategies: \
+         'edge_detection' (YOLO on edge, JSON to cloud), \
+         'compressed_keyframes' (JPEG keyframes to cloud VLM), \
+         'hybrid' (both edge detection and keyframes), \
+         'local_only' (no cloud upload, privacy mode). \
+         Optionally set keyframe_rate_hz (0.01-10.0)."
+    }
+
+    async fn execute(
+        &self,
+        input: Self::Input,
+        ctx: &ToolContext,
+    ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
+        use roz_core::edge::vision::{VisionConfig, VisionStrategy};
+        use tokio::sync::RwLock;
+
+        let Some(config) = ctx.extensions.get::<Arc<RwLock<VisionConfig>>>() else {
+            return Ok(ToolResult::error(
+                "vision configuration not available on this worker".to_string(),
+            ));
+        };
+
+        let strategy = match input.strategy.as_str() {
+            "edge_detection" => VisionStrategy::EdgeDetection,
+            "compressed_keyframes" => VisionStrategy::CompressedKeyframes,
+            "hybrid" => VisionStrategy::Hybrid,
+            "local_only" => VisionStrategy::LocalOnly,
+            other => {
+                return Ok(ToolResult::error(format!(
+                    "unknown strategy '{other}'. Valid: edge_detection, compressed_keyframes, hybrid, local_only"
+                )));
+            }
+        };
+
+        let mut cfg = config.write().await;
+        cfg.strategy = strategy;
+
+        if let Some(rate) = input.keyframe_rate_hz {
+            if !(0.01..=10.0).contains(&rate) {
+                return Ok(ToolResult::error(format!(
+                    "keyframe_rate_hz must be between 0.01 and 10.0, got {rate}"
+                )));
+            }
+            cfg.keyframe_rate_hz = rate;
+        }
+
+        Ok(ToolResult::success(serde_json::json!({
+            "strategy": input.strategy,
+            "keyframe_rate_hz": cfg.keyframe_rate_hz,
+        })))
     }
 }
 
@@ -307,5 +391,119 @@ mod tests {
             result.error.as_deref().unwrap().contains("not yet available"),
             "error should indicate feature is not yet available"
         );
+    }
+
+    #[tokio::test]
+    async fn tools_register_with_dispatcher() {
+        use roz_agent::dispatch::ToolDispatcher;
+        use roz_core::tools::ToolCategory;
+        use std::time::Duration;
+
+        let mut dispatcher = ToolDispatcher::new(Duration::from_secs(5));
+        dispatcher.register_with_category(Box::new(CaptureFrameTool), ToolCategory::Pure);
+        dispatcher.register_with_category(Box::new(ListCamerasTool), ToolCategory::Pure);
+        dispatcher.register_with_category(Box::new(SetVisionStrategyTool), ToolCategory::Pure);
+
+        let schemas = dispatcher.schemas();
+        let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"capture_frame"), "capture_frame not registered");
+        assert!(names.contains(&"list_cameras"), "list_cameras not registered");
+        assert!(
+            names.contains(&"set_vision_strategy"),
+            "set_vision_strategy not registered"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_vision_strategy_updates_shared_config() {
+        use roz_core::edge::vision::{VisionConfig, VisionStrategy};
+        use tokio::sync::RwLock;
+
+        let config = Arc::new(RwLock::new(VisionConfig::default()));
+        assert_eq!(config.read().await.strategy, VisionStrategy::Hybrid);
+
+        let mut ext = Extensions::new();
+        ext.insert(config.clone());
+
+        let ctx = ToolContext {
+            task_id: "test-task".into(),
+            tenant_id: "test-tenant".into(),
+            call_id: "test-call".into(),
+            extensions: ext,
+        };
+
+        let tool = SetVisionStrategyTool;
+        let input = SetVisionStrategyInput {
+            strategy: "compressed_keyframes".to_string(),
+            keyframe_rate_hz: Some(1.0),
+        };
+        let result = TypedToolExecutor::execute(&tool, input, &ctx).await.unwrap();
+        assert!(result.is_success());
+
+        let updated = config.read().await;
+        assert_eq!(updated.strategy, VisionStrategy::CompressedKeyframes);
+        assert!((updated.keyframe_rate_hz - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn set_vision_strategy_rejects_unknown_strategy() {
+        use roz_core::edge::vision::VisionConfig;
+        use tokio::sync::RwLock;
+
+        let config = Arc::new(RwLock::new(VisionConfig::default()));
+        let mut ext = Extensions::new();
+        ext.insert(config);
+
+        let ctx = ToolContext {
+            task_id: "test-task".into(),
+            tenant_id: "test-tenant".into(),
+            call_id: "test-call".into(),
+            extensions: ext,
+        };
+
+        let tool = SetVisionStrategyTool;
+        let input = SetVisionStrategyInput {
+            strategy: "turbo_mode".to_string(),
+            keyframe_rate_hz: None,
+        };
+        let result = TypedToolExecutor::execute(&tool, input, &ctx).await.unwrap();
+        assert!(result.is_error());
+    }
+
+    #[tokio::test]
+    async fn set_vision_strategy_rejects_invalid_rate() {
+        use roz_core::edge::vision::VisionConfig;
+        use tokio::sync::RwLock;
+
+        let config = Arc::new(RwLock::new(VisionConfig::default()));
+        let mut ext = Extensions::new();
+        ext.insert(config);
+
+        let ctx = ToolContext {
+            task_id: "test-task".into(),
+            tenant_id: "test-tenant".into(),
+            call_id: "test-call".into(),
+            extensions: ext,
+        };
+
+        let tool = SetVisionStrategyTool;
+        let input = SetVisionStrategyInput {
+            strategy: "hybrid".to_string(),
+            keyframe_rate_hz: Some(50.0), // way above 10.0 limit
+        };
+        let result = TypedToolExecutor::execute(&tool, input, &ctx).await.unwrap();
+        assert!(result.is_error());
+    }
+
+    #[tokio::test]
+    async fn set_vision_strategy_no_config_returns_error() {
+        let ctx = test_ctx();
+        let tool = SetVisionStrategyTool;
+        let input = SetVisionStrategyInput {
+            strategy: "hybrid".to_string(),
+            keyframe_rate_hz: None,
+        };
+        let result = TypedToolExecutor::execute(&tool, input, &ctx).await.unwrap();
+        assert!(result.is_error());
     }
 }
