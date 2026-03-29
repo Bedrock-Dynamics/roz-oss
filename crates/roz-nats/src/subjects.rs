@@ -118,8 +118,9 @@ impl Subjects {
     }
 
     /// E-stop subject for a worker: `safety.estop.{worker_id}`.
-    pub fn estop(worker_id: &str) -> String {
-        format!("safety.estop.{worker_id}")
+    pub fn estop(worker_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        Ok(format!("safety.estop.{worker_id}"))
     }
 
     /// Build a WebRTC offer subject: `webrtc.{worker_id}.{peer_id}.offer`.
@@ -252,8 +253,15 @@ mod tests {
 
     #[test]
     fn estop_subject() {
-        let subject = Subjects::estop("robot-arm-1");
+        let subject = Subjects::estop("robot-arm-1").unwrap();
         assert_eq!(subject, "safety.estop.robot-arm-1");
+    }
+
+    #[test]
+    fn estop_validates_worker_id() {
+        assert!(Subjects::estop("valid-worker").is_ok());
+        assert!(Subjects::estop("worker.with.dots").is_err());
+        assert!(Subjects::estop("").is_err());
     }
 
     #[test]

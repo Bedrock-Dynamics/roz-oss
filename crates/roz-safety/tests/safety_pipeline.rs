@@ -64,7 +64,10 @@ async fn worker_staleness_triggers_estop_over_nats() {
         let event = roz_safety::estop::EStopEvent::heartbeat_timeout(worker);
         let payload = event.to_json_bytes().expect("serialize e-stop");
         safety_client
-            .publish(format!("safety.estop.{worker}"), payload)
+            .publish(
+                roz_nats::subjects::Subjects::estop(worker).expect("valid worker_id"),
+                payload,
+            )
             .await
             .expect("pub estop");
     }

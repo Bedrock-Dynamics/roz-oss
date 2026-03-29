@@ -175,7 +175,13 @@ pub async fn estop(
         ));
     };
 
-    let subject = roz_nats::subjects::Subjects::estop(&host.name);
+    let subject = roz_nats::subjects::Subjects::estop(&host.name).map_err(|e| {
+        tracing::error!(error = %e, host_id = %id, "invalid host name for estop subject");
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid host name for estop subject"})),
+        )
+    })?;
     nats.publish(subject, bytes::Bytes::from_static(b"{}"))
         .await
         .map_err(|e| {

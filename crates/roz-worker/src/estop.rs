@@ -8,7 +8,7 @@
 
 /// Subscribe to e-stop events for this worker.
 pub async fn subscribe_estop(nats: &async_nats::Client, worker_id: &str) -> anyhow::Result<async_nats::Subscriber> {
-    let subject = format!("safety.estop.{worker_id}");
+    let subject = roz_nats::subjects::Subjects::estop(worker_id).expect("valid worker_id for estop subject");
     let sub = nats.subscribe(subject).await?;
     Ok(sub)
 }

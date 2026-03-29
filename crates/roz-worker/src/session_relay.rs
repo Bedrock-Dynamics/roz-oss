@@ -200,11 +200,34 @@ async fn handle_edge_session(
                     phases: Vec::new(),
                 };
 
+                // Spawn keepalive task for long agent turns.
+                let keepalive_nats = nats.clone();
+                let keepalive_subject = response_subject.clone();
+                let keepalive_cancel = CancellationToken::new();
+                let kc = keepalive_cancel.clone();
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(5));
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                let msg = serde_json::json!({"type": "keepalive"});
+                                if let Ok(payload) = serde_json::to_vec(&msg) {
+                                    let _ = keepalive_nats
+                                        .publish(keepalive_subject.clone(), payload.into())
+                                        .await;
+                                }
+                            }
+                            () = kc.cancelled() => return,
+                        }
+                    }
+                });
+
                 let mut estop_rx = estop_rx.clone();
                 let agent_result = tokio::select! {
                     result = agent.run(input) => result,
                     _ = estop_rx.changed() => {
                         if *estop_rx.borrow() {
+                            keepalive_cancel.cancel();
                             tracing::error!(session_id, "E-STOP fired during agent execution — aborting turn");
                             let error = serde_json::json!({"type": "error", "message": "E-STOP activated during execution"});
                             if let Ok(payload) = serde_json::to_vec(&error) {
@@ -215,6 +238,8 @@ async fn handle_edge_session(
                         continue;
                     }
                 };
+
+                keepalive_cancel.cancel();
 
                 match agent_result {
                     Ok(output) => {

@@ -2004,7 +2004,7 @@ mod tests {
         let nats_client = async_nats::connect(nats_guard.url()).await.expect("connect NATS");
 
         // 4. Subscribe to estop subject BEFORE sending the request.
-        let estop_subject = format!("safety.estop.{}", host.name);
+        let estop_subject = roz_nats::subjects::Subjects::estop(&host.name).expect("valid host name");
         let mut sub = nats_client
             .subscribe(estop_subject.clone())
             .await

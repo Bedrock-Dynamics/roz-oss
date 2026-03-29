@@ -74,7 +74,13 @@ async fn main() -> Result<()> {
             Some(stale_ids) = stale_rx.recv() => {
                 for worker_id in &stale_ids {
                     let event = EStopEvent::heartbeat_timeout(worker_id);
-                    let subject = format!("safety.estop.{worker_id}");
+                    let subject = match roz_nats::subjects::Subjects::estop(worker_id) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!(worker_id, error = %e, "invalid worker_id for estop subject");
+                            continue;
+                        }
+                    };
                     match event.to_json_bytes() {
                         Ok(payload) => {
                             if let Err(e) = nats.publish(subject, payload).await {

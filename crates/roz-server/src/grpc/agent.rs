@@ -2030,6 +2030,10 @@ async fn run_edge_relay(
 
             let msg_type = envelope["type"].as_str().unwrap_or("");
             let response = match msg_type {
+                "keepalive" => {
+                    // Worker is alive but busy. Reset timeout by continuing the loop.
+                    continue;
+                }
                 "session_started" => {
                     let sid = envelope["session_id"].as_str().unwrap_or("").to_string();
                     let model = envelope["model"].as_str().unwrap_or("").to_string();

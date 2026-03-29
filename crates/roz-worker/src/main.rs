@@ -5,6 +5,7 @@ use anyhow::Result;
 use async_nats::jetstream::Context as JetStreamContext;
 use futures::StreamExt;
 use roz_nats::dispatch::TaskInvocation;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use uuid::Uuid;
 
@@ -249,6 +250,16 @@ async fn main() -> Result<()> {
     let estop_rx = roz_worker::estop::spawn_estop_listener(estop_sub);
     tracing::info!(worker_id = %config.worker_id, "e-stop listener active");
 
+    // Spawn idle watchdog — fires if no NATS message arrives within 30s.
+    let watchdog = Arc::new(roz_worker::command_watchdog::CommandWatchdog::new(Duration::from_secs(
+        30,
+    )));
+    let watchdog_cancel = CancellationToken::new();
+    let wd = watchdog.clone();
+    let wd_cancel = watchdog_cancel.clone();
+    tokio::spawn(async move { wd.run(wd_cancel).await });
+    tracing::info!("idle watchdog active (30s deadline)");
+
     // Register with server
     if !config.api_key.is_empty() {
         match roz_worker::registration::register_host(&config.api_url, &config.api_key, &config.worker_id).await {
@@ -280,6 +291,8 @@ async fn main() -> Result<()> {
     let restate_url = config.restate_url.clone();
 
     while let Some(msg) = sub.next().await {
+        watchdog.pet();
+
         if *estop_rx.borrow() {
             tracing::error!("E-STOP active — rejecting task invocation");
             continue;
