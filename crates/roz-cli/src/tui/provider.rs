@@ -31,6 +31,13 @@ pub enum AgentEvent {
         output_tokens: u32,
         stop_reason: String,
     },
+    /// Camera snapshot captured by the agent for inline display.
+    ImageSnapshot {
+        camera: String,
+        media_type: String,
+        data: String, // base64
+        caption: Option<String>,
+    },
     /// Error from the backend.
     Error(String),
 }

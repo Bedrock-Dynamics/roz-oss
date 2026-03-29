@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
             cli::Commands::Config(args) => commands::config::execute(&args.command, &config).await,
             cli::Commands::Doctor => commands::doctor::execute(&config).await,
             cli::Commands::Estop { host } => commands::estop::execute(&config, &host).await,
+            cli::Commands::Camera { host } => commands::camera::execute(&config, &host).await,
         },
     }
 }

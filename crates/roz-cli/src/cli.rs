@@ -74,6 +74,10 @@ pub struct GlobalOpts {
     /// Force edge agent (robot-side reasoning)
     #[arg(long, conflicts_with = "cloud")]
     pub edge: bool,
+
+    /// Enable video feed from the target host's cameras
+    #[arg(long, requires = "host")]
+    pub video: bool,
 }
 
 impl GlobalOpts {
@@ -144,6 +148,13 @@ pub enum Commands {
     #[command(name = "estop")]
     Estop {
         /// Host name or ID to e-stop
+        host: String,
+    },
+    /// View camera feed from a robot host
+    #[command(name = "camera")]
+    Camera {
+        /// Host name or ID
+        #[arg(long)]
         host: String,
     },
 }

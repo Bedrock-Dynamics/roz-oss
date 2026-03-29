@@ -49,6 +49,60 @@ pub struct WorkerConfig {
     /// Defaults to 1.5 rad/s if not specified. Set via `ROZ_MAX_VELOCITY`.
     #[serde(default)]
     pub max_velocity: Option<f64>,
+    /// Camera subsystem configuration.
+    #[serde(default)]
+    pub camera: CameraConfig,
+}
+
+/// Camera subsystem configuration for the worker.
+///
+/// Controls whether the camera pipeline is started, which encoder to use,
+/// and ICE (STUN/TURN) settings for WebRTC peer connections.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CameraConfig {
+    #[serde(default = "default_camera_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub encoder: roz_core::camera::EncoderSelection,
+    #[serde(default)]
+    pub test_pattern: bool,
+    #[serde(default = "default_stun_url")]
+    pub stun_url: String,
+    #[serde(default)]
+    pub turn_url: Option<String>,
+    #[serde(default)]
+    pub turn_username: Option<String>,
+    #[serde(default)]
+    pub turn_credential: Option<String>,
+    #[serde(default = "default_max_viewers")]
+    pub max_viewers: usize,
+}
+
+impl Default for CameraConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_camera_enabled(),
+            encoder: roz_core::camera::EncoderSelection::default(),
+            test_pattern: false,
+            stun_url: default_stun_url(),
+            turn_url: None,
+            turn_username: None,
+            turn_credential: None,
+            max_viewers: default_max_viewers(),
+        }
+    }
+}
+
+const fn default_camera_enabled() -> bool {
+    cfg!(target_os = "linux")
+}
+
+fn default_stun_url() -> String {
+    "stun:stun.l.google.com:19302".to_string()
+}
+
+const fn default_max_viewers() -> usize {
+    10
 }
 
 fn default_worker_id() -> String {

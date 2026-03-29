@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod camera;
 pub mod config;
 pub mod doctor;
 pub mod env;

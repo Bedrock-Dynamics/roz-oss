@@ -17,7 +17,7 @@ pub async fn execute(config: &CliConfig, host: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn resolve_host_id(client: &reqwest::Client, api_url: &str, host: &str) -> anyhow::Result<String> {
+pub async fn resolve_host_id(client: &reqwest::Client, api_url: &str, host: &str) -> anyhow::Result<String> {
     if uuid::Uuid::parse_str(host).is_ok() {
         return Ok(host.to_string());
     }

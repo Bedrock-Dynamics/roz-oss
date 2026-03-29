@@ -203,6 +203,10 @@ fn RozRepl(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         in_stream = false;
                         md = markdown::MarkdownRenderer::new();
                     }
+                    AgentEvent::ImageSnapshot { camera, caption, .. } => {
+                        let label = caption.as_deref().unwrap_or("image");
+                        stdout.println(format!("[Snapshot: {camera} \u{2014} {label}]"));
+                    }
                     AgentEvent::Error(msg) => {
                         flush_line_buf(&mut line_buf, &mut md, &stdout);
 

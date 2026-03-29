@@ -198,8 +198,22 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Initialize camera system
+    let camera_manager = if config.camera.enabled || config.camera.test_pattern {
+        let hub = roz_worker::camera::stream_hub::StreamHub::new();
+        let mut manager = roz_worker::camera::CameraManager::new(hub);
+        if config.camera.test_pattern {
+            let cam_info = manager.add_test_pattern().await;
+            tracing::info!(camera = %cam_info.id, "test pattern camera registered");
+        }
+        Some(manager)
+    } else {
+        tracing::info!("camera system disabled");
+        None
+    };
+
     // Publish capabilities on startup
-    let caps = roz_core::capabilities::RobotCapabilities {
+    let mut caps = roz_core::capabilities::RobotCapabilities {
         robot_type: "generic".to_string(),
         joints: vec![],
         control_modes: vec!["position".to_string(), "velocity".to_string()],
@@ -208,6 +222,23 @@ async fn main() -> Result<()> {
         max_velocity: config.max_velocity.unwrap_or(1.5),
         cameras: vec![],
     };
+
+    if let Some(ref cam_mgr) = camera_manager {
+        caps.cameras = cam_mgr
+            .cameras()
+            .iter()
+            .map(|c| roz_core::capabilities::CameraCapability {
+                id: c.id.0.clone(),
+                label: c.label.clone(),
+                resolution: [
+                    c.supported_resolutions.first().map_or(640, |r| r.0),
+                    c.supported_resolutions.first().map_or(480, |r| r.1),
+                ],
+                fps: c.max_fps,
+                hw_encoder: c.hw_encoder_available,
+            })
+            .collect();
+    }
     let caps_subject =
         roz_nats::subjects::Subjects::capabilities(&config.worker_id).expect("valid worker_id for capabilities");
     if let Ok(payload) = serde_json::to_vec(&caps)
