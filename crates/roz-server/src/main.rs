@@ -243,6 +243,7 @@ async fn main() {
         nats_client,
         model_config,
         auth: Arc::new(roz_server::auth::ApiKeyAuth),
+        meter: Arc::new(roz_agent::meter::NoOpMeter),
     };
 
     // Spawn internal NATS request-reply handlers (e.g. spawn_worker tool bypass).
@@ -303,6 +304,7 @@ mod tests {
                 direct_api_key: None,
             },
             auth: Arc::new(roz_server::auth::ApiKeyAuth),
+            meter: Arc::new(roz_agent::meter::NoOpMeter),
         }
     }
 
@@ -1967,6 +1969,7 @@ mod tests {
                 direct_api_key: None,
             },
             auth: Arc::new(roz_server::auth::ApiKeyAuth),
+            meter: Arc::new(roz_agent::meter::NoOpMeter),
         }
     }
 

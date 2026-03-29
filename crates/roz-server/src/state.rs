@@ -42,4 +42,6 @@ pub struct AppState {
     pub model_config: ModelConfig,
     /// Pluggable REST auth provider. OSS uses `ApiKeyAuth`, cloud injects Clerk JWT support.
     pub auth: Arc<dyn RestAuth>,
+    /// Pluggable usage metering. OSS uses `NoOpMeter`, cloud injects billing logic.
+    pub meter: Arc<dyn roz_agent::meter::UsageMeter>,
 }
