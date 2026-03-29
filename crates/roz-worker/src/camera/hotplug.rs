@@ -14,7 +14,6 @@ pub enum HotplugEvent {
 #[cfg(target_os = "linux")]
 pub async fn watch_dev_video(event_tx: tokio::sync::mpsc::Sender<HotplugEvent>) {
     use inotify::{EventMask, Inotify, WatchMask};
-    use tokio::io::AsyncReadExt;
 
     let Ok(inotify) = Inotify::init() else {
         tracing::error!("failed to initialize inotify for /dev/ hot-plug monitoring");

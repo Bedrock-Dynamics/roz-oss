@@ -299,9 +299,9 @@ impl CameraSource for V4lSource {
                     break;
                 }
 
-                // E2: stream.next() returns Option<io::Result<...>>, not Result<...>
+                // v4l CaptureStream::next() returns Result<(&[u8], &Metadata)>
                 match stream.next() {
-                    Some(Ok((buf, _meta))) => {
+                    Ok((buf, _meta)) => {
                         let i420 = yuyv_to_i420(buf, width, height);
                         let frame = RawFrame {
                             camera_id: id.clone(),
@@ -316,12 +316,8 @@ impl CameraSource for V4lSource {
                         }
                         seq += 1;
                     }
-                    Some(Err(e)) => {
+                    Err(e) => {
                         tracing::error!(error = %e, "V4L capture error");
-                        break;
-                    }
-                    None => {
-                        tracing::warn!("V4L stream ended unexpectedly");
                         break;
                     }
                 }
