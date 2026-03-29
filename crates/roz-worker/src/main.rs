@@ -17,6 +17,7 @@ async fn execute_task(
     task_js: JetStreamContext,
     task_http: reqwest::Client,
     restate_url: String,
+    mut estop_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     tracing::info!("starting task execution");
 
@@ -43,7 +44,7 @@ async fn execute_task(
     let safety = roz_agent::safety::SafetyStack::new(guards);
 
     // Spawn Copper controller for OodaReAct mode.
-    let copper_handle = match invocation.mode {
+    let mut copper_handle = match invocation.mode {
         roz_nats::dispatch::ExecutionMode::OodaReAct => {
             let max_velocity = task_config.max_velocity.unwrap_or(1.5);
             let handle = roz_worker::copper_handle::CopperHandle::spawn(max_velocity);
@@ -75,7 +76,34 @@ async fn execute_task(
 
     let mut agent =
         roz_agent::agent_loop::AgentLoop::new(model, dispatcher, safety, spatial).with_extensions(extensions);
-    let output = agent.run(agent_input).await;
+
+    let output = tokio::select! {
+        result = agent.run(agent_input) => result,
+        _ = estop_rx.changed() => {
+            if *estop_rx.borrow() {
+                tracing::error!(task_id = %task_id, "E-STOP during task execution");
+                // DROP copper handle — triggers emergency halt (zeroes all commands).
+                drop(copper_handle.take());
+                let agent_err = roz_agent::error::AgentError::Safety("E-STOP activated during task execution".into());
+                let result = roz_worker::dispatch::build_task_result(task_id, Err(agent_err));
+                if let Err(e) = roz_worker::dispatch::signal_result(
+                    &task_http,
+                    &restate_url,
+                    &task_id.to_string(),
+                    &result,
+                )
+                .await
+                {
+                    tracing::error!(error = %e, "failed to signal E-STOP result to Restate");
+                }
+                return;
+            }
+            // Spurious wakeup (value still false) — re-run agent. This path is
+            // unreachable in practice because estop_rx only transitions false→true,
+            // but we must handle it for the compiler.
+            agent.run(roz_worker::dispatch::build_agent_input(&invocation)).await
+        }
+    };
 
     // If this is a child task (has a parent), notify the parent's team stream that this
     // child worker has exited. Complements WorkerCompleted/WorkerFailed which are published
@@ -288,8 +316,20 @@ async fn main() -> Result<()> {
         let task_config = config.clone();
         let task_js = js.clone();
 
+        let task_estop_rx = estop_rx.clone();
         let span = tracing::info_span!("worker.execute_task", task_id = %task_id);
-        tokio::spawn(execute_task(invocation, task_id, task_config, task_js, task_http, restate_url).instrument(span));
+        tokio::spawn(
+            execute_task(
+                invocation,
+                task_id,
+                task_config,
+                task_js,
+                task_http,
+                restate_url,
+                task_estop_rx,
+            )
+            .instrument(span),
+        );
     }
 
     tracing::warn!("NATS subscription closed, worker exiting");

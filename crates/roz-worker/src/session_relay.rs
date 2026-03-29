@@ -200,7 +200,23 @@ async fn handle_edge_session(
                     phases: Vec::new(),
                 };
 
-                match agent.run(input).await {
+                let mut estop_rx = estop_rx.clone();
+                let agent_result = tokio::select! {
+                    result = agent.run(input) => result,
+                    _ = estop_rx.changed() => {
+                        if *estop_rx.borrow() {
+                            tracing::error!(session_id, "E-STOP fired during agent execution — aborting turn");
+                            let error = serde_json::json!({"type": "error", "message": "E-STOP activated during execution"});
+                            if let Ok(payload) = serde_json::to_vec(&error) {
+                                let _ = nats.publish(response_subject.clone(), payload.into()).await;
+                            }
+                            break;
+                        }
+                        continue;
+                    }
+                };
+
+                match agent_result {
                     Ok(output) => {
                         // Send text response (may be None if agent produced no text).
                         if let Some(ref text) = output.final_response {
