@@ -260,8 +260,16 @@ mod tests {
     #[test]
     fn estop_validates_worker_id() {
         assert!(Subjects::estop("valid-worker").is_ok());
-        assert!(Subjects::estop("worker.with.dots").is_err());
-        assert!(Subjects::estop("").is_err());
+        assert!(
+            Subjects::estop("worker.with.dots").is_err(),
+            "dots would break NATS subject hierarchy"
+        );
+        assert!(
+            Subjects::estop("worker*wildcard").is_err(),
+            "wildcards would match unintended subjects"
+        );
+        assert!(Subjects::estop("").is_err(), "empty worker_id is invalid");
+        assert!(Subjects::estop("worker>greater").is_err(), "> is NATS full-wildcard");
     }
 
     #[test]
