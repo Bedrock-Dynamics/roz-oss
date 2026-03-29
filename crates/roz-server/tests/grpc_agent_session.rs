@@ -296,7 +296,9 @@ async fn full_agent_session_lifecycle() {
                 history: vec![],
                 project_context: vec![],
                 max_context_tokens: None,
-                agent_placement: None, camera_ids: vec![], enable_video: false,
+                agent_placement: None,
+                camera_ids: vec![],
+                enable_video: false,
             })),
         })
         .await
@@ -594,7 +596,9 @@ async fn project_context_included_in_system_prompt() {
                     "# rules/safety.md\nNever delete files without confirmation.".into(),
                 ],
                 max_context_tokens: None,
-                agent_placement: None, camera_ids: vec![], enable_video: false,
+                agent_placement: None,
+                camera_ids: vec![],
+                enable_video: false,
             })),
         })
         .await
@@ -804,7 +808,9 @@ async fn start_session_with_host_id_stores_in_session() {
                 history: vec![],
                 project_context: vec![],
                 max_context_tokens: None,
-                agent_placement: None, camera_ids: vec![], enable_video: false,
+                agent_placement: None,
+                camera_ids: vec![],
+                enable_video: false,
             })),
         })
         .await
@@ -935,7 +941,9 @@ async fn model_tier_names_resolve_to_actual_models() {
                 history: vec![],
                 project_context: vec![],
                 max_context_tokens: None,
-                agent_placement: None, camera_ids: vec![], enable_video: false,
+                agent_placement: None,
+                camera_ids: vec![],
+                enable_video: false,
             })),
         })
         .await
@@ -1069,7 +1077,9 @@ async fn session_with_host_receives_telemetry() {
                 history: vec![],
                 project_context: vec![],
                 max_context_tokens: None,
-                agent_placement: None, camera_ids: vec![], enable_video: false,
+                agent_placement: None,
+                camera_ids: vec![],
+                enable_video: false,
             })),
         })
         .await
