@@ -160,8 +160,9 @@ impl AdaptiveBitrateController {
     }
 
     /// Override hysteresis durations (for testing).
-    #[cfg(test)]
-    fn with_stability(mut self, upgrade: Duration, downgrade: Duration) -> Self {
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn with_stability(mut self, upgrade: Duration, downgrade: Duration) -> Self {
         self.upgrade_stability = upgrade;
         self.downgrade_stability = downgrade;
         self
