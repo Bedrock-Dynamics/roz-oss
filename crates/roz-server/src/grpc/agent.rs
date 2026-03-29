@@ -34,6 +34,7 @@ use roz_core::auth::AuthIdentity;
 use roz_core::tools::ToolCategory;
 
 use roz_core::team::{TeamEvent as CoreTeamEvent, WorkerFailReason};
+use roz_nats::subjects::Subjects;
 use roz_nats::team::{TEAM_STREAM, team_subject_pattern};
 
 use super::convert::value_to_struct;
@@ -504,6 +505,7 @@ async fn run_session_loop(
                         && let Some(nats) = nats_client
                     {
                         spawn_telemetry_relay(pool, nats, host_id_str, tx).await;
+                        spawn_webrtc_signaling_relay(pool, nats, host_id_str, tx).await;
                     }
 
                     // Edge mode: relay the entire session to the worker via NATS
@@ -1206,16 +1208,41 @@ async fn run_session_loop(
                     "agent_session.register_tools"
                 );
             }
-            // Phase 1b stub: WebRTC signaling will be wired in Phase 2.
-            Some(session_request::Request::WebrtcAnswer(_)) => {
-                tracing::debug!("WebRTC answer received (not yet wired)");
+            // WebRTC answer: serialize and publish to NATS for the worker.
+            Some(session_request::Request::WebrtcAnswer(answer)) => {
+                if let (Some(sess), Some(nats)) = (&session, nats_client) {
+                    if let Some(host_id_str) = &sess.host_id {
+                        relay_webrtc_answer(pool, nats, host_id_str, &answer).await;
+                    } else {
+                        tracing::debug!("WebRTC answer received but no host_id on session");
+                    }
+                } else {
+                    tracing::debug!("WebRTC answer received but session or NATS unavailable");
+                }
             }
-            // Phase 4 stubs: camera signaling will be wired in later tasks.
-            Some(session_request::Request::IceCandidate(_)) => {
-                tracing::debug!("ICE candidate received (not yet wired)");
+            // ICE candidate: serialize and publish to NATS for the worker.
+            Some(session_request::Request::IceCandidate(candidate)) => {
+                if let (Some(sess), Some(nats)) = (&session, nats_client) {
+                    if let Some(host_id_str) = &sess.host_id {
+                        relay_ice_candidate(pool, nats, host_id_str, &candidate).await;
+                    } else {
+                        tracing::debug!("ICE candidate received but no host_id on session");
+                    }
+                } else {
+                    tracing::debug!("ICE candidate received but session or NATS unavailable");
+                }
             }
-            Some(session_request::Request::CameraRequest(_)) => {
-                tracing::debug!("camera request received (not yet wired)");
+            // Camera request: serialize and publish to NATS for the worker.
+            Some(session_request::Request::CameraRequest(cam_req)) => {
+                if let (Some(sess), Some(nats)) = (&session, nats_client) {
+                    if let Some(host_id_str) = &sess.host_id {
+                        relay_camera_request(pool, nats, host_id_str, &cam_req).await;
+                    } else {
+                        tracing::debug!("camera request received but no host_id on session");
+                    }
+                } else {
+                    tracing::debug!("camera request received but session or NATS unavailable");
+                }
             }
             None => {}
         }
@@ -1312,6 +1339,252 @@ async fn spawn_telemetry_relay(
                     response: Some(session_response::Response::Telemetry(update)),
                 };
                 if telem_tx.send(Ok(resp)).await.is_err() {
+                    break; // client disconnected
+                }
+            }
+        }
+    });
+}
+
+/// Resolve `host_id` (UUID string) to the host's `name` (= `worker_id`) via Postgres.
+///
+/// Returns `None` if the UUID is invalid or the host is not found.
+async fn resolve_worker_id(pool: &PgPool, host_id_str: &str) -> Option<String> {
+    let host_uuid = uuid::Uuid::parse_str(host_id_str).ok()?;
+    let host = roz_db::hosts::get_by_id(pool, host_uuid).await.ok()??;
+    Some(host.name)
+}
+
+/// Relay a `WebRtcAnswer` from the gRPC client to the worker via NATS.
+///
+/// Publishes a JSON payload matching the worker's `SignalingRelay` format
+/// on `webrtc.{worker_id}.{peer_id}.answer`.
+async fn relay_webrtc_answer(
+    pool: &PgPool,
+    nats: &async_nats::Client,
+    host_id_str: &str,
+    answer: &roz_v1::WebRtcAnswer,
+) {
+    let Some(worker_id) = resolve_worker_id(pool, host_id_str).await else {
+        tracing::debug!(host_id = %host_id_str, "cannot relay WebRTC answer: host not found");
+        return;
+    };
+
+    let subject = match Subjects::webrtc_answer(&worker_id, &answer.peer_id) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "invalid worker/peer id for WebRTC answer subject");
+            return;
+        }
+    };
+
+    let payload = serde_json::json!({
+        "sdp": answer.sdp,
+        "ice_candidates": answer.ice_candidates,
+    });
+    let bytes = match serde_json::to_vec(&payload) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to serialize WebRTC answer");
+            return;
+        }
+    };
+
+    if let Err(e) = nats.publish(subject.clone(), bytes.into()).await {
+        tracing::warn!(subject = %subject, error = %e, "failed to publish WebRTC answer to NATS");
+    } else {
+        tracing::debug!(subject = %subject, "relayed WebRTC answer to worker");
+    }
+}
+
+/// Relay an `IceCandidate` from the gRPC client to the worker via NATS.
+///
+/// Publishes a JSON payload on `webrtc.{worker_id}.{peer_id}.ice.remote`.
+async fn relay_ice_candidate(
+    pool: &PgPool,
+    nats: &async_nats::Client,
+    host_id_str: &str,
+    candidate: &roz_v1::IceCandidate,
+) {
+    let Some(worker_id) = resolve_worker_id(pool, host_id_str).await else {
+        tracing::debug!(host_id = %host_id_str, "cannot relay ICE candidate: host not found");
+        return;
+    };
+
+    let subject = match Subjects::webrtc_ice_remote(&worker_id, &candidate.peer_id) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "invalid worker/peer id for ICE candidate subject");
+            return;
+        }
+    };
+
+    let payload = serde_json::json!({
+        "candidate": candidate.candidate,
+        "sdp_mid": candidate.sdp_mid,
+        "sdp_m_line_index": candidate.sdp_m_line_index,
+    });
+    let bytes = match serde_json::to_vec(&payload) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to serialize ICE candidate");
+            return;
+        }
+    };
+
+    if let Err(e) = nats.publish(subject.clone(), bytes.into()).await {
+        tracing::warn!(subject = %subject, error = %e, "failed to publish ICE candidate to NATS");
+    } else {
+        tracing::debug!(subject = %subject, "relayed ICE candidate to worker");
+    }
+}
+
+/// Relay a `CameraRequest` from the gRPC client to the worker via NATS.
+///
+/// Publishes a JSON payload on `camera.{worker_id}.request`.
+async fn relay_camera_request(
+    pool: &PgPool,
+    nats: &async_nats::Client,
+    host_id_str: &str,
+    cam_req: &roz_v1::CameraRequest,
+) {
+    let Some(worker_id) = resolve_worker_id(pool, host_id_str).await else {
+        tracing::debug!(host_id = %host_id_str, "cannot relay camera request: host not found");
+        return;
+    };
+
+    let subject = match Subjects::camera_request(&worker_id) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "invalid worker id for camera request subject");
+            return;
+        }
+    };
+
+    let payload = serde_json::json!({
+        "host_id": cam_req.host_id,
+        "camera_ids": cam_req.camera_ids,
+    });
+    let bytes = match serde_json::to_vec(&payload) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to serialize camera request");
+            return;
+        }
+    };
+
+    if let Err(e) = nats.publish(subject.clone(), bytes.into()).await {
+        tracing::warn!(subject = %subject, error = %e, "failed to publish camera request to NATS");
+    } else {
+        tracing::debug!(subject = %subject, "relayed camera request to worker");
+    }
+}
+
+/// Subscribe to NATS WebRTC offer and ICE candidate subjects for a host and
+/// relay them as `SessionResponse` messages on the gRPC stream.
+///
+/// Resolves `host_id` to `worker_id`, then subscribes to:
+/// - `webrtc.{worker_id}.*.offer` -> `SessionResponse::WebrtcOffer`
+/// - `webrtc.{worker_id}.*.ice.local` -> `SessionResponse::IceCandidate`
+async fn spawn_webrtc_signaling_relay(
+    pool: &PgPool,
+    nats: &async_nats::Client,
+    host_id_str: &str,
+    tx: &mpsc::Sender<Result<SessionResponse, Status>>,
+) {
+    let Some(worker_id) = resolve_worker_id(pool, host_id_str).await else {
+        tracing::debug!(host_id = %host_id_str, "host not found, skipping WebRTC signaling relay");
+        return;
+    };
+
+    // Subscribe to all WebRTC subjects for this worker.
+    let wildcard_subject = match Subjects::webrtc_wildcard(&worker_id) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(worker_id = %worker_id, error = %e, "invalid worker name for WebRTC wildcard subject");
+            return;
+        }
+    };
+
+    let webrtc_sub = match nats.subscribe(wildcard_subject.clone()).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(subject = %wildcard_subject, error = %e, "failed to subscribe to WebRTC signaling");
+            return;
+        }
+    };
+
+    tracing::info!(subject = %wildcard_subject, host_id = %host_id_str, "WebRTC signaling relay started");
+
+    let relay_tx = tx.clone();
+    let host_id_for_relay = host_id_str.to_string();
+    tokio::spawn(async move {
+        let mut sub = webrtc_sub;
+        while let Some(msg) = sub.next().await {
+            let subject_str = msg.subject.as_str();
+            // Parse NATS subject segments: webrtc.{worker_id}.{peer_id}.{type}[.{subtype}]
+            let segments: Vec<&str> = subject_str.split('.').collect();
+            let peer_id = segments.get(2).unwrap_or(&"").to_string();
+            let sig_type = segments.get(3).copied().unwrap_or("");
+
+            let resp = match sig_type {
+                "offer" => {
+                    // Worker -> client: WebRTC offer (JSON format from SignalingRelay).
+                    match serde_json::from_slice::<serde_json::Value>(&msg.payload) {
+                        Ok(data) => {
+                            let sdp = data["sdp"].as_str().unwrap_or_default().to_string();
+                            let camera_ids: Vec<String> = data["camera_ids"]
+                                .as_array()
+                                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                                .unwrap_or_default();
+                            Some(session_response::Response::WebrtcOffer(roz_v1::WebRtcOffer {
+                                host_id: host_id_for_relay.clone(),
+                                sdp,
+                                ice_candidates: vec![],
+                                peer_id: peer_id.clone(),
+                                camera_ids,
+                            }))
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, subject = %subject_str, "failed to decode WebRTC offer");
+                            None
+                        }
+                    }
+                }
+                // webrtc.{worker_id}.{peer_id}.ice.local -> relay as IceCandidate
+                "ice" if segments.get(4).copied() == Some("local") => {
+                    match serde_json::from_slice::<serde_json::Value>(&msg.payload) {
+                        Ok(data) => {
+                            let candidate = data["candidate"].as_str().unwrap_or_default().to_string();
+                            let sdp_mid = data["sdp_mid"].as_str().unwrap_or_default().to_string();
+                            #[expect(
+                                clippy::cast_possible_truncation,
+                                reason = "sdp_m_line_index values are small integers"
+                            )]
+                            let sdp_m_line_index = data["sdp_m_line_index"].as_u64().unwrap_or(0) as u32;
+                            Some(session_response::Response::IceCandidate(roz_v1::IceCandidate {
+                                host_id: host_id_for_relay.clone(),
+                                peer_id: peer_id.clone(),
+                                candidate,
+                                sdp_mid,
+                                sdp_m_line_index,
+                            }))
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, subject = %subject_str, "failed to decode ICE candidate");
+                            None
+                        }
+                    }
+                }
+                // answer / ice.remote are client->worker direction, not relayed back.
+                _ => None,
+            };
+
+            if let Some(response) = resp {
+                let session_resp = SessionResponse {
+                    response: Some(response),
+                };
+                if relay_tx.send(Ok(session_resp)).await.is_err() {
                     break; // client disconnected
                 }
             }

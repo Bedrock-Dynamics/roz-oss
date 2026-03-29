@@ -161,6 +161,12 @@ impl Subjects {
         validate_token("worker_id", worker_id)?;
         Ok(format!("camera.{worker_id}.event"))
     }
+
+    /// Build a camera request subject: `camera.{worker_id}.request`.
+    pub fn camera_request(worker_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        Ok(format!("camera.{worker_id}.request"))
+    }
 }
 
 #[cfg(test)]
@@ -328,5 +334,10 @@ mod tests {
     #[test]
     fn camera_event_subject() {
         assert_eq!(Subjects::camera_event("robot1").unwrap(), "camera.robot1.event");
+    }
+
+    #[test]
+    fn camera_request_subject() {
+        assert_eq!(Subjects::camera_request("robot1").unwrap(), "camera.robot1.request");
     }
 }

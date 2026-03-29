@@ -1,6 +1,8 @@
 pub mod adaptive;
 pub mod encoder;
 pub mod hotplug;
+pub mod perception;
+pub mod snapshot;
 pub mod source;
 pub mod stream_hub;
 
