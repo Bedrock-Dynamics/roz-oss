@@ -6,6 +6,7 @@ pub mod delegation;
 pub mod dispatch;
 pub mod drift;
 pub mod error;
+pub mod meter;
 pub mod model;
 pub mod provenance;
 pub mod safety;
