@@ -204,13 +204,100 @@ impl CameraSource for V4lSource {
         &self.id
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     async fn start(
         &mut self,
-        _width: u32,
-        _height: u32,
-        _fps: u32,
+        width: u32,
+        height: u32,
+        fps: u32,
     ) -> anyhow::Result<tokio::sync::mpsc::Receiver<RawFrame>> {
-        todo!("V4L2 capture not yet implemented")
+        use v4l::FourCC;
+        use v4l::prelude::*;
+        use v4l::video::Capture;
+
+        const MAX_RESOLUTION: u32 = 4096;
+        if width == 0 || height == 0 || width > MAX_RESOLUTION || height > MAX_RESOLUTION {
+            anyhow::bail!("invalid resolution {width}x{height} (max {MAX_RESOLUTION}x{MAX_RESOLUTION})");
+        }
+        if self.active {
+            anyhow::bail!("V4L source already active");
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(fps as usize);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let id = self.id.clone();
+        let device_path = self.device_path.clone();
+
+        // V4L capture runs in a blocking thread -- the v4l crate uses
+        // synchronous mmap reads that must not run on the tokio runtime.
+        tokio::task::spawn_blocking(move || {
+            let dev = match Device::with_path(&device_path) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::error!(error = %e, device = %device_path, "failed to open V4L device");
+                    return;
+                }
+            };
+
+            // Request YUYV format -- most USB cameras support it natively.
+            let mut format = dev.format().unwrap_or_default();
+            format.width = width;
+            format.height = height;
+            format.fourcc = FourCC::new(b"YUYV");
+            if let Err(e) = dev.set_format(&format) {
+                tracing::warn!(error = %e, "failed to set V4L format, using device default");
+            }
+
+            // E9: use v4l::io::mmap::Stream, not MmapStream
+            let mut stream = match v4l::io::mmap::Stream::with_buffers(&dev, v4l::buffer::Type::VideoCapture, 4) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to create V4L mmap stream");
+                    return;
+                }
+            };
+
+            let mut seq: u64 = 0;
+            let start = std::time::Instant::now();
+
+            loop {
+                if cancel_clone.is_cancelled() {
+                    break;
+                }
+
+                // E2: stream.next() returns Option<io::Result<...>>, not Result<...>
+                match stream.next() {
+                    Some(Ok((buf, _meta))) => {
+                        let i420 = yuyv_to_i420(buf, width, height);
+                        let frame = RawFrame {
+                            camera_id: id.clone(),
+                            width,
+                            height,
+                            data: i420,
+                            timestamp_us: start.elapsed().as_micros() as u64,
+                            seq,
+                        };
+                        if tx.blocking_send(frame).is_err() {
+                            break; // receiver dropped
+                        }
+                        seq += 1;
+                    }
+                    Some(Err(e)) => {
+                        tracing::error!(error = %e, "V4L capture error");
+                        break;
+                    }
+                    None => {
+                        tracing::warn!("V4L stream ended unexpectedly");
+                        break;
+                    }
+                }
+            }
+        });
+
+        self.active = true;
+        self.cancel = Some(cancel);
+        Ok(rx)
     }
 
     async fn stop(&mut self) {
@@ -223,6 +310,50 @@ impl CameraSource for V4lSource {
     fn is_active(&self) -> bool {
         self.active
     }
+}
+
+/// Convert YUYV (YUV 4:2:2 packed) to I420 (YUV 4:2:0 planar).
+///
+/// YUYV packing: [Y0, U0, Y1, V0] per macropixel (2 horizontal pixels).
+/// I420 output: full-resolution Y plane, then quarter-resolution U and V planes.
+#[cfg(target_os = "linux")]
+#[allow(clippy::cast_possible_truncation)]
+fn yuyv_to_i420(yuyv: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let w = width as usize;
+    let h = height as usize;
+    let y_size = w * h;
+    let uv_size = (w / 2) * (h / 2);
+    let mut out = vec![0u8; y_size + uv_size * 2];
+
+    let (y_plane, uv_planes) = out.split_at_mut(y_size);
+    let (u_plane, v_plane) = uv_planes.split_at_mut(uv_size);
+
+    for row in 0..h {
+        for col in (0..w).step_by(2) {
+            let yuyv_idx = (row * w + col) * 2;
+            if yuyv_idx + 3 >= yuyv.len() {
+                break;
+            }
+
+            let y0 = yuyv[yuyv_idx];
+            let u = yuyv[yuyv_idx + 1];
+            let y1 = yuyv[yuyv_idx + 2];
+            let v = yuyv[yuyv_idx + 3];
+
+            y_plane[row * w + col] = y0;
+            y_plane[row * w + col + 1] = y1;
+
+            // Subsample UV: take from even rows only (4:2:0 vertical subsampling)
+            if row % 2 == 0 {
+                let uv_row = row / 2;
+                let uv_col = col / 2;
+                u_plane[uv_row * (w / 2) + uv_col] = u;
+                v_plane[uv_row * (w / 2) + uv_col] = v;
+            }
+        }
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -308,5 +439,48 @@ mod tests {
         // Idempotent: stop again should not panic
         source.stop().await;
         assert!(!source.is_active());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn yuyv_to_i420_basic_conversion() {
+        // 4x2 YUYV frame: 4 pixels wide, 2 pixels tall
+        // YUYV packing: [Y0, U0, Y1, V0, Y2, U1, Y3, V1] per row pair
+        let width = 4u32;
+        let height = 2u32;
+        // 4x2 = 8 pixels, YUYV is 2 bytes/pixel = 16 bytes
+        let yuyv = vec![
+            // row 0: 4 pixels
+            16, 128, 235, 128, // Y0=16, U=128, Y1=235, V=128
+            81, 90, 145, 240, // Y2=81, U=90, Y3=145, V=240
+            // row 1: 4 pixels
+            41, 110, 210, 200, // Y4=41, U=110, Y5=210, V=200
+            106, 128, 170, 128, // Y6=106, U=128, Y7=170, V=128
+        ];
+
+        let i420 = super::yuyv_to_i420(&yuyv, width, height);
+
+        // I420 size: Y=4*2=8, U=2*1=2, V=2*1=2 => 12 bytes
+        assert_eq!(i420.len(), RawFrame::expected_len(width, height));
+
+        // Y plane: all 8 luma values in row-major order
+        assert_eq!(i420[0], 16); // Y0
+        assert_eq!(i420[1], 235); // Y1
+        assert_eq!(i420[2], 81); // Y2
+        assert_eq!(i420[3], 145); // Y3
+        assert_eq!(i420[4], 41); // Y4
+        assert_eq!(i420[5], 210); // Y5
+        assert_eq!(i420[6], 106); // Y6
+        assert_eq!(i420[7], 170); // Y7
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn yuyv_to_i420_output_size_matches_expected() {
+        let width = 640u32;
+        let height = 480u32;
+        let yuyv = vec![128u8; (width * height * 2) as usize]; // YUYV: 2 bytes/pixel
+        let i420 = super::yuyv_to_i420(&yuyv, width, height);
+        assert_eq!(i420.len(), RawFrame::expected_len(width, height));
     }
 }
