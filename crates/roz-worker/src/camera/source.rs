@@ -215,6 +215,7 @@ impl CameraSource for V4lSource {
         fps: u32,
     ) -> anyhow::Result<tokio::sync::mpsc::Receiver<RawFrame>> {
         use v4l::FourCC;
+        use v4l::io::traits::CaptureStream;
         use v4l::prelude::*;
         use v4l::video::Capture;
 
@@ -251,7 +252,13 @@ impl CameraSource for V4lSource {
             };
 
             // Request YUYV format -- most USB cameras support it natively.
-            let mut format = dev.format().unwrap_or_default();
+            let mut format = match dev.format() {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = init_tx.send(Err(anyhow::anyhow!("failed to get V4L device format: {e}")));
+                    return;
+                }
+            };
             format.width = width;
             format.height = height;
             format.fourcc = FourCC::new(b"YUYV");
