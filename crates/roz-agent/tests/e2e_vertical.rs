@@ -170,6 +170,8 @@ async fn agent_loop_tool_roundtrip() {
         response_schema: None,
         streaming: false,
         history: vec![],
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
     };
 
     let output = agent_loop.run(input).await.expect("agent loop should complete");
@@ -234,6 +236,8 @@ async fn agent_loop_ooda_react_spatial() {
         response_schema: None,
         streaming: false,
         history: vec![],
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
     };
 
     let output = agent_loop.run(input).await.expect("agent loop should complete");
@@ -304,6 +308,8 @@ async fn agent_loop_safety_clamps_velocity() {
         response_schema: None,
         streaming: false,
         history: vec![],
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
     };
 
     let output = agent_loop.run(input).await.expect("agent loop should complete");
@@ -459,6 +465,8 @@ async fn agent_loop_multi_tool_batches_results() {
         response_schema: None,
         streaming: false,
         history: vec![],
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
     };
 
     let output = agent_loop.run(input).await.expect("agent loop should complete");
@@ -540,6 +548,8 @@ async fn gemini_multi_tool_batches_results() {
         response_schema: None,
         streaming: false,
         history: vec![],
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
     };
 
     let output = agent_loop.run(input).await.expect("gemini agent loop should complete");
@@ -610,6 +620,8 @@ async fn agent_loop_streaming_tool_roundtrip() {
         response_schema: None,
         streaming: true,
         history: vec![],
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
     };
 
     let output = agent_loop.run(input).await.expect("agent loop should complete");
@@ -668,6 +680,8 @@ async fn delegation_tool_roundtrip() {
         response_schema: None,
         streaming: false,
         history: vec![],
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
     };
 
     let output = agent_loop
@@ -755,6 +769,8 @@ async fn delegation_tool_roundtrip_gemini_as_primary() {
         response_schema: None,
         streaming: false,
         history: vec![],
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
     };
 
     let output = agent_loop
@@ -849,6 +865,8 @@ async fn compaction_does_not_fire_on_normal_conversation() {
         response_schema: None,
         streaming: false,
         history: vec![],
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
     };
 
     let output = agent_loop.run(input).await.expect("agent loop should complete");
@@ -944,6 +962,8 @@ async fn compaction_fires_correctly_with_small_context_budget() {
         response_schema: None,
         streaming: false,
         history: vec![],
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
     };
 
     let output = agent_loop.run(input).await.expect(

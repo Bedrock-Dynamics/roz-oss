@@ -174,6 +174,7 @@ async fn handle_edge_session(
             "user_message" => {
                 let user_text = envelope["text"].as_str().unwrap_or("").to_string();
 
+                let agent_cancel = CancellationToken::new();
                 let input = AgentInput {
                     task_id: session_id.to_string(),
                     tenant_id: "edge".to_string(),
@@ -188,6 +189,8 @@ async fn handle_edge_session(
                     streaming: false,
                     history: Vec::new(),
                     phases: Vec::new(),
+                    cancellation_token: Some(agent_cancel.clone()),
+                    control_mode: roz_core::safety::ControlMode::for_remote(),
                 };
 
                 // Spawn keepalive task for long agent turns.
@@ -217,6 +220,7 @@ async fn handle_edge_session(
                     result = agent.run(input) => result,
                     _ = estop_rx.changed() => {
                         if *estop_rx.borrow() {
+                            agent_cancel.cancel(); // cooperative cancel first
                             keepalive_cancel.cancel();
                             tracing::error!(session_id, "E-STOP fired during agent execution — aborting turn");
                             let error = serde_json::json!({"type": "error", "message": "E-STOP activated during execution"});

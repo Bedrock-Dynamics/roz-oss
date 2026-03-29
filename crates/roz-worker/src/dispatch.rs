@@ -34,6 +34,8 @@ pub fn build_agent_input(inv: &TaskInvocation) -> AgentInput {
         response_schema: None,
         streaming: false,
         history: vec![],
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
     };
 
     // Inject robot controller interface context.

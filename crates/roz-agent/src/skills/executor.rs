@@ -76,6 +76,8 @@ impl SkillExecutor {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent_loop.run(input).await?;

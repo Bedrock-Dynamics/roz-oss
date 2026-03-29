@@ -5619,6 +5619,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tracing",
  "uuid",
 ]
@@ -5798,6 +5799,7 @@ dependencies = [
  "logfire",
  "parking_lot",
  "roz-core",
+ "roz-nats",
  "roz-test",
  "serde",
  "serde_json",

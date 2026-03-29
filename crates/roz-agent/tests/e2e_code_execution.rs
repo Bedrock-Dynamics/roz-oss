@@ -41,6 +41,8 @@ fn build_input_with_prompt(system_prompt: Vec<String>, user_message: &str) -> Ag
         response_schema: None,
         streaming: false,
         history: vec![],
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
     }
 }
 
@@ -202,6 +204,8 @@ async fn live_model_generates_and_executes_wasm() {
         response_schema: None,
         streaming: false,
         history: vec![],
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
     };
 
     let output = agent.run(input).await.expect("agent should complete");
@@ -340,6 +344,8 @@ Respond with ONLY the WAT code. No explanation, no markdown fences, just raw WAT
         response_schema: None,
         streaming: false,
         history: vec![],
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
     };
 
     let output = agent.run(input).await.expect("agent should complete");

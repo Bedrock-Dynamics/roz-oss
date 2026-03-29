@@ -109,6 +109,8 @@ async fn agent_deploys_sin_controller_and_arm_oscillates() {
         response_schema: None,
         streaming: false,
         history: vec![],
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
     };
 
     let output = agent.run(input).await.expect("agent loop should complete");

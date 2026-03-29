@@ -165,6 +165,12 @@ pub struct AgentInput {
     /// Conversation history from prior turns. Inserted between the system
     /// message and the new user message so the model sees the full context.
     pub history: Vec<Message>,
+    /// Cooperative cancellation token. When cancelled, the agent loop exits
+    /// cleanly at the next cycle boundary with `AgentError::Cancelled`.
+    pub cancellation_token: Option<tokio_util::sync::CancellationToken>,
+    /// Control mode for this session. Supervised requires human monitoring
+    /// for physical actions. Default: Autonomous.
+    pub control_mode: roz_core::safety::ControlMode,
 }
 
 /// Output from a completed agent loop run.
@@ -631,6 +637,17 @@ impl AgentLoop {
             .await;
 
         loop {
+            // Cooperative cancellation check
+            if let Some(ref token) = input.cancellation_token
+                && token.is_cancelled()
+            {
+                tracing::info!(task_id = %input.task_id, cycles, "agent loop cancelled cooperatively");
+                return Err(AgentError::Cancelled {
+                    partial_input_tokens: u64::from(total_usage.input_tokens),
+                    partial_output_tokens: u64::from(total_usage.output_tokens),
+                });
+            }
+
             if cycles >= input.max_cycles {
                 tracing::warn!(
                     cycles,
@@ -1132,6 +1149,17 @@ impl AgentLoop {
         let mut phase_signalled = false;
 
         loop {
+            // Cooperative cancellation check
+            if let Some(ref token) = input.cancellation_token
+                && token.is_cancelled()
+            {
+                tracing::info!(task_id = %input.task_id, cycles, "agent loop cancelled cooperatively");
+                return Err(AgentError::Cancelled {
+                    partial_input_tokens: u64::from(total_usage.input_tokens),
+                    partial_output_tokens: u64::from(total_usage.output_tokens),
+                });
+            }
+
             if cycles >= input.max_cycles {
                 tracing::warn!(
                     cycles,
@@ -1483,6 +1511,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -1538,6 +1568,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -1632,6 +1664,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -1698,6 +1732,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -1743,6 +1779,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         // This should NOT panic because React mode never calls spatial.snapshot()
@@ -1835,6 +1873,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -1954,6 +1994,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -2068,6 +2110,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -2304,6 +2348,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -2356,6 +2402,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let result = agent.run(input).await;
@@ -2479,6 +2527,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -2619,6 +2669,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -2769,6 +2821,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -2855,6 +2909,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -2932,6 +2988,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -2997,6 +3055,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -3085,6 +3145,8 @@ mod tests {
             response_schema: Some(schema.clone()),
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let _output = agent.run(input).await.unwrap();
@@ -3184,6 +3246,8 @@ mod tests {
             response_schema: Some(schema),
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -3256,6 +3320,8 @@ mod tests {
             response_schema: Some(schema),
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -3326,6 +3392,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -3389,6 +3457,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output_ns = agent_ns.run(input_ns).await.unwrap();
@@ -3414,6 +3484,8 @@ mod tests {
             response_schema: None,
             streaming: true,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output_s = agent_s.run(input_s).await.unwrap();
@@ -3513,6 +3585,8 @@ mod tests {
             response_schema: None,
             streaming: true,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -3592,6 +3666,8 @@ mod tests {
             response_schema: None,
             streaming: true,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -3644,6 +3720,8 @@ mod tests {
             response_schema: None,
             streaming: true,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -3814,6 +3892,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -3964,6 +4044,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -4127,6 +4209,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -4251,6 +4335,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -4331,6 +4417,8 @@ mod tests {
             response_schema: None,
             streaming: true,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -4397,6 +4485,8 @@ mod tests {
             response_schema: None,
             streaming: true,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let (presence_tx, _presence_rx) = mpsc::channel(16);
@@ -4477,6 +4567,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let (presence_tx, _presence_rx) = mpsc::channel(16);
@@ -4557,6 +4649,8 @@ mod tests {
             response_schema: None,
             streaming: true,
             history,
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let (presence_tx, _presence_rx) = mpsc::channel(16);
@@ -4668,6 +4762,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.unwrap();
@@ -4753,6 +4849,8 @@ mod tests {
             response_schema: None,
             streaming: true,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let _output = agent.run_streaming(input, chunk_tx, presence_tx).await.unwrap();
@@ -4826,6 +4924,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         }
     }
 
@@ -5139,6 +5239,8 @@ mod tests {
                 response_schema: None,
                 streaming: false,
                 history: vec![],
+                cancellation_token: None,
+                control_mode: roz_core::safety::ControlMode::default(),
             }
         }
     }
@@ -5553,6 +5655,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.expect("run should not fail");
@@ -5645,6 +5749,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         agent.run(input).await.expect("run should not fail");
@@ -5728,6 +5834,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         agent.run(input).await.expect("run should not fail");
@@ -5847,6 +5955,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.expect("run should not fail");
@@ -5958,6 +6068,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         agent.run(input).await.expect("run should not fail");
@@ -6061,6 +6173,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         agent.run(input).await.expect("run should not fail");
@@ -6169,6 +6283,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.expect("run should not fail");

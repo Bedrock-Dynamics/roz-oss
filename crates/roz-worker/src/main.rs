@@ -22,7 +22,9 @@ async fn execute_task(
 ) {
     tracing::info!("starting task execution");
 
-    let agent_input = roz_worker::dispatch::build_agent_input(&invocation);
+    let agent_cancel = CancellationToken::new();
+    let mut agent_input = roz_worker::dispatch::build_agent_input(&invocation);
+    agent_input.cancellation_token = Some(agent_cancel.clone());
     let model = match roz_worker::model_factory::build_model(&task_config) {
         Ok(m) => m,
         Err(e) => {
@@ -83,6 +85,7 @@ async fn execute_task(
         _ = estop_rx.changed() => {
             if *estop_rx.borrow() {
                 tracing::error!(task_id = %task_id, "E-STOP during task execution");
+                agent_cancel.cancel(); // cooperative cancel first
                 // DROP copper handle — triggers emergency halt (zeroes all commands).
                 drop(copper_handle.take());
                 let agent_err = roz_agent::error::AgentError::Safety("E-STOP activated during task execution".into());

@@ -1035,6 +1035,8 @@ async fn provider_loop(
                     streaming: true,
                     history: Vec::new(),
                     phases: Vec::new(),
+                    cancellation_token: None,
+                    control_mode: roz_core::safety::ControlMode::default(),
                 };
 
                 // Streaming channels

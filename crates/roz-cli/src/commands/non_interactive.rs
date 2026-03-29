@@ -130,6 +130,8 @@ async fn execute_byok(config: &ProviderConfig, task: &str) -> anyhow::Result<()>
         streaming: false,
         history: Vec::new(),
         phases: Vec::new(),
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
     };
 
     let result = agent_loop.run(input).await;

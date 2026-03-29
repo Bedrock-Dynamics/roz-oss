@@ -30,6 +30,7 @@ futures-core.workspace = true
 async-stream.workspace = true
 tokio-stream.workspace = true
 schemars.workspace = true
+tokio-util.workspace = true
 
 [dev-dependencies]
 crc32fast = { workspace = true }

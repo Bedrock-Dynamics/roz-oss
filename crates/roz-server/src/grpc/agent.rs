@@ -726,6 +726,8 @@ async fn run_session_loop(
                     response_schema: None,
                     streaming: true,
                     history: sess.messages.clone(), // pass accumulated history
+                    cancellation_token: None,
+                    control_mode: roz_core::safety::ControlMode::default(),
                 };
 
                 // Create the chunk channel for streaming.

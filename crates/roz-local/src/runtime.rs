@@ -541,6 +541,8 @@ impl LocalRuntime {
             response_schema: None,
             streaming: false,
             history: self.history.clone(),
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.map_err(RuntimeError::Model)?;
@@ -585,6 +587,8 @@ impl LocalRuntime {
             response_schema: None,
             streaming: true,
             history: self.history.clone(),
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let (chunk_tx, chunk_rx) = mpsc::channel::<StreamChunk>(64);
