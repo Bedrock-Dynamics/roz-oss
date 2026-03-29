@@ -61,7 +61,7 @@ async fn execute_task(
             handle.state(),
         )))
     } else {
-        Box::new(roz_agent::spatial_provider::MockSpatialContextProvider::empty())
+        Box::new(roz_agent::spatial_provider::NullSpatialContextProvider)
     };
 
     // When Copper is active, register the deploy_controller tool and inject the
@@ -168,11 +168,11 @@ async fn main() -> Result<()> {
     let hb_nats = nats.clone();
     let hb_worker_id = config.worker_id.clone();
     tokio::spawn(async move {
+        let subject = roz_nats::subjects::Subjects::event(&hb_worker_id, "heartbeat").expect("valid worker_id");
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
             interval.tick().await;
-            let subject = format!("events.{hb_worker_id}.heartbeat");
-            if let Err(e) = hb_nats.publish(subject, bytes::Bytes::from_static(b"{}")).await {
+            if let Err(e) = hb_nats.publish(subject.clone(), bytes::Bytes::from_static(b"{}")).await {
                 tracing::warn!(error = %e, "failed to publish heartbeat");
             }
         }

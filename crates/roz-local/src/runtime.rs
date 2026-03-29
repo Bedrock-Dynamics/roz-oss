@@ -11,7 +11,7 @@ use roz_agent::error::AgentError;
 use roz_agent::model::create_model;
 use roz_agent::model::types::{Message, Model, StreamChunk};
 use roz_agent::safety::stack::SafetyStack;
-use roz_agent::spatial_provider::{MockSpatialContextProvider, SpatialContextProvider};
+use roz_agent::spatial_provider::{NullSpatialContextProvider, SpatialContextProvider};
 use roz_copper::handle::CopperHandle;
 use roz_core::tools::ToolCategory;
 use tokio::sync::mpsc;
@@ -396,7 +396,7 @@ impl LocalRuntime {
             provider.auto_detect_telemetry_tool();
             Box::new(provider)
         } else {
-            Box::new(MockSpatialContextProvider::empty())
+            Box::new(NullSpatialContextProvider)
         }
     }
 

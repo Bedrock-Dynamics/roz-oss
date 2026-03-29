@@ -991,7 +991,7 @@ async fn provider_loop(
 
     let dispatcher = tools::build_dispatcher();
     let safety = roz_agent::safety::SafetyStack::new(vec![]); // no-op for BYOK
-    let spatial = roz_agent::spatial_provider::MockSpatialContextProvider::empty();
+    let spatial = roz_agent::spatial_provider::NullSpatialContextProvider;
 
     let mut agent_loop = roz_agent::agent_loop::AgentLoop::new(model, dispatcher, safety, Box::new(spatial));
 

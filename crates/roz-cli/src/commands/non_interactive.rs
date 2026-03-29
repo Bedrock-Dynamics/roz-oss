@@ -107,7 +107,7 @@ async fn execute_byok(config: &ProviderConfig, task: &str) -> anyhow::Result<()>
 
     let dispatcher = crate::tui::tools::build_dispatcher();
     let safety = roz_agent::safety::SafetyStack::new(vec![]);
-    let spatial = roz_agent::spatial_provider::MockSpatialContextProvider::empty();
+    let spatial = roz_agent::spatial_provider::NullSpatialContextProvider;
     let mut agent_loop = roz_agent::agent_loop::AgentLoop::new(model, dispatcher, safety, Box::new(spatial));
 
     let constitution = roz_agent::constitution::build_constitution(roz_agent::agent_loop::AgentLoopMode::React);

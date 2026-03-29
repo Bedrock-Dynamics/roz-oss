@@ -29,6 +29,17 @@ impl SpatialContextProvider for MockSpatialContextProvider {
     }
 }
 
+/// No-op spatial context provider for sessions without spatial data.
+/// Used in cloud sessions and CLI where no robot hardware is connected.
+pub struct NullSpatialContextProvider;
+
+#[async_trait]
+impl SpatialContextProvider for NullSpatialContextProvider {
+    async fn snapshot(&self, _task_id: &str) -> SpatialContext {
+        SpatialContext::default()
+    }
+}
+
 /// A spatial provider that panics if `snapshot()` is called.
 /// Used in tests to verify that React mode never observes spatial context.
 #[cfg(test)]

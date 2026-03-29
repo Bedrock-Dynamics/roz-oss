@@ -29,7 +29,7 @@ use roz_agent::dispatch::remote::{
 };
 use roz_agent::model::types::StreamChunk;
 use roz_agent::safety::SafetyStack;
-use roz_agent::spatial_provider::MockSpatialContextProvider;
+use roz_agent::spatial_provider::NullSpatialContextProvider;
 use roz_core::auth::AuthIdentity;
 use roz_core::tools::ToolCategory;
 
@@ -742,7 +742,7 @@ async fn run_session_loop(
                 let (relay_done_tx, relay_done_rx) = tokio::sync::oneshot::channel::<()>();
 
                 let safety = SafetyStack::new(vec![]);
-                let spatial = Box::new(MockSpatialContextProvider::empty());
+                let spatial = Box::new(NullSpatialContextProvider);
                 let mut agent_loop = AgentLoop::new(model, dispatcher, safety, spatial)
                     .with_pending_approvals(pending_approvals.clone());
 
