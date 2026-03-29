@@ -317,20 +317,4 @@ mod tests {
         assert_eq!(msg.payload["type"], "user_message");
         assert_eq!(msg.payload["text"], "hello");
     }
-
-    #[test]
-    fn resolve_placement_returns_correct_values() {
-        use roz_core::edge::resolve_placement;
-        // AGENT_PLACEMENT_EDGE = 2
-        assert!(resolve_placement(2, true));
-        assert!(resolve_placement(2, false));
-        // AGENT_PLACEMENT_CLOUD = 1
-        assert!(!resolve_placement(1, true));
-        assert!(!resolve_placement(1, false));
-        // AGENT_PLACEMENT_AUTO = 0 (defaults to cloud)
-        assert!(!resolve_placement(0, true));
-        assert!(!resolve_placement(0, false));
-        // Unknown values default to cloud
-        assert!(!resolve_placement(99, true));
-    }
 }

@@ -746,6 +746,14 @@ impl AgentLoop {
                 AgentLoopMode::OodaReAct => {
                     tracing::debug!("observing spatial context");
                     let ctx = self.spatial.snapshot(&input.task_id).await;
+                    if ctx.entities.is_empty() && ctx.screenshots.is_empty() {
+                        tracing::warn!(
+                            task_id = %input.task_id,
+                            "OodaReAct observe phase returned empty spatial context — \
+                             no entities or screenshots. Agent is operating without \
+                             environmental observation."
+                        );
+                    }
                     messages.push(build_spatial_observation(&ctx));
                     ctx
                 }
@@ -1225,6 +1233,14 @@ impl AgentLoop {
                 AgentLoopMode::OodaReAct => {
                     tracing::debug!("observing spatial context");
                     let ctx = self.spatial.snapshot(&input.task_id).await;
+                    if ctx.entities.is_empty() && ctx.screenshots.is_empty() {
+                        tracing::warn!(
+                            task_id = %input.task_id,
+                            "OodaReAct observe phase returned empty spatial context — \
+                             no entities or screenshots. Agent is operating without \
+                             environmental observation."
+                        );
+                    }
                     messages.push(build_spatial_observation(&ctx));
                     ctx
                 }

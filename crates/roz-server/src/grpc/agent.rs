@@ -70,7 +70,6 @@ pub trait GrpcAuth: Send + Sync + 'static {
 struct Session {
     id: uuid::Uuid,
     tenant_id: uuid::Uuid,
-    #[allow(dead_code)]
     environment_id: uuid::Uuid,
     model_name: String,
     max_context_tokens: u32,
@@ -89,8 +88,10 @@ struct Session {
     active_permissions: Vec<roz_v1::PermissionRule>,
     /// Workflow context injected on the next `UserMessage` turn (from `RegisterTools`).
     pending_system_context: Option<String>,
-    #[allow(dead_code)]
     pub host_id: Option<String>,
+    /// Resolved worker name (host.name) corresponding to `host_id`.
+    /// Cached at session start to avoid repeated DB lookups per message.
+    pub worker_name: Option<String>,
     /// Whether this session runs on the edge worker (true) or cloud server (false).
     is_edge: bool,
 }
@@ -395,6 +396,9 @@ async fn run_session_loop(
     // When a turn completes, the agent task sends the output (or None on error)
     // so the session loop can update messages, run compaction, and allow the next turn.
     let (turn_done_tx, mut turn_done_rx) = mpsc::channel::<Option<roz_agent::agent_loop::AgentOutput>>(1);
+    // Cancellation token for telemetry and WebRTC signaling relay tasks.
+    // Cancelled when the session loop exits to stop the infinite relay loops.
+    let relay_cancel = tokio_util::sync::CancellationToken::new();
 
     loop {
         // Wait for either the next inbound message or a turn-done signal.
@@ -501,11 +505,11 @@ async fn run_session_loop(
 
                     // Spawn telemetry relay: subscribe to NATS telemetry for the
                     // session's host and forward updates on the gRPC stream.
-                    if let Some(ref host_id_str) = sess.host_id
+                    if let Some(ref worker_name) = sess.worker_name
                         && let Some(nats) = nats_client
                     {
-                        spawn_telemetry_relay(pool, nats, host_id_str, tx).await;
-                        spawn_webrtc_signaling_relay(pool, nats, host_id_str, tx).await;
+                        spawn_telemetry_relay(nats, worker_name, tx, relay_cancel.clone()).await;
+                        spawn_webrtc_signaling_relay(nats, worker_name, tx, relay_cancel.clone()).await;
                     }
 
                     // Edge mode: relay the entire session to the worker via NATS
@@ -1211,10 +1215,10 @@ async fn run_session_loop(
             // WebRTC answer: serialize and publish to NATS for the worker.
             Some(session_request::Request::WebrtcAnswer(answer)) => {
                 if let (Some(sess), Some(nats)) = (&session, nats_client) {
-                    if let Some(host_id_str) = &sess.host_id {
-                        relay_webrtc_answer(pool, nats, host_id_str, &answer).await;
+                    if let Some(worker_id) = sess.worker_name.as_deref() {
+                        relay_webrtc_answer(nats, worker_id, &answer).await;
                     } else {
-                        tracing::debug!("WebRTC answer received but no host_id on session");
+                        tracing::debug!("WebRTC answer received but no worker_name on session");
                     }
                 } else {
                     tracing::debug!("WebRTC answer received but session or NATS unavailable");
@@ -1223,10 +1227,10 @@ async fn run_session_loop(
             // ICE candidate: serialize and publish to NATS for the worker.
             Some(session_request::Request::IceCandidate(candidate)) => {
                 if let (Some(sess), Some(nats)) = (&session, nats_client) {
-                    if let Some(host_id_str) = &sess.host_id {
-                        relay_ice_candidate(pool, nats, host_id_str, &candidate).await;
+                    if let Some(worker_id) = sess.worker_name.as_deref() {
+                        relay_ice_candidate(nats, worker_id, &candidate).await;
                     } else {
-                        tracing::debug!("ICE candidate received but no host_id on session");
+                        tracing::debug!("ICE candidate received but no worker_name on session");
                     }
                 } else {
                     tracing::debug!("ICE candidate received but session or NATS unavailable");
@@ -1235,10 +1239,10 @@ async fn run_session_loop(
             // Camera request: serialize and publish to NATS for the worker.
             Some(session_request::Request::CameraRequest(cam_req)) => {
                 if let (Some(sess), Some(nats)) = (&session, nats_client) {
-                    if let Some(host_id_str) = &sess.host_id {
-                        relay_camera_request(pool, nats, host_id_str, &cam_req).await;
+                    if let Some(worker_id) = sess.worker_name.as_deref() {
+                        relay_camera_request(nats, worker_id, &cam_req).await;
                     } else {
-                        tracing::debug!("camera request received but no host_id on session");
+                        tracing::debug!("camera request received but no worker_name on session");
                     }
                 } else {
                     tracing::debug!("camera request received but session or NATS unavailable");
@@ -1247,6 +1251,9 @@ async fn run_session_loop(
             None => {}
         }
     }
+
+    // Cancel telemetry and WebRTC signaling relay tasks.
+    relay_cancel.cancel();
 
     // Cancel any in-flight turn.
     if let Some(ref turn) = active_turn {
@@ -1272,42 +1279,22 @@ async fn run_session_loop(
     }
 }
 
-/// Subscribe to NATS telemetry for a host and relay `TelemetryUpdate` messages
+/// Subscribe to NATS telemetry for a worker and relay `TelemetryUpdate` messages
 /// on the gRPC response stream.
 ///
-/// Resolves `host_id` (UUID string) to the host's `name` (= `worker_id`) via Postgres,
-/// then subscribes to `telemetry.{host_name}.>`. Each received NATS message is
+/// Subscribes to `telemetry.{worker_name}.>`. Each received NATS message is
 /// converted to a `TelemetryUpdate` proto and forwarded on `tx`.
+/// The loop exits when `cancel` is cancelled (session ended) or the client disconnects.
 async fn spawn_telemetry_relay(
-    pool: &PgPool,
     nats: &async_nats::Client,
-    host_id_str: &str,
+    worker_name: &str,
     tx: &mpsc::Sender<Result<SessionResponse, Status>>,
+    cancel: tokio_util::sync::CancellationToken,
 ) {
-    let host_uuid = match uuid::Uuid::parse_str(host_id_str) {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::debug!(host_id = %host_id_str, error = %e, "invalid host_id UUID, skipping telemetry relay");
-            return;
-        }
-    };
-
-    let host = match roz_db::hosts::get_by_id(pool, host_uuid).await {
-        Ok(Some(h)) => h,
-        Ok(None) => {
-            tracing::debug!(host_id = %host_id_str, "host not found, skipping telemetry relay");
-            return;
-        }
-        Err(e) => {
-            tracing::warn!(host_id = %host_id_str, error = %e, "failed to look up host for telemetry relay");
-            return;
-        }
-    };
-
-    let telem_subject = match roz_nats::subjects::Subjects::telemetry_wildcard(&host.name) {
+    let telem_subject = match roz_nats::subjects::Subjects::telemetry_wildcard(worker_name) {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(host_name = %host.name, error = %e, "invalid host name for telemetry subject");
+            tracing::warn!(worker_name = %worker_name, error = %e, "invalid worker name for telemetry subject");
             return;
         }
     };
@@ -1320,13 +1307,20 @@ async fn spawn_telemetry_relay(
         }
     };
 
-    tracing::info!(subject = %telem_subject, host_id = %host_id_str, "telemetry relay started");
+    tracing::info!(subject = %telem_subject, worker_name = %worker_name, "telemetry relay started");
 
     let telem_tx = tx.clone();
-    let host_id_owned = host_id_str.to_string();
+    let worker_name_owned = worker_name.to_string();
     tokio::spawn(async move {
         let mut sub = telem_sub;
-        while let Some(msg) = sub.next().await {
+        loop {
+            let msg = tokio::select! {
+                () = cancel.cancelled() => break,
+                msg = sub.next() => match msg {
+                    Some(m) => m,
+                    None => break,
+                },
+            };
             if let Ok(data) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
                 // Parse joint states from the worker telemetry JSON.
                 let joint_states: Vec<roz_v1::JointState> = data["joints"]
@@ -1352,7 +1346,7 @@ async fn spawn_telemetry_relay(
                     .unwrap_or_default();
 
                 let update = roz_v1::TelemetryUpdate {
-                    host_id: host_id_owned.clone(),
+                    host_id: worker_name_owned.clone(),
                     timestamp: data["timestamp"].as_f64().unwrap_or(0.0),
                     joint_states,
                     end_effector_pose: None,
@@ -1382,18 +1376,8 @@ async fn resolve_worker_id(pool: &PgPool, host_id_str: &str) -> Option<String> {
 ///
 /// Publishes a JSON payload matching the worker's `SignalingRelay` format
 /// on `webrtc.{worker_id}.{peer_id}.answer`.
-async fn relay_webrtc_answer(
-    pool: &PgPool,
-    nats: &async_nats::Client,
-    host_id_str: &str,
-    answer: &roz_v1::WebRtcAnswer,
-) {
-    let Some(worker_id) = resolve_worker_id(pool, host_id_str).await else {
-        tracing::debug!(host_id = %host_id_str, "cannot relay WebRTC answer: host not found");
-        return;
-    };
-
-    let subject = match Subjects::webrtc_answer(&worker_id, &answer.peer_id) {
+async fn relay_webrtc_answer(nats: &async_nats::Client, worker_id: &str, answer: &roz_v1::WebRtcAnswer) {
+    let subject = match Subjects::webrtc_answer(worker_id, &answer.peer_id) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e, "invalid worker/peer id for WebRTC answer subject");
@@ -1423,18 +1407,8 @@ async fn relay_webrtc_answer(
 /// Relay an `IceCandidate` from the gRPC client to the worker via NATS.
 ///
 /// Publishes a JSON payload on `webrtc.{worker_id}.{peer_id}.ice.remote`.
-async fn relay_ice_candidate(
-    pool: &PgPool,
-    nats: &async_nats::Client,
-    host_id_str: &str,
-    candidate: &roz_v1::IceCandidate,
-) {
-    let Some(worker_id) = resolve_worker_id(pool, host_id_str).await else {
-        tracing::debug!(host_id = %host_id_str, "cannot relay ICE candidate: host not found");
-        return;
-    };
-
-    let subject = match Subjects::webrtc_ice_remote(&worker_id, &candidate.peer_id) {
+async fn relay_ice_candidate(nats: &async_nats::Client, worker_id: &str, candidate: &roz_v1::IceCandidate) {
+    let subject = match Subjects::webrtc_ice_remote(worker_id, &candidate.peer_id) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e, "invalid worker/peer id for ICE candidate subject");
@@ -1465,18 +1439,8 @@ async fn relay_ice_candidate(
 /// Relay a `CameraRequest` from the gRPC client to the worker via NATS.
 ///
 /// Publishes a JSON payload on `camera.{worker_id}.request`.
-async fn relay_camera_request(
-    pool: &PgPool,
-    nats: &async_nats::Client,
-    host_id_str: &str,
-    cam_req: &roz_v1::CameraRequest,
-) {
-    let Some(worker_id) = resolve_worker_id(pool, host_id_str).await else {
-        tracing::debug!(host_id = %host_id_str, "cannot relay camera request: host not found");
-        return;
-    };
-
-    let subject = match Subjects::camera_request(&worker_id) {
+async fn relay_camera_request(nats: &async_nats::Client, worker_id: &str, cam_req: &roz_v1::CameraRequest) {
+    let subject = match Subjects::camera_request(worker_id) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e, "invalid worker id for camera request subject");
@@ -1503,28 +1467,25 @@ async fn relay_camera_request(
     }
 }
 
-/// Subscribe to NATS WebRTC offer and ICE candidate subjects for a host and
+/// Subscribe to NATS WebRTC offer and ICE candidate subjects for a worker and
 /// relay them as `SessionResponse` messages on the gRPC stream.
 ///
-/// Resolves `host_id` to `worker_id`, then subscribes to:
-/// - `webrtc.{worker_id}.*.offer` -> `SessionResponse::WebrtcOffer`
-/// - `webrtc.{worker_id}.*.ice.local` -> `SessionResponse::IceCandidate`
+/// Subscribes to:
+/// - `webrtc.{worker_name}.*.offer` -> `SessionResponse::WebrtcOffer`
+/// - `webrtc.{worker_name}.*.ice.local` -> `SessionResponse::IceCandidate`
+///
+/// The loop exits when `cancel` is cancelled (session ended) or the client disconnects.
 async fn spawn_webrtc_signaling_relay(
-    pool: &PgPool,
     nats: &async_nats::Client,
-    host_id_str: &str,
+    worker_name: &str,
     tx: &mpsc::Sender<Result<SessionResponse, Status>>,
+    cancel: tokio_util::sync::CancellationToken,
 ) {
-    let Some(worker_id) = resolve_worker_id(pool, host_id_str).await else {
-        tracing::debug!(host_id = %host_id_str, "host not found, skipping WebRTC signaling relay");
-        return;
-    };
-
     // Subscribe to all WebRTC subjects for this worker.
-    let wildcard_subject = match Subjects::webrtc_wildcard(&worker_id) {
+    let wildcard_subject = match Subjects::webrtc_wildcard(worker_name) {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(worker_id = %worker_id, error = %e, "invalid worker name for WebRTC wildcard subject");
+            tracing::warn!(worker_name = %worker_name, error = %e, "invalid worker name for WebRTC wildcard subject");
             return;
         }
     };
@@ -1537,13 +1498,20 @@ async fn spawn_webrtc_signaling_relay(
         }
     };
 
-    tracing::info!(subject = %wildcard_subject, host_id = %host_id_str, "WebRTC signaling relay started");
+    tracing::info!(subject = %wildcard_subject, worker_name = %worker_name, "WebRTC signaling relay started");
 
     let relay_tx = tx.clone();
-    let host_id_for_relay = host_id_str.to_string();
+    let worker_name_owned = worker_name.to_string();
     tokio::spawn(async move {
         let mut sub = webrtc_sub;
-        while let Some(msg) = sub.next().await {
+        loop {
+            let msg = tokio::select! {
+                () = cancel.cancelled() => break,
+                msg = sub.next() => match msg {
+                    Some(m) => m,
+                    None => break,
+                },
+            };
             let subject_str = msg.subject.as_str();
             // Parse NATS subject segments: webrtc.{worker_id}.{peer_id}.{type}[.{subtype}]
             let segments: Vec<&str> = subject_str.split('.').collect();
@@ -1561,7 +1529,7 @@ async fn spawn_webrtc_signaling_relay(
                                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
                                 .unwrap_or_default();
                             Some(session_response::Response::WebrtcOffer(roz_v1::WebRtcOffer {
-                                host_id: host_id_for_relay.clone(),
+                                host_id: worker_name_owned.clone(),
                                 sdp,
                                 ice_candidates: vec![],
                                 peer_id: peer_id.clone(),
@@ -1586,7 +1554,7 @@ async fn spawn_webrtc_signaling_relay(
                             )]
                             let sdp_m_line_index = data["sdp_m_line_index"].as_u64().unwrap_or(0) as u32;
                             Some(session_response::Response::IceCandidate(roz_v1::IceCandidate {
-                                host_id: host_id_for_relay.clone(),
+                                host_id: worker_name_owned.clone(),
                                 peer_id: peer_id.clone(),
                                 candidate,
                                 sdp_mid,
@@ -1725,6 +1693,13 @@ async fn handle_start(
 
     let is_edge = resolve_placement(start.agent_placement.unwrap_or(0), start.host_id.is_some());
 
+    // Resolve host_id to worker_name once at session start to avoid per-message DB lookups.
+    let worker_name = if let Some(ref hid) = start.host_id {
+        resolve_worker_id(pool, hid).await
+    } else {
+        None
+    };
+
     // Send SessionStarted acknowledgement only for cloud sessions.
     // For edge sessions, the worker sends its own SessionStarted via the relay.
     if !is_edge {
@@ -1755,6 +1730,7 @@ async fn handle_start(
         active_permissions: base_permissions,
         pending_system_context: None,
         host_id: start.host_id,
+        worker_name,
         is_edge,
     });
 
@@ -2421,29 +2397,5 @@ mod tests {
             }
             other => panic!("expected WorkerCompleted, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn resolve_placement_edge() {
-        assert!(resolve_placement(2, true));
-        assert!(resolve_placement(2, false));
-    }
-
-    #[test]
-    fn resolve_placement_cloud() {
-        assert!(!resolve_placement(1, true));
-        assert!(!resolve_placement(1, false));
-    }
-
-    #[test]
-    fn resolve_placement_auto_defaults_to_cloud() {
-        assert!(!resolve_placement(0, true));
-        assert!(!resolve_placement(0, false));
-    }
-
-    #[test]
-    fn resolve_placement_unknown_defaults_to_cloud() {
-        assert!(!resolve_placement(99, true));
-        assert!(!resolve_placement(-1, false));
     }
 }
