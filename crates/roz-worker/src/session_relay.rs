@@ -254,7 +254,12 @@ async fn handle_edge_session(
                             }
                             break;
                         }
-                        continue;
+                        // Spurious wakeup (value still false) — agent future already
+                        // cancelled, user message consumed. This is unreachable in
+                        // practice because estop_rx only transitions false→true.
+                        Err(roz_agent::error::AgentError::Internal(
+                            anyhow::anyhow!("estop watch fired without activation — agent turn lost"),
+                        ))
                     }
                 };
 

@@ -5593,8 +5593,9 @@ dependencies = [
 
 [[package]]
 name = "roz-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "anyhow",
  "async-nats",
  "async-stream",
  "async-trait",
@@ -5626,7 +5627,7 @@ dependencies = [
 
 [[package]]
 name = "roz-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -5673,7 +5674,7 @@ dependencies = [
 
 [[package]]
 name = "roz-copper"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -5702,7 +5703,7 @@ dependencies = [
 
 [[package]]
 name = "roz-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5722,7 +5723,7 @@ dependencies = [
 
 [[package]]
 name = "roz-db"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5742,7 +5743,7 @@ dependencies = [
 
 [[package]]
 name = "roz-local"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5767,7 +5768,7 @@ dependencies = [
 
 [[package]]
 name = "roz-nats"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-nats",
  "base64 0.22.1",
@@ -5789,7 +5790,7 @@ dependencies = [
 
 [[package]]
 name = "roz-safety"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -5811,7 +5812,7 @@ dependencies = [
 
 [[package]]
 name = "roz-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -5859,7 +5860,7 @@ dependencies = [
 
 [[package]]
 name = "roz-test"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "testcontainers",
  "testcontainers-modules",
@@ -5868,7 +5869,7 @@ dependencies = [
 
 [[package]]
 name = "roz-worker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -5912,7 +5913,7 @@ dependencies = [
 
 [[package]]
 name = "roz-zenoh"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "serde",

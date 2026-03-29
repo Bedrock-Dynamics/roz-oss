@@ -24,6 +24,7 @@ uuid.workspace = true
 reqwest = { workspace = true }
 reqwest-eventsource.workspace = true
 eventsource-stream = "0.2"
+anyhow.workspace = true
 thiserror.workspace = true
 futures.workspace = true
 futures-core.workspace = true

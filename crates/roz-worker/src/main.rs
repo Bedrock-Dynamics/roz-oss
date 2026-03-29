@@ -128,10 +128,12 @@ async fn execute_task(
                 }
                 return;
             }
-            // Spurious wakeup (value still false) — re-run agent. This path is
-            // unreachable in practice because estop_rx only transitions false→true,
-            // but we must handle it for the compiler.
-            agent.run(roz_worker::dispatch::build_agent_input(&invocation)).await
+            // Spurious wakeup (value still false) — agent future already cancelled,
+            // input consumed. This is unreachable in practice because estop_rx only
+            // transitions false→true, but we cannot recover the moved input.
+            Err(roz_agent::error::AgentError::Internal(
+                anyhow::anyhow!("estop watch fired without activation — agent turn lost"),
+            ))
         }
     };
 

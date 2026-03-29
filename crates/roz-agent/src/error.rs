@@ -45,6 +45,10 @@ pub enum AgentError {
         partial_input_tokens: u64,
         partial_output_tokens: u64,
     },
+
+    /// Internal / unexpected error that does not fit another variant.
+    #[error("internal error: {0}")]
+    Internal(#[source] anyhow::Error),
 }
 
 impl AgentError {

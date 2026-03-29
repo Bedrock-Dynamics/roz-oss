@@ -24,8 +24,10 @@ pub struct AdaptiveBitrateController {
     current_tier: usize,
     /// Exponentially-weighted moving average of the network score.
     ewma_score: f64,
-    /// When the current tier was entered (for hysteresis timing).
-    tier_entered_at: Instant,
+    /// Candidate tier the score has been pointing to (if different from current).
+    pending_tier: Option<usize>,
+    /// When `pending_tier` first appeared (for hysteresis timing).
+    pending_since: Instant,
     /// How long the score must exceed the upgrade threshold before moving up.
     upgrade_stability: Duration,
     /// How long the score must stay below the downgrade threshold before moving down.
@@ -60,7 +62,8 @@ impl AdaptiveBitrateController {
         Self {
             current_tier: TIER_MEDIUM,
             ewma_score: 0.6, // neutral starting score (in MEDIUM band)
-            tier_entered_at: Instant::now(),
+            pending_tier: None,
+            pending_since: Instant::now(),
             upgrade_stability: Duration::from_secs(5),
             downgrade_stability: Duration::from_secs(1),
         }
@@ -74,40 +77,40 @@ impl AdaptiveBitrateController {
         self.ewma_score = (1.0 - EWMA_ALPHA).mul_add(self.ewma_score, EWMA_ALPHA * raw_score);
 
         let desired_tier = Self::score_to_tier(self.ewma_score);
-        let elapsed = self.tier_entered_at.elapsed();
 
-        match desired_tier.cmp(&self.current_tier) {
-            std::cmp::Ordering::Less => {
-                // Upgrade (lower index = higher quality). Require sustained stability.
-                if elapsed >= self.upgrade_stability {
-                    self.current_tier = desired_tier;
-                    self.tier_entered_at = Instant::now();
-                    tracing::info!(
-                        tier = Self::tier_name(self.current_tier),
-                        ewma = self.ewma_score,
-                        "adaptive bitrate: upgraded"
-                    );
-                    return Some(self.current_profile());
-                }
+        if desired_tier == self.current_tier {
+            // Desired tier matches current -- clear any pending candidate.
+            self.pending_tier = None;
+            return None;
+        }
+
+        // Desired tier differs from current. Track as candidate with hysteresis.
+        if self.pending_tier == Some(desired_tier) {
+            // Same candidate as before -- check if stability window elapsed.
+            let stability = if desired_tier < self.current_tier {
+                self.upgrade_stability
+            } else {
+                self.downgrade_stability
+            };
+            if self.pending_since.elapsed() >= stability {
+                let direction = if desired_tier < self.current_tier {
+                    "upgraded"
+                } else {
+                    "downgraded"
+                };
+                self.current_tier = desired_tier;
+                self.pending_tier = None;
+                tracing::info!(
+                    tier = Self::tier_name(self.current_tier),
+                    ewma = self.ewma_score,
+                    "adaptive bitrate: {direction}"
+                );
+                return Some(self.current_profile());
             }
-            std::cmp::Ordering::Greater => {
-                // Downgrade (higher index = lower quality). React quickly.
-                if elapsed >= self.downgrade_stability {
-                    self.current_tier = desired_tier;
-                    self.tier_entered_at = Instant::now();
-                    tracing::info!(
-                        tier = Self::tier_name(self.current_tier),
-                        ewma = self.ewma_score,
-                        "adaptive bitrate: downgraded"
-                    );
-                    return Some(self.current_profile());
-                }
-            }
-            std::cmp::Ordering::Equal => {
-                // Desired tier matches current -- reset the clock so hysteresis
-                // only counts *continuous* time in a different band.
-                self.tier_entered_at = Instant::now();
-            }
+        } else {
+            // New candidate tier -- reset the hysteresis clock.
+            self.pending_tier = Some(desired_tier);
+            self.pending_since = Instant::now();
         }
 
         None
@@ -213,10 +216,11 @@ mod tests {
         //                        = 1.0 - (0 + 0.0075 + 0.004) = 0.9885
         // Starting EWMA = 0.6. After N samples: ewma = 0.7*ewma + 0.3*0.9885
         // Need ewma > 0.8.
-        // After 1: 0.7*0.6 + 0.3*0.9885 = 0.42 + 0.2966 = 0.7166
-        // After 2: 0.7*0.7166 + 0.3*0.9885 = 0.5016 + 0.2966 = 0.7982
-        // After 3: 0.7*0.7982 + 0.3*0.9885 = 0.5587 + 0.2966 = 0.8553 -> above 0.8
-        for _ in 0..3 {
+        // After 1: 0.7*0.6 + 0.3*0.9885 = 0.42 + 0.2966 = 0.7166  -> MEDIUM (clears pending)
+        // After 2: 0.7*0.7166 + 0.3*0.9885 = 0.5016 + 0.2966 = 0.7982 -> MEDIUM
+        // After 3: 0.7*0.7982 + 0.3*0.9885 = 0.5587 + 0.2966 = 0.8553 -> HIGH (sets pending)
+        // After 4: ewma still > 0.8 -> pending confirmed, tier switches
+        for _ in 0..4 {
             ctrl.on_rtcp_feedback(&feedback);
         }
 
@@ -237,13 +241,14 @@ mod tests {
         // terrible_feedback score ~ 1.0 - (0.5*0.5 + 0.3*(150/200) + 0.2*(400/500))
         //                         = 1.0 - (0.25 + 0.225 + 0.16) = 0.365
         // Starting EWMA = 0.6. After N samples:
-        // After 1: 0.7*0.6 + 0.3*0.365 = 0.42 + 0.1095 = 0.5295
-        // After 2: 0.7*0.5295 + 0.3*0.365 = 0.3707 + 0.1095 = 0.4802
-        // After 3: 0.7*0.4802 + 0.3*0.365 = 0.3361 + 0.1095 = 0.4456
-        // After 4: 0.7*0.4456 + 0.3*0.365 = 0.3119 + 0.1095 = 0.4214
-        // After 5: 0.7*0.4214 + 0.3*0.365 = 0.2950 + 0.1095 = 0.4045
-        // After 6: 0.7*0.4045 + 0.3*0.365 = 0.2832 + 0.1095 = 0.3927 -> below 0.4
-        for _ in 0..6 {
+        // After 1: 0.7*0.6 + 0.3*0.365 = 0.42 + 0.1095 = 0.5295  -> MEDIUM (clears pending)
+        // After 2: 0.7*0.5295 + 0.3*0.365 = 0.3707 + 0.1095 = 0.4802 -> MEDIUM
+        // After 3: 0.7*0.4802 + 0.3*0.365 = 0.3361 + 0.1095 = 0.4456 -> MEDIUM
+        // After 4: 0.7*0.4456 + 0.3*0.365 = 0.3119 + 0.1095 = 0.4214 -> MEDIUM
+        // After 5: 0.7*0.4214 + 0.3*0.365 = 0.2950 + 0.1095 = 0.4045 -> MEDIUM
+        // After 6: 0.7*0.4045 + 0.3*0.365 = 0.2832 + 0.1095 = 0.3927 -> LOW (sets pending)
+        // After 7: ewma still < 0.4 -> pending confirmed, tier switches
+        for _ in 0..7 {
             ctrl.on_rtcp_feedback(&feedback);
         }
 

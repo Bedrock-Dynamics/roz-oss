@@ -16,19 +16,8 @@ pub async fn register_host(api_url: &str, api_key: &str, worker_id: &str) -> Res
     let client = reqwest::Client::new();
     let base = api_url.trim_end_matches('/');
 
-    // 1. List hosts and find matching name
-    let resp = client
-        .get(format!("{base}/v1/hosts"))
-        .bearer_auth(api_key)
-        .send()
-        .await
-        .context("GET /v1/hosts request failed")?
-        .error_for_status()
-        .context("GET /v1/hosts returned error status")?;
-
-    let body: serde_json::Value = resp.json().await.context("failed to parse GET /v1/hosts response")?;
-
-    let host_id = find_host_by_name(&body, worker_id);
+    // 1. List hosts and find matching name (paginated)
+    let host_id = find_host_paginated(&client, base, api_key, worker_id).await?;
 
     let id = if let Some(existing_id) = host_id {
         existing_id
@@ -48,16 +37,9 @@ pub async fn register_host(api_url: &str, api_key: &str, worker_id: &str) -> Res
 
         // Handle 409 Conflict: another worker registered the same name concurrently.
         if resp.status() == reqwest::StatusCode::CONFLICT {
-            let retry_resp = client
-                .get(format!("{base}/v1/hosts"))
-                .bearer_auth(api_key)
-                .send()
-                .await
-                .context("GET /v1/hosts retry request failed")?
-                .error_for_status()
-                .context("GET /v1/hosts retry returned error status")?;
-            let retry_body: serde_json::Value = retry_resp.json().await.context("failed to parse retry response")?;
-            find_host_by_name(&retry_body, worker_id).context("host not found after conflict retry")?
+            find_host_paginated(&client, base, api_key, worker_id)
+                .await?
+                .context("host not found after conflict retry")?
         } else {
             let resp = resp
                 .error_for_status()
@@ -80,6 +62,44 @@ pub async fn register_host(api_url: &str, api_key: &str, worker_id: &str) -> Res
         .context("PATCH host status returned error status")?;
 
     Ok(id)
+}
+
+/// Paginate through `GET /v1/hosts` looking for a host whose `name` matches `worker_id`.
+async fn find_host_paginated(
+    client: &reqwest::Client,
+    base: &str,
+    api_key: &str,
+    worker_id: &str,
+) -> Result<Option<Uuid>> {
+    let limit: usize = 50;
+    let mut offset: usize = 0;
+    loop {
+        let resp = client
+            .get(format!("{base}/v1/hosts?limit={limit}&offset={offset}"))
+            .bearer_auth(api_key)
+            .send()
+            .await
+            .context("GET /v1/hosts request failed")?
+            .error_for_status()
+            .context("GET /v1/hosts returned error status")?;
+
+        let body: serde_json::Value = resp.json().await.context("failed to parse GET /v1/hosts response")?;
+
+        if let Some(id) = find_host_by_name(&body, worker_id) {
+            return Ok(Some(id));
+        }
+
+        // Check if we've exhausted the last page.
+        let page_len = body
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        if page_len < limit {
+            break; // last page
+        }
+        offset += limit;
+    }
+    Ok(None)
 }
 
 /// Search the `{"data": [...]}` response for a host whose `name` matches `worker_id`.

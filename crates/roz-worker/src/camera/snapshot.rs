@@ -93,6 +93,9 @@ pub fn spawn_snapshot_feeder(
         // Allow an immediate first capture by setting last_capture far in the past.
         let mut last_capture = tokio::time::Instant::now() - tokio::time::Duration::from_secs(3600);
 
+        // Track the camera_id so we can clear the stale snapshot on shutdown.
+        let mut camera_id_str: Option<String> = None;
+
         loop {
             tokio::select! {
                 () = cancel.cancelled() => {
@@ -104,6 +107,11 @@ pub fn spawn_snapshot_feeder(
                         tracing::debug!("snapshot feeder: frame channel closed");
                         break;
                     };
+
+                    // Remember camera_id for cleanup on exit.
+                    if camera_id_str.is_none() {
+                        camera_id_str = Some(frame.camera_id.0.clone());
+                    }
 
                     // Read current config each cycle (allows runtime changes via SetVisionStrategyTool).
                     let cfg = config.read().await;
@@ -138,6 +146,12 @@ pub fn spawn_snapshot_feeder(
                     );
                 }
             }
+        }
+
+        // Clear stale snapshot on feeder exit (cancellation or channel close).
+        if let Some(cam_id) = &camera_id_str {
+            provider.remove_snapshot(cam_id).await;
+            tracing::debug!(camera_id = %cam_id, "snapshot feeder stopped — cleared stale snapshot");
         }
     })
 }

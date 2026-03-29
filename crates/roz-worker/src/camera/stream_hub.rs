@@ -31,11 +31,16 @@ pub struct ViewerHandle {
 
 impl Drop for ViewerHandle {
     fn drop(&mut self) {
-        let prev = self.count.fetch_sub(1, Ordering::Relaxed);
-        // `prev` is the value *before* subtraction, so new count is prev - 1.
-        let new = prev.saturating_sub(1);
-        let _ = self.viewer_count_tx.send(new);
-        tracing::debug!(camera_id = %self.camera_id, viewers = new, "viewer disconnected");
+        let prev = self
+            .count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+        if let Ok(prev_val) = prev {
+            let new = prev_val - 1;
+            let _ = self.viewer_count_tx.send(new);
+            tracing::debug!(camera_id = %self.camera_id, viewers = new, "viewer disconnected");
+        } else {
+            tracing::warn!(camera_id = %self.camera_id, "viewer count already zero on drop — skipping decrement");
+        }
     }
 }
 

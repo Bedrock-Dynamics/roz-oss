@@ -121,6 +121,9 @@ impl CameraSource for TestPatternSource {
         if width == 0 || height == 0 || width > MAX_RESOLUTION || height > MAX_RESOLUTION {
             anyhow::bail!("invalid resolution {width}x{height} (max {MAX_RESOLUTION}x{MAX_RESOLUTION})");
         }
+        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            anyhow::bail!("resolution {width}x{height} must be even for I420/YUYV formats");
+        }
         if self.active {
             anyhow::bail!("test pattern already active");
         }
@@ -219,6 +222,9 @@ impl CameraSource for V4lSource {
         if width == 0 || height == 0 || width > MAX_RESOLUTION || height > MAX_RESOLUTION {
             anyhow::bail!("invalid resolution {width}x{height} (max {MAX_RESOLUTION}x{MAX_RESOLUTION})");
         }
+        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+            anyhow::bail!("resolution {width}x{height} must be even for I420/YUYV formats");
+        }
         if self.active {
             anyhow::bail!("V4L source already active");
         }
@@ -229,13 +235,17 @@ impl CameraSource for V4lSource {
         let id = self.id.clone();
         let device_path = self.device_path.clone();
 
+        // Synchronize device initialization: the blocking task sends Ok/Err
+        // after setup, so the caller knows whether the device actually opened.
+        let (init_tx, init_rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
+
         // V4L capture runs in a blocking thread -- the v4l crate uses
         // synchronous mmap reads that must not run on the tokio runtime.
         tokio::task::spawn_blocking(move || {
             let dev = match Device::with_path(&device_path) {
                 Ok(d) => d,
                 Err(e) => {
-                    tracing::error!(error = %e, device = %device_path, "failed to open V4L device");
+                    let _ = init_tx.send(Err(anyhow::anyhow!("failed to open V4L device {device_path}: {e}")));
                     return;
                 }
             };
@@ -245,18 +255,34 @@ impl CameraSource for V4lSource {
             format.width = width;
             format.height = height;
             format.fourcc = FourCC::new(b"YUYV");
-            if let Err(e) = dev.set_format(&format) {
-                tracing::warn!(error = %e, "failed to set V4L format, using device default");
+            match dev.set_format(&format) {
+                Ok(actual) => {
+                    if actual.width != width || actual.height != height {
+                        let _ = init_tx.send(Err(anyhow::anyhow!(
+                            "V4L device returned {actual_w}x{actual_h} instead of requested {width}x{height}",
+                            actual_w = actual.width,
+                            actual_h = actual.height,
+                        )));
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = init_tx.send(Err(anyhow::anyhow!("failed to set V4L format: {e}")));
+                    return;
+                }
             }
 
             // E9: use v4l::io::mmap::Stream, not MmapStream
             let mut stream = match v4l::io::mmap::Stream::with_buffers(&dev, v4l::buffer::Type::VideoCapture, 4) {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::error!(error = %e, "failed to create V4L mmap stream");
+                    let _ = init_tx.send(Err(anyhow::anyhow!("failed to create V4L mmap stream: {e}")));
                     return;
                 }
             };
+
+            // Device and stream are ready — signal success to caller.
+            let _ = init_tx.send(Ok(()));
 
             let mut seq: u64 = 0;
             let start = std::time::Instant::now();
@@ -294,6 +320,11 @@ impl CameraSource for V4lSource {
                 }
             }
         });
+
+        // Wait for device initialization before returning Ok to caller.
+        init_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("V4L init task dropped without signaling"))??;
 
         self.active = true;
         self.cancel = Some(cancel);
