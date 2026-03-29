@@ -23,7 +23,7 @@ pub fn build_agent_input(inv: &TaskInvocation) -> AgentInput {
     let mut agent_input = AgentInput {
         task_id: inv.task_id.to_string(),
         tenant_id: inv.tenant_id.clone(),
-        system_prompt: vec![build_constitution(mode)],
+        system_prompt: vec![build_constitution(mode, &[])],
         user_message: inv.prompt.clone(),
         max_cycles: DEFAULT_MAX_CYCLES,
         max_tokens: DEFAULT_MAX_TOKENS,

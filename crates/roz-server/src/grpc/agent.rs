@@ -1767,7 +1767,7 @@ fn build_system_prompt_blocks(
     per_message_context: &[roz_v1::ContentBlock],
     pending_system_context: Option<String>,
 ) -> Vec<String> {
-    let mut blocks = vec![build_constitution(mode)];
+    let mut blocks = vec![build_constitution(mode, &[])];
 
     // Consolidate all project context into one block (session-stable).
     let mut project_parts = Vec::new();

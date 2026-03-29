@@ -262,6 +262,18 @@ impl ToolDispatcher {
         }
     }
 
+    /// Returns the names of all enabled tools.
+    ///
+    /// Useful for passing to [`crate::constitution::build_constitution`] so
+    /// it can include conditional tiers based on which tools are registered.
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tools
+            .iter()
+            .filter(|(_, e)| e.enabled)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     /// Returns schemas for only the enabled tools.
     pub fn schemas(&self) -> Vec<ToolSchema> {
         self.tools

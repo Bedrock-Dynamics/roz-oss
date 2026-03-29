@@ -110,7 +110,7 @@ async fn execute_byok(config: &ProviderConfig, task: &str) -> anyhow::Result<()>
     let spatial = roz_agent::spatial_provider::NullSpatialContextProvider;
     let mut agent_loop = roz_agent::agent_loop::AgentLoop::new(model, dispatcher, safety, Box::new(spatial));
 
-    let constitution = roz_agent::constitution::build_constitution(roz_agent::agent_loop::AgentLoopMode::React);
+    let constitution = roz_agent::constitution::build_constitution(roz_agent::agent_loop::AgentLoopMode::React, &[]);
     let mut system_prompt = vec![constitution];
     if let Some(ctx) = crate::tui::context::load_project_context() {
         system_prompt.push(ctx);

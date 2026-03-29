@@ -162,6 +162,15 @@ async fn handle_edge_session(
         tracing::info!(session_id, "camera perception tools registered for edge session");
     }
 
+    // Parse execution mode from start_msg (E8: use extracted function).
+    // Default to OodaReAct for edge sessions (workers with physical capabilities).
+    let session_mode = parse_edge_session_mode(&start_msg, config.max_velocity.is_some());
+
+    // Build constitution AFTER tool registration so conditional tiers match.
+    let names = dispatcher.tool_names();
+    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let constitution = build_constitution(session_mode, &name_refs);
+
     let guards: Vec<Box<dyn roz_agent::safety::SafetyGuard>> = vec![Box::new(
         roz_agent::safety::guards::VelocityLimiter::new(config.max_velocity.unwrap_or(1.5)),
     )];
@@ -169,11 +178,6 @@ async fn handle_edge_session(
     let spatial: Box<dyn roz_agent::spatial_provider::SpatialContextProvider> =
         Box::new(crate::camera::snapshot::CameraSpatialProvider::new());
     let mut agent = AgentLoop::new(model, dispatcher, safety, spatial).with_extensions(extensions);
-
-    // Parse execution mode from start_msg (E8: use extracted function).
-    // Default to OodaReAct for edge sessions (workers with physical capabilities).
-    let session_mode = parse_edge_session_mode(&start_msg, config.max_velocity.is_some());
-    let constitution = build_constitution(session_mode);
 
     tracing::info!(session_id, ?session_mode, "edge session mode resolved");
 

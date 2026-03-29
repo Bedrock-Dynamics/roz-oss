@@ -503,7 +503,9 @@ impl LocalRuntime {
         }
 
         // System prompt blocks
-        let mut system_prompt = vec![build_constitution(mode)];
+        let names = dispatcher.tool_names();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut system_prompt = vec![build_constitution(mode, &name_refs)];
         let agents_md_path = self.project_dir.join("AGENTS.md");
         if let Ok(agents_content) = std::fs::read_to_string(&agents_md_path)
             && !agents_content.is_empty()

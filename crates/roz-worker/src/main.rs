@@ -20,6 +20,7 @@ async fn execute_task(
     invocation: TaskInvocation,
     task_id: Uuid,
     task_config: roz_worker::config::WorkerConfig,
+    task_nats: async_nats::Client,
     task_js: JetStreamContext,
     task_http: reqwest::Client,
     restate_url: String,
@@ -101,6 +102,44 @@ async fn execute_task(
             roz_core::tools::ToolCategory::Pure,
         );
         tracing::info!("camera perception tools registered");
+    }
+
+    // Register team tools (spawn_worker, watch_team) when this is an orchestrator
+    // (no parent_task_id). Workers cannot spawn their own workers.
+    if invocation.parent_task_id.is_none() {
+        if let Ok(tenant_uuid) = invocation.tenant_id.parse::<Uuid>() {
+            dispatcher.register_with_category(
+                Box::new(roz_agent::tools::spawn_worker::SpawnWorkerTool::new(
+                    task_nats.clone(),
+                    task_id,
+                    invocation.environment_id,
+                    task_js.clone(),
+                    tenant_uuid,
+                )),
+                roz_core::tools::ToolCategory::Pure,
+            );
+            dispatcher.register_with_category(
+                Box::new(roz_agent::tools::watch_team::WatchTeamTool::new(
+                    task_js.clone(),
+                    task_id,
+                )),
+                roz_core::tools::ToolCategory::Pure,
+            );
+            tracing::info!("team tools registered (orchestrator mode)");
+        } else {
+            tracing::warn!(
+                tenant_id = %invocation.tenant_id,
+                "skipping team tool registration: tenant_id is not a valid UUID"
+            );
+        }
+    }
+
+    // Rebuild constitution now that all tools are registered, so conditional
+    // tiers (camera, WASM, team, etc.) match the actual tool set.
+    {
+        let names = dispatcher.tool_names();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        agent_input.system_prompt[0] = roz_agent::constitution::build_constitution(agent_input.mode, &name_refs);
     }
 
     let mut agent =
@@ -361,6 +400,7 @@ async fn main() -> Result<()> {
             "dispatching task"
         );
 
+        let task_nats = nats.clone();
         let task_http = http.clone();
         let restate_url = restate_url.clone();
         let task_id = invocation.task_id;
@@ -375,6 +415,7 @@ async fn main() -> Result<()> {
                 invocation,
                 task_id,
                 task_config,
+                task_nats,
                 task_js,
                 task_http,
                 restate_url,

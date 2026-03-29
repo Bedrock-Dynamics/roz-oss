@@ -834,7 +834,7 @@ fn print_context_breakdown(session: &State<Option<Session>>, model: &str, stdout
         };
 
     // Constitution size estimate.
-    let constitution = roz_agent::constitution::build_constitution(roz_agent::agent_loop::AgentLoopMode::React);
+    let constitution = roz_agent::constitution::build_constitution(roz_agent::agent_loop::AgentLoopMode::React, &[]);
     let constitution_tokens = estimate_tokens(constitution.len());
 
     // Project context size estimate.
@@ -999,7 +999,8 @@ async fn provider_loop(
     // Block 0: constitution (always present).
     // Block 1: project context from AGENTS.md / ROBOT.md (if found).
     let system_prompt = {
-        let constitution = roz_agent::constitution::build_constitution(roz_agent::agent_loop::AgentLoopMode::React);
+        let constitution =
+            roz_agent::constitution::build_constitution(roz_agent::agent_loop::AgentLoopMode::React, &[]);
         let mut blocks = vec![constitution];
         if let Some(project_ctx) = context::load_project_context() {
             blocks.push(project_ctx);
