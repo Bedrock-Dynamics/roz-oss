@@ -77,6 +77,97 @@ impl Subjects {
         validate_token("worker_id", worker_id)?;
         Ok(format!("invoke.{worker_id}.>"))
     }
+
+    /// Build a telemetry state subject: `telemetry.{worker_id}.state`.
+    pub fn telemetry_state(worker_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        Ok(format!("telemetry.{worker_id}.state"))
+    }
+
+    /// Build a telemetry sensors subject: `telemetry.{worker_id}.sensors`.
+    pub fn telemetry_sensors(worker_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        Ok(format!("telemetry.{worker_id}.sensors"))
+    }
+
+    /// Build a capabilities subject: `capabilities.{worker_id}`.
+    pub fn capabilities(worker_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        Ok(format!("capabilities.{worker_id}"))
+    }
+
+    /// Build a session request subject: `session.{worker_id}.{session_id}.request`.
+    pub fn session_request(worker_id: &str, session_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        validate_token("session_id", session_id)?;
+        Ok(format!("session.{worker_id}.{session_id}.request"))
+    }
+
+    /// Build a session response subject: `session.{worker_id}.{session_id}.response`.
+    pub fn session_response(worker_id: &str, session_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        validate_token("session_id", session_id)?;
+        Ok(format!("session.{worker_id}.{session_id}.response"))
+    }
+
+    /// Build a session control subject: `session.{worker_id}.{session_id}.control`.
+    pub fn session_control(worker_id: &str, session_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        validate_token("session_id", session_id)?;
+        Ok(format!("session.{worker_id}.{session_id}.control"))
+    }
+
+    /// E-stop subject for a worker: `safety.estop.{worker_id}`.
+    pub fn estop(worker_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        Ok(format!("safety.estop.{worker_id}"))
+    }
+
+    /// Build a WebRTC offer subject: `webrtc.{worker_id}.{peer_id}.offer`.
+    pub fn webrtc_offer(worker_id: &str, peer_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        validate_token("peer_id", peer_id)?;
+        Ok(format!("webrtc.{worker_id}.{peer_id}.offer"))
+    }
+
+    /// Build a WebRTC answer subject: `webrtc.{worker_id}.{peer_id}.answer`.
+    pub fn webrtc_answer(worker_id: &str, peer_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        validate_token("peer_id", peer_id)?;
+        Ok(format!("webrtc.{worker_id}.{peer_id}.answer"))
+    }
+
+    /// Build a local ICE candidate subject: `webrtc.{worker_id}.{peer_id}.ice.local`.
+    pub fn webrtc_ice_local(worker_id: &str, peer_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        validate_token("peer_id", peer_id)?;
+        Ok(format!("webrtc.{worker_id}.{peer_id}.ice.local"))
+    }
+
+    /// Build a remote ICE candidate subject: `webrtc.{worker_id}.{peer_id}.ice.remote`.
+    pub fn webrtc_ice_remote(worker_id: &str, peer_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        validate_token("peer_id", peer_id)?;
+        Ok(format!("webrtc.{worker_id}.{peer_id}.ice.remote"))
+    }
+
+    /// Build a wildcard WebRTC subject: `webrtc.{worker_id}.>`.
+    pub fn webrtc_wildcard(worker_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        Ok(format!("webrtc.{worker_id}.>"))
+    }
+
+    /// Build a camera event subject: `camera.{worker_id}.event`.
+    pub fn camera_event(worker_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        Ok(format!("camera.{worker_id}.event"))
+    }
+
+    /// Build a camera request subject: `camera.{worker_id}.request`.
+    pub fn camera_request(worker_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        Ok(format!("camera.{worker_id}.request"))
+    }
 }
 
 #[cfg(test)]
@@ -158,5 +249,111 @@ mod tests {
     fn invoke_wildcard_valid() {
         let subject = Subjects::invoke_wildcard("worker-1").unwrap();
         assert_eq!(subject, "invoke.worker-1.>");
+    }
+
+    #[test]
+    fn estop_subject() {
+        let subject = Subjects::estop("robot-arm-1").unwrap();
+        assert_eq!(subject, "safety.estop.robot-arm-1");
+    }
+
+    #[test]
+    fn estop_validates_worker_id() {
+        assert!(Subjects::estop("valid-worker").is_ok());
+        assert!(
+            Subjects::estop("worker.with.dots").is_err(),
+            "dots would break NATS subject hierarchy"
+        );
+        assert!(
+            Subjects::estop("worker*wildcard").is_err(),
+            "wildcards would match unintended subjects"
+        );
+        assert!(Subjects::estop("").is_err(), "empty worker_id is invalid");
+        assert!(Subjects::estop("worker>greater").is_err(), "> is NATS full-wildcard");
+    }
+
+    #[test]
+    fn telemetry_state_subject() {
+        assert_eq!(Subjects::telemetry_state("robot1").unwrap(), "telemetry.robot1.state");
+    }
+
+    #[test]
+    fn telemetry_sensors_subject() {
+        assert_eq!(
+            Subjects::telemetry_sensors("robot1").unwrap(),
+            "telemetry.robot1.sensors"
+        );
+    }
+
+    #[test]
+    fn session_request_subject() {
+        assert_eq!(
+            Subjects::session_request("robot1", "sess-123").unwrap(),
+            "session.robot1.sess-123.request"
+        );
+    }
+
+    #[test]
+    fn session_response_subject() {
+        assert_eq!(
+            Subjects::session_response("robot1", "sess-123").unwrap(),
+            "session.robot1.sess-123.response"
+        );
+    }
+
+    #[test]
+    fn session_control_subject() {
+        assert_eq!(
+            Subjects::session_control("robot1", "sess-123").unwrap(),
+            "session.robot1.sess-123.control"
+        );
+    }
+
+    #[test]
+    fn capabilities_subject() {
+        assert_eq!(Subjects::capabilities("robot1").unwrap(), "capabilities.robot1");
+    }
+
+    #[test]
+    fn webrtc_offer_subject() {
+        assert_eq!(
+            Subjects::webrtc_offer("robot1", "peer-abc").unwrap(),
+            "webrtc.robot1.peer-abc.offer"
+        );
+    }
+
+    #[test]
+    fn webrtc_answer_subject() {
+        assert_eq!(
+            Subjects::webrtc_answer("robot1", "peer-abc").unwrap(),
+            "webrtc.robot1.peer-abc.answer"
+        );
+    }
+
+    #[test]
+    fn webrtc_ice_subjects() {
+        assert_eq!(
+            Subjects::webrtc_ice_local("robot1", "peer-abc").unwrap(),
+            "webrtc.robot1.peer-abc.ice.local"
+        );
+        assert_eq!(
+            Subjects::webrtc_ice_remote("robot1", "peer-abc").unwrap(),
+            "webrtc.robot1.peer-abc.ice.remote"
+        );
+    }
+
+    #[test]
+    fn webrtc_wildcard_subject() {
+        assert_eq!(Subjects::webrtc_wildcard("robot1").unwrap(), "webrtc.robot1.>");
+    }
+
+    #[test]
+    fn camera_event_subject() {
+        assert_eq!(Subjects::camera_event("robot1").unwrap(), "camera.robot1.event");
+    }
+
+    #[test]
+    fn camera_request_subject() {
+        assert_eq!(Subjects::camera_request("robot1").unwrap(), "camera.robot1.request");
     }
 }

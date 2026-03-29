@@ -4,10 +4,16 @@ use crate::tui::provider::{AgentEvent, Provider, ProviderConfig};
 /// Run a single prompt without the TUI and output JSON to stdout.
 ///
 /// Used for headless robot deployments where no terminal is available.
-pub async fn execute(config: &CliConfig, model_flag: Option<&str>, task: &str) -> anyhow::Result<()> {
+pub async fn execute(
+    config: &CliConfig,
+    model_flag: Option<&str>,
+    task: &str,
+    host_flag: Option<&str>,
+) -> anyhow::Result<()> {
     // Detect provider from model ref, credentials, and project config
     let roz_toml = super::interactive::read_roz_toml_model_ref();
-    let provider_config = ProviderConfig::detect(model_flag, config.access_token.as_deref(), roz_toml.as_deref());
+    let mut provider_config = ProviderConfig::detect(model_flag, config.access_token.as_deref(), roz_toml.as_deref());
+    provider_config.host = host_flag.map(String::from);
 
     if provider_config.api_key.is_none() && provider_config.provider != Provider::Ollama {
         anyhow::bail!("No credentials configured. Run `roz auth login` or set ANTHROPIC_API_KEY.");
@@ -101,10 +107,10 @@ async fn execute_byok(config: &ProviderConfig, task: &str) -> anyhow::Result<()>
 
     let dispatcher = crate::tui::tools::build_dispatcher();
     let safety = roz_agent::safety::SafetyStack::new(vec![]);
-    let spatial = roz_agent::spatial_provider::MockSpatialContextProvider::empty();
+    let spatial = roz_agent::spatial_provider::NullSpatialContextProvider;
     let mut agent_loop = roz_agent::agent_loop::AgentLoop::new(model, dispatcher, safety, Box::new(spatial));
 
-    let constitution = roz_agent::constitution::build_constitution(roz_agent::agent_loop::AgentLoopMode::React);
+    let constitution = roz_agent::constitution::build_constitution(roz_agent::agent_loop::AgentLoopMode::React, &[]);
     let mut system_prompt = vec![constitution];
     if let Some(ctx) = crate::tui::context::load_project_context() {
         system_prompt.push(ctx);
@@ -124,6 +130,8 @@ async fn execute_byok(config: &ProviderConfig, task: &str) -> anyhow::Result<()>
         streaming: false,
         history: Vec::new(),
         phases: Vec::new(),
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
     };
 
     let result = agent_loop.run(input).await;

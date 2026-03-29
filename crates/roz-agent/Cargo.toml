@@ -1,6 +1,6 @@
 [package]
 name = "roz-agent"
-version = "0.1.0"
+version.workspace = true
 edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
@@ -24,12 +24,14 @@ uuid.workspace = true
 reqwest = { workspace = true }
 reqwest-eventsource.workspace = true
 eventsource-stream = "0.2"
+anyhow.workspace = true
 thiserror.workspace = true
 futures.workspace = true
 futures-core.workspace = true
 async-stream.workspace = true
 tokio-stream.workspace = true
 schemars.workspace = true
+tokio-util.workspace = true
 
 [dev-dependencies]
 crc32fast = { workspace = true }

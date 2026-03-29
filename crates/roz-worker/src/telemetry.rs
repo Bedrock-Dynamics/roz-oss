@@ -63,6 +63,17 @@ impl TelemetryPublisher {
     }
 }
 
+/// Publish a telemetry state message to NATS.
+///
+/// Sends `data` on the `telemetry.{worker_id}.state` subject.
+/// Callers are responsible for rate limiting (e.g. via `TelemetryPublisher::should_publish`).
+pub async fn publish_state(nats: &async_nats::Client, worker_id: &str, data: &serde_json::Value) -> anyhow::Result<()> {
+    let subject = Subjects::telemetry_state(worker_id).map_err(|e| anyhow::anyhow!("invalid worker_id: {e}"))?;
+    let payload = serde_json::to_vec(data)?;
+    nats.publish(subject, payload.into()).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

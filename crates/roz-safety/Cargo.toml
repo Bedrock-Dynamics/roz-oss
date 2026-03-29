@@ -1,6 +1,6 @@
 [package]
 name = "roz-safety"
-version = "0.1.0"
+version.workspace = true
 edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 roz-core = { path = "../roz-core" }
+roz-nats = { path = "../roz-nats" }
 tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true }

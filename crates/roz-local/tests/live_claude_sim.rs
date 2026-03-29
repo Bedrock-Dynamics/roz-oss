@@ -52,6 +52,8 @@ async fn real_claude_moves_arm_via_mcp() {
         response_schema: None,
         streaming: false,
         history: vec![],
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
     };
 
     let output = agent.run(input).await.unwrap();

@@ -65,6 +65,8 @@ async fn real_claude_writes_wat_and_deploys_controller() {
         response_schema: None,
         streaming: false,
         history: vec![],
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
     };
 
     let output = agent.run(input).await.unwrap();

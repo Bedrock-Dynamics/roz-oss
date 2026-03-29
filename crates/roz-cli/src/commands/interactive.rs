@@ -12,6 +12,7 @@ pub async fn execute(
     model_flag: Option<&str>,
     resume: bool,
     resume_session: Option<&str>,
+    host_flag: Option<&str>,
 ) -> anyhow::Result<()> {
     // Read project config
     let roz_toml = read_roz_toml();
@@ -22,6 +23,8 @@ pub async fn execute(
         config.access_token.as_deref(),
         roz_toml.model_ref.as_deref(),
     );
+
+    provider_config.host = host_flag.map(String::from);
 
     render::welcome_banner_with_config(&provider_config);
 

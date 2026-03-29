@@ -29,6 +29,9 @@ message SessionRequest {
     PermissionDecision permission_decision = 8;
     // D3: IDE registers / unregisters dynamic tool sets (e.g. MCP sim tools).
     RegisterTools register_tools = 9;
+    WebRtcAnswer webrtc_answer = 14;
+    IceCandidate ice_candidate = 15;
+    CameraRequest camera_request = 16;
   }
 }
 
@@ -40,6 +43,15 @@ message StartSession {
   repeated ConversationMessage history = 5;
   repeated string project_context = 6;
   optional uint32 max_context_tokens = 7;
+  optional AgentPlacement agent_placement = 8;
+  repeated string camera_ids = 9;
+  bool enable_video = 10;
+}
+
+enum AgentPlacement {
+  AGENT_PLACEMENT_AUTO = 0;
+  AGENT_PLACEMENT_CLOUD = 1;
+  AGENT_PLACEMENT_EDGE = 2;
 }
 
 message ConversationMessage {
@@ -186,6 +198,11 @@ message SessionResponse {
     ContextCompacted context_compacted = 9;
     PresenceHint presence_hint = 10;
     ActivityUpdate activity_update = 11;
+    TelemetryUpdate telemetry = 14;
+    TaskProgress task_progress = 15;
+    WebRtcOffer webrtc_offer = 16;
+    IceCandidate ice_candidate = 17;
+    CameraUpdate camera_update = 18;
   }
 }
 
@@ -278,6 +295,84 @@ message ToolSchema {
   google.protobuf.Struct parameters_schema = 3;
   uint32 timeout_ms = 4;
   ToolCategoryHint category = 5;
+}
+
+message JointState {
+  string name = 1;
+  double position = 2;
+  double velocity = 3;
+  double effort = 4;
+}
+
+message Pose {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+  double qx = 4;
+  double qy = 5;
+  double qz = 6;
+  double qw = 7;
+}
+
+message TelemetryUpdate {
+  string host_id = 1;
+  double timestamp = 2;
+  repeated JointState joint_states = 3;
+  optional Pose end_effector_pose = 4;
+  map<string, double> sensor_readings = 5;
+}
+
+message TaskProgress {
+  string task_id = 1;
+  string phase = 2;
+  float progress = 3;
+  string description = 4;
+}
+
+message WebRtcOffer {
+  string host_id = 1;
+  string sdp = 2;
+  repeated string ice_candidates = 3;
+  string peer_id = 4;
+  repeated string camera_ids = 5;
+}
+
+message WebRtcAnswer {
+  string host_id = 1;
+  string sdp = 2;
+  repeated string ice_candidates = 3;
+  string peer_id = 4;
+}
+
+// Trickle ICE candidate exchanged between worker and client via server relay.
+message IceCandidate {
+  string host_id = 1;
+  string peer_id = 2;
+  string candidate = 3;
+  string sdp_mid = 4;
+  uint32 sdp_m_line_index = 5;
+}
+
+// Client requests specific cameras to stream.
+message CameraRequest {
+  string host_id = 1;
+  repeated string camera_ids = 2;
+}
+
+// Server notifies client of camera changes (hot-plug).
+message CameraUpdate {
+  string host_id = 1;
+  repeated CameraInfoProto cameras = 2;
+  string event = 3;
+}
+
+message CameraInfoProto {
+  string id = 1;
+  string label = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  uint32 fps = 5;
+  bool hw_encoder = 6;
 }
 
 // --- WatchTeam RPC ---

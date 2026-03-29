@@ -23,7 +23,7 @@ pub fn build_agent_input(inv: &TaskInvocation) -> AgentInput {
     let mut agent_input = AgentInput {
         task_id: inv.task_id.to_string(),
         tenant_id: inv.tenant_id.clone(),
-        system_prompt: vec![build_constitution(mode)],
+        system_prompt: vec![build_constitution(mode, &[])],
         user_message: inv.prompt.clone(),
         max_cycles: DEFAULT_MAX_CYCLES,
         max_tokens: DEFAULT_MAX_TOKENS,
@@ -34,6 +34,8 @@ pub fn build_agent_input(inv: &TaskInvocation) -> AgentInput {
         response_schema: None,
         streaming: false,
         history: vec![],
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
     };
 
     // Inject robot controller interface context.

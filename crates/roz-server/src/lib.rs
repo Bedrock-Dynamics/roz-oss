@@ -50,6 +50,7 @@ pub fn build_router(state: AppState) -> Router {
                 .delete(routes::hosts::delete),
         )
         .route("/v1/hosts/{id}/status", patch(routes::hosts::update_status))
+        .route("/v1/hosts/{id}/estop", post(routes::hosts::estop))
         // Task CRUD
         .route("/v1/tasks", get(routes::tasks::list).post(routes::tasks::create))
         .route("/v1/tasks/{id}", get(routes::tasks::get).delete(routes::tasks::delete))

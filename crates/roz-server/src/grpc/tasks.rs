@@ -162,13 +162,24 @@ impl TaskService for TaskServiceImpl {
 
         // Publish task invocation to NATS for worker dispatch (only if host_id is provided).
         if let (Some(nats), Some(host_id_str)) = (&self.nats_client, &body.host_id) {
+            // Resolve UUID to hostname — workers subscribe to invoke.{hostname}.>
+            let host_uuid =
+                Uuid::parse_str(host_id_str).map_err(|_| Status::invalid_argument("host_id is not a valid UUID"))?;
+            let host = roz_db::hosts::get_by_id(&self.pool, host_uuid)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "failed to look up host");
+                    Status::internal(format!("failed to look up host: {e}"))
+                })?
+                .ok_or_else(|| Status::not_found(format!("host {host_id_str} not found")))?;
+
             let invocation = roz_nats::dispatch::TaskInvocation {
                 task_id: task.id,
                 tenant_id: tenant_id.to_string(),
                 prompt: task.prompt.clone(),
                 environment_id: task.environment_id,
                 safety_policy_id: None,
-                host_id: Uuid::parse_str(host_id_str).unwrap_or(Uuid::nil()),
+                host_id: host_uuid,
                 timeout_secs: body.timeout_secs.unwrap_or(300),
                 mode: roz_nats::dispatch::ExecutionMode::React,
                 parent_task_id: None,
@@ -176,7 +187,10 @@ impl TaskService for TaskServiceImpl {
                 traceparent: roz_nats::dispatch::current_traceparent(),
                 phases: vec![],
             };
-            let subject = format!("invoke.{host_id_str}.{}", task.id);
+            let subject = roz_nats::subjects::Subjects::invoke(&host.name, &task.id.to_string()).map_err(|e| {
+                tracing::error!(error = %e, "invalid host name or task id for NATS subject");
+                Status::invalid_argument(format!("invalid NATS subject: {e}"))
+            })?;
             if let Ok(payload) = serde_json::to_vec(&invocation)
                 && let Err(e) = nats.publish(subject, payload.into()).await
             {

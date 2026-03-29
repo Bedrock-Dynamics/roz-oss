@@ -5,57 +5,34 @@ use anyhow::Result;
 use async_nats::jetstream::Context as JetStreamContext;
 use futures::StreamExt;
 use roz_nats::dispatch::TaskInvocation;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use uuid::Uuid;
 
-/// Build the agent model from worker config, wrapping in `FallbackModel` when configured.
-fn build_model(config: &roz_worker::config::WorkerConfig) -> anyhow::Result<Box<dyn roz_agent::model::Model>> {
-    let primary = roz_agent::model::create_model(
-        &config.model_name,
-        &config.gateway_url,
-        &config.gateway_api_key,
-        config.model_timeout_secs,
-        &config.anthropic_provider,
-        config.anthropic_api_key.as_deref(),
-    )?;
-
-    if let Some(ref fallback_name) = config.fallback_model {
-        match roz_agent::model::create_model(
-            fallback_name,
-            &config.gateway_url,
-            &config.gateway_api_key,
-            config.model_timeout_secs,
-            &config.anthropic_provider,
-            config.anthropic_api_key.as_deref(),
-        ) {
-            Ok(fallback) => {
-                tracing::info!(fallback_model = %fallback_name, "model fallback configured");
-                Ok(Box::new(roz_agent::model::FallbackModel::new(primary, fallback)))
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to create fallback model, proceeding without");
-                Ok(primary)
-            }
-        }
-    } else {
-        Ok(primary)
-    }
-}
-
 /// Run the agent loop for a single task, publish `WorkerExited` to the parent's team stream
 /// if this is a child task, then signal the result back to Restate.
+#[expect(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "sequential task lifecycle with model + tools + safety"
+)]
 async fn execute_task(
     invocation: TaskInvocation,
     task_id: Uuid,
     task_config: roz_worker::config::WorkerConfig,
+    task_nats: async_nats::Client,
     task_js: JetStreamContext,
     task_http: reqwest::Client,
     restate_url: String,
+    mut estop_rx: tokio::sync::watch::Receiver<bool>,
+    camera_manager: Option<Arc<roz_worker::camera::CameraManager>>,
 ) {
     tracing::info!("starting task execution");
 
-    let agent_input = roz_worker::dispatch::build_agent_input(&invocation);
-    let model = match build_model(&task_config) {
+    let agent_cancel = CancellationToken::new();
+    let mut agent_input = roz_worker::dispatch::build_agent_input(&invocation);
+    agent_input.cancellation_token = Some(agent_cancel.clone());
+    let model = match roz_worker::model_factory::build_model(&task_config) {
         Ok(m) => m,
         Err(e) => {
             tracing::error!(error = %e, "failed to build model for task, aborting");
@@ -71,10 +48,13 @@ async fn execute_task(
     };
 
     let mut dispatcher = roz_agent::dispatch::ToolDispatcher::new(Duration::from_secs(30));
-    let safety = roz_agent::safety::SafetyStack::new(vec![]);
+    let guards: Vec<Box<dyn roz_agent::safety::SafetyGuard>> = vec![Box::new(
+        roz_agent::safety::guards::VelocityLimiter::new(task_config.max_velocity.unwrap_or(1.5)),
+    )];
+    let safety = roz_agent::safety::SafetyStack::new(guards);
 
     // Spawn Copper controller for OodaReAct mode.
-    let copper_handle = match invocation.mode {
+    let mut copper_handle = match invocation.mode {
         roz_nats::dispatch::ExecutionMode::OodaReAct => {
             let max_velocity = task_config.max_velocity.unwrap_or(1.5);
             let handle = roz_worker::copper_handle::CopperHandle::spawn(max_velocity);
@@ -90,7 +70,7 @@ async fn execute_task(
             handle.state(),
         )))
     } else {
-        Box::new(roz_agent::spatial_provider::MockSpatialContextProvider::empty())
+        Box::new(roz_agent::spatial_provider::NullSpatialContextProvider)
     };
 
     // When Copper is active, register the deploy_controller tool and inject the
@@ -104,9 +84,97 @@ async fn execute_task(
         );
     }
 
+    // Register camera perception tools when cameras are available.
+    if let Some(ref cam_mgr) = camera_manager {
+        extensions.insert(cam_mgr.clone());
+        let shared_vision_config = Arc::new(tokio::sync::RwLock::new(roz_core::edge::vision::VisionConfig::default()));
+        extensions.insert(shared_vision_config);
+        dispatcher.register_with_category(
+            Box::new(roz_worker::camera::perception::CaptureFrameTool),
+            roz_core::tools::ToolCategory::Pure,
+        );
+        dispatcher.register_with_category(
+            Box::new(roz_worker::camera::perception::ListCamerasTool),
+            roz_core::tools::ToolCategory::Pure,
+        );
+        dispatcher.register_with_category(
+            Box::new(roz_worker::camera::perception::SetVisionStrategyTool),
+            roz_core::tools::ToolCategory::Pure,
+        );
+        tracing::info!("camera perception tools registered");
+    }
+
+    // Register team tools (spawn_worker, watch_team) when this is an orchestrator
+    // (no parent_task_id). Workers cannot spawn their own workers.
+    if invocation.parent_task_id.is_none() {
+        if let Ok(tenant_uuid) = invocation.tenant_id.parse::<Uuid>() {
+            dispatcher.register_with_category(
+                Box::new(roz_agent::tools::spawn_worker::SpawnWorkerTool::new(
+                    task_nats.clone(),
+                    task_id,
+                    invocation.environment_id,
+                    task_js.clone(),
+                    tenant_uuid,
+                )),
+                roz_core::tools::ToolCategory::Pure,
+            );
+            dispatcher.register_with_category(
+                Box::new(roz_agent::tools::watch_team::WatchTeamTool::new(
+                    task_js.clone(),
+                    task_id,
+                )),
+                roz_core::tools::ToolCategory::Pure,
+            );
+            tracing::info!("team tools registered (orchestrator mode)");
+        } else {
+            tracing::warn!(
+                tenant_id = %invocation.tenant_id,
+                "skipping team tool registration: tenant_id is not a valid UUID"
+            );
+        }
+    }
+
+    // Rebuild constitution now that all tools are registered, so conditional
+    // tiers (camera, WASM, team, etc.) match the actual tool set.
+    {
+        let names = dispatcher.tool_names();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        agent_input.system_prompt[0] = roz_agent::constitution::build_constitution(agent_input.mode, &name_refs);
+    }
+
     let mut agent =
         roz_agent::agent_loop::AgentLoop::new(model, dispatcher, safety, spatial).with_extensions(extensions);
-    let output = agent.run(agent_input).await;
+
+    let output = tokio::select! {
+        result = agent.run(agent_input) => result,
+        _ = estop_rx.changed() => {
+            if *estop_rx.borrow() {
+                tracing::error!(task_id = %task_id, "E-STOP during task execution");
+                agent_cancel.cancel(); // cooperative cancel first
+                // DROP copper handle — triggers emergency halt (zeroes all commands).
+                drop(copper_handle.take());
+                let agent_err = roz_agent::error::AgentError::Safety("E-STOP activated during task execution".into());
+                let result = roz_worker::dispatch::build_task_result(task_id, Err(agent_err));
+                if let Err(e) = roz_worker::dispatch::signal_result(
+                    &task_http,
+                    &restate_url,
+                    &task_id.to_string(),
+                    &result,
+                )
+                .await
+                {
+                    tracing::error!(error = %e, "failed to signal E-STOP result to Restate");
+                }
+                return;
+            }
+            // Spurious wakeup (value still false) — agent future already cancelled,
+            // input consumed. This is unreachable in practice because estop_rx only
+            // transitions false→true, but we cannot recover the moved input.
+            Err(roz_agent::error::AgentError::Internal(
+                anyhow::anyhow!("estop watch fired without activation — agent turn lost"),
+            ))
+        }
+    };
 
     // If this is a child task (has a parent), notify the parent's team stream that this
     // child worker has exited. Complements WorkerCompleted/WorkerFailed which are published
@@ -139,6 +207,10 @@ async fn execute_task(
 }
 
 #[tokio::main]
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential startup with telemetry + capabilities + task loop"
+)]
 async fn main() -> Result<()> {
     let logfire = logfire::configure()
         .with_service_name("roz-worker")
@@ -166,13 +238,124 @@ async fn main() -> Result<()> {
     let hb_nats = nats.clone();
     let hb_worker_id = config.worker_id.clone();
     tokio::spawn(async move {
+        let subject = roz_nats::subjects::Subjects::event(&hb_worker_id, "heartbeat").expect("valid worker_id");
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
             interval.tick().await;
-            let subject = format!("events.{hb_worker_id}.heartbeat");
-            if let Err(e) = hb_nats.publish(subject, bytes::Bytes::from_static(b"{}")).await {
+            if let Err(e) = hb_nats.publish(subject.clone(), bytes::Bytes::from_static(b"{}")).await {
                 tracing::warn!(error = %e, "failed to publish heartbeat");
             }
+        }
+    });
+
+    // Spawn telemetry publisher (10 Hz)
+    let telem_nats = nats.clone();
+    let telem_worker_id = config.worker_id.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            interval.tick().await;
+            let state = serde_json::json!({
+                "timestamp": chrono::Utc::now().timestamp_millis(),
+                "joints": [],
+                "sensors": {}
+            });
+            if let Err(e) = roz_worker::telemetry::publish_state(&telem_nats, &telem_worker_id, &state).await {
+                tracing::trace!(error = %e, "telemetry publish failed");
+            }
+        }
+    });
+
+    // Initialize camera system
+    let camera_manager: Option<Arc<roz_worker::camera::CameraManager>> =
+        if config.camera.enabled || config.camera.test_pattern {
+            let hub = roz_worker::camera::stream_hub::StreamHub::new();
+            let mut manager = roz_worker::camera::CameraManager::new(hub);
+            if config.camera.test_pattern {
+                let cam_info = manager.add_test_pattern().await;
+                tracing::info!(camera = %cam_info.id, "test pattern camera registered");
+            }
+            Some(Arc::new(manager))
+        } else {
+            tracing::info!("camera system disabled");
+            None
+        };
+
+    // Publish capabilities on startup
+    let mut caps = roz_core::capabilities::RobotCapabilities {
+        robot_type: "generic".to_string(),
+        joints: vec![],
+        control_modes: vec!["position".to_string(), "velocity".to_string()],
+        workspace_bounds: None,
+        sensors: vec![],
+        max_velocity: config.max_velocity.unwrap_or(1.5),
+        cameras: vec![],
+    };
+
+    if let Some(ref cam_mgr) = camera_manager {
+        caps.cameras = cam_mgr
+            .cameras()
+            .iter()
+            .map(|c| roz_core::capabilities::CameraCapability {
+                id: c.id.0.clone(),
+                label: c.label.clone(),
+                resolution: [
+                    c.supported_resolutions.first().map_or(640, |r| r.0),
+                    c.supported_resolutions.first().map_or(480, |r| r.1),
+                ],
+                fps: c.max_fps,
+                hw_encoder: c.hw_encoder_available,
+            })
+            .collect();
+    }
+    let caps_subject =
+        roz_nats::subjects::Subjects::capabilities(&config.worker_id).expect("valid worker_id for capabilities");
+    if let Ok(payload) = serde_json::to_vec(&caps)
+        && let Err(e) = nats.publish(caps_subject, payload.into()).await
+    {
+        tracing::warn!(error = %e, "failed to publish capabilities");
+    }
+
+    // Subscribe to e-stop events
+    let estop_sub = roz_worker::estop::subscribe_estop(&nats, &config.worker_id).await?;
+    let estop_rx = roz_worker::estop::spawn_estop_listener(estop_sub);
+    tracing::info!(worker_id = %config.worker_id, "e-stop listener active");
+
+    // Spawn idle watchdog — fires if no NATS message arrives within 30s.
+    let watchdog = Arc::new(roz_worker::command_watchdog::CommandWatchdog::new(Duration::from_secs(
+        30,
+    )));
+    let watchdog_cancel = CancellationToken::new();
+    let wd = watchdog.clone();
+    let wd_cancel = watchdog_cancel.clone();
+    tokio::spawn(async move { wd.run(wd_cancel).await });
+    tracing::info!("idle watchdog active (30s deadline)");
+
+    // Register with server
+    if !config.api_key.is_empty() {
+        match roz_worker::registration::register_host(&config.api_url, &config.api_key, &config.worker_id).await {
+            Ok(host_id) => tracing::info!(host_id = %host_id, "registered with server"),
+            Err(e) => tracing::warn!(error = %e, "host registration failed"),
+        }
+    }
+
+    // Spawn edge agent session relay (handles gRPC sessions relayed via NATS).
+    let relay_nats = nats.clone();
+    let relay_worker_id = config.worker_id.clone();
+    let relay_config = config.clone();
+    let relay_estop_rx = estop_rx.clone();
+    let relay_camera_mgr = camera_manager.clone();
+    tokio::spawn(async move {
+        if let Err(e) = roz_worker::session_relay::spawn_session_relay(
+            relay_nats,
+            relay_worker_id,
+            relay_config,
+            relay_estop_rx,
+            relay_camera_mgr,
+        )
+        .await
+        {
+            tracing::error!(error = %e, "session relay exited");
         }
     });
 
@@ -185,6 +368,13 @@ async fn main() -> Result<()> {
     let restate_url = config.restate_url.clone();
 
     while let Some(msg) = sub.next().await {
+        watchdog.pet();
+
+        if *estop_rx.borrow() {
+            tracing::error!("E-STOP active — rejecting task invocation");
+            continue;
+        }
+
         tracing::info!(
             subject = %msg.subject,
             bytes = msg.payload.len(),
@@ -210,14 +400,30 @@ async fn main() -> Result<()> {
             "dispatching task"
         );
 
+        let task_nats = nats.clone();
         let task_http = http.clone();
         let restate_url = restate_url.clone();
         let task_id = invocation.task_id;
         let task_config = config.clone();
         let task_js = js.clone();
+        let task_camera_mgr = camera_manager.clone();
 
+        let task_estop_rx = estop_rx.clone();
         let span = tracing::info_span!("worker.execute_task", task_id = %task_id);
-        tokio::spawn(execute_task(invocation, task_id, task_config, task_js, task_http, restate_url).instrument(span));
+        tokio::spawn(
+            execute_task(
+                invocation,
+                task_id,
+                task_config,
+                task_nats,
+                task_js,
+                task_http,
+                restate_url,
+                task_estop_rx,
+                task_camera_mgr,
+            )
+            .instrument(span),
+        );
     }
 
     tracing::warn!("NATS subscription closed, worker exiting");

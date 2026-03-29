@@ -203,6 +203,10 @@ fn RozRepl(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         in_stream = false;
                         md = markdown::MarkdownRenderer::new();
                     }
+                    AgentEvent::ImageSnapshot { camera, caption, .. } => {
+                        let label = caption.as_deref().unwrap_or("image");
+                        stdout.println(format!("[Snapshot: {camera} \u{2014} {label}]"));
+                    }
                     AgentEvent::Error(msg) => {
                         flush_line_buf(&mut line_buf, &mut md, &stdout);
 
@@ -830,7 +834,7 @@ fn print_context_breakdown(session: &State<Option<Session>>, model: &str, stdout
         };
 
     // Constitution size estimate.
-    let constitution = roz_agent::constitution::build_constitution(roz_agent::agent_loop::AgentLoopMode::React);
+    let constitution = roz_agent::constitution::build_constitution(roz_agent::agent_loop::AgentLoopMode::React, &[]);
     let constitution_tokens = estimate_tokens(constitution.len());
 
     // Project context size estimate.
@@ -987,7 +991,7 @@ async fn provider_loop(
 
     let dispatcher = tools::build_dispatcher();
     let safety = roz_agent::safety::SafetyStack::new(vec![]); // no-op for BYOK
-    let spatial = roz_agent::spatial_provider::MockSpatialContextProvider::empty();
+    let spatial = roz_agent::spatial_provider::NullSpatialContextProvider;
 
     let mut agent_loop = roz_agent::agent_loop::AgentLoop::new(model, dispatcher, safety, Box::new(spatial));
 
@@ -995,7 +999,8 @@ async fn provider_loop(
     // Block 0: constitution (always present).
     // Block 1: project context from AGENTS.md / ROBOT.md (if found).
     let system_prompt = {
-        let constitution = roz_agent::constitution::build_constitution(roz_agent::agent_loop::AgentLoopMode::React);
+        let constitution =
+            roz_agent::constitution::build_constitution(roz_agent::agent_loop::AgentLoopMode::React, &[]);
         let mut blocks = vec![constitution];
         if let Some(project_ctx) = context::load_project_context() {
             blocks.push(project_ctx);
@@ -1031,6 +1036,8 @@ async fn provider_loop(
                     streaming: true,
                     history: Vec::new(),
                     phases: Vec::new(),
+                    cancellation_token: None,
+                    control_mode: roz_core::safety::ControlMode::default(),
                 };
 
                 // Streaming channels

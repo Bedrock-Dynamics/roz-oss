@@ -98,3 +98,31 @@ async fn invoke_message_reaches_worker_subject() {
         "params.destination should match"
     );
 }
+
+/// Verifies that keepalive messages (the same JSON format published by
+/// `session_relay.rs`) transit NATS and arrive intact on the response
+/// subject. This proves the server-side timeout reset mechanism works
+/// at the transport level.
+#[tokio::test]
+async fn keepalive_messages_flow_through_nats() {
+    let guard = roz_test::nats_container().await;
+    let nats = async_nats::connect(guard.url()).await.expect("connect");
+
+    let subject = "session.test-worker.test-session.response";
+    let mut sub = nats.subscribe(subject).await.expect("subscribe");
+
+    // Publish a keepalive message (same format as session_relay.rs).
+    let keepalive = serde_json::json!({"type": "keepalive"});
+    let payload = serde_json::to_vec(&keepalive).expect("serialize keepalive");
+    nats.publish(subject, payload.into()).await.expect("publish keepalive");
+    nats.flush().await.expect("flush");
+
+    // Verify it arrives with the correct payload.
+    let msg = tokio::time::timeout(Duration::from_secs(5), sub.next())
+        .await
+        .expect("timed out waiting for keepalive")
+        .expect("subscription closed");
+
+    let received: serde_json::Value = serde_json::from_slice(&msg.payload).expect("deserialize keepalive");
+    assert_eq!(received["type"], "keepalive");
+}

@@ -38,6 +38,17 @@ pub enum AgentError {
     /// The session is aborted to prevent repeated failed actuations on a robotics platform.
     #[error("circuit breaker tripped after {consecutive_error_turns} consecutive all-error turns")]
     CircuitBreakerTripped { consecutive_error_turns: u32 },
+
+    /// Agent loop was cancelled via `CancellationToken`.
+    #[error("agent loop cancelled (partial usage: {partial_input_tokens} in / {partial_output_tokens} out)")]
+    Cancelled {
+        partial_input_tokens: u64,
+        partial_output_tokens: u64,
+    },
+
+    /// Internal / unexpected error that does not fit another variant.
+    #[error("internal error: {0}")]
+    Internal(#[source] anyhow::Error),
 }
 
 impl AgentError {
@@ -107,6 +118,27 @@ mod tests {
             message: "invalid json".into(),
         };
         assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn cancelled_is_not_retryable() {
+        let err = AgentError::Cancelled {
+            partial_input_tokens: 50,
+            partial_output_tokens: 25,
+        };
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn cancelled_displays_partial_usage() {
+        let err = AgentError::Cancelled {
+            partial_input_tokens: 100,
+            partial_output_tokens: 50,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("cancelled"), "should mention cancellation: {msg}");
+        assert!(msg.contains("100"), "should contain input tokens: {msg}");
+        assert!(msg.contains("50"), "should contain output tokens: {msg}");
     }
 
     #[test]

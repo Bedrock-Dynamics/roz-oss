@@ -154,6 +154,8 @@ async fn full_vertical_claude_wasm_gazebo() {
         response_schema: None,
         streaming: false,
         history: vec![],
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
     };
     let output = agent.run(input).await.unwrap();
     println!("Claude: {}", output.final_response.as_deref().unwrap_or("<none>"));

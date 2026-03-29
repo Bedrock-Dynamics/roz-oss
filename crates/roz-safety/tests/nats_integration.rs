@@ -78,7 +78,7 @@ async fn estop_published_on_stale_heartbeat() {
     let estop = EStopEvent::heartbeat_timeout("worker-1");
     let payload = estop.to_json_bytes().expect("serialize e-stop event");
 
-    let subject = format!("safety.estop.{}", stale[0]);
+    let subject = roz_nats::subjects::Subjects::estop(&stale[0]).expect("valid worker_id");
     client.publish(subject, payload).await.expect("publish e-stop");
     client.flush().await.expect("flush");
 

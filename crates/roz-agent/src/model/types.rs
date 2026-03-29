@@ -12,6 +12,8 @@ pub enum ModelCapability {
     VisionAnalysis,
     FastClassification,
     EdgeInference,
+    /// Video-native model input (Gemini Live, Qwen-VL, etc.)
+    VideoInput,
 }
 
 /// Strategy for controlling model tool selection behavior.

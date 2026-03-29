@@ -91,6 +91,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             api_key: Some("roz_sk_test".into()),
             api_url: "https://roz-api.fly.dev".into(),
+            host: None,
         };
         let lines = info_lines(&config);
         assert_eq!(lines[0], format!("roz v{}", env!("CARGO_PKG_VERSION")));
@@ -106,6 +107,7 @@ mod tests {
             model: "claude-sonnet-4-6-20250514".into(),
             api_key: Some("sk-ant-test".into()),
             api_url: "https://api.anthropic.com".into(),
+            host: None,
         };
         let lines = info_lines(&config);
         assert_eq!(lines[2], "anthropic");
@@ -119,6 +121,7 @@ mod tests {
             model: "llama3:8b".into(),
             api_key: None,
             api_url: "http://localhost:11434".into(),
+            host: None,
         };
         let lines = info_lines(&config);
         assert_eq!(lines[2], "localhost:11434");
@@ -131,6 +134,7 @@ mod tests {
             model: "gpt-4o".into(),
             api_key: Some("sk-openai-test".into()),
             api_url: "https://api.openai.com".into(),
+            host: None,
         };
         let lines = info_lines(&config);
         assert_eq!(lines[2], "openai");
@@ -144,6 +148,7 @@ mod tests {
             model: "claude-sonnet-4-6".into(),
             api_key: None,
             api_url: "https://api.anthropic.com".into(),
+            host: None,
         };
         let lines = info_lines(&config);
         assert!(lines[3].contains("not authenticated"));

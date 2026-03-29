@@ -11,7 +11,7 @@ use roz_agent::error::AgentError;
 use roz_agent::model::create_model;
 use roz_agent::model::types::{Message, Model, StreamChunk};
 use roz_agent::safety::stack::SafetyStack;
-use roz_agent::spatial_provider::{MockSpatialContextProvider, SpatialContextProvider};
+use roz_agent::spatial_provider::{NullSpatialContextProvider, SpatialContextProvider};
 use roz_copper::handle::CopperHandle;
 use roz_core::tools::ToolCategory;
 use tokio::sync::mpsc;
@@ -396,7 +396,7 @@ impl LocalRuntime {
             provider.auto_detect_telemetry_tool();
             Box::new(provider)
         } else {
-            Box::new(MockSpatialContextProvider::empty())
+            Box::new(NullSpatialContextProvider)
         }
     }
 
@@ -503,7 +503,9 @@ impl LocalRuntime {
         }
 
         // System prompt blocks
-        let mut system_prompt = vec![build_constitution(mode)];
+        let names = dispatcher.tool_names();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut system_prompt = vec![build_constitution(mode, &name_refs)];
         let agents_md_path = self.project_dir.join("AGENTS.md");
         if let Ok(agents_content) = std::fs::read_to_string(&agents_md_path)
             && !agents_content.is_empty()
@@ -541,6 +543,8 @@ impl LocalRuntime {
             response_schema: None,
             streaming: false,
             history: self.history.clone(),
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent.run(input).await.map_err(RuntimeError::Model)?;
@@ -585,6 +589,8 @@ impl LocalRuntime {
             response_schema: None,
             streaming: true,
             history: self.history.clone(),
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let (chunk_tx, chunk_rx) = mpsc::channel::<StreamChunk>(64);

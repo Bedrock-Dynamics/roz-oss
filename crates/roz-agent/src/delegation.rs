@@ -173,6 +173,8 @@ impl ToolExecutor for DelegationTool {
             response_schema: None,
             streaming: false,
             history,
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         // 5. Run the delegatee
@@ -264,6 +266,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent_loop.run(input).await.unwrap();
@@ -393,6 +397,8 @@ mod tests {
             response_schema: None,
             streaming: false,
             history,
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
         };
 
         let output = agent_loop.run(input).await.unwrap();

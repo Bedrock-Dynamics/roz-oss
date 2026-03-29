@@ -1,6 +1,6 @@
 [package]
 name = "roz-worker"
-version = "0.1.0"
+version.workspace = true
 edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
@@ -22,6 +22,8 @@ rusqlite.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 async-trait.workspace = true
+schemars.workspace = true
+base64.workspace = true
 parking_lot.workspace = true
 anyhow.workspace = true
 arc-swap = "1"
@@ -33,8 +35,16 @@ ed25519-dalek.workspace = true
 reqwest.workspace = true
 roz-copper = { path = "../roz-copper", default-features = false }
 roz-local = { path = "../roz-local" }
+tokio-util.workspace = true
 futures = "0.3"
 bytes = "1"
+str0m = { workspace = true }
+openh264 = { workspace = true }
+image = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+v4l = { workspace = true }
+inotify = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

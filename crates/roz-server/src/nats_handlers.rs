@@ -114,6 +114,29 @@ async fn spawn_task_handler(nats: NatsClient, pool: PgPool, restate_ingress_url:
             }
         }
 
+        // Resolve host UUID to hostname — workers subscribe to invoke.{hostname}.>
+        let host_uuid = match uuid::Uuid::parse_str(&req.host_id) {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::error!(host_id = %req.host_id, error = %e, "invalid host_id UUID in SpawnRequest");
+                send_error(&nats, &reply_subject, &format!("invalid host_id UUID: {e}")).await;
+                continue;
+            }
+        };
+        let host_name = match roz_db::hosts::get_by_id(&pool, host_uuid).await {
+            Ok(Some(h)) => h.name,
+            Ok(None) => {
+                tracing::error!(host_id = %req.host_id, "host not found for NATS dispatch");
+                send_error(&nats, &reply_subject, &format!("host {} not found", req.host_id)).await;
+                continue;
+            }
+            Err(e) => {
+                tracing::error!(host_id = %req.host_id, error = %e, "failed to look up host for NATS dispatch");
+                send_error(&nats, &reply_subject, &format!("host lookup failed: {e}")).await;
+                continue;
+            }
+        };
+
         // Publish NATS invocation for worker dispatch.
         let invocation = roz_nats::dispatch::TaskInvocation {
             task_id: task.id,
@@ -121,10 +144,7 @@ async fn spawn_task_handler(nats: NatsClient, pool: PgPool, restate_ingress_url:
             prompt: task.prompt.clone(),
             environment_id: task.environment_id,
             safety_policy_id: None,
-            host_id: uuid::Uuid::parse_str(&req.host_id).unwrap_or_else(|e| {
-                    tracing::warn!(host_id = %req.host_id, error = %e, "invalid host_id UUID in SpawnRequest, routing to nil");
-                    uuid::Uuid::nil()
-                }),
+            host_id: host_uuid,
             timeout_secs: 300,
             mode: roz_nats::dispatch::ExecutionMode::React,
             parent_task_id: Some(req.parent_task_id),
@@ -132,7 +152,7 @@ async fn spawn_task_handler(nats: NatsClient, pool: PgPool, restate_ingress_url:
             traceparent: roz_nats::dispatch::current_traceparent(),
             phases: req.phases.clone(),
         };
-        let invoke_subject = format!("invoke.{}.{}", req.host_id, task.id);
+        let invoke_subject = format!("invoke.{host_name}.{}", task.id);
         if let Ok(payload) = serde_json::to_vec(&invocation)
             && let Err(e) = nats.publish(invoke_subject, payload.into()).await
         {

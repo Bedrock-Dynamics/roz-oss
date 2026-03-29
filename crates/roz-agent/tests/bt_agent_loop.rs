@@ -110,6 +110,8 @@ async fn bt_execution_through_agent_loop() {
         response_schema: None,
         streaming: false,
         history: vec![],
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
     };
 
     let output = agent_loop.run(input).await.expect("agent loop should complete");

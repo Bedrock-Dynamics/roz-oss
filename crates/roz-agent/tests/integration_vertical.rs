@@ -36,6 +36,8 @@ fn build_input(system_prompt: Vec<String>, user_message: &str) -> AgentInput {
         response_schema: None,
         streaming: false,
         history: vec![],
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
     }
 }
 
