@@ -9,9 +9,14 @@ pub struct Tenant {
     pub kind: String,
     pub external_id: Option<String>,
     /// Billing plan slug: "free", "paid", "team", "enterprise".
-    /// Column has DEFAULT 'free'; #[sqlx(default)] handles pre-migration rows.
     #[sqlx(default)]
     pub plan: String,
+    /// Bedrock Dynamics org members — skip all budget enforcement.
+    #[sqlx(default)]
+    pub is_internal: bool,
+    /// Pro trial expiration. While `now() < trial_ends_at`, tenant gets paid-tier limits.
+    #[sqlx(default)]
+    pub trial_ends_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
