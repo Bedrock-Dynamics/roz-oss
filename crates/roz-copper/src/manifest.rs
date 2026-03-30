@@ -18,6 +18,9 @@ pub struct RobotManifest {
     pub sensors: Vec<Sensor>,
     /// Safety parameters.
     pub safety: Option<SafetyConfig>,
+    /// Channel manifest for the WASM controller interface.
+    /// If present, used to build the [`roz_core::channels::ChannelManifest`] for this robot.
+    pub channels: Option<ChannelConfig>,
 }
 
 /// Robot identity metadata.
@@ -62,6 +65,49 @@ pub struct Sensor {
     pub rate_hz: Option<u32>,
 }
 
+/// Channel configuration section of `robot.toml`.
+///
+/// Maps directly to [`roz_core::channels::ChannelManifest`] via
+/// [`RobotManifest::channel_manifest`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelConfig {
+    /// Robot identifier (matches `ChannelManifest::robot_id`).
+    pub robot_id: String,
+    /// Robot class (e.g. `"manipulator"`, `"expressive"`, `"drone"`).
+    pub robot_class: String,
+    /// Control loop rate in Hz.
+    pub control_rate_hz: u32,
+    /// Command channels (written by the controller each tick).
+    #[serde(default)]
+    pub commands: Vec<ChannelDef>,
+    /// State channels (read by the controller each tick).
+    #[serde(default)]
+    pub states: Vec<ChannelDef>,
+}
+
+/// A single channel definition in `robot.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelDef {
+    /// Channel name (`ros2_control` convention: `"joint_name/interface_type"`).
+    pub name: String,
+    /// `"position"`, `"velocity"`, or `"effort"`.
+    #[serde(rename = "type")]
+    pub interface_type: String,
+    /// Physical unit string (e.g. `"rad"`, `"m"`, `"rad/s"`).
+    pub unit: String,
+    /// `[min, max]` value limits.
+    pub limits: [f64; 2],
+    /// Safe default value (usually `0.0`).
+    #[serde(default)]
+    pub default: f64,
+    /// Max rate of change per tick for acceleration/jerk limiting.
+    pub max_rate_of_change: Option<f64>,
+    /// Index of the corresponding position state channel.
+    pub position_state_index: Option<usize>,
+    /// Cross-channel delta constraint: `[other_command_index, max_delta]`.
+    pub max_delta_from: Option<[f64; 2]>,
+}
+
 /// Safety configuration for the robot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SafetyConfig {
@@ -85,6 +131,51 @@ impl RobotManifest {
         let contents = std::fs::read_to_string(path)?;
         let manifest: Self = toml::from_str(&contents)?;
         Ok(manifest)
+    }
+
+    /// Build a [`roz_core::channels::ChannelManifest`] from the `[channels]` section.
+    ///
+    /// Returns `None` if no `[channels]` section is present in the manifest.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an `interface_type` string is not one of `"position"`, `"velocity"`, or `"effort"`.
+    #[must_use]
+    pub fn channel_manifest(&self) -> Option<roz_core::channels::ChannelManifest> {
+        use roz_core::channels::{ChannelDescriptor, ChannelManifest, InterfaceType};
+
+        let ch = self.channels.as_ref()?;
+
+        let convert = |def: &ChannelDef| -> ChannelDescriptor {
+            let interface_type = match def.interface_type.as_str() {
+                "position" => InterfaceType::Position,
+                "velocity" => InterfaceType::Velocity,
+                "effort" => InterfaceType::Effort,
+                other => panic!("unknown interface_type in robot.toml: {other:?}"),
+            };
+            ChannelDescriptor {
+                name: def.name.clone(),
+                interface_type,
+                unit: def.unit.clone(),
+                limits: (def.limits[0], def.limits[1]),
+                default: def.default,
+                max_rate_of_change: def.max_rate_of_change,
+                position_state_index: def.position_state_index,
+                max_delta_from: def.max_delta_from.map(|[idx, delta]| {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let index = idx as usize;
+                    (index, delta)
+                }),
+            }
+        };
+
+        Some(ChannelManifest {
+            robot_id: ch.robot_id.clone(),
+            robot_class: ch.robot_class.clone(),
+            control_rate_hz: ch.control_rate_hz,
+            commands: ch.commands.iter().map(convert).collect(),
+            states: ch.states.iter().map(convert).collect(),
+        })
     }
 
     /// Render as a concise system prompt block (~400-500 tokens).
@@ -183,5 +274,107 @@ watchdog_timeout_ms = 500
         assert!(prompt.contains("arm"));
         assert!(prompt.contains("imu"));
         assert!(prompt.contains("80N"));
+    }
+
+    #[test]
+    fn channel_manifest_from_robot_toml() {
+        let toml_str = r#"
+[robot]
+name = "test"
+description = "test"
+
+[channels]
+robot_id = "test"
+robot_class = "test"
+control_rate_hz = 50
+
+[[channels.commands]]
+name = "joint/position"
+type = "position"
+unit = "rad"
+limits = [-1.0, 1.0]
+position_state_index = 0
+
+[[channels.states]]
+name = "joint/position"
+type = "position"
+unit = "rad"
+limits = [-1.0, 1.0]
+"#;
+        let manifest: RobotManifest = toml::from_str(toml_str).unwrap();
+        let ch = manifest.channel_manifest().unwrap();
+        assert_eq!(ch.robot_id, "test");
+        assert_eq!(ch.control_rate_hz, 50);
+        assert_eq!(ch.commands.len(), 1);
+        assert_eq!(ch.states.len(), 1);
+        assert_eq!(
+            ch.commands[0].interface_type,
+            roz_core::channels::InterfaceType::Position
+        );
+        assert_eq!(ch.commands[0].limits, (-1.0, 1.0));
+        assert_eq!(ch.commands[0].position_state_index, Some(0));
+    }
+
+    #[test]
+    fn channel_manifest_none_when_no_channels_section() {
+        let manifest: RobotManifest = toml::from_str(EXAMPLE_TOML).unwrap();
+        assert!(manifest.channel_manifest().is_none());
+    }
+
+    #[test]
+    fn channel_manifest_with_max_delta_from() {
+        let toml_str = r#"
+[robot]
+name = "test"
+description = "test"
+
+[channels]
+robot_id = "test"
+robot_class = "test"
+control_rate_hz = 100
+
+[[channels.commands]]
+name = "a/position"
+type = "position"
+unit = "rad"
+limits = [-3.14, 3.14]
+max_delta_from = [1, 1.5]
+
+[[channels.commands]]
+name = "b/position"
+type = "position"
+unit = "rad"
+limits = [-3.14, 3.14]
+"#;
+        let manifest: RobotManifest = toml::from_str(toml_str).unwrap();
+        let ch = manifest.channel_manifest().unwrap();
+        assert_eq!(ch.commands[0].max_delta_from, Some((1, 1.5)));
+        assert_eq!(ch.commands[1].max_delta_from, None);
+    }
+
+    #[test]
+    fn reachy_mini_robot_toml_loads() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/reachy-mini/robot.toml");
+        if path.exists() {
+            let manifest = RobotManifest::load(&path).unwrap();
+            assert_eq!(manifest.robot.name, "reachy-mini");
+            let ch = manifest.channel_manifest().unwrap();
+            assert_eq!(ch.robot_id, "reachy_mini");
+            assert_eq!(ch.robot_class, "expressive");
+            assert_eq!(ch.control_rate_hz, 50);
+            assert_eq!(ch.commands.len(), 9);
+            assert_eq!(ch.states.len(), 9);
+
+            // Verify head/orientation.yaw has max_delta_from body/yaw
+            assert_eq!(ch.commands[5].name, "head/orientation.yaw");
+            assert_eq!(ch.commands[5].max_delta_from, Some((6, 1.1345)));
+
+            // All channels are position type
+            assert!(
+                ch.commands
+                    .iter()
+                    .all(|c| c.interface_type == roz_core::channels::InterfaceType::Position)
+            );
+        }
     }
 }
