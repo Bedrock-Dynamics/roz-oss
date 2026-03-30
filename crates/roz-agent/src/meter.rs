@@ -71,3 +71,135 @@ impl UsageMeter for NoOpMeter {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_loop::{AgentInput, AgentLoop, AgentLoopMode};
+    use crate::dispatch::ToolDispatcher;
+    use crate::model::types::*;
+    use crate::safety::SafetyStack;
+    use crate::spatial_provider::MockSpatialContextProvider;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// Mock meter that records every `check_budget` and `record_usage` call.
+    struct MockMeter {
+        check_count: Arc<Mutex<u32>>,
+        record_count: Arc<Mutex<u32>>,
+        recorded_events: Arc<Mutex<Vec<UsageRecord>>>,
+    }
+
+    impl MockMeter {
+        fn new() -> (
+            Self,
+            Arc<Mutex<u32>>,
+            Arc<Mutex<u32>>,
+            Arc<Mutex<Vec<UsageRecord>>>,
+        ) {
+            let check_count = Arc::new(Mutex::new(0));
+            let record_count = Arc::new(Mutex::new(0));
+            let recorded_events = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    check_count: Arc::clone(&check_count),
+                    record_count: Arc::clone(&record_count),
+                    recorded_events: Arc::clone(&recorded_events),
+                },
+                check_count,
+                record_count,
+                recorded_events,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl UsageMeter for MockMeter {
+        async fn check_budget(&self, _tenant_id: &str) -> BudgetStatus {
+            *self.check_count.lock().unwrap() += 1;
+            BudgetStatus::WithinBudget
+        }
+
+        async fn record_usage(&self, record: UsageRecord) -> anyhow::Result<()> {
+            *self.record_count.lock().unwrap() += 1;
+            self.recorded_events.lock().unwrap().push(record);
+            Ok(())
+        }
+    }
+
+    fn simple_response(text: &str) -> CompletionResponse {
+        CompletionResponse {
+            parts: vec![ContentPart::Text {
+                text: text.to_string(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage {
+                input_tokens: 50,
+                output_tokens: 20,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn build_input(user_message: &str) -> AgentInput {
+        AgentInput {
+            task_id: "test-meter-1".to_string(),
+            tenant_id: "tenant-abc".to_string(),
+            model_name: "mock-model".to_string(),
+            system_prompt: vec!["You are a test agent.".to_string()],
+            user_message: user_message.to_string(),
+            max_cycles: 10,
+            max_tokens: 4096,
+            max_context_tokens: 200_000,
+            mode: AgentLoopMode::React,
+            phases: vec![],
+            tool_choice: None,
+            response_schema: None,
+            streaming: false,
+            history: vec![],
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_loop_calls_meter() {
+        let (mock_meter, check_count, record_count, recorded_events) = MockMeter::new();
+
+        let model = Box::new(MockModel::new(
+            vec![ModelCapability::TextReasoning],
+            vec![simple_response("Hello!")],
+        ));
+        let dispatcher = ToolDispatcher::new(Duration::from_secs(30));
+        let safety = SafetyStack::new(vec![]);
+        let spatial = Box::new(MockSpatialContextProvider::empty());
+
+        let mut agent = AgentLoop::new(model, dispatcher, safety, spatial)
+            .with_meter(Arc::new(mock_meter));
+
+        let input = build_input("Say hello");
+        let output = agent.run(input).await.expect("agent loop should complete");
+
+        // Sanity: the loop ran one cycle and produced a response.
+        assert_eq!(output.cycles, 1);
+        assert_eq!(output.final_response.as_deref(), Some("Hello!"));
+
+        // Budget was checked at least once (before the LLM call).
+        let checks = *check_count.lock().unwrap();
+        assert!(checks >= 1, "check_budget should be called at least once, got {checks}");
+
+        // Usage was recorded at least once (after the LLM response).
+        let records = *record_count.lock().unwrap();
+        assert!(records >= 1, "record_usage should be called at least once, got {records}");
+
+        // Verify the recorded UsageRecord has the expected shape.
+        let events = recorded_events.lock().unwrap();
+        let first = &events[0];
+        assert_eq!(first.resource_type, "ai_tokens");
+        assert_eq!(first.tenant_id, "tenant-abc");
+        assert_eq!(first.model.as_deref(), Some("mock-model"));
+        assert_eq!(first.input_tokens, Some(50));
+        assert_eq!(first.output_tokens, Some(20));
+        assert!(first.quantity > 0, "quantity should be positive (sum of tokens)");
+    }
+}
