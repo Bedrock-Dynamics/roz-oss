@@ -132,6 +132,7 @@ async fn full_vertical_claude_wasm_gazebo() {
     // 4. Agent setup
     let mut extensions = Extensions::new();
     extensions.insert(handle.cmd_tx());
+    extensions.insert(manifest.clone());
     let dispatcher = build_dispatcher(&mcp);
     let model = roz_agent::model::create_model("claude-sonnet-4-6", "", "", 120, "anthropic", Some(&api_key)).unwrap();
     let safety = SafetyStack::new(vec![]);

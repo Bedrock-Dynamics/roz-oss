@@ -496,10 +496,12 @@ impl LocalRuntime {
             );
         }
 
-        // Build Extensions with cmd_tx if controller is running
+        // Build Extensions with cmd_tx + manifest if controller is running
         let mut extensions = roz_agent::dispatch::Extensions::new();
         if let Some(ref handle) = self.copper_handle {
             extensions.insert(handle.cmd_tx());
+            // TODO(reachy-mini): Read manifest from ProjectManifest / roz.toml.
+            extensions.insert(roz_core::channels::ChannelManifest::ur5());
         }
 
         // System prompt blocks

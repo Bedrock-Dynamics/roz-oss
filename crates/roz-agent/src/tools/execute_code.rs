@@ -82,7 +82,7 @@ impl TypedToolExecutor for ExecuteCodeTool {
     async fn execute(
         &self,
         input: Self::Input,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
         const MAX_CODE_SIZE: usize = 100_000; // 100 KB
         if input.code.len() > MAX_CODE_SIZE {
@@ -100,9 +100,16 @@ impl TypedToolExecutor for ExecuteCodeTool {
             return Ok(ToolResult::error(serde_json::to_string(&output)?));
         }
 
-        // Try WAT/WASM first — use production safety limits for verification.
-        // Use a UR5-like manifest so that set_velocity has proper limits.
-        let manifest = roz_core::channels::ChannelManifest::ur5();
+        // Read manifest from context — no UR5 fallback.
+        let manifest = ctx
+            .extensions
+            .get::<roz_core::channels::ChannelManifest>()
+            .cloned()
+            .ok_or_else(|| {
+                Box::<dyn std::error::Error + Send + Sync>::from(
+                    "no ChannelManifest in ToolContext — configure the robot type before executing code",
+                )
+            })?;
         let host_ctx = roz_copper::wit_host::HostContext::with_manifest(manifest);
         let wasm_result = roz_copper::wasm::CuWasmTask::from_source_with_host(input.code.as_bytes(), host_ctx);
         let mut task = match wasm_result {
@@ -185,11 +192,13 @@ mod tests {
     use super::*;
 
     fn test_ctx() -> ToolContext {
+        let mut ext = crate::dispatch::Extensions::new();
+        ext.insert(roz_core::channels::ChannelManifest::ur5());
         ToolContext {
             task_id: "test-task".to_string(),
             tenant_id: "test-tenant".to_string(),
             call_id: String::new(),
-            extensions: crate::dispatch::Extensions::default(),
+            extensions: ext,
         }
     }
 

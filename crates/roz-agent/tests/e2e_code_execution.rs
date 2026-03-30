@@ -11,13 +11,20 @@
 //! Run: cargo test -p roz-agent --test e2e_code_execution
 
 use roz_agent::agent_loop::{AgentInput, AgentLoop, AgentLoopMode};
-use roz_agent::dispatch::ToolDispatcher;
+use roz_agent::dispatch::{Extensions, ToolDispatcher};
 use roz_agent::model::types::*;
 use roz_agent::safety::SafetyStack;
 use roz_agent::spatial_provider::MockSpatialContextProvider;
 use roz_agent::tools::execute_code::{EXECUTE_CODE_TOOL_NAME, ExecuteCodeTool};
 use serde_json::json;
 use std::time::Duration;
+
+/// Build extensions with a UR5 manifest for execute_code tests.
+fn test_extensions() -> Extensions {
+    let mut ext = Extensions::new();
+    ext.insert(roz_core::channels::ChannelManifest::ur5());
+    ext
+}
 
 fn build_input(user_message: &str) -> AgentInput {
     build_input_with_prompt(
@@ -95,7 +102,7 @@ async fn agent_generates_code_and_wasm_executes() {
 
     let safety = SafetyStack::new(vec![]);
     let spatial = Box::new(MockSpatialContextProvider::empty());
-    let mut agent = AgentLoop::new(model, dispatcher, safety, spatial);
+    let mut agent = AgentLoop::new(model, dispatcher, safety, spatial).with_extensions(test_extensions());
 
     let input = build_input("Wave the arm back and forth");
     let output = agent.run(input).await.expect("agent loop should complete");
@@ -154,7 +161,7 @@ async fn agent_handles_wasm_compilation_failure() {
     dispatcher.register(Box::new(ExecuteCodeTool));
     let safety = SafetyStack::new(vec![]);
     let spatial = Box::new(MockSpatialContextProvider::empty());
-    let mut agent = AgentLoop::new(model, dispatcher, safety, spatial);
+    let mut agent = AgentLoop::new(model, dispatcher, safety, spatial).with_extensions(test_extensions());
 
     let input = build_input("Write a controller");
     let output = agent
@@ -185,7 +192,7 @@ async fn live_model_generates_and_executes_wasm() {
     dispatcher.register(Box::new(ExecuteCodeTool));
     let safety = SafetyStack::new(vec![]);
     let spatial = Box::new(MockSpatialContextProvider::empty());
-    let mut agent = AgentLoop::new(model, dispatcher, safety, spatial);
+    let mut agent = AgentLoop::new(model, dispatcher, safety, spatial).with_extensions(test_extensions());
 
     let input = AgentInput {
         task_id: "live-test".to_string(),
