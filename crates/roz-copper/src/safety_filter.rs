@@ -1,4 +1,4 @@
-use roz_core::channels::ChannelManifest;
+use roz_core::channels::{ChannelManifest, InterfaceType};
 use roz_core::command::{CommandFrame, MotorCommand};
 
 /// Copper task that clamps motor commands to safety limits.
@@ -156,18 +156,36 @@ impl SafetyFilterTask {
                     .max_rate_of_change
                     .map_or(v, |max_rate| v.clamp(prev - max_rate, prev + max_rate));
 
-                // 4. Position limit enforcement (if paired with a state channel)
+                // 4. Position limit enforcement (if paired with a state channel).
+                //
+                // The safe action depends on the command interface type:
+                //   - Velocity: zero the command (stop moving toward the limit).
+                //   - Position/Effort: clamp to the boundary (hold at the limit,
+                //     do NOT zero — zero means "go to origin" for position channels).
                 if let Some(pos_idx) = desc.position_state_index
                     && let Some(&pos) = self.current_positions.get(pos_idx)
                     && let Some(pos_desc) = manifest.states.get(pos_idx)
                 {
                     let upper = pos_desc.limits.1;
                     let lower = pos_desc.limits.0;
-                    if pos >= upper - POSITION_LIMIT_MARGIN && v > 0.0 {
-                        return 0.0;
-                    }
-                    if pos <= lower + POSITION_LIMIT_MARGIN && v < 0.0 {
-                        return 0.0;
+
+                    match desc.interface_type {
+                        InterfaceType::Velocity => {
+                            if pos >= upper - POSITION_LIMIT_MARGIN && v > 0.0 {
+                                return 0.0;
+                            }
+                            if pos <= lower + POSITION_LIMIT_MARGIN && v < 0.0 {
+                                return 0.0;
+                            }
+                        }
+                        InterfaceType::Position | InterfaceType::Effort => {
+                            if pos >= upper - POSITION_LIMIT_MARGIN && v > pos {
+                                return v.clamp(lower, upper);
+                            }
+                            if pos <= lower + POSITION_LIMIT_MARGIN && v < pos {
+                                return v.clamp(lower, upper);
+                            }
+                        }
                     }
                 }
 
@@ -430,6 +448,96 @@ mod tests {
         assert_eq!(
             clamped.values[0], 0.0,
             "positive velocity near upper position limit should be zeroed"
+        );
+    }
+
+    #[test]
+    fn clamp_frame_position_channel_clamps_to_limit_not_zero() {
+        // Build a minimal position-controlled manifest (1 command channel)
+        use roz_core::channels::{ChannelDescriptor, InterfaceType};
+
+        let manifest = ChannelManifest {
+            robot_id: "test_pos".into(),
+            robot_class: "test".into(),
+            control_rate_hz: 50,
+            commands: vec![ChannelDescriptor {
+                name: "joint/position".into(),
+                interface_type: InterfaceType::Position,
+                unit: "rad".into(),
+                limits: (-0.698, 0.698), // +/-40 degrees
+                default: 0.0,
+                max_rate_of_change: None,
+                position_state_index: Some(0),
+            }],
+            states: vec![ChannelDescriptor {
+                name: "joint/position".into(),
+                interface_type: InterfaceType::Position,
+                unit: "rad".into(),
+                limits: (-0.698, 0.698),
+                default: 0.0,
+                max_rate_of_change: None,
+                position_state_index: None,
+            }],
+        };
+
+        let mut filter = SafetyFilterTask::new(std::f64::consts::PI, 0.0, None);
+
+        // Position near upper limit
+        filter.update_positions(&[0.68]);
+
+        // Command above the limit
+        let frame = CommandFrame { values: vec![0.75] };
+        let clamped = filter.clamp_frame(&frame, &manifest);
+
+        // Position channel: should clamp to upper limit (0.698), NOT return 0.0
+        assert!(
+            (clamped.values[0] - 0.698).abs() < 0.01,
+            "position channel should clamp to limit 0.698, got {}",
+            clamped.values[0]
+        );
+    }
+
+    #[test]
+    fn clamp_frame_velocity_channel_still_zeros_at_limit() {
+        // Existing velocity behavior must be preserved
+        use roz_core::channels::{ChannelDescriptor, InterfaceType};
+
+        let manifest = ChannelManifest {
+            robot_id: "test_vel".into(),
+            robot_class: "test".into(),
+            control_rate_hz: 100,
+            commands: vec![ChannelDescriptor {
+                name: "joint/velocity".into(),
+                interface_type: InterfaceType::Velocity,
+                unit: "rad/s".into(),
+                limits: (-1.5, 1.5),
+                default: 0.0,
+                max_rate_of_change: None,
+                position_state_index: Some(0),
+            }],
+            states: vec![ChannelDescriptor {
+                name: "joint/position".into(),
+                interface_type: InterfaceType::Position,
+                unit: "rad".into(),
+                limits: (-std::f64::consts::TAU, std::f64::consts::TAU),
+                default: 0.0,
+                max_rate_of_change: None,
+                position_state_index: None,
+            }],
+        };
+
+        let mut filter = SafetyFilterTask::new(1.5, 0.0, None);
+        let near_upper = std::f64::consts::TAU - 0.03;
+        filter.update_positions(&[near_upper]);
+
+        let frame = CommandFrame { values: vec![0.5] };
+        let clamped = filter.clamp_frame(&frame, &manifest);
+
+        // Velocity channel: should still return 0.0 (existing behavior)
+        assert_eq!(
+            clamped.values[0], 0.0,
+            "velocity channel should zero at boundary, got {}",
+            clamped.values[0]
         );
     }
 
