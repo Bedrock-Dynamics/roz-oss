@@ -64,7 +64,7 @@ impl SafetyFilterTask {
     ///
     /// Called when a new [`ChannelManifest`] is loaded and the control rate
     /// changes (e.g. 100 Hz -> 50 Hz).
-    pub fn set_tick_period(&mut self, period_secs: f64) {
+    pub const fn set_tick_period(&mut self, period_secs: f64) {
         self.tick_period = period_secs;
     }
 

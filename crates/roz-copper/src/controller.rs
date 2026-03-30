@@ -40,11 +40,7 @@ fn tick_period_from_hz(control_rate_hz: u32) -> Duration {
 ///
 /// Returns `Some(period)` when a new WASM controller is loaded so the caller
 /// can update the loop's tick period and safety filter.
-fn handle_command(
-    cmd: ControllerCommand,
-    wasm_task: &mut Option<CuWasmTask>,
-    running: &mut bool,
-) -> Option<Duration> {
+fn handle_command(cmd: ControllerCommand, wasm_task: &mut Option<CuWasmTask>, running: &mut bool) -> Option<Duration> {
     match cmd {
         ControllerCommand::LoadWasm(bytes, manifest) => {
             let new_period = tick_period_from_hz(manifest.control_rate_hz);
@@ -92,11 +88,105 @@ fn handle_command(
     }
 }
 
+/// Publish current controller state to the shared `ArcSwap`.
+///
+/// Clears `last_output` on idle ticks (not running and no error present)
+/// so the agent does not see stale data.
+fn publish_state(
+    shared_state: &Arc<ArcSwap<ControllerState>>,
+    tick: u64,
+    running: bool,
+    last_output: &mut Option<serde_json::Value>,
+    entities: &[roz_core::spatial::EntityState],
+    estop_reason: Option<&str>,
+) {
+    if !running && last_output.as_ref().is_none_or(|o| o.get("error").is_none()) {
+        *last_output = None;
+    }
+    shared_state.store(Arc::new(ControllerState {
+        last_tick: tick,
+        running,
+        last_output: last_output.clone(),
+        entities: entities.to_vec(),
+        estop_reason: estop_reason.map(String::from),
+    }));
+}
+
+/// Drain emergency and normal command channels, returning whether any
+/// command was received on `cmd_rx` (for watchdog bookkeeping).
+fn drain_commands(
+    cmd_rx: &std::sync::mpsc::Receiver<ControllerCommand>,
+    emergency_rx: Option<&std::sync::mpsc::Receiver<ControllerCommand>>,
+    wasm_task: &mut Option<CuWasmTask>,
+    running: &mut bool,
+    tick_period: &mut Duration,
+    safety_filter: &mut SafetyFilterTask,
+) -> bool {
+    // Emergency channel first (bypasses tokio bridge).
+    if let Some(erx) = emergency_rx {
+        while let Ok(cmd) = erx.try_recv() {
+            if let Some(new_period) = handle_command(cmd, wasm_task, running) {
+                *tick_period = new_period;
+                safety_filter.set_tick_period(new_period.as_secs_f64());
+            }
+        }
+    }
+
+    // Normal command channel.
+    let mut received = false;
+    while let Ok(cmd) = cmd_rx.try_recv() {
+        received = true;
+        if let Some(new_period) = handle_command(cmd, wasm_task, running) {
+            *tick_period = new_period;
+            safety_filter.set_tick_period(new_period.as_secs_f64());
+        }
+    }
+    received
+}
+
+/// Check the agent watchdog timer. If the agent has gone silent for longer
+/// than `timeout`, autonomously halt the controller, send zero velocity to
+/// `zero_sender` (if provided), and fire an estop notification.
+///
+/// Returns `true` when the watchdog fired (caller should skip the WASM tick).
+#[allow(clippy::too_many_arguments)]
+fn check_watchdog(
+    running: &mut bool,
+    last_agent_contact: Instant,
+    timeout: Duration,
+    last_velocity_count: usize,
+    zero_sender: Option<&dyn crate::io::ActuatorSink>,
+    estop_tx: &tokio::sync::mpsc::Sender<String>,
+    estop_reason: &mut Option<String>,
+    last_output: &mut Option<serde_json::Value>,
+) -> bool {
+    if !*running || last_agent_contact.elapsed() <= timeout {
+        return false;
+    }
+    tracing::error!("agent watchdog timeout ({timeout:?}), autonomous halt");
+    *running = false;
+    if let Some(sink) = zero_sender {
+        let _ = sink.send(&CommandFrame::zero(last_velocity_count.max(6)));
+    }
+    let reason = format!(
+        "controller_error: agent watchdog timeout ({}ms)",
+        last_agent_contact.elapsed().as_millis()
+    );
+    let _ = estop_tx.try_send(reason.clone());
+    *estop_reason = Some(reason);
+    *last_output = Some(serde_json::json!({
+        "error": "agent watchdog timeout",
+        "elapsed_ms": last_agent_contact.elapsed().as_millis(),
+    }));
+    true
+}
+
 /// Tick the WASM controller, extract commands, and apply safety filtering.
 ///
 /// Returns the clamped [`CommandFrame`] if any non-default command values
-/// were produced this tick. On WASM trap, sets `running` to `false` and
-/// records the error in `last_output`.
+/// were produced this tick. On WASM trap, sets `running` to `false`,
+/// records the error in `last_output`, and sends the reason through
+/// `estop_tx` so the supervisor/adapter can disable motors.
 ///
 /// # Sensor injection
 ///
@@ -104,12 +194,22 @@ fn handle_command(
 /// via [`CuWasmTask::host_context_mut`] **before** calling this function.
 /// `run_controller_loop` does this automatically when a `SensorSource` is
 /// provided.
+///
+/// # E-stop propagation
+///
+/// Any tick error (explicit `request_estop()`, epoch timeout, OOM, or
+/// generic WASM trap) is sent through `estop_tx` via `try_send` so the
+/// real-time loop is never blocked by a slow receiver. The returned
+/// `estop_reason` is set on the error message for inclusion in
+/// [`ControllerState`].
 fn tick_wasm(
     task: &mut CuWasmTask,
     tick: u64,
     running: &mut bool,
     last_output: &mut Option<serde_json::Value>,
     safety_filter: &mut SafetyFilterTask,
+    estop_tx: &tokio::sync::mpsc::Sender<String>,
+    estop_reason: &mut Option<String>,
 ) -> Option<CommandFrame> {
     match task.tick(tick) {
         Ok(()) => {
@@ -144,10 +244,18 @@ fn tick_wasm(
             Some(clamped)
         }
         Err(e) => {
-            tracing::error!(tick, error = %e, "WASM tick failed, halting");
+            let msg = e.to_string();
+            tracing::error!(tick, error = %msg, "WASM tick failed, halting");
             *running = false;
+
+            // Notify supervisor/adapter of the controller error.
+            // try_send is non-blocking — critical for the real-time loop.
+            let reason = format!("controller_error: {msg}");
+            let _ = estop_tx.try_send(reason.clone());
+            *estop_reason = Some(reason);
+
             *last_output = Some(serde_json::json!({
-                "error": e.to_string(),
+                "error": msg,
                 "tick": tick,
             }));
             None
@@ -195,6 +303,7 @@ pub fn run_controller_loop(
     mut sensor: Option<&mut dyn crate::io::SensorSource>,
     watchdog_timeout: Duration,
     emergency_rx: Option<&std::sync::mpsc::Receiver<ControllerCommand>>,
+    estop_tx: &tokio::sync::mpsc::Sender<String>,
 ) {
     let mut safety_filter = SafetyFilterTask::new(max_velocity, 50.0, None);
     let mut wasm_task: Option<CuWasmTask> = None;
@@ -211,6 +320,9 @@ pub fn run_controller_loop(
     let mut last_agent_contact = Instant::now();
     let mut last_velocity_count: usize = 0;
 
+    // E-stop reason — set on WASM error or watchdog timeout.
+    let mut estop_reason: Option<String> = None;
+
     // Latest sensor data, persisted across ticks until new data arrives.
     let mut entities: Vec<roz_core::spatial::EntityState> = Vec::new();
     let mut sensor_joint_positions: Vec<f64> = Vec::new();
@@ -222,15 +334,21 @@ pub fn run_controller_loop(
     while !shutdown.load(Ordering::Relaxed) {
         let tick_start = Instant::now();
 
-        // --- Drain emergency channel first (bypasses tokio bridge) ---
-        if let Some(erx) = emergency_rx {
-            while let Ok(cmd) = erx.try_recv() {
-                if let Some(new_period) = handle_command(cmd, &mut wasm_task, &mut running) {
-                    tick_period = new_period;
-                    safety_filter.set_tick_period(new_period.as_secs_f64());
-                }
-                last_agent_contact = Instant::now();
-            }
+        // --- Drain commands (emergency first, then normal) ---
+        let received = drain_commands(
+            cmd_rx,
+            emergency_rx,
+            &mut wasm_task,
+            &mut running,
+            &mut tick_period,
+            &mut safety_filter,
+        );
+        if received {
+            last_agent_contact = Instant::now();
+        }
+        // Emergency channel also resets watchdog (any contact counts).
+        if emergency_rx.is_some_and(|_| received) {
+            last_agent_contact = Instant::now();
         }
 
         // --- Read sensor data (non-blocking) ---
@@ -243,49 +361,36 @@ pub fn run_controller_loop(
             sensor_sim_time_ns = frame.sim_time_ns;
         }
 
-        // --- Drain all pending commands (non-blocking) ---
-        let mut received_command = false;
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            received_command = true;
-            if let Some(new_period) = handle_command(cmd, &mut wasm_task, &mut running) {
-                tick_period = new_period;
-                safety_filter.set_tick_period(new_period.as_secs_f64());
-            }
-        }
-        if received_command {
-            last_agent_contact = Instant::now();
-        }
-
-        // --- Agent watchdog — auto-halt if agent goes silent ---
-        if running && last_agent_contact.elapsed() > watchdog_timeout {
-            tracing::error!("agent watchdog timeout ({:?}), autonomous halt", watchdog_timeout);
-            running = false;
-            if let Some(sink) = actuator {
-                let zero_count = last_velocity_count.max(6);
-                let _ = sink.send(&CommandFrame::zero(zero_count));
-            }
-            last_output = Some(serde_json::json!({
-                "error": "agent watchdog timeout",
-                "elapsed_ms": last_agent_contact.elapsed().as_millis(),
-            }));
-        }
+        check_watchdog(
+            &mut running,
+            last_agent_contact,
+            watchdog_timeout,
+            last_velocity_count,
+            actuator,
+            estop_tx,
+            &mut estop_reason,
+            &mut last_output,
+        );
 
         // --- Tick WASM controller ---
         if running && let Some(ref mut task) = wasm_task {
             // Inject latest sensor data into HostContext before WASM tick.
-            // Note: reset_commands() is called inside CuWasmTask::tick().
-            // Concatenate positions + velocities into state_values (matches
-            // UR5 manifest layout: positions 0..N, velocities N..2N).
             let ctx = task.host_context_mut();
             ctx.state_values.clear();
             ctx.state_values.extend_from_slice(&sensor_joint_positions);
             ctx.state_values.extend_from_slice(&sensor_joint_velocities);
             ctx.sim_time_ns = sensor_sim_time_ns;
-
-            // Inject sensor positions for position-limit enforcement.
             safety_filter.update_positions(&sensor_joint_positions);
 
-            if let Some(ref clamped) = tick_wasm(task, tick, &mut running, &mut last_output, &mut safety_filter) {
+            if let Some(ref clamped) = tick_wasm(
+                task,
+                tick,
+                &mut running,
+                &mut last_output,
+                &mut safety_filter,
+                estop_tx,
+                &mut estop_reason,
+            ) {
                 last_velocity_count = clamped.values.len();
                 if let Some(sink) = actuator
                     && let Err(e) = sink.send(clamped)
@@ -295,43 +400,36 @@ pub fn run_controller_loop(
             }
         }
 
-        // --- Publish state (lock-free) ---
-        // Clear last_output on idle ticks (not running, no new output).
-        if !running && last_output.as_ref().is_none_or(|o| o.get("error").is_none()) {
-            last_output = None;
-        }
-        shared_state.store(Arc::new(ControllerState {
-            last_tick: tick,
+        publish_state(
+            shared_state,
+            tick,
             running,
-            last_output: last_output.clone(),
-            entities: entities.clone(),
-        }));
-
+            &mut last_output,
+            &entities,
+            estop_reason.as_deref(),
+        );
         tick += 1;
 
-        // --- Sleep for remainder of tick period ---
         let elapsed = tick_start.elapsed();
         if let Some(remaining) = tick_period.checked_sub(elapsed) {
             std::thread::sleep(remaining);
         }
     }
 
-    // --- Final drain: process any emergency commands that arrived during shutdown ---
-    // This handles the race where Drop sends Halt + sets shutdown simultaneously:
-    // the loop exits on shutdown before draining the emergency channel.
+    // Final drain: process emergency commands that arrived during shutdown.
     if let Some(erx) = emergency_rx {
         while let Ok(cmd) = erx.try_recv() {
             let _ = handle_command(cmd, &mut wasm_task, &mut running);
         }
     }
-    // Publish final state so observers see running=false after emergency halt.
-    shared_state.store(Arc::new(ControllerState {
-        last_tick: tick,
+    publish_state(
+        shared_state,
+        tick,
         running,
-        last_output: last_output.clone(),
-        entities,
-    }));
-
+        &mut last_output,
+        &entities,
+        estop_reason.as_deref(),
+    );
     tracing::info!(total_ticks = tick, "copper controller loop stopped");
 }
 
@@ -367,6 +465,7 @@ pub fn run_controller_loop_with_gazebo(
     mut gazebo: GazeboConfig,
     watchdog_timeout: Duration,
     emergency_rx: Option<&std::sync::mpsc::Receiver<ControllerCommand>>,
+    estop_tx: &tokio::sync::mpsc::Sender<String>,
 ) {
     let mut safety_filter = SafetyFilterTask::new(max_velocity, 50.0, None);
     let mut wasm_task: Option<CuWasmTask> = None;
@@ -383,6 +482,9 @@ pub fn run_controller_loop_with_gazebo(
     let mut last_agent_contact = Instant::now();
     let mut last_velocity_count: usize = 0;
 
+    // E-stop reason — set on WASM error or watchdog timeout.
+    let mut estop_reason: Option<String> = None;
+
     tracing::info!(
         max_velocity,
         ?watchdog_timeout,
@@ -392,43 +494,37 @@ pub fn run_controller_loop_with_gazebo(
     while !shutdown.load(Ordering::Relaxed) {
         let tick_start = Instant::now();
 
-        // --- Drain emergency channel first (bypasses tokio bridge) ---
-        if let Some(erx) = emergency_rx {
-            while let Ok(cmd) = erx.try_recv() {
-                if let Some(new_period) = handle_command(cmd, &mut wasm_task, &mut running) {
-                    tick_period = new_period;
-                    safety_filter.set_tick_period(new_period.as_secs_f64());
-                }
-                last_agent_contact = Instant::now();
-            }
+        // --- Drain commands (emergency first, then normal) ---
+        let received = drain_commands(
+            cmd_rx,
+            emergency_rx,
+            &mut wasm_task,
+            &mut running,
+            &mut tick_period,
+            &mut safety_filter,
+        );
+        if received {
+            last_agent_contact = Instant::now();
         }
 
         // --- Read pose data from Gazebo (non-blocking) ---
-        // Drain all buffered pose messages, keeping only the latest.
         while let Some((pose_v, _meta)) = gazebo.pose_subscriber.try_recv() {
             entities = crate::gazebo_sensor::poses_to_entities(&pose_v);
-        }
-
-        // --- Drain all pending commands (non-blocking) ---
-        let mut received_command = false;
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            received_command = true;
-            if let Some(new_period) = handle_command(cmd, &mut wasm_task, &mut running) {
-                tick_period = new_period;
-                safety_filter.set_tick_period(new_period.as_secs_f64());
-            }
-        }
-        if received_command {
-            last_agent_contact = Instant::now();
         }
 
         // --- Agent watchdog — auto-halt if agent goes silent ---
         if running && last_agent_contact.elapsed() > watchdog_timeout {
             tracing::error!("agent watchdog timeout ({:?}), autonomous halt", watchdog_timeout);
             running = false;
-            // Send zero velocity via Gazebo publisher.
-            let zero_count = last_velocity_count.max(6);
-            let _ = gazebo.joint_publisher.send(&CommandFrame::zero(zero_count));
+            let _ = gazebo
+                .joint_publisher
+                .send(&CommandFrame::zero(last_velocity_count.max(6)));
+            let reason = format!(
+                "controller_error: agent watchdog timeout ({}ms)",
+                last_agent_contact.elapsed().as_millis()
+            );
+            let _ = estop_tx.try_send(reason.clone());
+            estop_reason = Some(reason);
             last_output = Some(serde_json::json!({
                 "error": "agent watchdog timeout",
                 "elapsed_ms": last_agent_contact.elapsed().as_millis(),
@@ -437,8 +533,15 @@ pub fn run_controller_loop_with_gazebo(
 
         // --- Tick WASM controller ---
         if running && let Some(ref mut task) = wasm_task {
-            // Note: reset_commands() is called inside CuWasmTask::tick().
-            if let Some(ref clamped) = tick_wasm(task, tick, &mut running, &mut last_output, &mut safety_filter) {
+            if let Some(ref clamped) = tick_wasm(
+                task,
+                tick,
+                &mut running,
+                &mut last_output,
+                &mut safety_filter,
+                estop_tx,
+                &mut estop_reason,
+            ) {
                 last_velocity_count = clamped.values.len();
                 if let Err(e) = gazebo.joint_publisher.send(clamped) {
                     tracing::warn!(error = %e, "failed to send joint command to Gazebo");
@@ -446,39 +549,36 @@ pub fn run_controller_loop_with_gazebo(
             }
         }
 
-        // --- Publish state (lock-free) ---
-        if !running && last_output.as_ref().is_none_or(|o| o.get("error").is_none()) {
-            last_output = None;
-        }
-        shared_state.store(Arc::new(ControllerState {
-            last_tick: tick,
+        publish_state(
+            shared_state,
+            tick,
             running,
-            last_output: last_output.clone(),
-            entities: entities.clone(),
-        }));
-
+            &mut last_output,
+            &entities,
+            estop_reason.as_deref(),
+        );
         tick += 1;
 
-        // --- Sleep for remainder of tick period ---
         let elapsed = tick_start.elapsed();
         if let Some(remaining) = tick_period.checked_sub(elapsed) {
             std::thread::sleep(remaining);
         }
     }
 
-    // --- Final drain: process any emergency commands that arrived during shutdown ---
+    // Final drain: process emergency commands that arrived during shutdown.
     if let Some(erx) = emergency_rx {
         while let Ok(cmd) = erx.try_recv() {
             let _ = handle_command(cmd, &mut wasm_task, &mut running);
         }
     }
-    shared_state.store(Arc::new(ControllerState {
-        last_tick: tick,
+    publish_state(
+        shared_state,
+        tick,
         running,
-        last_output: last_output.clone(),
-        entities,
-    }));
-
+        &mut last_output,
+        &entities,
+        estop_reason.as_deref(),
+    );
     tracing::info!(total_ticks = tick, "copper controller loop stopped (gazebo)");
 }
 
@@ -510,7 +610,7 @@ mod tests {
         assert_eq!(period, Duration::from_millis(2));
     }
 
-    /// Helper: spawn controller loop, return (tx, state, shutdown, join_handle).
+    /// Helper: spawn controller loop, return (tx, state, shutdown, join_handle, estop_rx).
     fn spawn_controller(
         max_velocity: f64,
     ) -> (
@@ -518,16 +618,28 @@ mod tests {
         Arc<ArcSwap<ControllerState>>,
         Arc<AtomicBool>,
         std::thread::JoinHandle<()>,
+        tokio::sync::mpsc::Receiver<String>,
     ) {
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
         let state = Arc::new(ArcSwap::from_pointee(ControllerState::default()));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let (estop_tx, estop_rx) = tokio::sync::mpsc::channel(4);
         let s = Arc::clone(&state);
         let sd = Arc::clone(&shutdown);
         let handle = std::thread::spawn(move || {
-            run_controller_loop(&rx, &s, max_velocity, &sd, None, None, Duration::from_secs(60), None);
+            run_controller_loop(
+                &rx,
+                &s,
+                max_velocity,
+                &sd,
+                None,
+                None,
+                Duration::from_secs(60),
+                None,
+                &estop_tx,
+            );
         });
-        (tx, state, shutdown, handle)
+        (tx, state, shutdown, handle, estop_rx)
     }
 
     fn stop(shutdown: &Arc<AtomicBool>, handle: std::thread::JoinHandle<()>) {
@@ -539,7 +651,7 @@ mod tests {
 
     #[test]
     fn starts_idle_and_publishes_state() {
-        let (_tx, state, shutdown, handle) = spawn_controller(1.5);
+        let (_tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
         std::thread::sleep(Duration::from_millis(50));
 
         let current = state.load();
@@ -554,7 +666,7 @@ mod tests {
     fn loads_wasm_and_ticks() {
         let wat = r#"(module (func (export "process") (param i64) nop))"#;
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-        let (tx, state, shutdown, handle) = spawn_controller(1.5);
+        let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
 
         tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
             .unwrap();
@@ -575,7 +687,7 @@ mod tests {
     fn halts_on_wasm_trap() {
         let wat = r#"(module (func (export "process") (param i64) unreachable))"#;
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-        let (tx, state, shutdown, handle) = spawn_controller(1.5);
+        let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
 
         tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
             .unwrap();
@@ -604,7 +716,7 @@ mod tests {
             )
         "#;
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-        let (tx, state, shutdown, handle) = spawn_controller(1.5);
+        let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
 
         tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
             .unwrap();
@@ -637,7 +749,7 @@ mod tests {
             )
         "#;
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-        let (tx, state, shutdown, handle) = spawn_controller(1.5);
+        let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
 
         tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
             .unwrap();
@@ -671,7 +783,7 @@ mod tests {
             )
         "#;
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-        let (tx, state, shutdown, handle) = spawn_controller(1.5);
+        let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
 
         tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
             .unwrap();
@@ -701,7 +813,7 @@ mod tests {
             )
         "#;
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(3, 1.5);
-        let (tx, state, shutdown, handle) = spawn_controller(1.5);
+        let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
 
         tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
             .unwrap();
@@ -737,7 +849,7 @@ mod tests {
             )
         "#;
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-        let (tx, state, shutdown, handle) = spawn_controller(1.5);
+        let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
 
         tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
             .unwrap();
@@ -766,7 +878,7 @@ mod tests {
             )
         "#;
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-        let (tx, state, shutdown, handle) = spawn_controller(1.5);
+        let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
 
         tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
             .unwrap();
@@ -810,7 +922,7 @@ mod tests {
             )
         "#;
 
-        let (tx, state, shutdown, handle) = spawn_controller(1.5);
+        let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
 
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
         tx.send(ControllerCommand::LoadWasm(wat_slow.as_bytes().to_vec(), manifest))
@@ -847,7 +959,7 @@ mod tests {
             )
         "#;
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-        let (tx, state, shutdown, handle) = spawn_controller(1.5);
+        let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
 
         tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
             .unwrap();
@@ -858,6 +970,65 @@ mod tests {
         let output = current.last_output.as_ref().expect("should have error output");
         let err = output["error"].as_str().unwrap();
         assert!(err.contains("e-stop"), "error should mention e-stop: {err}");
+
+        // estop_reason should be set in shared state for agent observability.
+        let reason = current.estop_reason.as_ref().expect("estop_reason should be set");
+        assert!(
+            reason.contains("e-stop"),
+            "estop_reason should mention e-stop: {reason}"
+        );
+
+        stop(&shutdown, handle);
+    }
+
+    #[test]
+    fn estop_channel_notified_on_wasm_trap() {
+        // WASM module that traps immediately (unreachable).
+        let wat = r#"(module (func (export "process") (param i64) unreachable))"#;
+        let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
+        let (tx, state, shutdown, handle, mut estop_rx) = spawn_controller(1.5);
+
+        tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Controller should have halted.
+        assert!(!state.load().running, "should halt after trap");
+
+        // Estop channel should have received a notification (non-blocking check).
+        let msg = estop_rx.try_recv().expect("estop channel should have a message");
+        assert!(
+            msg.starts_with("controller_error:"),
+            "estop message should be prefixed with controller_error: got {msg}"
+        );
+
+        // estop_reason in shared state should match.
+        let reason = state.load().estop_reason.clone().expect("estop_reason should be set");
+        assert_eq!(reason, msg, "shared state reason should match channel message");
+
+        stop(&shutdown, handle);
+    }
+
+    #[test]
+    fn estop_channel_notified_on_explicit_estop() {
+        // WASM module that calls request_estop().
+        let wat = r#"
+            (module
+                (import "safety" "request_estop" (func $estop))
+                (func (export "process") (param i64) (call $estop))
+            )
+        "#;
+        let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
+        let (tx, _state, shutdown, handle, mut estop_rx) = spawn_controller(1.5);
+
+        tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+
+        let msg = estop_rx
+            .try_recv()
+            .expect("estop channel should have a message for explicit e-stop");
+        assert!(msg.contains("e-stop"), "estop message should mention e-stop: {msg}");
 
         stop(&shutdown, handle);
     }
@@ -880,10 +1051,21 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
         let state = Arc::new(ArcSwap::from_pointee(ControllerState::default()));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let (estop_tx, _estop_rx) = tokio::sync::mpsc::channel(4);
         let s = Arc::clone(&state);
         let sd = Arc::clone(&shutdown);
         let handle = std::thread::spawn(move || {
-            run_controller_loop(&rx, &s, 1.5, &sd, Some(&*sink_ref), None, Duration::from_secs(60), None);
+            run_controller_loop(
+                &rx,
+                &s,
+                1.5,
+                &sd,
+                Some(&*sink_ref),
+                None,
+                Duration::from_secs(60),
+                None,
+                &estop_tx,
+            );
         });
 
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
@@ -932,6 +1114,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
         let state = Arc::new(ArcSwap::from_pointee(ControllerState::default()));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let (estop_tx, _estop_rx) = tokio::sync::mpsc::channel(4);
         let s = Arc::clone(&state);
         let sd = Arc::clone(&shutdown);
         let handle = std::thread::spawn(move || {
@@ -944,6 +1127,7 @@ mod tests {
                 Some(&mut source),
                 Duration::from_secs(60),
                 None,
+                &estop_tx,
             );
         });
 
@@ -993,6 +1177,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
         let state = Arc::new(ArcSwap::from_pointee(ControllerState::default()));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let (estop_tx, _estop_rx) = tokio::sync::mpsc::channel(4);
         let s = Arc::clone(&state);
         let sd = Arc::clone(&shutdown);
 
@@ -1007,6 +1192,7 @@ mod tests {
                 None,
                 Duration::from_millis(100),
                 None,
+                &estop_tx,
             );
         });
 
