@@ -74,6 +74,10 @@ pub struct HostContext {
     /// Count of WIT host function rejections (velocity exceeded, NaN, etc.).
     /// Incremented by host functions, checked by verification.
     pub rejection_count: AtomicU32,
+    /// Agent-writable JSON config, readable by WASM via `config::get_len`
+    /// and `config::get_copy` host functions. Updated between ticks via
+    /// `ControllerCommand::UpdateParams`.
+    pub config_json: Vec<u8>,
 }
 
 impl Default for HostContext {
@@ -95,6 +99,7 @@ impl Default for HostContext {
                 .build(),
             sim_time_ns: 0,
             rejection_count: AtomicU32::new(0),
+            config_json: Vec::new(),
         }
     }
 }
@@ -209,6 +214,7 @@ pub fn register_host_functions(linker: &mut Linker<HostContext>) -> anyhow::Resu
     register_channel_functions(linker)?;
     register_legacy_functions(linker)?;
     register_system_functions(linker)?;
+    register_config_functions(linker)?;
     Ok(())
 }
 
@@ -503,6 +509,42 @@ fn register_system_functions(linker: &mut Linker<HostContext>) -> anyhow::Result
     Ok(())
 }
 
+/// Register config host functions: `config::get_len` and `config::get_copy`.
+///
+/// These allow WASM controllers to read agent-provided JSON config
+/// (e.g., PID gains) that was injected via `ControllerCommand::UpdateParams`.
+fn register_config_functions(linker: &mut Linker<HostContext>) -> anyhow::Result<()> {
+    // config::get_len — WASM queries config size
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    linker.func_wrap(
+        "config",
+        "get_len",
+        |caller: wasmtime::Caller<'_, HostContext>| -> i32 { caller.data().config_json.len() as i32 },
+    )?;
+
+    // config::get_copy — WASM provides buffer, host copies config into it
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+    linker.func_wrap(
+        "config",
+        "get_copy",
+        |mut caller: wasmtime::Caller<'_, HostContext>, ptr: i32, max_len: i32| -> i32 {
+            let config = caller.data().config_json.clone(); // clone to avoid borrow conflict
+            let copy_len = config.len().min(max_len as usize);
+            if copy_len == 0 {
+                return 0;
+            }
+            if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
+                if memory.write(&mut caller, ptr as usize, &config[..copy_len]).is_ok() {
+                    return copy_len as i32;
+                }
+            }
+            0 // write failed
+        },
+    )?;
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -549,6 +591,7 @@ mod tests {
                     default: 0.0,
                     max_rate_of_change: None,
                     position_state_index: None,
+                    max_delta_from: None,
                 },
                 ChannelDescriptor {
                     name: "joint1/velocity".into(),
@@ -558,6 +601,7 @@ mod tests {
                     default: 0.0,
                     max_rate_of_change: None,
                     position_state_index: None,
+                    max_delta_from: None,
                 },
             ],
             states: vec![
@@ -569,6 +613,7 @@ mod tests {
                     default: 0.0,
                     max_rate_of_change: None,
                     position_state_index: None,
+                    max_delta_from: None,
                 },
                 ChannelDescriptor {
                     name: "joint1/position".into(),
@@ -578,6 +623,7 @@ mod tests {
                     default: 0.0,
                     max_rate_of_change: None,
                     position_state_index: None,
+                    max_delta_from: None,
                 },
             ],
         }
@@ -1301,6 +1347,7 @@ mod tests {
                 default: 0.0,
                 max_rate_of_change: None,
                 position_state_index: None,
+                max_delta_from: None,
             }],
             states: vec![
                 ChannelDescriptor {
@@ -1311,6 +1358,7 @@ mod tests {
                     default: 0.0,
                     max_rate_of_change: None,
                     position_state_index: None,
+                    max_delta_from: None,
                 },
                 ChannelDescriptor {
                     name: "j0/velocity".into(),
@@ -1320,6 +1368,7 @@ mod tests {
                     default: 0.0,
                     max_rate_of_change: None,
                     position_state_index: None,
+                    max_delta_from: None,
                 },
             ],
         };
@@ -1374,6 +1423,19 @@ mod tests {
             other => panic!("expected i32, got {other:?}"),
         };
         assert_eq!(cnt, 6, "get_joint_count should return 6 for UR5");
+    }
+
+    #[test]
+    fn config_json_starts_empty() {
+        let ctx = HostContext::default();
+        assert!(ctx.config_json.is_empty());
+    }
+
+    #[test]
+    fn config_json_with_manifest_starts_empty() {
+        let manifest = roz_core::channels::ChannelManifest::default();
+        let ctx = HostContext::with_manifest(manifest);
+        assert!(ctx.config_json.is_empty());
     }
 
     #[test]

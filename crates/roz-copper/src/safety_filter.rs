@@ -476,6 +476,7 @@ mod tests {
                 default: 0.0,
                 max_rate_of_change: None,
                 position_state_index: Some(0),
+                max_delta_from: None,
             }],
             states: vec![ChannelDescriptor {
                 name: "joint/position".into(),
@@ -485,6 +486,7 @@ mod tests {
                 default: 0.0,
                 max_rate_of_change: None,
                 position_state_index: None,
+                max_delta_from: None,
             }],
         };
 
@@ -522,6 +524,7 @@ mod tests {
                 default: 0.0,
                 max_rate_of_change: None,
                 position_state_index: Some(0),
+                max_delta_from: None,
             }],
             states: vec![ChannelDescriptor {
                 name: "joint/position".into(),
@@ -531,6 +534,7 @@ mod tests {
                 default: 0.0,
                 max_rate_of_change: None,
                 position_state_index: None,
+                max_delta_from: None,
             }],
         };
 

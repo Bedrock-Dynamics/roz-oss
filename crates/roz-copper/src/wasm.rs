@@ -370,6 +370,26 @@ mod tests {
     }
 
     #[test]
+    fn wasm_reads_config_via_host_functions() {
+        // WAT module that calls config::get_len and stores result in a global
+        let wat = r#"
+            (module
+                (import "config" "get_len" (func $config_len (result i32)))
+                (global $len (export "config_len") (mut i32) (i32.const -1))
+                (func (export "process") (param i64)
+                    (global.set $len (call $config_len))
+                )
+            )
+        "#;
+        let mut host = HostContext::default();
+        host.config_json = br#"{"kp":1.5}"#.to_vec();
+        let mut task = CuWasmTask::from_source_with_host(wat.as_bytes(), host).unwrap();
+        task.tick(0).unwrap();
+        let len = task.get_global_i32("config_len").unwrap();
+        assert_eq!(len, 10); // {"kp":1.5} is 10 bytes
+    }
+
+    #[test]
     fn wasm_long_computation_interrupted_within_budget() {
         // WAT module with a loop that takes ~50ms
         // At deadline 8 (8ms), should be interrupted well before completion

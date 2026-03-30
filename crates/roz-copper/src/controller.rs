@@ -82,7 +82,13 @@ fn handle_command(cmd: ControllerCommand, wasm_task: &mut Option<CuWasmTask>, ru
             None
         }
         ControllerCommand::UpdateParams(params) => {
-            tracing::debug!(?params, "controller params update (not yet implemented)");
+            if let Some(ref mut task) = *wasm_task {
+                let json_bytes = serde_json::to_vec(&params).unwrap_or_default();
+                task.host_context_mut().config_json = json_bytes;
+                tracing::debug!("controller params updated");
+            } else {
+                tracing::warn!("UpdateParams ignored — no WASM controller loaded");
+            }
             None
         }
     }
