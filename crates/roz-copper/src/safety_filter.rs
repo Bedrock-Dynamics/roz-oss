@@ -143,67 +143,78 @@ impl SafetyFilterTask {
     /// 4. **Position limit enforcement** -- zeroes velocity when the paired position state
     ///    channel is at/beyond its boundary moving toward it.
     pub fn clamp_frame(&mut self, frame: &CommandFrame, manifest: &ChannelManifest) -> CommandFrame {
-        let values: Vec<f64> = frame
-            .values
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| {
-                let Some(desc) = manifest.commands.get(i) else {
-                    return 0.0; // Out-of-bounds channel — safe default
-                };
+        let mut clamped_so_far: Vec<f64> = Vec::with_capacity(frame.values.len());
 
-                // 1. NaN/Inf → channel default
-                let v = if v.is_finite() { v } else { desc.default };
+        for (i, &raw_v) in frame.values.iter().enumerate() {
+            let Some(desc) = manifest.commands.get(i) else {
+                clamped_so_far.push(0.0); // Out-of-bounds channel — safe default
+                continue;
+            };
 
-                // 2. Per-channel limit clamp
-                let v = v.clamp(desc.limits.0, desc.limits.1);
+            // 1. NaN/Inf → channel default
+            let mut v = if raw_v.is_finite() { raw_v } else { desc.default };
 
-                // 3. Rate-of-change limiting (if configured for this channel)
-                let prev = self.prev_velocities.get(i).copied().unwrap_or(desc.default);
-                let v = desc
-                    .max_rate_of_change
-                    .map_or(v, |max_rate| v.clamp(prev - max_rate, prev + max_rate));
+            // 2. Per-channel limit clamp
+            v = v.clamp(desc.limits.0, desc.limits.1);
 
-                // 4. Position limit enforcement (if paired with a state channel).
-                //
-                // The safe action depends on the command interface type:
-                //   - Velocity: zero the command (stop moving toward the limit).
-                //   - Position/Effort: clamp to the boundary (hold at the limit,
-                //     do NOT zero — zero means "go to origin" for position channels).
-                if let Some(pos_idx) = desc.position_state_index
-                    && let Some(&pos) = self.current_positions.get(pos_idx)
-                    && let Some(pos_desc) = manifest.states.get(pos_idx)
-                {
-                    let upper = pos_desc.limits.1;
-                    let lower = pos_desc.limits.0;
+            // 3. Rate-of-change limiting (if configured for this channel)
+            let prev = self.prev_velocities.get(i).copied().unwrap_or(desc.default);
+            v = desc
+                .max_rate_of_change
+                .map_or(v, |max_rate| v.clamp(prev - max_rate, prev + max_rate));
 
-                    match desc.interface_type {
-                        InterfaceType::Velocity => {
-                            if pos >= upper - POSITION_LIMIT_MARGIN && v > 0.0 {
-                                return 0.0;
-                            }
-                            if pos <= lower + POSITION_LIMIT_MARGIN && v < 0.0 {
-                                return 0.0;
-                            }
+            // 4. Position limit enforcement (if paired with a state channel).
+            //
+            // The safe action depends on the command interface type:
+            //   - Velocity: zero the command (stop moving toward the limit).
+            //   - Position/Effort: clamp to the boundary (hold at the limit,
+            //     do NOT zero — zero means "go to origin" for position channels).
+            if let Some(pos_idx) = desc.position_state_index
+                && let Some(&pos) = self.current_positions.get(pos_idx)
+                && let Some(pos_desc) = manifest.states.get(pos_idx)
+            {
+                let upper = pos_desc.limits.1;
+                let lower = pos_desc.limits.0;
+
+                match desc.interface_type {
+                    InterfaceType::Velocity => {
+                        if pos >= upper - POSITION_LIMIT_MARGIN && v > 0.0 {
+                            v = 0.0;
+                        } else if pos <= lower + POSITION_LIMIT_MARGIN && v < 0.0 {
+                            v = 0.0;
                         }
-                        InterfaceType::Position | InterfaceType::Effort => {
-                            if pos >= upper - POSITION_LIMIT_MARGIN && v > pos {
-                                return v.clamp(lower, upper);
-                            }
-                            if pos <= lower + POSITION_LIMIT_MARGIN && v < pos {
-                                return v.clamp(lower, upper);
-                            }
+                    }
+                    InterfaceType::Position | InterfaceType::Effort => {
+                        if (pos >= upper - POSITION_LIMIT_MARGIN && v > pos)
+                            || (pos <= lower + POSITION_LIMIT_MARGIN && v < pos)
+                        {
+                            v = v.clamp(lower, upper);
                         }
                     }
                 }
+            }
 
-                v
-            })
-            .collect();
+            // 5. Cross-channel delta constraint
+            if let Some((other_idx, max_delta)) = desc.max_delta_from {
+                // Use the already-clamped value of the other channel if available,
+                // otherwise use the raw input value.
+                let other_val = if other_idx < clamped_so_far.len() {
+                    clamped_so_far[other_idx]
+                } else {
+                    frame.values.get(other_idx).copied().unwrap_or(0.0)
+                };
+                let delta = v - other_val;
+                if delta.abs() > max_delta {
+                    v = other_val + delta.signum() * max_delta;
+                }
+            }
 
-        self.prev_velocities.clone_from(&values);
+            clamped_so_far.push(v);
+        }
 
-        CommandFrame { values }
+        self.prev_velocities.clone_from(&clamped_so_far);
+
+        CommandFrame { values: clamped_so_far }
     }
 }
 
@@ -591,5 +602,63 @@ mod tests {
         let frame = CommandFrame { values: vec![] };
         let clamped = filter.clamp_frame(&frame, &manifest);
         assert!(clamped.values.is_empty());
+    }
+
+    #[test]
+    fn clamp_frame_enforces_yaw_delta_constraint() {
+        use roz_core::channels::{ChannelDescriptor, InterfaceType};
+
+        let limit_65_deg = 65.0_f64.to_radians();
+        let manifest = ChannelManifest {
+            robot_id: "test".into(),
+            robot_class: "test".into(),
+            control_rate_hz: 50,
+            commands: vec![
+                ChannelDescriptor {
+                    name: "head_yaw".into(),
+                    interface_type: InterfaceType::Position,
+                    unit: "rad".into(),
+                    limits: (-std::f64::consts::PI, std::f64::consts::PI),
+                    default: 0.0,
+                    max_rate_of_change: None,
+                    position_state_index: None,
+                    max_delta_from: Some((1, limit_65_deg)), // constrained to body_yaw
+                },
+                ChannelDescriptor {
+                    name: "body_yaw".into(),
+                    interface_type: InterfaceType::Position,
+                    unit: "rad".into(),
+                    limits: (-std::f64::consts::PI, std::f64::consts::PI),
+                    default: 0.0,
+                    max_rate_of_change: None,
+                    position_state_index: None,
+                    max_delta_from: None,
+                },
+            ],
+            states: vec![],
+        };
+
+        let mut filter = SafetyFilterTask::new(std::f64::consts::PI, 0.0, None);
+
+        // Body at 0, head at 90 deg (exceeds 65 deg delta) -> clamp to 65 deg
+        let frame = CommandFrame {
+            values: vec![std::f64::consts::FRAC_PI_2, 0.0],
+        };
+        let clamped = filter.clamp_frame(&frame, &manifest);
+        assert!(
+            (clamped.values[0] - limit_65_deg).abs() < 0.01,
+            "head yaw should clamp to 65 deg from body, got {} deg",
+            clamped.values[0].to_degrees()
+        );
+
+        // Body at 0, head at 50 deg (within 65 deg) -> pass through
+        let frame2 = CommandFrame {
+            values: vec![50.0_f64.to_radians(), 0.0],
+        };
+        let clamped2 = filter.clamp_frame(&frame2, &manifest);
+        assert!(
+            (clamped2.values[0] - 50.0_f64.to_radians()).abs() < 0.01,
+            "head yaw within delta should pass through"
+        );
     }
 }

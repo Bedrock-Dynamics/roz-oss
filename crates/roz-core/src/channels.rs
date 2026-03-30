@@ -51,6 +51,11 @@ pub struct ChannelDescriptor {
     /// `None` = no position limit checking for this channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position_state_index: Option<usize>,
+    /// Maximum absolute delta between this channel and another command channel.
+    /// Used for coupled constraints (e.g., head-body yaw cable limit).
+    /// Format: `(other_command_index, max_delta_radians)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_delta_from: Option<(usize, f64)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +102,7 @@ impl ChannelManifest {
                 default: 0.0,
                 max_rate_of_change: Some(0.5), // 50 rad/s^2 at 100 Hz
                 position_state_index: Some(i), // pairs with position state at same index
+                max_delta_from: None,
             })
             .collect();
 
@@ -111,6 +117,7 @@ impl ChannelManifest {
                 default: 0.0,
                 max_rate_of_change: None,
                 position_state_index: None,
+                max_delta_from: None,
             })
             .collect();
 
@@ -122,6 +129,7 @@ impl ChannelManifest {
             default: 0.0,
             max_rate_of_change: None,
             position_state_index: None,
+            max_delta_from: None,
         }));
 
         Self {
@@ -148,6 +156,7 @@ impl ChannelManifest {
                     default: 0.0,
                     max_rate_of_change: Some(2.0),
                     position_state_index: None,
+                    max_delta_from: None,
                 },
                 ChannelDescriptor {
                     name: "body/velocity.y".into(),
@@ -157,6 +166,7 @@ impl ChannelManifest {
                     default: 0.0,
                     max_rate_of_change: Some(2.0),
                     position_state_index: None,
+                    max_delta_from: None,
                 },
                 ChannelDescriptor {
                     name: "body/velocity.z".into(),
@@ -166,6 +176,7 @@ impl ChannelManifest {
                     default: 0.0,
                     max_rate_of_change: Some(1.5),
                     position_state_index: None,
+                    max_delta_from: None,
                 },
                 ChannelDescriptor {
                     name: "body/yaw_rate".into(),
@@ -175,6 +186,7 @@ impl ChannelManifest {
                     default: 0.0,
                     max_rate_of_change: Some(1.0),
                     position_state_index: None,
+                    max_delta_from: None,
                 },
             ],
             states: vec![
@@ -186,6 +198,7 @@ impl ChannelManifest {
                     default: 0.0,
                     max_rate_of_change: None,
                     position_state_index: None,
+                    max_delta_from: None,
                 },
                 ChannelDescriptor {
                     name: "body/position.y".into(),
@@ -195,6 +208,7 @@ impl ChannelManifest {
                     default: 0.0,
                     max_rate_of_change: None,
                     position_state_index: None,
+                    max_delta_from: None,
                 },
                 ChannelDescriptor {
                     name: "body/position.z".into(),
@@ -204,6 +218,7 @@ impl ChannelManifest {
                     default: 0.0,
                     max_rate_of_change: None,
                     position_state_index: None,
+                    max_delta_from: None,
                 },
                 ChannelDescriptor {
                     name: "body/yaw".into(),
@@ -213,6 +228,7 @@ impl ChannelManifest {
                     default: 0.0,
                     max_rate_of_change: None,
                     position_state_index: None,
+                    max_delta_from: None,
                 },
             ],
         }
@@ -233,6 +249,7 @@ impl ChannelManifest {
                     default: 0.0,
                     max_rate_of_change: Some(0.5),
                     position_state_index: None,
+                    max_delta_from: None,
                 },
                 ChannelDescriptor {
                     name: "base/angular.z".into(),
@@ -242,6 +259,7 @@ impl ChannelManifest {
                     default: 0.0,
                     max_rate_of_change: Some(1.0),
                     position_state_index: None,
+                    max_delta_from: None,
                 },
             ],
             states: vec![
@@ -253,6 +271,7 @@ impl ChannelManifest {
                     default: 0.0,
                     max_rate_of_change: None,
                     position_state_index: None,
+                    max_delta_from: None,
                 },
                 ChannelDescriptor {
                     name: "base/odom.y".into(),
@@ -262,6 +281,7 @@ impl ChannelManifest {
                     default: 0.0,
                     max_rate_of_change: None,
                     position_state_index: None,
+                    max_delta_from: None,
                 },
                 ChannelDescriptor {
                     name: "base/odom.yaw".into(),
@@ -271,6 +291,7 @@ impl ChannelManifest {
                     default: 0.0,
                     max_rate_of_change: None,
                     position_state_index: None,
+                    max_delta_from: None,
                 },
             ],
         }
@@ -336,6 +357,7 @@ impl ChannelManifest {
                 default: 0.0,
                 max_rate_of_change: None,
                 position_state_index: Some(idx),
+                max_delta_from: None,
             });
         }
 
@@ -349,6 +371,7 @@ impl ChannelManifest {
                 default: 0.0,
                 max_rate_of_change: None,
                 position_state_index: Some(idx),
+                max_delta_from: None,
             });
         }
 
@@ -361,6 +384,7 @@ impl ChannelManifest {
             default: 0.0,
             max_rate_of_change: None,
             position_state_index: Some(6),
+            max_delta_from: None,
         });
 
         // Antennas (indices 7-8)
@@ -374,8 +398,12 @@ impl ChannelManifest {
                 default: 0.0,
                 max_rate_of_change: None,
                 position_state_index: Some(idx),
+                max_delta_from: None,
             });
         }
+
+        // Head yaw (index 5) constrained to <=65 deg from body yaw (index 6)
+        commands[5].max_delta_from = Some((6, 65.0_f64.to_radians()));
 
         // State channels mirror commands
         let states: Vec<ChannelDescriptor> = commands
@@ -388,6 +416,7 @@ impl ChannelManifest {
                 default: cmd.default,
                 max_rate_of_change: None,
                 position_state_index: None,
+                max_delta_from: None,
             })
             .collect();
 
@@ -415,6 +444,7 @@ impl ChannelManifest {
                 default: 0.0,
                 max_rate_of_change: None,
                 position_state_index: None,
+                max_delta_from: None,
             })
             .collect();
 

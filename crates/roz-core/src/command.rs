@@ -489,6 +489,7 @@ mod tests {
                     default: 0.5, // non-zero default
                     max_rate_of_change: None,
                     position_state_index: None,
+                    max_delta_from: None,
                 },
                 ChannelDescriptor {
                     name: "b".into(),
@@ -498,6 +499,7 @@ mod tests {
                     default: 0.0,
                     max_rate_of_change: None,
                     position_state_index: None,
+                    max_delta_from: None,
                 },
             ],
             states: vec![],
