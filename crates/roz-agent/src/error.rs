@@ -46,6 +46,11 @@ pub enum AgentError {
         partial_output_tokens: u64,
     },
 
+    /// Tenant's usage limit has been reached. Includes plan name and reset time
+    /// so the client can display a meaningful message.
+    #[error("usage limit reached on plan '{plan}', resets {period_end}")]
+    BudgetExceeded { plan: String, period_end: String },
+
     /// Internal / unexpected error that does not fit another variant.
     #[error("internal error: {0}")]
     Internal(#[source] anyhow::Error),

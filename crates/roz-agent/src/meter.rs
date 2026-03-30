@@ -91,12 +91,7 @@ mod tests {
     }
 
     impl MockMeter {
-        fn new() -> (
-            Self,
-            Arc<Mutex<u32>>,
-            Arc<Mutex<u32>>,
-            Arc<Mutex<Vec<UsageRecord>>>,
-        ) {
+        fn new() -> (Self, Arc<Mutex<u32>>, Arc<Mutex<u32>>, Arc<Mutex<Vec<UsageRecord>>>) {
             let check_count = Arc::new(Mutex::new(0));
             let record_count = Arc::new(Mutex::new(0));
             let recorded_events = Arc::new(Mutex::new(Vec::new()));
@@ -129,9 +124,7 @@ mod tests {
 
     fn simple_response(text: &str) -> CompletionResponse {
         CompletionResponse {
-            parts: vec![ContentPart::Text {
-                text: text.to_string(),
-            }],
+            parts: vec![ContentPart::Text { text: text.to_string() }],
             stop_reason: StopReason::EndTurn,
             usage: TokenUsage {
                 input_tokens: 50,
@@ -174,8 +167,7 @@ mod tests {
         let safety = SafetyStack::new(vec![]);
         let spatial = Box::new(MockSpatialContextProvider::empty());
 
-        let mut agent = AgentLoop::new(model, dispatcher, safety, spatial)
-            .with_meter(Arc::new(mock_meter));
+        let mut agent = AgentLoop::new(model, dispatcher, safety, spatial).with_meter(Arc::new(mock_meter));
 
         let input = build_input("Say hello");
         let output = agent.run(input).await.expect("agent loop should complete");
@@ -190,7 +182,10 @@ mod tests {
 
         // Usage was recorded at least once (after the LLM response).
         let records = *record_count.lock().unwrap();
-        assert!(records >= 1, "record_usage should be called at least once, got {records}");
+        assert!(
+            records >= 1,
+            "record_usage should be called at least once, got {records}"
+        );
 
         // Verify the recorded UsageRecord has the expected shape.
         let events = recorded_events.lock().unwrap();

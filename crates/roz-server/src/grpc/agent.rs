@@ -839,12 +839,11 @@ async fn run_session_loop(
                             let (client_code, client_message) = match &e {
                                 roz_agent::error::AgentError::Model(_)
                                 | roz_agent::error::AgentError::Http(_)
-                                | roz_agent::error::AgentError::Stream { .. } => {
-                                    ("agent_error".into(), "Model request failed. Please try again.".to_string())
-                                }
-                                roz_agent::error::AgentError::Safety(_) => {
-                                    ("safety_violation".into(), e.to_string())
-                                }
+                                | roz_agent::error::AgentError::Stream { .. } => (
+                                    "agent_error".into(),
+                                    "Model request failed. Please try again.".to_string(),
+                                ),
+                                roz_agent::error::AgentError::Safety(_) => ("safety_violation".into(), e.to_string()),
                                 roz_agent::error::AgentError::BudgetExceeded { .. } => {
                                     ("budget_exceeded".into(), e.to_string())
                                 }

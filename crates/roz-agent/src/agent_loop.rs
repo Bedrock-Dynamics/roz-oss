@@ -1,6 +1,7 @@
 use crate::context::ContextManager;
 use crate::dispatch::{ToolContext, ToolDispatcher};
 use crate::error::AgentError;
+use crate::meter::BudgetStatus;
 use crate::model::types::{
     CompletionRequest, CompletionResponse, ContentPart, Message, MessageRole, Model, StopReason, StreamChunk,
     StreamResponse, TokenUsage, ToolChoiceStrategy,
@@ -663,8 +664,15 @@ impl AgentLoop {
 
             // Usage budget check — stop before the next LLM call if hard-limited.
             let budget = self.meter.check_budget(&input.tenant_id).await;
-            if budget.is_hard_limited() {
-                tracing::info!(tenant_id = %input.tenant_id, "usage limit reached for tenant");
+            if let BudgetStatus::HardLimited { plan, period_end } = budget {
+                tracing::info!(%plan, %period_end, tenant_id = %input.tenant_id, "budget exhausted");
+                if cycles == 0 {
+                    return Err(AgentError::BudgetExceeded {
+                        plan,
+                        period_end: period_end.to_rfc3339(),
+                    });
+                }
+                // Mid-turn: break gracefully with partial output
                 break;
             }
 
@@ -1255,8 +1263,15 @@ impl AgentLoop {
 
             // Usage budget check — stop before the next LLM call if hard-limited.
             let budget = self.meter.check_budget(&input.tenant_id).await;
-            if budget.is_hard_limited() {
-                tracing::info!(tenant_id = %input.tenant_id, "usage limit reached for tenant");
+            if let BudgetStatus::HardLimited { plan, period_end } = budget {
+                tracing::info!(%plan, %period_end, tenant_id = %input.tenant_id, "budget exhausted");
+                if cycles == 0 {
+                    return Err(AgentError::BudgetExceeded {
+                        plan,
+                        period_end: period_end.to_rfc3339(),
+                    });
+                }
+                // Mid-turn: break gracefully with partial output
                 break;
             }
 
