@@ -1,6 +1,8 @@
 //! Real-time Copper controller loop.
 //!
-//! Runs on a dedicated thread at ~100 Hz. Drains commands from a
+//! Runs on a dedicated thread at the rate specified by the loaded
+//! [`ChannelManifest`](roz_core::channels::ChannelManifest) (defaults to
+//! 100 Hz when no manifest is loaded). Drains commands from a
 //! `std::sync::mpsc` channel (non-blocking), ticks the WASM controller,
 //! applies safety filtering, and publishes state via `ArcSwap`.
 
@@ -16,20 +18,41 @@ use crate::channels::{ControllerCommand, ControllerState};
 use crate::safety_filter::SafetyFilterTask;
 use crate::wasm::CuWasmTask;
 
-/// Target tick rate: 100 Hz = 10 ms per tick.
-const TICK_PERIOD: Duration = Duration::from_millis(10);
+/// Default tick rate: 100 Hz = 10 ms per tick.
+///
+/// Used when no WASM controller (and thus no [`ChannelManifest`]) is loaded.
+/// Once a manifest is loaded, the tick period is derived from
+/// [`ChannelManifest::control_rate_hz`].
+const DEFAULT_TICK_PERIOD: Duration = Duration::from_millis(10);
 
 // ---------------------------------------------------------------------------
 // Shared helpers (used by both plain and Gazebo controller loops)
 // ---------------------------------------------------------------------------
 
+/// Derive the tick period from a manifest's `control_rate_hz`.
+///
+/// Returns [`DEFAULT_TICK_PERIOD`] when the rate is zero (division guard).
+fn tick_period_from_hz(control_rate_hz: u32) -> Duration {
+    Duration::from_millis(1000 / u64::from(control_rate_hz.max(1)))
+}
+
 /// Process a single [`ControllerCommand`], updating wasm task and running state.
-fn handle_command(cmd: ControllerCommand, wasm_task: &mut Option<CuWasmTask>, running: &mut bool) {
+///
+/// Returns `Some(period)` when a new WASM controller is loaded so the caller
+/// can update the loop's tick period and safety filter.
+fn handle_command(
+    cmd: ControllerCommand,
+    wasm_task: &mut Option<CuWasmTask>,
+    running: &mut bool,
+) -> Option<Duration> {
     match cmd {
         ControllerCommand::LoadWasm(bytes, manifest) => {
+            let new_period = tick_period_from_hz(manifest.control_rate_hz);
             tracing::info!(
                 bytes = bytes.len(),
                 channels = manifest.command_count(),
+                control_rate_hz = manifest.control_rate_hz,
+                tick_period_ms = new_period.as_millis(),
                 "loading new WASM controller"
             );
             let host_ctx = crate::wit_host::HostContext::with_manifest(manifest);
@@ -38,17 +61,20 @@ fn handle_command(cmd: ControllerCommand, wasm_task: &mut Option<CuWasmTask>, ru
                     *wasm_task = Some(task);
                     *running = true;
                     tracing::info!("WASM controller loaded and running");
+                    Some(new_period)
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "failed to load WASM controller");
                     *wasm_task = None;
                     *running = false;
+                    None
                 }
             }
         }
         ControllerCommand::Halt => {
             tracing::info!("controller halted");
             *running = false;
+            None
         }
         ControllerCommand::Resume => {
             if wasm_task.is_some() {
@@ -57,9 +83,11 @@ fn handle_command(cmd: ControllerCommand, wasm_task: &mut Option<CuWasmTask>, ru
             } else {
                 tracing::warn!("resume ignored — no WASM controller loaded");
             }
+            None
         }
         ControllerCommand::UpdateParams(params) => {
             tracing::debug!(?params, "controller params update (not yet implemented)");
+            None
         }
     }
 }
@@ -175,6 +203,10 @@ pub fn run_controller_loop(
     // Persists across ticks so error/halt state is readable by the agent.
     let mut last_output: Option<serde_json::Value> = None;
 
+    // Tick period — starts at the default (100 Hz) and updates when a manifest
+    // is loaded via `LoadWasm`.
+    let mut tick_period = DEFAULT_TICK_PERIOD;
+
     // Agent watchdog state.
     let mut last_agent_contact = Instant::now();
     let mut last_velocity_count: usize = 0;
@@ -193,7 +225,10 @@ pub fn run_controller_loop(
         // --- Drain emergency channel first (bypasses tokio bridge) ---
         if let Some(erx) = emergency_rx {
             while let Ok(cmd) = erx.try_recv() {
-                handle_command(cmd, &mut wasm_task, &mut running);
+                if let Some(new_period) = handle_command(cmd, &mut wasm_task, &mut running) {
+                    tick_period = new_period;
+                    safety_filter.set_tick_period(new_period.as_secs_f64());
+                }
                 last_agent_contact = Instant::now();
             }
         }
@@ -212,7 +247,10 @@ pub fn run_controller_loop(
         let mut received_command = false;
         while let Ok(cmd) = cmd_rx.try_recv() {
             received_command = true;
-            handle_command(cmd, &mut wasm_task, &mut running);
+            if let Some(new_period) = handle_command(cmd, &mut wasm_task, &mut running) {
+                tick_period = new_period;
+                safety_filter.set_tick_period(new_period.as_secs_f64());
+            }
         }
         if received_command {
             last_agent_contact = Instant::now();
@@ -273,7 +311,7 @@ pub fn run_controller_loop(
 
         // --- Sleep for remainder of tick period ---
         let elapsed = tick_start.elapsed();
-        if let Some(remaining) = TICK_PERIOD.checked_sub(elapsed) {
+        if let Some(remaining) = tick_period.checked_sub(elapsed) {
             std::thread::sleep(remaining);
         }
     }
@@ -283,7 +321,7 @@ pub fn run_controller_loop(
     // the loop exits on shutdown before draining the emergency channel.
     if let Some(erx) = emergency_rx {
         while let Ok(cmd) = erx.try_recv() {
-            handle_command(cmd, &mut wasm_task, &mut running);
+            let _ = handle_command(cmd, &mut wasm_task, &mut running);
         }
     }
     // Publish final state so observers see running=false after emergency halt.
@@ -337,6 +375,10 @@ pub fn run_controller_loop_with_gazebo(
     let mut last_output: Option<serde_json::Value> = None;
     let mut entities: Vec<roz_core::spatial::EntityState> = Vec::new();
 
+    // Tick period — starts at the default (100 Hz) and updates when a manifest
+    // is loaded via `LoadWasm`.
+    let mut tick_period = DEFAULT_TICK_PERIOD;
+
     // Agent watchdog state.
     let mut last_agent_contact = Instant::now();
     let mut last_velocity_count: usize = 0;
@@ -353,7 +395,10 @@ pub fn run_controller_loop_with_gazebo(
         // --- Drain emergency channel first (bypasses tokio bridge) ---
         if let Some(erx) = emergency_rx {
             while let Ok(cmd) = erx.try_recv() {
-                handle_command(cmd, &mut wasm_task, &mut running);
+                if let Some(new_period) = handle_command(cmd, &mut wasm_task, &mut running) {
+                    tick_period = new_period;
+                    safety_filter.set_tick_period(new_period.as_secs_f64());
+                }
                 last_agent_contact = Instant::now();
             }
         }
@@ -368,7 +413,10 @@ pub fn run_controller_loop_with_gazebo(
         let mut received_command = false;
         while let Ok(cmd) = cmd_rx.try_recv() {
             received_command = true;
-            handle_command(cmd, &mut wasm_task, &mut running);
+            if let Some(new_period) = handle_command(cmd, &mut wasm_task, &mut running) {
+                tick_period = new_period;
+                safety_filter.set_tick_period(new_period.as_secs_f64());
+            }
         }
         if received_command {
             last_agent_contact = Instant::now();
@@ -413,7 +461,7 @@ pub fn run_controller_loop_with_gazebo(
 
         // --- Sleep for remainder of tick period ---
         let elapsed = tick_start.elapsed();
-        if let Some(remaining) = TICK_PERIOD.checked_sub(elapsed) {
+        if let Some(remaining) = tick_period.checked_sub(elapsed) {
             std::thread::sleep(remaining);
         }
     }
@@ -421,7 +469,7 @@ pub fn run_controller_loop_with_gazebo(
     // --- Final drain: process any emergency commands that arrived during shutdown ---
     if let Some(erx) = emergency_rx {
         while let Ok(cmd) = erx.try_recv() {
-            handle_command(cmd, &mut wasm_task, &mut running);
+            let _ = handle_command(cmd, &mut wasm_task, &mut running);
         }
     }
     shared_state.store(Arc::new(ControllerState {
@@ -437,6 +485,30 @@ pub fn run_controller_loop_with_gazebo(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tick_period_from_manifest() {
+        use roz_core::channels::ChannelManifest;
+
+        // Default manifest: 100 Hz -> 10 ms
+        let manifest = ChannelManifest::default();
+        let period = tick_period_from_hz(manifest.control_rate_hz);
+        assert_eq!(period, Duration::from_millis(10));
+
+        // Reachy Mini at 50 Hz -> 20 ms
+        let mut mini_manifest = ChannelManifest::default();
+        mini_manifest.control_rate_hz = 50;
+        let period = tick_period_from_hz(mini_manifest.control_rate_hz);
+        assert_eq!(period, Duration::from_millis(20));
+
+        // Edge case: 0 Hz should not panic, falls back to 1 Hz -> 1000 ms
+        let period = tick_period_from_hz(0);
+        assert_eq!(period, Duration::from_millis(1000));
+
+        // High rate: 500 Hz -> 2 ms
+        let period = tick_period_from_hz(500);
+        assert_eq!(period, Duration::from_millis(2));
+    }
 
     /// Helper: spawn controller loop, return (tx, state, shutdown, join_handle).
     fn spawn_controller(

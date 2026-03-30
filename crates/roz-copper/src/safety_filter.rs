@@ -60,6 +60,14 @@ impl SafetyFilterTask {
         }
     }
 
+    /// Update the tick period used for acceleration limiting.
+    ///
+    /// Called when a new [`ChannelManifest`] is loaded and the control rate
+    /// changes (e.g. 100 Hz -> 50 Hz).
+    pub fn set_tick_period(&mut self, period_secs: f64) {
+        self.tick_period = period_secs;
+    }
+
     /// Update known joint positions from sensor feedback.
     ///
     /// Call before [`clamp`](Self::clamp) each tick for position limit enforcement.
@@ -538,6 +546,36 @@ mod tests {
             clamped.values[0], 0.0,
             "velocity channel should zero at boundary, got {}",
             clamped.values[0]
+        );
+    }
+
+    #[test]
+    fn set_tick_period_affects_acceleration_limit() {
+        // At 100 Hz (0.01 s): max_delta = 50 * 0.01 = 0.5 rad/s per tick
+        let mut filter = SafetyFilterTask::new(1.5, 50.0, None);
+
+        let cmd = MotorCommand {
+            joint_velocities: vec![1.5],
+            joint_positions: None,
+            control_mode: ControlMode::Velocity,
+        };
+        let clamped = filter.clamp(&cmd);
+        assert!(
+            (clamped.joint_velocities[0] - 0.5).abs() < 0.01,
+            "at 100 Hz, max delta should be 0.5: got {}",
+            clamped.joint_velocities[0]
+        );
+
+        // Switch to 50 Hz (0.02 s): max_delta = 50 * 0.02 = 1.0 rad/s per tick
+        // Reset prev_velocities so we start from zero again.
+        let mut filter = SafetyFilterTask::new(1.5, 50.0, None);
+        filter.set_tick_period(0.02);
+
+        let clamped = filter.clamp(&cmd);
+        assert!(
+            (clamped.joint_velocities[0] - 1.0).abs() < 0.01,
+            "at 50 Hz, max delta should be 1.0: got {}",
+            clamped.joint_velocities[0]
         );
     }
 
