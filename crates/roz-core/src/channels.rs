@@ -297,6 +297,109 @@ impl ChannelManifest {
             .count()
     }
 
+    /// Reachy Mini (Pollen Robotics): 9 position command channels, 9 position state channels.
+    ///
+    /// Cartesian head pose (x,y,z,roll,pitch,yaw) + body yaw + 2 antennas.
+    /// Position-controlled at 50 Hz via the daemon's `set_target()` API.
+    /// Joint limits from official Pollen Robotics documentation.
+    pub fn reachy_mini() -> Self {
+        let limit_40_deg = 40.0_f64.to_radians();
+        let limit_160_deg = 160.0_f64.to_radians();
+
+        let head_pos_names = ["head/position.x", "head/position.y", "head/position.z"];
+        let head_pos_limits = [
+            (-0.03, 0.03),   // x: ±30mm
+            (-0.03, 0.03),   // y: ±30mm
+            (-0.015, 0.015), // z: ±15mm
+        ];
+
+        let head_orient_names = [
+            "head/orientation.roll",
+            "head/orientation.pitch",
+            "head/orientation.yaw",
+        ];
+        let head_orient_limits = [
+            (-limit_40_deg, limit_40_deg), // roll: ±40 deg
+            (-limit_40_deg, limit_40_deg), // pitch: ±40 deg
+            (-PI, PI),                     // yaw: ±180 deg
+        ];
+
+        let mut commands = Vec::with_capacity(9);
+
+        for (name, limits) in head_pos_names.iter().zip(head_pos_limits.iter()) {
+            let idx = commands.len();
+            commands.push(ChannelDescriptor {
+                name: (*name).into(),
+                interface_type: InterfaceType::Position,
+                unit: "m".into(),
+                limits: *limits,
+                default: 0.0,
+                max_rate_of_change: None,
+                position_state_index: Some(idx),
+            });
+        }
+
+        for (name, limits) in head_orient_names.iter().zip(head_orient_limits.iter()) {
+            let idx = commands.len();
+            commands.push(ChannelDescriptor {
+                name: (*name).into(),
+                interface_type: InterfaceType::Position,
+                unit: "rad".into(),
+                limits: *limits,
+                default: 0.0,
+                max_rate_of_change: None,
+                position_state_index: Some(idx),
+            });
+        }
+
+        // Body yaw (index 6)
+        commands.push(ChannelDescriptor {
+            name: "body/yaw".into(),
+            interface_type: InterfaceType::Position,
+            unit: "rad".into(),
+            limits: (-limit_160_deg, limit_160_deg),
+            default: 0.0,
+            max_rate_of_change: None,
+            position_state_index: Some(6),
+        });
+
+        // Antennas (indices 7-8)
+        for name in ["left_antenna/position", "right_antenna/position"] {
+            let idx = commands.len();
+            commands.push(ChannelDescriptor {
+                name: name.into(),
+                interface_type: InterfaceType::Position,
+                unit: "rad".into(),
+                limits: (0.0, 120.0_f64.to_radians()),
+                default: 0.0,
+                max_rate_of_change: None,
+                position_state_index: Some(idx),
+            });
+        }
+
+        // State channels mirror commands
+        let states: Vec<ChannelDescriptor> = commands
+            .iter()
+            .map(|cmd| ChannelDescriptor {
+                name: cmd.name.clone(),
+                interface_type: cmd.interface_type,
+                unit: cmd.unit.clone(),
+                limits: cmd.limits,
+                default: cmd.default,
+                max_rate_of_change: None,
+                position_state_index: None,
+            })
+            .collect();
+
+        Self {
+            robot_id: "reachy_mini".into(),
+            robot_class: "expressive".into(),
+            control_rate_hz: 50,
+            commands,
+            states,
+        }
+    }
+
     /// Generic N-joint velocity-only manifest for backward compatibility.
     ///
     /// Creates `n_joints` velocity command channels with symmetric limits
@@ -447,5 +550,37 @@ mod tests {
 
         assert_eq!(m.commands[0].name, "base/linear.x");
         assert_eq!(m.commands[1].name, "base/angular.z");
+    }
+
+    #[test]
+    fn reachy_mini_manifest_structure() {
+        let m = ChannelManifest::reachy_mini();
+        assert_eq!(m.robot_id, "reachy_mini");
+        assert_eq!(m.robot_class, "expressive");
+        assert_eq!(m.control_rate_hz, 50);
+        assert_eq!(m.commands.len(), 9);
+        assert_eq!(m.states.len(), 9);
+
+        assert_eq!(m.commands[0].name, "head/position.x");
+        assert_eq!(m.commands[5].name, "head/orientation.yaw");
+        assert_eq!(m.commands[6].name, "body/yaw");
+        assert_eq!(m.commands[7].name, "left_antenna/position");
+        assert_eq!(m.commands[8].name, "right_antenna/position");
+
+        // All position type
+        assert!(m.commands.iter().all(|c| c.interface_type == InterfaceType::Position));
+
+        // Head pitch ±40 deg
+        let limit_40 = 40.0_f64.to_radians();
+        assert!((m.commands[4].limits.1 - limit_40).abs() < 0.001);
+
+        // Body yaw ±160 deg
+        let limit_160 = 160.0_f64.to_radians();
+        assert!((m.commands[6].limits.1 - limit_160).abs() < 0.001);
+
+        // State/command pairing
+        for (i, cmd) in m.commands.iter().enumerate() {
+            assert_eq!(cmd.position_state_index, Some(i));
+        }
     }
 }
