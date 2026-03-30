@@ -8,6 +8,10 @@ pub struct Tenant {
     pub slug: String,
     pub kind: String,
     pub external_id: Option<String>,
+    /// Billing plan slug: "free", "paid", "team", "enterprise".
+    /// Column has DEFAULT 'free'; #[sqlx(default)] handles pre-migration rows.
+    #[sqlx(default)]
+    pub plan: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
