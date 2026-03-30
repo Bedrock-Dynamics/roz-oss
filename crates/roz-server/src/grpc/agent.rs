@@ -836,19 +836,24 @@ async fn run_session_loop(
                         Err(e) => {
                             tracing::error!(error = %e, "agent turn failed");
                             // Sanitize: don't leak internal URLs or gateway details to client
-                            let client_message = match &e {
+                            let (client_code, client_message) = match &e {
                                 roz_agent::error::AgentError::Model(_)
                                 | roz_agent::error::AgentError::Http(_)
                                 | roz_agent::error::AgentError::Stream { .. } => {
-                                    "Model request failed. Please try again.".to_string()
+                                    ("agent_error".into(), "Model request failed. Please try again.".to_string())
                                 }
-                                roz_agent::error::AgentError::Safety(_) => e.to_string(),
-                                _ => "Internal error. Please try again.".to_string(),
+                                roz_agent::error::AgentError::Safety(_) => {
+                                    ("safety_violation".into(), e.to_string())
+                                }
+                                roz_agent::error::AgentError::BudgetExceeded { .. } => {
+                                    ("budget_exceeded".into(), e.to_string())
+                                }
+                                _ => ("agent_error".into(), "Internal error. Please try again.".to_string()),
                             };
                             let _ = agent_tx
                                 .send(Ok(SessionResponse {
                                     response: Some(session_response::Response::Error(roz_v1::SessionError {
-                                        code: "agent_error".into(),
+                                        code: client_code,
                                         message: client_message,
                                         retryable: e.is_retryable(),
                                     })),
