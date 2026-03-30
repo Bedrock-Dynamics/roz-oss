@@ -159,6 +159,7 @@ async fn agent_loop_tool_roundtrip() {
     let input = AgentInput {
         task_id: "e2e-tool-roundtrip".to_string(),
         tenant_id: "test-tenant".to_string(),
+        model_name: String::new(),
         system_prompt: vec!["You are a calculator assistant. Use the calculator tool to multiply numbers. Always use the tool, never calculate in your head.".to_string()],
         user_message: "What is 7 times 8?".to_string(),
         max_cycles: 5,
@@ -223,6 +224,7 @@ async fn agent_loop_ooda_react_spatial() {
     let input = AgentInput {
         task_id: "e2e-spatial".to_string(),
         tenant_id: "test-tenant".to_string(),
+        model_name: String::new(),
         system_prompt: vec![
             "You are a robot monitoring assistant. Describe the spatial state of all entities you observe.".to_string(),
         ],
@@ -297,6 +299,7 @@ async fn agent_loop_safety_clamps_velocity() {
     let input = AgentInput {
         task_id: "e2e-velocity-clamp".to_string(),
         tenant_id: "test-tenant".to_string(),
+        model_name: String::new(),
         system_prompt: vec!["You are a robot arm controller. When asked to move, use the move_arm tool with the requested velocity and target.".to_string()],
         user_message: "Move the arm to [5, 5, 5] at velocity 10 m/s".to_string(),
         max_cycles: 5,
@@ -445,6 +448,7 @@ async fn agent_loop_multi_tool_batches_results() {
     let input = AgentInput {
         task_id: "e2e-multi-tool-batch".to_string(),
         tenant_id: "test-tenant".to_string(),
+        model_name: String::new(),
         system_prompt: vec![
             "You have two tools: calculator and lookup. \
              When asked to compute area, FIRST call lookup for \
@@ -528,6 +532,7 @@ async fn gemini_multi_tool_batches_results() {
     let input = AgentInput {
         task_id: "e2e-gemini-multi-tool".to_string(),
         tenant_id: "test-tenant".to_string(),
+        model_name: String::new(),
         system_prompt: vec![
             "You have two tools: calculator and lookup. \
              When asked to compute area, FIRST call lookup for \
@@ -609,6 +614,7 @@ async fn agent_loop_streaming_tool_roundtrip() {
     let input = AgentInput {
         task_id: "e2e-streaming-roundtrip".to_string(),
         tenant_id: "test-tenant".to_string(),
+        model_name: String::new(),
         system_prompt: vec!["You are a calculator assistant. Use the calculator tool to multiply numbers. Always use the tool, never calculate in your head.".to_string()],
         user_message: "What is 7 times 8?".to_string(),
         max_cycles: 5,
@@ -662,6 +668,7 @@ async fn delegation_tool_roundtrip() {
     let input = AgentInput {
         task_id: "e2e-delegation-roundtrip".to_string(),
         tenant_id: "test-tenant".to_string(),
+        model_name: String::new(),
         system_prompt: vec![
             "You have a delegate_to_spatial tool. Use it to delegate spatial analysis \
              tasks. When asked about spatial relationships or distances, delegate to the \
@@ -751,6 +758,7 @@ async fn delegation_tool_roundtrip_gemini_as_primary() {
     let input = AgentInput {
         task_id: "e2e-delegation-gemini-primary".to_string(),
         tenant_id: "test-tenant".to_string(),
+        model_name: String::new(),
         system_prompt: vec![
             "You have a delegate_to_spatial tool. Use it to delegate spatial analysis \
              tasks. When asked about spatial relationships or distances, delegate to the \
@@ -846,6 +854,7 @@ async fn compaction_does_not_fire_on_normal_conversation() {
     let input = AgentInput {
         task_id: "e2e-no-compaction".to_string(),
         tenant_id: "test-tenant".to_string(),
+        model_name: String::new(),
         system_prompt: vec![
             "You are a key-value lookup assistant. \
              Use the kv_lookup tool to check keys. \
@@ -948,6 +957,7 @@ async fn compaction_fires_correctly_with_small_context_budget() {
     let input = AgentInput {
         task_id: "e2e-small-context".to_string(),
         tenant_id: "test-tenant".to_string(),
+        model_name: String::new(),
         system_prompt: vec![system_prompt],
         user_message: "Use the kv_lookup tool to check keys: \
              foo, bar, baz. Report the values."

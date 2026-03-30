@@ -132,6 +132,8 @@ pub struct AgentServiceImpl {
     anthropic_provider: String,
     direct_api_key: Option<String>,
     fallback_model_name: Option<String>,
+    /// Usage metering — passed to each `AgentLoop` for budget checks and recording.
+    meter: Arc<dyn roz_agent::meter::UsageMeter>,
 }
 
 impl AgentServiceImpl {
@@ -149,6 +151,7 @@ impl AgentServiceImpl {
         anthropic_provider: String,
         direct_api_key: Option<String>,
         fallback_model_name: Option<String>,
+        meter: Arc<dyn roz_agent::meter::UsageMeter>,
     ) -> Self {
         Self {
             pool,
@@ -163,6 +166,7 @@ impl AgentServiceImpl {
             anthropic_provider,
             direct_api_key,
             fallback_model_name,
+            meter,
         }
     }
 }
@@ -188,6 +192,7 @@ impl AgentService for AgentServiceImpl {
         let direct_api_key = self.direct_api_key.clone();
         let fallback_model_name = self.fallback_model_name.clone();
         let nats_client = self.nats_client.clone();
+        let meter = self.meter.clone();
 
         // Extract auth header from gRPC metadata before consuming the request.
         let auth_header = request
@@ -216,6 +221,7 @@ impl AgentService for AgentServiceImpl {
                 auth_header.as_deref(),
                 &mut inbound,
                 nats_client.as_ref(),
+                meter,
             )
             .await;
         });
@@ -369,7 +375,7 @@ struct ModelConfig {
 
 #[tracing::instrument(
     name = "agent_session.stream",
-    skip(tx, pool, auth, model_config, inbound, nats_client),
+    skip(tx, pool, auth, model_config, inbound, nats_client, meter),
     fields(session_id = tracing::field::Empty, tenant_id = tracing::field::Empty, environment_id = tracing::field::Empty, model = %default_model)
 )]
 #[expect(
@@ -389,6 +395,7 @@ async fn run_session_loop(
     auth_header: Option<&str>,
     inbound: &mut Streaming<SessionRequest>,
     nats_client: Option<&async_nats::Client>,
+    meter: Arc<dyn roz_agent::meter::UsageMeter>,
 ) {
     let mut session: Option<Session> = None;
     let mut cancelled = false;
@@ -722,6 +729,7 @@ async fn run_session_loop(
                 let agent_input = AgentInput {
                     task_id: sess.id.to_string(),
                     tenant_id: sess.tenant_id.to_string(),
+                    model_name: sess.model_name.clone(),
                     system_prompt,
                     user_message: user_content,
                     max_cycles: 200, // safety ceiling, not behavioral limit
@@ -753,7 +761,8 @@ async fn run_session_loop(
                 let safety = SafetyStack::new(vec![]);
                 let spatial = Box::new(NullSpatialContextProvider);
                 let mut agent_loop = AgentLoop::new(model, dispatcher, safety, spatial)
-                    .with_pending_approvals(pending_approvals.clone());
+                    .with_pending_approvals(pending_approvals.clone())
+                    .with_meter(meter.clone());
 
                 let turn_cancel = tokio_util::sync::CancellationToken::new();
 

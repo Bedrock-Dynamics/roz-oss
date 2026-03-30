@@ -121,6 +121,7 @@ fn grpc_router(state: &AppState) -> Router {
         std::env::var("ROZ_FALLBACK_MODEL")
             .ok()
             .filter(|k| !k.trim().is_empty()),
+        state.meter.clone(),
     );
 
     // Use tonic::service::Routes directly (bypasses tonic::transport::Server
@@ -1915,6 +1916,7 @@ mod tests {
             state.model_config.anthropic_provider.clone(),
             state.model_config.direct_api_key.clone(),
             None, // fallback_model_name
+            state.meter.clone(),
         );
 
         tokio::spawn(async move {

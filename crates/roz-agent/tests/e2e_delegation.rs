@@ -63,6 +63,7 @@ async fn claude_delegates_spatial_to_gemini() {
     let input = AgentInput {
         task_id: "e2e-delegation".to_string(),
         tenant_id: "test".to_string(),
+        model_name: String::new(),
         system_prompt: vec![
             "You have a delegate_to_spatial tool. When asked for spatial or physical analysis, \
              you MUST call delegate_to_spatial with a clear task description. \

@@ -158,6 +158,7 @@ impl ToolExecutor for DelegationTool {
         let input = AgentInput {
             task_id: ctx.task_id.clone(),
             tenant_id: ctx.tenant_id.clone(),
+            model_name: String::new(),
             system_prompt: vec![
                 "You are a spatial analysis assistant. Analyze the provided spatial data, \
                  measurements, or visual information and return a clear, structured response."
@@ -255,6 +256,7 @@ mod tests {
         let input = AgentInput {
             task_id: "test-delegation".to_string(),
             tenant_id: "test-tenant".to_string(),
+            model_name: String::new(),
             system_prompt: vec!["You are a spatial analysis assistant.".to_string()],
             user_message: "analyze scene\n\nContext:\nrobot at [1,2,3]".to_string(),
             max_cycles: 1,
@@ -386,6 +388,7 @@ mod tests {
         let input = AgentInput {
             task_id: "test-delegation".to_string(),
             tenant_id: "test-tenant".to_string(),
+            model_name: String::new(),
             system_prompt: vec!["You are a spatial analysis assistant.".to_string()],
             user_message: task.to_string(),
             max_cycles: 1,

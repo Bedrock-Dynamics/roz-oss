@@ -30,6 +30,7 @@ fn build_input_with_prompt(system_prompt: Vec<String>, user_message: &str) -> Ag
     AgentInput {
         task_id: "e2e-test".to_string(),
         tenant_id: "test".to_string(),
+        model_name: String::new(),
         system_prompt,
         user_message: user_message.to_string(),
         max_cycles: 5,
@@ -189,6 +190,7 @@ async fn live_model_generates_and_executes_wasm() {
     let input = AgentInput {
         task_id: "live-test".to_string(),
         tenant_id: "test".to_string(),
+        model_name: String::new(),
         system_prompt: vec![
             "You are a robot controller. You have access to the execute_code tool. \
              When asked to control a robot, write a WAT (WebAssembly Text) module \
@@ -335,6 +337,7 @@ Respond with ONLY the WAT code. No explanation, no markdown fences, just raw WAT
     let input = AgentInput {
         task_id: "live-channel-test".to_string(),
         tenant_id: "test".to_string(),
+        model_name: String::new(),
         system_prompt: vec![system_prompt],
         user_message: "Write a WAT module that oscillates command channel 0 using sin. \
             Use the tick parameter to compute sin(tick * 0.05) * 0.5 and write it to channel 0."

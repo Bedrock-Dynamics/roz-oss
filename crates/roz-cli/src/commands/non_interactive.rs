@@ -119,6 +119,7 @@ async fn execute_byok(config: &ProviderConfig, task: &str) -> anyhow::Result<()>
     let input = roz_agent::agent_loop::AgentInput {
         task_id: uuid::Uuid::new_v4().to_string(),
         tenant_id: "cli".to_string(),
+        model_name: String::new(),
         system_prompt,
         user_message: task.to_string(),
         max_cycles: 20,

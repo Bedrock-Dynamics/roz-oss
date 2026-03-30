@@ -532,6 +532,7 @@ impl LocalRuntime {
         let input = AgentInput {
             task_id: uuid::Uuid::new_v4().to_string(),
             tenant_id: "local".to_string(),
+            model_name: String::new(),
             system_prompt,
             user_message: user_message.to_string(),
             max_cycles: 10,
@@ -578,6 +579,7 @@ impl LocalRuntime {
         let input = AgentInput {
             task_id: uuid::Uuid::new_v4().to_string(),
             tenant_id: "local".to_string(),
+            model_name: String::new(),
             system_prompt,
             user_message: user_message.to_string(),
             max_cycles: 10,

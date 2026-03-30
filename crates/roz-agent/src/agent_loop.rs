@@ -139,6 +139,9 @@ pub const RESPOND_TOOL_NAME: &str = "__respond";
 pub struct AgentInput {
     pub task_id: String,
     pub tenant_id: String,
+    /// Model name used for this run (e.g. `"claude-sonnet-4-6"`).
+    /// Included in `UsageRecord` for per-model billing breakdowns.
+    pub model_name: String,
     pub system_prompt: Vec<String>,
     pub user_message: String,
     pub max_cycles: u32,
@@ -204,6 +207,8 @@ pub struct AgentLoop {
     pending_approvals: Option<crate::dispatch::remote::PendingApprovals>,
     /// Runtime-injected handles (e.g. `CopperHandle` `cmd_tx`) passed to every `ToolContext`.
     extensions: crate::dispatch::Extensions,
+    /// Usage metering — check budget before LLM calls, record usage after.
+    meter: std::sync::Arc<dyn crate::meter::UsageMeter>,
 }
 
 /// Accumulates streamed JSON fragments for a single tool call.
@@ -254,7 +259,15 @@ impl AgentLoop {
             retry_config: RetryConfig::default(),
             pending_approvals: None,
             extensions: crate::dispatch::Extensions::default(),
+            meter: std::sync::Arc::new(crate::meter::NoOpMeter),
         }
+    }
+
+    /// Set the usage meter for budget checks and usage recording.
+    #[must_use]
+    pub fn with_meter(mut self, meter: std::sync::Arc<dyn crate::meter::UsageMeter>) -> Self {
+        self.meter = meter;
+        self
     }
 
     /// Set extensions for tool context (e.g., `CopperHandle` `cmd_tx`).
@@ -648,6 +661,13 @@ impl AgentLoop {
                 });
             }
 
+            // Usage budget check — stop before the next LLM call if hard-limited.
+            let budget = self.meter.check_budget(&input.tenant_id).await;
+            if budget.is_hard_limited() {
+                tracing::info!(tenant_id = %input.tenant_id, "usage limit reached for tenant");
+                break;
+            }
+
             if cycles >= input.max_cycles {
                 tracing::warn!(
                     cycles,
@@ -827,6 +847,26 @@ impl AgentLoop {
             total_usage.output_tokens += resp.usage.output_tokens;
             total_usage.cache_read_tokens += resp.usage.cache_read_tokens;
             total_usage.cache_creation_tokens += resp.usage.cache_creation_tokens;
+
+            // Record usage for this cycle (non-blocking, best-effort).
+            if let Err(e) = self
+                .meter
+                .record_usage(crate::meter::UsageRecord {
+                    tenant_id: input.tenant_id.clone(),
+                    session_id: uuid::Uuid::parse_str(&input.task_id).unwrap_or_default(),
+                    resource_type: "ai_tokens".into(),
+                    model: Some(input.model_name.clone()),
+                    quantity: i64::from(resp.usage.input_tokens) + i64::from(resp.usage.output_tokens),
+                    input_tokens: Some(i64::from(resp.usage.input_tokens)),
+                    output_tokens: Some(i64::from(resp.usage.output_tokens)),
+                    cache_read_tokens: Some(i64::from(resp.usage.cache_read_tokens)),
+                    cache_creation_tokens: Some(i64::from(resp.usage.cache_creation_tokens)),
+                    idempotency_key: format!("{}:{}", input.task_id, cycles),
+                })
+                .await
+            {
+                tracing::warn!(?e, "failed to record usage event");
+            }
 
             messages.push(Message::assistant_parts(resp.parts.clone()));
             if let Some(text) = resp.text() {
@@ -1213,6 +1253,13 @@ impl AgentLoop {
                 });
             }
 
+            // Usage budget check — stop before the next LLM call if hard-limited.
+            let budget = self.meter.check_budget(&input.tenant_id).await;
+            if budget.is_hard_limited() {
+                tracing::info!(tenant_id = %input.tenant_id, "usage limit reached for tenant");
+                break;
+            }
+
             if cycles >= input.max_cycles {
                 tracing::warn!(
                     cycles,
@@ -1380,6 +1427,26 @@ impl AgentLoop {
             total_usage.output_tokens += resp.usage.output_tokens;
             total_usage.cache_read_tokens += resp.usage.cache_read_tokens;
             total_usage.cache_creation_tokens += resp.usage.cache_creation_tokens;
+
+            // Record usage for this cycle (non-blocking, best-effort).
+            if let Err(e) = self
+                .meter
+                .record_usage(crate::meter::UsageRecord {
+                    tenant_id: input.tenant_id.clone(),
+                    session_id: uuid::Uuid::parse_str(&input.task_id).unwrap_or_default(),
+                    resource_type: "ai_tokens".into(),
+                    model: Some(input.model_name.clone()),
+                    quantity: i64::from(resp.usage.input_tokens) + i64::from(resp.usage.output_tokens),
+                    input_tokens: Some(i64::from(resp.usage.input_tokens)),
+                    output_tokens: Some(i64::from(resp.usage.output_tokens)),
+                    cache_read_tokens: Some(i64::from(resp.usage.cache_read_tokens)),
+                    cache_creation_tokens: Some(i64::from(resp.usage.cache_creation_tokens)),
+                    idempotency_key: format!("{}:{}", input.task_id, cycles),
+                })
+                .await
+            {
+                tracing::warn!(?e, "failed to record usage event");
+            }
 
             messages.push(Message::assistant_parts(resp.parts.clone()));
             if let Some(text) = resp.text() {
@@ -1566,6 +1633,7 @@ mod tests {
         let input = AgentInput {
             task_id: "test-task".into(),
             tenant_id: "test-tenant".into(),
+            model_name: String::new(),
             system_prompt: vec!["You are a robot arm controller.".into()],
             user_message: "Move the arm to x=1".into(),
             max_cycles: 10,
@@ -1624,6 +1692,7 @@ mod tests {
         let input = AgentInput {
             task_id: "test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec![],
             user_message: "Go".into(),
             max_cycles: 3,
@@ -1723,6 +1792,7 @@ mod tests {
         let input = AgentInput {
             task_id: "safety-test".into(),
             tenant_id: "test-tenant".into(),
+            model_name: String::new(),
             system_prompt: vec!["You are a safe robot.".into()],
             user_message: "Do something".into(),
             max_cycles: 10,
@@ -1793,6 +1863,7 @@ mod tests {
         let input = AgentInput {
             task_id: "clamp-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec![],
             user_message: "Move fast".into(),
             max_cycles: 5,
@@ -1841,6 +1912,7 @@ mod tests {
         let input = AgentInput {
             task_id: "react-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["You are a helpful assistant.".into()],
             user_message: "Say hello".into(),
             max_cycles: 5,
@@ -1936,6 +2008,7 @@ mod tests {
         let input = AgentInput {
             task_id: "spatial-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["You are a robot controller.".into()],
             user_message: "Check the scene".into(),
             max_cycles: 5,
@@ -2058,6 +2131,7 @@ mod tests {
         let input = AgentInput {
             task_id: "screenshot-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["You are a robot controller.".into()],
             user_message: "Inspect the scene".into(),
             max_cycles: 5,
@@ -2175,6 +2249,7 @@ mod tests {
         let input = AgentInput {
             task_id: "no-screenshot-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["You are a robot controller.".into()],
             user_message: "Inspect the scene".into(),
             max_cycles: 5,
@@ -2414,6 +2489,7 @@ mod tests {
         let input = AgentInput {
             task_id: "retry-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["System".into()],
             user_message: "Hello".into(),
             max_cycles: 5,
@@ -2468,6 +2544,7 @@ mod tests {
         let input = AgentInput {
             task_id: "fatal-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["System".into()],
             user_message: "Hello".into(),
             max_cycles: 5,
@@ -2595,6 +2672,7 @@ mod tests {
         let input = AgentInput {
             task_id: "compact-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec![big_system.clone()],
             user_message: big_user,
             max_cycles: 5,
@@ -2740,6 +2818,7 @@ mod tests {
         let input = AgentInput {
             task_id: "tool-id-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["You have sensors.".into()],
             user_message: "Read the lidar".into(),
             max_cycles: 5,
@@ -2893,6 +2972,7 @@ mod tests {
         let input = AgentInput {
             task_id: "catalog-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["You are a robot controller.".into()],
             user_message: "Move the arm".into(),
             max_cycles: 5,
@@ -2981,6 +3061,7 @@ mod tests {
         let input = AgentInput {
             task_id: "no-catalog-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["You are a helpful assistant.".into()],
             user_message: "Hello".into(),
             max_cycles: 5,
@@ -3060,6 +3141,7 @@ mod tests {
         let input = AgentInput {
             task_id: "tool-choice-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["You are a test assistant.".into()],
             user_message: "Test".into(),
             max_cycles: 5,
@@ -3127,6 +3209,7 @@ mod tests {
         let input = AgentInput {
             task_id: "tool-choice-none-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["You are a test assistant.".into()],
             user_message: "Test".into(),
             max_cycles: 5,
@@ -3218,6 +3301,7 @@ mod tests {
         let input = AgentInput {
             task_id: "respond-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["You are a test assistant.".into()],
             user_message: "What is the answer?".into(),
             max_cycles: 5,
@@ -3320,6 +3404,7 @@ mod tests {
         let input = AgentInput {
             task_id: "respond-dispatch-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["Return structured output.".into()],
             user_message: "Give me results.".into(),
             max_cycles: 5,
@@ -3395,6 +3480,7 @@ mod tests {
         let input = AgentInput {
             task_id: "mixed-respond-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["Structured output test.".into()],
             user_message: "Read and respond.".into(),
             max_cycles: 5,
@@ -3467,6 +3553,7 @@ mod tests {
         let input = AgentInput {
             task_id: "no-schema-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["You are a test assistant.".into()],
             user_message: "Hello".into(),
             max_cycles: 5,
@@ -3533,6 +3620,7 @@ mod tests {
         let input_ns = AgentInput {
             task_id: "equiv-ns".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["You are a test assistant.".into()],
             user_message: "Say hello".into(),
             max_cycles: 5,
@@ -3560,6 +3648,7 @@ mod tests {
         let input_s = AgentInput {
             task_id: "equiv-s".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["You are a test assistant.".into()],
             user_message: "Say hello".into(),
             max_cycles: 5,
@@ -3663,6 +3752,7 @@ mod tests {
         let input = AgentInput {
             task_id: "stream-tools".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["You are a robot arm controller.".into()],
             user_message: "Move the arm to x=1".into(),
             max_cycles: 10,
@@ -3746,6 +3836,7 @@ mod tests {
         let input = AgentInput {
             task_id: "stream-assemble".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["Sensor controller.".into()],
             user_message: "Read the lidar".into(),
             max_cycles: 5,
@@ -3801,6 +3892,7 @@ mod tests {
         let input = AgentInput {
             task_id: "stream-thinking".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["Think carefully.".into()],
             user_message: "What is 6*7?".into(),
             max_cycles: 5,
@@ -3975,6 +4067,7 @@ mod tests {
         let input = AgentInput {
             task_id: "mixed-dispatch-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec![],
             user_message: "Do three things".into(),
             max_cycles: 5,
@@ -4129,6 +4222,7 @@ mod tests {
         let input = AgentInput {
             task_id: "order-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec![],
             user_message: "Go".into(),
             max_cycles: 5,
@@ -4296,6 +4390,7 @@ mod tests {
         let input = AgentInput {
             task_id: "safety-mixed".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec![],
             user_message: "Go".into(),
             max_cycles: 5,
@@ -4424,6 +4519,7 @@ mod tests {
         let input = AgentInput {
             task_id: "pure-bypass".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec![],
             user_message: "Calculate".into(),
             max_cycles: 5,
@@ -4508,6 +4604,7 @@ mod tests {
         let input = AgentInput {
             task_id: "stream-test".into(),
             tenant_id: "test-tenant".into(),
+            model_name: String::new(),
             system_prompt: vec!["You are a robot controller.".into()],
             user_message: "Move the arm.".into(),
             max_cycles: 5,
@@ -4577,6 +4674,7 @@ mod tests {
         let input = AgentInput {
             task_id: "streaming-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["You are helpful.".into()],
             user_message: "Say hello".into(),
             max_cycles: 5,
@@ -4660,6 +4758,7 @@ mod tests {
         let input = AgentInput {
             task_id: "non-streaming-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["System".into()],
             user_message: "Hello".into(),
             max_cycles: 5,
@@ -4743,6 +4842,7 @@ mod tests {
         let input = AgentInput {
             task_id: "history-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["You are a helpful assistant.".into()],
             user_message: "Do you remember what I asked before?".into(),
             max_cycles: 5,
@@ -4858,6 +4958,7 @@ mod tests {
         let input = AgentInput {
             task_id: "multi-tool-batch".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["You are a robot controller.".into()],
             user_message: "Move arm and read sensor".into(),
             max_cycles: 10,
@@ -4946,6 +5047,7 @@ mod tests {
         let input = AgentInput {
             task_id: "presence-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec!["Be brief.".into()],
             user_message: "Hi".into(),
             max_cycles: 3,
@@ -5021,6 +5123,7 @@ mod tests {
         AgentInput {
             task_id: "cb-test".into(),
             tenant_id: "test".into(),
+            model_name: String::new(),
             system_prompt: vec![],
             user_message: "Go".into(),
             max_cycles,
@@ -5345,6 +5448,7 @@ mod tests {
             AgentInput {
                 task_id: "approval-test".into(),
                 tenant_id: "test-tenant".into(),
+                model_name: String::new(),
                 system_prompt: vec![],
                 user_message: "Run the sensitive op".into(),
                 max_cycles: 5,
@@ -5760,6 +5864,7 @@ mod tests {
         let input = AgentInput {
             task_id: "ap-test".into(),
             tenant_id: "test-tenant".into(),
+            model_name: String::new(),
             system_prompt: vec!["You are a test agent.".into()],
             user_message: "Run phase test.".into(),
             max_cycles: 10,
@@ -5861,6 +5966,7 @@ mod tests {
         let input = AgentInput {
             task_id: "ap-schema-test".into(),
             tenant_id: "test-tenant".into(),
+            model_name: String::new(),
             system_prompt: vec!["Test agent.".into()],
             user_message: "Do nothing.".into(),
             max_cycles: 5,
@@ -5947,6 +6053,7 @@ mod tests {
         let input = AgentInput {
             task_id: "ap-schema-signal-test".into(),
             tenant_id: "test-tenant".into(),
+            model_name: String::new(),
             system_prompt: vec!["Test agent.".into()],
             user_message: "Do nothing.".into(),
             max_cycles: 5,
@@ -6065,6 +6172,7 @@ mod tests {
         let input = AgentInput {
             task_id: "after-cycles-test".into(),
             tenant_id: "test-tenant".into(),
+            model_name: String::new(),
             system_prompt: vec!["Test agent.".into()],
             user_message: "Run phase test.".into(),
             max_cycles: 10,
@@ -6186,6 +6294,7 @@ mod tests {
         let input = AgentInput {
             task_id: "named-filter-test".into(),
             tenant_id: "test-tenant".into(),
+            model_name: String::new(),
             system_prompt: vec!["Test agent.".into()],
             user_message: "Do something.".into(),
             max_cycles: 5,
@@ -6292,6 +6401,7 @@ mod tests {
         let input = AgentInput {
             task_id: "none-filter-test".into(),
             tenant_id: "test-tenant".into(),
+            model_name: String::new(),
             system_prompt: vec!["Test agent.".into()],
             user_message: "Do nothing.".into(),
             max_cycles: 5,
@@ -6398,6 +6508,7 @@ mod tests {
         let input = AgentInput {
             task_id: "no-signal-test".into(),
             tenant_id: "test-tenant".into(),
+            model_name: String::new(),
             system_prompt: vec!["Test agent.".into()],
             user_message: "Run without signalling.".into(),
             max_cycles: 3,

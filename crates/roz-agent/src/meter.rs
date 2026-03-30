@@ -9,10 +9,7 @@ pub enum BudgetStatus {
     /// Exceeded included allocation, but overage is allowed (paid/team plans).
     InOverage { plan: String },
     /// Hard-limited, cannot proceed (free plan, no payment method).
-    HardLimited {
-        plan: String,
-        period_end: DateTime<Utc>,
-    },
+    HardLimited { plan: String, period_end: DateTime<Utc> },
 }
 
 impl BudgetStatus {

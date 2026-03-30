@@ -26,6 +26,7 @@ fn build_input(system_prompt: Vec<String>, user_message: &str) -> AgentInput {
     AgentInput {
         task_id: "test-1".to_string(),
         tenant_id: "test".to_string(),
+        model_name: String::new(),
         system_prompt,
         user_message: user_message.to_string(),
         max_cycles: 10,

@@ -207,6 +207,7 @@ async fn handle_edge_session(
                 let input = AgentInput {
                     task_id: session_id.to_string(),
                     tenant_id: "edge".to_string(),
+                    model_name: String::new(),
                     system_prompt: vec![constitution.clone()],
                     user_message: user_text,
                     max_cycles: 20,

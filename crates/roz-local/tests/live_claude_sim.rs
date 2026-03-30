@@ -39,6 +39,7 @@ async fn real_claude_moves_arm_via_mcp() {
     let input = roz_agent::agent_loop::AgentInput {
         task_id: "live-mcp-test".into(),
         tenant_id: "test".into(),
+        model_name: String::new(),
         system_prompt: vec![
             "You are controlling a UR5 robot arm via MCP tools. Use the available tools to move the arm.".into(),
         ],

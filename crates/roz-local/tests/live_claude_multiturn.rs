@@ -34,6 +34,7 @@ fn build_input(user_message: &str, history: Vec<Message>) -> AgentInput {
     AgentInput {
         task_id: format!("multiturn-{}", uuid::Uuid::new_v4()),
         tenant_id: "test".into(),
+        model_name: String::new(),
         system_prompt: vec![SYSTEM_PROMPT.into()],
         user_message: user_message.into(),
         max_cycles: 5,

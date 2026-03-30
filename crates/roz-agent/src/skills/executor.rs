@@ -65,6 +65,7 @@ impl SkillExecutor {
         let input = AgentInput {
             task_id: req.task_id.to_string(),
             tenant_id: req.tenant_id.to_string(),
+            model_name: String::new(),
             system_prompt: vec![req.system_prompt.to_string()],
             user_message: req.user_message.to_string(),
             max_cycles: 10,

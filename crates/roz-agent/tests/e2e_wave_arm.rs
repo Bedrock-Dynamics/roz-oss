@@ -100,6 +100,7 @@ async fn agent_deploys_sin_controller_and_arm_oscillates() {
     let input = AgentInput {
         task_id: "e2e-wave-arm".to_string(),
         tenant_id: "test".to_string(),
+        model_name: String::new(),
         system_prompt: vec!["You are a robot controller. Deploy WASM controllers to move the arm.".to_string()],
         user_message: "Wave the arm back and forth".to_string(),
         max_cycles: 5,

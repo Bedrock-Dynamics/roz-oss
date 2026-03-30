@@ -142,6 +142,7 @@ async fn full_vertical_claude_wasm_gazebo() {
     let input = AgentInput {
         task_id: "full-vertical-gazebo".into(),
         tenant_id: "test".into(),
+        model_name: String::new(),
         system_prompt: vec![robot_system_prompt(manifest.commands.len())],
         user_message:
             "Write a simple WASM controller that sets command channel 0 to 0.2 on every tick, then deploy it.".into(),

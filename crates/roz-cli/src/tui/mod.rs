@@ -1025,6 +1025,7 @@ async fn provider_loop(
                 let input = roz_agent::agent_loop::AgentInput {
                     task_id: uuid::Uuid::new_v4().to_string(),
                     tenant_id: "cli".to_string(),
+                    model_name: String::new(),
                     system_prompt: system_prompt.clone(),
                     user_message: user_text,
                     max_cycles: 20,

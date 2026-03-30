@@ -52,6 +52,7 @@ async fn real_claude_writes_wat_and_deploys_controller() {
     let input = roz_agent::agent_loop::AgentInput {
         task_id: "live-wasm-test".into(),
         tenant_id: "test".into(),
+        model_name: String::new(),
         system_prompt: vec![robot_context],
         user_message:
             "Write a WASM controller that oscillates the first joint using sin(tick * 0.05) * 0.3, then deploy it."

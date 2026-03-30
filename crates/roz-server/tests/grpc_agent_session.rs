@@ -241,6 +241,7 @@ async fn full_agent_session_lifecycle() {
         "anthropic".into(),
         None, // direct_api_key
         None, // fallback_model_name
+        Arc::new(roz_agent::meter::NoOpMeter),
     );
     tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -554,6 +555,7 @@ async fn project_context_included_in_system_prompt() {
         "anthropic".into(),
         None, // direct_api_key
         None, // fallback_model_name
+        Arc::new(roz_agent::meter::NoOpMeter),
     );
     tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -769,6 +771,7 @@ async fn start_session_with_host_id_stores_in_session() {
         "anthropic".into(),
         None, // direct_api_key
         None, // fallback_model_name
+        Arc::new(roz_agent::meter::NoOpMeter),
     );
     tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -903,6 +906,7 @@ async fn model_tier_names_resolve_to_actual_models() {
         "anthropic".into(),
         None, // direct_api_key
         None, // fallback_model_name
+        Arc::new(roz_agent::meter::NoOpMeter),
     );
     tokio::spawn(async move {
         tonic::transport::Server::builder()
@@ -1036,6 +1040,7 @@ async fn session_with_host_receives_telemetry() {
         "anthropic".into(),
         None,
         None,
+        Arc::new(roz_agent::meter::NoOpMeter),
     );
     tokio::spawn(async move {
         tonic::transport::Server::builder()

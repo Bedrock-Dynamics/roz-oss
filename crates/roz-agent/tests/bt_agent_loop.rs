@@ -101,6 +101,7 @@ async fn bt_execution_through_agent_loop() {
     let input = AgentInput {
         task_id: "bt-test-1".to_string(),
         tenant_id: "test-tenant".to_string(),
+        model_name: String::new(),
         system_prompt: vec!["You are a robot controller. Use execute_skill to run BT skills.".to_string()],
         user_message: "Pick and place the object.".to_string(),
         max_cycles: 5,
