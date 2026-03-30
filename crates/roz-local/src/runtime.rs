@@ -500,8 +500,18 @@ impl LocalRuntime {
         let mut extensions = roz_agent::dispatch::Extensions::new();
         if let Some(ref handle) = self.copper_handle {
             extensions.insert(handle.cmd_tx());
-            // TODO(reachy-mini): Read manifest from ProjectManifest / roz.toml.
-            extensions.insert(roz_core::channels::ChannelManifest::ur5());
+            // Load channel manifest from robot.toml if present in project directory.
+            let robot_toml_path = self.project_dir.join("robot.toml");
+            if let Ok(robot_manifest) =
+                roz_copper::manifest::RobotManifest::load(&robot_toml_path)
+            {
+                if let Some(channel_manifest) = robot_manifest.channel_manifest() {
+                    extensions.insert(channel_manifest);
+                }
+            } else {
+                // No robot.toml — deploy_controller will error if called without a manifest.
+                tracing::debug!("no robot.toml found, skipping channel manifest injection");
+            }
         }
 
         // System prompt blocks
