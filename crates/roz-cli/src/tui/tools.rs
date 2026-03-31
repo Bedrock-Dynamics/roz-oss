@@ -346,13 +346,13 @@ robot_class = "expressive"
 control_rate_hz = 50
 
 [[channels.commands]]
-name = "head/pitch"
+name = "head_pitch"
 type = "position"
 unit = "rad"
 limits = [-0.35, 0.17]
 
 [[channels.states]]
-name = "head/pitch"
+name = "head_pitch"
 type = "position"
 unit = "rad"
 limits = [-0.35, 0.17]
@@ -371,7 +371,7 @@ path = "/api/motors/set_mode/{{mode}}"
 [daemon.move_to]
 method = "POST"
 path = "/api/move/goto"
-body = '{"pitch": {{head/pitch}}, "duration": {{duration}}}'
+body = '{"pitch": {{head_pitch}}, "duration": {{duration}}}'
 
 [daemon.play_animation]
 method = "POST"
@@ -421,7 +421,7 @@ available_moves = ["wake_up", "goto_sleep"]
         // Verify move_to has channel properties
         let move_to = schemas.iter().find(|s| s.name == "move_to").unwrap();
         let props = move_to.parameters["properties"].as_object().unwrap();
-        assert!(props.contains_key("head/pitch"));
+        assert!(props.contains_key("head_pitch"));
         assert!(props.contains_key("duration_secs"));
     }
 

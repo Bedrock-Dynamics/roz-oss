@@ -20,61 +20,61 @@ robot_class = "expressive"
 control_rate_hz = 50
 
 [[channels.commands]]
-name = "head/antenna.left"
+name = "left_antenna"
 type = "position"
 unit = "rad"
 limits = [-0.3, 0.3]
 
 [[channels.commands]]
-name = "head/antenna.right"
+name = "right_antenna"
 type = "position"
 unit = "rad"
 limits = [-0.3, 0.3]
 
 [[channels.commands]]
-name = "head/orientation.roll"
+name = "head_roll"
 type = "position"
 unit = "rad"
 limits = [-0.26, 0.26]
 
 [[channels.commands]]
-name = "head/orientation.pitch"
+name = "head_pitch"
 type = "position"
 unit = "rad"
 limits = [-0.35, 0.17]
 
 [[channels.commands]]
-name = "head/orientation.yaw"
+name = "head_yaw"
 type = "position"
 unit = "rad"
 limits = [-1.13, 1.13]
 
 [[channels.states]]
-name = "head/antenna.left"
+name = "left_antenna"
 type = "position"
 unit = "rad"
 limits = [-0.3, 0.3]
 
 [[channels.states]]
-name = "head/antenna.right"
+name = "right_antenna"
 type = "position"
 unit = "rad"
 limits = [-0.3, 0.3]
 
 [[channels.states]]
-name = "head/orientation.roll"
+name = "head_roll"
 type = "position"
 unit = "rad"
 limits = [-0.26, 0.26]
 
 [[channels.states]]
-name = "head/orientation.pitch"
+name = "head_pitch"
 type = "position"
 unit = "rad"
 limits = [-0.35, 0.17]
 
 [[channels.states]]
-name = "head/orientation.yaw"
+name = "head_yaw"
 type = "position"
 unit = "rad"
 limits = [-1.13, 1.13]
@@ -93,7 +93,7 @@ path = "/api/motors/set_mode/{{mode}}"
 [daemon.move_to]
 method = "POST"
 path = "/api/move/goto"
-body = '{"left_antenna": {{head/antenna.left}}, "right_antenna": {{head/antenna.right}}, "roll": {{head/orientation.roll}}, "pitch": {{head/orientation.pitch}}, "yaw": {{head/orientation.yaw}}, "duration": {{duration}}}'
+body = '{"left_antenna": {{left_antenna}}, "right_antenna": {{right_antenna}}, "roll": {{head_roll}}, "pitch": {{head_pitch}}, "yaw": {{head_yaw}}, "duration": {{duration}}}'
 
 [daemon.play_animation]
 method = "POST"
@@ -190,15 +190,15 @@ fn move_to_schema_has_channel_properties() {
         .expect("move_to should have properties");
 
     // Verify all command channels appear as properties
-    assert!(props.contains_key("head/antenna.left"));
-    assert!(props.contains_key("head/antenna.right"));
-    assert!(props.contains_key("head/orientation.roll"));
-    assert!(props.contains_key("head/orientation.pitch"));
-    assert!(props.contains_key("head/orientation.yaw"));
+    assert!(props.contains_key("left_antenna"));
+    assert!(props.contains_key("right_antenna"));
+    assert!(props.contains_key("head_roll"));
+    assert!(props.contains_key("head_pitch"));
+    assert!(props.contains_key("head_yaw"));
     assert!(props.contains_key("duration_secs"));
 
     // Verify channel property has type and limit description
-    let pitch = &props["head/orientation.pitch"];
+    let pitch = &props["head_pitch"];
     assert_eq!(pitch["type"], "number");
     let desc = pitch["description"].as_str().expect("should have description");
     assert!(desc.contains("rad"), "should mention unit");
