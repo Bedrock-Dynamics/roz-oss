@@ -6,7 +6,6 @@ pub mod convert;
 pub mod format;
 mod history;
 mod input;
-pub mod local_tools;
 pub mod markdown;
 mod pricing;
 mod proto;
@@ -972,7 +971,7 @@ async fn provider_loop(
         let (text_tx, text_rx) = async_channel::unbounded::<String>();
         let event_tx_cloud = event_tx.clone();
 
-        // Discover local daemon tools from robot.toml for client-side execution.
+        // Build unified tool set (CLI built-ins + daemon tools from robot.toml).
         let local_tool_opts = providers::cloud::build_local_tool_opts(std::path::Path::new("."));
 
         // Bridge: filter UserAction into plain text for the gRPC stream.
@@ -1026,7 +1025,7 @@ async fn provider_loop(
         }
     };
 
-    let dispatcher = tools::build_dispatcher();
+    let (dispatcher, _schemas) = tools::build_all_tools(std::path::Path::new("."));
     let safety = roz_agent::safety::SafetyStack::new(vec![]); // no-op for BYOK
     let spatial = roz_agent::spatial_provider::NullSpatialContextProvider;
 

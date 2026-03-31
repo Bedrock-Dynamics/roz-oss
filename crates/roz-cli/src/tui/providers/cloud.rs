@@ -8,12 +8,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, ClientTlsConfig};
 
 use crate::tui::convert::{struct_to_value, value_to_struct};
-use crate::tui::local_tools;
 use crate::tui::proto::roz_v1::{
     self, SessionRequest, StartSession, UserMessage, agent_service_client::AgentServiceClient, session_request,
     session_response,
 };
 use crate::tui::provider::{AgentEvent, ProviderConfig};
+use crate::tui::tools;
 
 /// Options for local tool execution in cloud mode.
 pub struct LocalToolOpts {
@@ -34,17 +34,17 @@ fn core_schema_to_proto(schema: &roz_core::tools::ToolSchema) -> roz_v1::ToolSch
     }
 }
 
-/// Build `LocalToolOpts` from the current project directory.
+/// Build `LocalToolOpts` from the unified tool set.
 ///
-/// Returns `None` if no `robot.toml` or no `[daemon]` section.
-pub fn build_local_tool_opts(project_dir: &std::path::Path) -> Option<LocalToolOpts> {
-    let dispatcher = local_tools::build_local_dispatcher(project_dir)?;
-    let core_schemas = local_tools::build_tool_schemas(project_dir);
+/// Always returns a valid `LocalToolOpts` -- CLI built-ins are always present,
+/// daemon tools from `robot.toml` are added when available.
+pub fn build_local_tool_opts(project_dir: &std::path::Path) -> LocalToolOpts {
+    let (dispatcher, core_schemas) = tools::build_all_tools(project_dir);
     let proto_schemas = core_schemas.iter().map(core_schema_to_proto).collect();
-    Some(LocalToolOpts {
+    LocalToolOpts {
         proto_schemas,
         dispatcher,
-    })
+    }
 }
 
 /// Execute a tool locally and send the result back to the server via gRPC.
@@ -63,7 +63,7 @@ async fn execute_tool_locally(
         .parameters
         .map_or_else(|| serde_json::Value::Object(serde_json::Map::new()), struct_to_value);
 
-    let ctx = local_tools::default_context();
+    let ctx = tools::default_context();
     let call = ToolCall {
         id: tool_call_id.clone(),
         tool: tool_name.clone(),
@@ -112,13 +112,13 @@ async fn execute_tool_locally(
 /// Run a long-lived gRPC session against Roz Cloud.
 ///
 /// Unlike BYOK providers (per-turn), Cloud maintains a persistent bidirectional
-/// stream. The server runs the agent loop; tools registered via `local_tools`
+/// stream. The server runs the agent loop; tools registered via `LocalToolOpts`
 /// execute client-side and their results are sent back on the gRPC stream.
 pub async fn stream_session(
     config: &ProviderConfig,
     msg_rx: async_channel::Receiver<String>,
     event_tx: async_channel::Sender<AgentEvent>,
-    local_tools: Option<LocalToolOpts>,
+    local_tools: LocalToolOpts,
 ) -> anyhow::Result<()> {
     let api_key = config
         .api_key
@@ -143,10 +143,7 @@ pub async fn stream_session(
     let (req_tx, req_rx) = tokio::sync::mpsc::channel::<SessionRequest>(32);
 
     // Extract tool schemas for StartSession
-    let tool_schemas = local_tools
-        .as_ref()
-        .map(|lt| lt.proto_schemas.clone())
-        .unwrap_or_default();
+    let tool_schemas = local_tools.proto_schemas.clone();
 
     // Send StartSession with registered tool schemas
     req_tx
@@ -183,7 +180,7 @@ pub async fn stream_session(
     });
 
     // Wrap the dispatcher in an Arc for sharing with tool execution tasks
-    let dispatcher = local_tools.map(|lt| Arc::new(Mutex::new(lt.dispatcher)));
+    let dispatcher = Arc::new(Mutex::new(local_tools.dispatcher));
 
     // Receive and map server events
     while let Some(resp) = stream.message().await? {
@@ -206,10 +203,13 @@ pub async fn stream_session(
                     })
                     .await?;
 
-                // Execute locally if we have a dispatcher
-                if let Some(ref disp) = dispatcher {
-                    tokio::spawn(execute_tool_locally(t, disp.clone(), req_tx.clone(), event_tx.clone()));
-                }
+                // Execute locally
+                tokio::spawn(execute_tool_locally(
+                    t,
+                    dispatcher.clone(),
+                    req_tx.clone(),
+                    event_tx.clone(),
+                ));
 
                 // ToolRequest was already sent above; don't emit a second event.
                 continue;

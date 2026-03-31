@@ -34,7 +34,7 @@ async fn execute_cloud(config: &ProviderConfig, task: &str) -> anyhow::Result<()
     text_tx.send(task.to_string()).await?;
     text_tx.close();
 
-    // Discover local daemon tools for client-side execution
+    // Build unified tool set (CLI built-ins + daemon tools from robot.toml)
     let local_tool_opts = crate::tui::providers::cloud::build_local_tool_opts(std::path::Path::new("."));
 
     // Spawn gRPC session in background
@@ -107,7 +107,7 @@ async fn execute_byok(config: &ProviderConfig, task: &str) -> anyhow::Result<()>
 
     let model = roz_agent::model::create_model(&config.model, "", "", 120, proxy_provider, Some(api_key))?;
 
-    let dispatcher = crate::tui::tools::build_dispatcher();
+    let (dispatcher, _schemas) = crate::tui::tools::build_all_tools(std::path::Path::new("."));
     let safety = roz_agent::safety::SafetyStack::new(vec![]);
     let spatial = roz_agent::spatial_provider::NullSpatialContextProvider;
     let mut agent_loop = roz_agent::agent_loop::AgentLoop::new(model, dispatcher, safety, Box::new(spatial));

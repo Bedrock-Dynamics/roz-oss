@@ -6,7 +6,7 @@
 
 use std::fs;
 
-use roz_cli::tui::local_tools;
+use roz_cli::tui::tools;
 use tempfile::TempDir;
 
 const REACHY_MINI_ROBOT_TOML: &str = r#"
@@ -106,37 +106,41 @@ path = "/api/motors/set_mode/disabled"
 "#;
 
 // ---------------------------------------------------------------------------
-// Tool discovery
+// Tool discovery (unified: builtins + daemon)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn discovers_daemon_tools_from_robot_toml() {
+fn discovers_all_tools_from_robot_toml() {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
 
-    let dispatcher = local_tools::build_local_dispatcher(dir.path()).expect("should build dispatcher from robot.toml");
-
-    let schemas = dispatcher.schemas();
+    let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
     let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
 
+    // CLI built-ins
+    assert!(names.contains(&"bash"), "should have bash");
+    assert!(names.contains(&"read_file"), "should have read_file");
+    assert!(names.contains(&"write_file"), "should have write_file");
+    assert!(names.contains(&"list_files"), "should have list_files");
+    assert!(names.contains(&"search"), "should have search");
+    assert!(names.contains(&"execute_code"), "should have execute_code");
+
+    // Daemon tools
     assert!(names.contains(&"get_robot_state"), "should have get_robot_state");
     assert!(names.contains(&"set_motors"), "should have set_motors");
     assert!(names.contains(&"move_to"), "should have move_to");
     assert!(names.contains(&"play_animation"), "should have play_animation");
-    assert_eq!(schemas.len(), 4, "should have exactly 4 daemon tools");
 }
 
 #[test]
-fn no_dispatcher_without_robot_toml() {
+fn builtins_only_without_robot_toml() {
     let dir = TempDir::new().unwrap();
-    assert!(
-        local_tools::build_local_dispatcher(dir.path()).is_none(),
-        "should return None when robot.toml is missing"
-    );
+    let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
+    assert_eq!(schemas.len(), 6, "should have exactly 6 CLI built-in tools");
 }
 
 #[test]
-fn no_dispatcher_without_daemon_section() {
+fn builtins_only_without_daemon_section() {
     let dir = TempDir::new().unwrap();
     fs::write(
         dir.path().join("robot.toml"),
@@ -144,9 +148,11 @@ fn no_dispatcher_without_daemon_section() {
     )
     .unwrap();
 
-    assert!(
-        local_tools::build_local_dispatcher(dir.path()).is_none(),
-        "should return None when [daemon] is missing"
+    let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
+    assert_eq!(
+        schemas.len(),
+        6,
+        "should have only CLI built-ins when [daemon] is missing"
     );
 }
 
@@ -159,7 +165,7 @@ fn builds_tool_schemas_from_robot_toml() {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
 
-    let schemas = local_tools::build_tool_schemas(dir.path());
+    let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
     let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
 
     assert!(names.contains(&"get_robot_state"));
@@ -173,7 +179,7 @@ fn move_to_schema_has_channel_properties() {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
 
-    let schemas = local_tools::build_tool_schemas(dir.path());
+    let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
     let move_to = schemas
         .iter()
         .find(|s| s.name == "move_to")
@@ -214,7 +220,7 @@ fn set_motors_schema_has_mode_parameter() {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
 
-    let schemas = local_tools::build_tool_schemas(dir.path());
+    let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
     let set_motors = schemas
         .iter()
         .find(|s| s.name == "set_motors")
@@ -231,7 +237,7 @@ fn play_animation_schema_mentions_available_moves() {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
 
-    let schemas = local_tools::build_tool_schemas(dir.path());
+    let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
     let play = schemas
         .iter()
         .find(|s| s.name == "play_animation")
@@ -254,10 +260,10 @@ fn play_animation_schema_mentions_available_moves() {
 }
 
 #[test]
-fn schemas_empty_for_missing_robot_toml() {
+fn schemas_include_builtins_for_missing_robot_toml() {
     let dir = TempDir::new().unwrap();
-    let schemas = local_tools::build_tool_schemas(dir.path());
-    assert!(schemas.is_empty(), "should return empty vec for missing robot.toml");
+    let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
+    assert_eq!(schemas.len(), 6, "should have 6 CLI built-in schemas");
 }
 
 // ---------------------------------------------------------------------------
@@ -271,7 +277,7 @@ fn proto_schema_conversion_roundtrips() {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
 
-    let schemas = local_tools::build_tool_schemas(dir.path());
+    let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
     for schema in &schemas {
         // Convert to proto struct and back
         let prost_struct = value_to_struct(schema.parameters.clone());
@@ -303,9 +309,9 @@ async fn get_robot_state_executes_against_daemon() {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
 
-    let dispatcher = local_tools::build_local_dispatcher(dir.path()).expect("should build dispatcher");
+    let (dispatcher, _schemas) = tools::build_all_tools(dir.path());
 
-    let ctx = local_tools::default_context();
+    let ctx = tools::default_context();
     let call = roz_core::tools::ToolCall {
         id: "test-call".into(),
         tool: "get_robot_state".into(),
