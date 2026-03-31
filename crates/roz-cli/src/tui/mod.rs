@@ -93,6 +93,7 @@ fn RozRepl(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let mut model = hooks.use_state(|| "claude-sonnet-4-6".to_string());
     let mut connected = hooks.use_state(|| false);
     let mut ui_state = hooks.use_state(|| UiState::Idle);
+    let robot_name = hooks.use_state(|| context::read_robot_name(std::path::Path::new(".")));
     let mut saved_input = hooks.use_state(String::new);
     let (stdout, _stderr) = hooks.use_output();
     let mut history = hooks.use_state(InputHistory::load);
@@ -160,16 +161,30 @@ fn RozRepl(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                         stdout.println(format::tool_call(&name, &params));
                     }
                     AgentEvent::ToolResultDisplay {
-                        name: _,
+                        name,
                         content,
                         is_error,
                     } => {
-                        let display = if content.len() > 200 {
-                            format!("{}...", &content[..200])
+                        // Try formatted display for known tool types
+                        let formatted = if name == "get_robot_state" && !is_error {
+                            serde_json::from_str(&content)
+                                .ok()
+                                .and_then(|v| format::format_robot_state(&v))
                         } else {
-                            content
+                            None
                         };
-                        stdout.println(format::tool_result(&display, !is_error));
+
+                        if let Some(pretty) = formatted {
+                            stdout.println(format::tool_result("ok", true));
+                            stdout.println(pretty);
+                        } else {
+                            let display = if content.len() > 200 {
+                                format!("{}...", &content[..200])
+                            } else {
+                                content
+                            };
+                            stdout.println(format::tool_result(&display, !is_error));
+                        }
                     }
                     AgentEvent::TurnComplete {
                         input_tokens,
@@ -314,8 +329,16 @@ fn RozRepl(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         .map(|s| format!(" [{}]", s.short_id()))
         .unwrap_or_default();
 
+    // Robot name prefix for status bar (e.g. "[reachy-mini] ")
+    let robot_label = robot_name
+        .read()
+        .as_ref()
+        .map(|n| format!("[{n}] "))
+        .unwrap_or_default();
+
     let connected_label = if connected.get() { "connected" } else { "" };
     let fixed_w = mode_label.width()
+        + robot_label.width()
         + " \u{00b7}  \u{00b7} ".width()
         + tok_display.width()
         + cost_display.width()
@@ -359,6 +382,13 @@ fn RozRepl(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                     weight: Weight::Bold,
                     wrap: TextWrap::NoWrap,
                 )
+                #(if robot_label.is_empty() {
+                    None
+                } else {
+                    Some(element! {
+                        Text(content: robot_label.clone(), color: Color::Cyan, wrap: TextWrap::NoWrap)
+                    })
+                })
                 Text(content: status_left, color: Color::DarkGrey, wrap: TextWrap::NoWrap)
                 #(if connected.get() {
                     Some(element! {
