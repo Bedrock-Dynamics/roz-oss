@@ -14,6 +14,8 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
 
 # Phase 4 — Skills, Sim-to-Real, DeviceTrust
 regex = { workspace = true }

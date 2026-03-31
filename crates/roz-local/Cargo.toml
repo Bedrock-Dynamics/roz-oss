@@ -19,6 +19,7 @@ uuid.workspace      = true
 chrono.workspace    = true
 tracing.workspace   = true
 thiserror.workspace = true
+reqwest.workspace   = true
 schemars.workspace  = true
 directories.workspace = true
 parking_lot.workspace = true

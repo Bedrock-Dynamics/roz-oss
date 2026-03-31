@@ -83,6 +83,14 @@ fn read_project_name(dir: &Path) -> Option<String> {
         .map(String::from)
 }
 
+/// Read the robot name from `robot.toml` if present in the project directory.
+pub fn read_robot_name(project_dir: &Path) -> Option<String> {
+    let robot_toml = project_dir.join("robot.toml");
+    let contents = std::fs::read_to_string(robot_toml).ok()?;
+    let manifest: roz_core::manifest::RobotManifest = toml::from_str(&contents).ok()?;
+    Some(manifest.robot.name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +184,29 @@ mod tests {
         let ctx = load_project_context_from(dir.path()).unwrap();
         assert!(ctx.contains("Agent instructions"));
         assert!(ctx.contains("Robot description"));
+    }
+
+    #[test]
+    fn reads_robot_name_from_robot_toml() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("robot.toml"),
+            "[robot]\nname = \"reachy-mini\"\ndescription = \"A small robot\"\n",
+        )
+        .unwrap();
+        assert_eq!(read_robot_name(dir.path()), Some("reachy-mini".to_string()));
+    }
+
+    #[test]
+    fn robot_name_none_when_no_robot_toml() {
+        let dir = TempDir::new().unwrap();
+        assert!(read_robot_name(dir.path()).is_none());
+    }
+
+    #[test]
+    fn robot_name_none_when_invalid_toml() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("robot.toml"), "not valid toml {{{").unwrap();
+        assert!(read_robot_name(dir.path()).is_none());
     }
 }
