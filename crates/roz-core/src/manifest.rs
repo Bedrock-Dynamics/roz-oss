@@ -207,23 +207,28 @@ impl RobotManifest {
     ///
     /// Returns `None` if no `[channels]` section is present in the manifest.
     ///
-    /// # Panics
-    ///
-    /// Panics if an `interface_type` string is not one of `"position"`, `"velocity"`, or `"effort"`.
+    /// Channels with an unrecognised `interface_type` are skipped with a warning
+    /// rather than panicking, so callers always get a best-effort manifest.
     #[must_use]
     pub fn channel_manifest(&self) -> Option<crate::channels::ChannelManifest> {
         use crate::channels::{ChannelDescriptor, ChannelManifest, InterfaceType};
 
         let ch = self.channels.as_ref()?;
 
-        let convert = |def: &ChannelDef| -> ChannelDescriptor {
+        let convert = |def: &ChannelDef| -> Option<ChannelDescriptor> {
             let interface_type = match def.interface_type.as_str() {
                 "position" => InterfaceType::Position,
                 "velocity" => InterfaceType::Velocity,
                 "effort" => InterfaceType::Effort,
-                other => panic!("unknown interface_type in robot.toml: {other:?}"),
+                other => {
+                    tracing::warn!(
+                        channel = %def.name,
+                        "unknown interface_type in robot.toml: {other:?}, skipping channel"
+                    );
+                    return None;
+                }
             };
-            ChannelDescriptor {
+            Some(ChannelDescriptor {
                 name: def.name.clone(),
                 interface_type,
                 unit: def.unit.clone(),
@@ -231,20 +236,26 @@ impl RobotManifest {
                 default: def.default,
                 max_rate_of_change: def.max_rate_of_change,
                 position_state_index: def.position_state_index,
-                max_delta_from: def.max_delta_from.map(|[idx, delta]| {
+                max_delta_from: def.max_delta_from.and_then(|[idx, delta]| {
+                    if idx < 0.0 || !idx.is_finite() {
+                        tracing::warn!(
+                            channel = %def.name,
+                            "invalid max_delta_from index {idx}, ignoring constraint"
+                        );
+                        return None;
+                    }
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    let index = idx as usize;
-                    (index, delta)
+                    Some((idx as usize, delta))
                 }),
-            }
+            })
         };
 
         Some(ChannelManifest {
             robot_id: ch.robot_id.clone(),
             robot_class: ch.robot_class.clone(),
             control_rate_hz: ch.control_rate_hz,
-            commands: ch.commands.iter().map(convert).collect(),
-            states: ch.states.iter().map(convert).collect(),
+            commands: ch.commands.iter().filter_map(&convert).collect(),
+            states: ch.states.iter().filter_map(&convert).collect(),
         })
     }
 

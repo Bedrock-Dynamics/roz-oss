@@ -485,9 +485,19 @@ impl LocalRuntime {
 
         // Load robot.toml (unconditional — daemon tools don't need Copper)
         let robot_toml_path = self.project_dir.join("robot.toml");
-        let robot_manifest = roz_core::manifest::RobotManifest::load(&robot_toml_path).ok();
+        let robot_manifest = match roz_core::manifest::RobotManifest::load(&robot_toml_path) {
+            Ok(m) => Some(m),
+            Err(e) if robot_toml_path.exists() => {
+                tracing::warn!("failed to parse robot.toml: {e}");
+                None
+            }
+            Err(_) => None, // file doesn't exist, that's fine
+        };
 
-        // Register daemon REST tools if [daemon] section present
+        // Register daemon REST tools if [daemon] section present.
+        // These register as Physical — the PermissionGuard in the safety stack
+        // gates execution at call time (Ask → requires approval, Safe → blocked),
+        // so no permission check is needed at registration time.
         if let Some(ref rm) = robot_manifest
             && let Some(ref daemon) = rm.daemon
         {

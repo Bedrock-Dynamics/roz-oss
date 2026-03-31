@@ -179,7 +179,9 @@ fn RozRepl(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
                             stdout.println(pretty);
                         } else {
                             let display = if content.len() > 200 {
-                                format!("{}...", &content[..200])
+                                // Truncate at a char boundary to avoid panicking on multi-byte UTF-8
+                                let end = content.char_indices().nth(200).map_or(content.len(), |(i, _)| i);
+                                format!("{}...", &content[..end])
                             } else {
                                 content
                             };
