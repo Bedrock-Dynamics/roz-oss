@@ -124,6 +124,7 @@ tonic-reflection = "0.13"
 tokio-util = "0.7"
 rmcp = { version = "1", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
 tempfile = "3"
+arc-swap = "1"
 
 # Phase 4 additions — Skills, Sim-to-Real, DeviceTrust
 regex = "1"

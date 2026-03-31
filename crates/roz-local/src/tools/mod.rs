@@ -1,8 +1,10 @@
 pub mod bash;
+pub mod controller_status;
 pub mod daemon;
 pub mod deploy_controller;
 pub mod env_start;
 pub mod env_stop;
 pub mod file_read;
 pub mod file_write;
+pub mod stop_controller;
 pub mod template;

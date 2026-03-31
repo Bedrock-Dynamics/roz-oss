@@ -5749,6 +5749,7 @@ dependencies = [
 name = "roz-local"
 version = "0.2.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "chrono",
  "directories",

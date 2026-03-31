@@ -21,6 +21,7 @@ tracing.workspace   = true
 thiserror.workspace = true
 reqwest.workspace   = true
 schemars.workspace  = true
+arc-swap.workspace  = true
 directories.workspace = true
 parking_lot.workspace = true
 rmcp = { workspace = true }
