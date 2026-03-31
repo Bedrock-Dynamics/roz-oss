@@ -1025,11 +1025,13 @@ async fn provider_loop(
         }
     };
 
-    let (dispatcher, _schemas) = tools::build_all_tools(std::path::Path::new("."));
+    let all_tools = tools::build_all_tools_with_copper(std::path::Path::new("."));
+    let _copper_handle = all_tools.copper_handle; // kept alive for session lifetime
     let safety = roz_agent::safety::SafetyStack::new(vec![]); // no-op for BYOK
     let spatial = roz_agent::spatial_provider::NullSpatialContextProvider;
 
-    let mut agent_loop = roz_agent::agent_loop::AgentLoop::new(model, dispatcher, safety, Box::new(spatial));
+    let mut agent_loop = roz_agent::agent_loop::AgentLoop::new(model, all_tools.dispatcher, safety, Box::new(spatial))
+        .with_extensions(all_tools.extensions);
 
     // Build the system prompt once at session start (stable across turns for cache hits).
     // Unified builder: constitution + robot.toml + AGENTS.md / ROBOT.md.

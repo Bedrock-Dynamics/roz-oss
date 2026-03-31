@@ -1,6 +1,8 @@
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use roz_agent::dispatch::{Extensions, ToolContext, ToolDispatcher, ToolExecutor};
 use roz_agent::tools::execute_code::ExecuteCodeTool;
@@ -42,6 +44,102 @@ pub fn build_all_tools(project_dir: &Path) -> (ToolDispatcher, Vec<(ToolSchema, 
     (dispatcher, schemas)
 }
 
+/// Complete tool set with optional Copper handle and shared Extensions.
+///
+/// The `CopperHandle` must outlive all tool dispatches — it owns the controller
+/// thread and command bridge. Dropping it sends an emergency halt.
+pub struct AllTools {
+    pub dispatcher: ToolDispatcher,
+    pub schemas: Vec<(ToolSchema, ToolCategory)>,
+    /// Kept alive to prevent the controller thread from halting on drop.
+    pub copper_handle: Option<roz_copper::handle::CopperHandle>,
+    /// Shared extensions containing `cmd_tx`, `ChannelManifest`, and
+    /// `Arc<ArcSwap<ControllerState>>` when Copper is active.
+    pub extensions: Extensions,
+}
+
+/// Build tools and optionally spawn the Copper WASM pipeline with a WS bridge.
+///
+/// When `robot.toml` has both `[daemon.websocket]` and `[channels]`, this:
+/// 1. Creates a WebSocket bridge (`WsActuatorSink` + `WsSensorSource`)
+/// 2. Spawns `CopperHandle::spawn_with_io()` with the bridge
+/// 3. Registers `deploy_controller`, `stop_controller`, `get_controller_status`
+/// 4. Injects `cmd_tx`, `ChannelManifest`, and `ControllerState` into Extensions
+///
+/// Falls back to the plain `build_all_tools` tool set when conditions aren't met.
+pub fn build_all_tools_with_copper(project_dir: &Path) -> AllTools {
+    let (mut dispatcher, _) = build_all_tools(project_dir);
+    let mut extensions = Extensions::default();
+    let mut copper_handle = None;
+
+    let robot_toml = project_dir.join("robot.toml");
+    if let Ok(manifest) = RobotManifest::load(&robot_toml)
+        && let Some(ref daemon) = manifest.daemon
+        && let Some(ref ws_config) = daemon.websocket
+        && let Some(channel_manifest) = manifest.channel_manifest()
+    {
+        // Build WS URL from daemon base_url + websocket path.
+        let ws_url = format!(
+            "{}{}",
+            daemon
+                .base_url
+                .replace("http://", "ws://")
+                .replace("https://", "wss://"),
+            ws_config.path,
+        );
+        let body_template = ws_config.set_target_body.clone().unwrap_or_default();
+
+        let bridge_config = roz_copper::io_ws::WsBridgeConfig {
+            url: ws_url,
+            set_target_type: ws_config.set_target_type.clone().unwrap_or_default(),
+            body_template,
+            channel_names: channel_manifest.commands.iter().map(|c| c.name.clone()).collect(),
+            channel_defaults: channel_manifest.commands.iter().map(|c| c.default).collect(),
+        };
+
+        // Create WS bridge on the current tokio runtime.
+        let rt = tokio::runtime::Handle::current();
+        let (actuator, sensor, _supervisor) = roz_copper::io_ws::create_ws_bridge(bridge_config, &rt);
+
+        // Spawn Copper with IO backends.
+        let handle = roz_copper::handle::CopperHandle::spawn_with_io(
+            1.5,
+            Some(actuator as Arc<dyn roz_copper::io::ActuatorSink>),
+            Some(sensor as Box<dyn roz_copper::io::SensorSource>),
+        );
+
+        // Inject into Extensions for tool access.
+        extensions.insert(handle.cmd_tx());
+        extensions.insert(channel_manifest);
+        extensions.insert(Arc::clone(handle.state()) as Arc<ArcSwap<roz_copper::channels::ControllerState>>);
+
+        // Register controller tools.
+        dispatcher.register_with_category(
+            Box::new(roz_local::tools::deploy_controller::DeployControllerTool),
+            ToolCategory::Physical,
+        );
+        dispatcher.register_with_category(
+            Box::new(roz_local::tools::stop_controller::StopControllerTool),
+            ToolCategory::Physical,
+        );
+        dispatcher.register_with_category(
+            Box::new(roz_local::tools::controller_status::GetControllerStatusTool),
+            ToolCategory::Pure,
+        );
+
+        tracing::info!("copper WASM pipeline spawned with WS bridge");
+        copper_handle = Some(handle);
+    }
+
+    let schemas = dispatcher.schemas_with_categories();
+    AllTools {
+        dispatcher,
+        schemas,
+        copper_handle,
+        extensions,
+    }
+}
+
 /// Build system prompt blocks: constitution + robot.toml + project context.
 ///
 /// Reuses `context::load_project_context_from()` for AGENTS.md/ROBOT.md,
@@ -74,6 +172,19 @@ pub fn default_context() -> ToolContext {
         tenant_id: "local".into(),
         call_id: String::new(),
         extensions: Extensions::default(),
+    }
+}
+
+/// `ToolContext` for local execution with pre-populated Extensions.
+///
+/// Used by the cloud provider path to inject Copper handles (cmd\_tx,
+/// `ChannelManifest`, `ControllerState`) into tool execution context.
+pub fn default_context_with(extensions: Extensions) -> ToolContext {
+    ToolContext {
+        task_id: "local".into(),
+        tenant_id: "local".into(),
+        call_id: String::new(),
+        extensions,
     }
 }
 
@@ -446,6 +557,156 @@ available_moves = ["wake_up", "goto_sleep"]
         let ctx = default_context();
         assert_eq!(ctx.task_id, "local");
         assert_eq!(ctx.tenant_id, "local");
+    }
+
+    #[test]
+    fn default_context_with_preserves_extensions() {
+        let mut ext = Extensions::default();
+        ext.insert(42_u32);
+        let ctx = default_context_with(ext);
+        assert_eq!(ctx.task_id, "local");
+        assert_eq!(ctx.extensions.get::<u32>(), Some(&42));
+    }
+
+    #[test]
+    fn copper_tools_not_registered_without_websocket() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("robot.toml"), MINIMAL_ROBOT_TOML).unwrap();
+        let all = build_all_tools_with_copper(dir.path());
+        // No websocket section -> no copper handle, no controller tools.
+        assert!(all.copper_handle.is_none());
+        let names: Vec<&str> = all.schemas.iter().map(|(s, _)| s.name.as_str()).collect();
+        assert!(!names.contains(&"deploy_controller"));
+        assert!(!names.contains(&"stop_controller"));
+        assert!(!names.contains(&"get_controller_status"));
+    }
+
+    #[test]
+    fn copper_tools_not_registered_without_channels() {
+        // websocket present but no [channels] -> Copper not spawned.
+        let dir = TempDir::new().unwrap();
+        let toml = r#"
+[robot]
+name = "test"
+description = "test"
+
+[daemon]
+base_url = "http://localhost:8000"
+
+[daemon.websocket]
+path = "/ws/sdk"
+"#;
+        fs::write(dir.path().join("robot.toml"), toml).unwrap();
+        let all = build_all_tools_with_copper(dir.path());
+        assert!(all.copper_handle.is_none());
+        let names: Vec<&str> = all.schemas.iter().map(|(s, _)| s.name.as_str()).collect();
+        assert!(!names.contains(&"deploy_controller"));
+    }
+
+    #[test]
+    fn copper_tools_not_registered_without_robot_toml() {
+        let dir = TempDir::new().unwrap();
+        let all = build_all_tools_with_copper(dir.path());
+        assert!(all.copper_handle.is_none());
+        // Only CLI built-ins.
+        assert_eq!(all.schemas.len(), 6);
+    }
+
+    /// Full copper path: websocket + channels -> spawns Copper, registers controller tools.
+    ///
+    /// The WS supervisor will retry connection in the background (no real daemon
+    /// is running), but the Copper controller thread and tools are registered
+    /// synchronously before this returns.
+    #[tokio::test]
+    async fn copper_spawns_with_websocket_and_channels() {
+        let dir = TempDir::new().unwrap();
+        let toml = r#"
+[robot]
+name = "copper-test"
+description = "test"
+
+[channels]
+robot_id = "test"
+robot_class = "expressive"
+control_rate_hz = 50
+
+[[channels.commands]]
+name = "head_pitch"
+type = "position"
+unit = "rad"
+limits = [-0.35, 0.17]
+
+[[channels.states]]
+name = "head_pitch"
+type = "position"
+unit = "rad"
+limits = [-0.35, 0.17]
+
+[daemon]
+base_url = "http://localhost:19999"
+
+[daemon.websocket]
+path = "/ws/sdk"
+set_target_type = "set_target"
+set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
+"#;
+        fs::write(dir.path().join("robot.toml"), toml).unwrap();
+        let all = build_all_tools_with_copper(dir.path());
+
+        // Copper handle should be present.
+        assert!(all.copper_handle.is_some(), "expected copper handle");
+
+        // Controller tools registered.
+        let names: Vec<&str> = all.schemas.iter().map(|(s, _)| s.name.as_str()).collect();
+        assert!(names.contains(&"deploy_controller"), "missing deploy_controller");
+        assert!(names.contains(&"stop_controller"), "missing stop_controller");
+        assert!(
+            names.contains(&"get_controller_status"),
+            "missing get_controller_status"
+        );
+
+        // Extensions populated.
+        assert!(
+            all.extensions
+                .get::<tokio::sync::mpsc::Sender<roz_copper::channels::ControllerCommand>>()
+                .is_some(),
+            "extensions should contain cmd_tx"
+        );
+        assert!(
+            all.extensions.get::<roz_core::channels::ChannelManifest>().is_some(),
+            "extensions should contain ChannelManifest"
+        );
+        assert!(
+            all.extensions
+                .get::<Arc<ArcSwap<roz_copper::channels::ControllerState>>>()
+                .is_some(),
+            "extensions should contain ControllerState"
+        );
+
+        // Verify categories.
+        let deploy_cat = all
+            .schemas
+            .iter()
+            .find(|(s, _)| s.name == "deploy_controller")
+            .map(|(_, c)| c);
+        assert_eq!(deploy_cat, Some(&ToolCategory::Physical));
+
+        let status_cat = all
+            .schemas
+            .iter()
+            .find(|(s, _)| s.name == "get_controller_status")
+            .map(|(_, c)| c);
+        assert_eq!(status_cat, Some(&ToolCategory::Pure));
+
+        // Existing daemon tools should also be present (from [daemon] section).
+        // No get_state/set_motors/etc in this toml -> only CLI builtins + 3 controller tools.
+        // CLI builtins(6) + controller tools(3) = 9
+        assert_eq!(all.schemas.len(), 9);
+
+        // Clean shutdown.
+        if let Some(handle) = all.copper_handle {
+            handle.shutdown().await;
+        }
     }
 
     #[test]
