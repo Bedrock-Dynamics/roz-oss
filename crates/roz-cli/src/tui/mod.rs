@@ -1,10 +1,12 @@
 mod agent;
 mod commands;
 pub mod context;
+pub mod convert;
 #[allow(dead_code)] // Formatters wired incrementally.
 pub mod format;
 mod history;
 mod input;
+pub mod local_tools;
 pub mod markdown;
 mod pricing;
 mod proto;
@@ -970,6 +972,9 @@ async fn provider_loop(
         let (text_tx, text_rx) = async_channel::unbounded::<String>();
         let event_tx_cloud = event_tx.clone();
 
+        // Discover local daemon tools from robot.toml for client-side execution.
+        let local_tool_opts = providers::cloud::build_local_tool_opts(std::path::Path::new("."));
+
         // Bridge: filter UserAction into plain text for the gRPC stream.
         let bridge = tokio::spawn({
             let msg_rx = msg_rx.clone();
@@ -988,7 +993,7 @@ async fn provider_loop(
             }
         });
 
-        if let Err(e) = providers::cloud::stream_session(&config, text_rx, event_tx_cloud).await {
+        if let Err(e) = providers::cloud::stream_session(&config, text_rx, event_tx_cloud, local_tool_opts).await {
             let display = classify_error_message(&e.to_string(), &config);
             let _ = event_tx.send(AgentEvent::Error(display)).await;
         }
