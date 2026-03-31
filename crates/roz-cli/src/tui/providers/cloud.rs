@@ -193,12 +193,18 @@ pub async fn stream_session(
     let response = client.stream_session(ReceiverStream::new(req_rx)).await?;
     let mut stream = response.into_inner();
 
-    // Spawn forwarder: user messages -> gRPC requests
+    // Keep a handle to check whether the message channel has been closed
+    // (non-interactive mode closes the sender after queuing the prompt).
+    let msg_closed = msg_rx.clone();
+
+    // Spawn forwarder: user messages -> gRPC requests.
+    // The forwarder gets its own clone; when msg_rx closes the loop exits
+    // and this clone is dropped.
+    let forwarder_tx = req_tx.clone();
     tokio::spawn({
-        let req_tx = req_tx.clone();
         async move {
             while let Ok(text) = msg_rx.recv().await {
-                let _ = req_tx
+                let _ = forwarder_tx
                     .send(SessionRequest {
                         request: Some(session_request::Request::UserMessage(UserMessage {
                             content: text,
@@ -209,6 +215,11 @@ pub async fn stream_session(
             }
         }
     });
+
+    // Wrap the original sender in Option so we can drop it after the final
+    // TurnComplete in non-interactive mode.  Tool execution tasks clone from
+    // this; interactive mode keeps it alive for the entire session.
+    let mut req_tx = Some(req_tx);
 
     // Wrap the dispatcher in an Arc for sharing with tool execution tasks
     let dispatcher = Arc::new(Mutex::new(local_tools.dispatcher));
@@ -234,18 +245,28 @@ pub async fn stream_session(
                     })
                     .await?;
 
-                // Execute locally
-                tokio::spawn(execute_tool_locally(
-                    t,
-                    dispatcher.clone(),
-                    req_tx.clone(),
-                    event_tx.clone(),
-                ));
+                // Execute locally (clone the sender if still available)
+                if let Some(ref tx) = req_tx {
+                    tokio::spawn(execute_tool_locally(
+                        t,
+                        dispatcher.clone(),
+                        tx.clone(),
+                        event_tx.clone(),
+                    ));
+                }
 
                 // ToolRequest was already sent above; don't emit a second event.
                 continue;
             }
             session_response::Response::TurnComplete(c) => {
+                // If no more user messages are coming (non-interactive mode),
+                // drop the last sender so the server sees the client stream
+                // end and closes its side -- preventing a deadlock.
+                // Interactive mode: msg_rx stays open, sender stays alive.
+                if msg_closed.is_closed() {
+                    req_tx.take();
+                }
+
                 let usage = c.usage.unwrap_or_default();
                 AgentEvent::TurnComplete {
                     input_tokens: usage.input_tokens,
