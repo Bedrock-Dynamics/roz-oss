@@ -21,6 +21,8 @@ pub struct RobotManifest {
     /// Channel manifest for the WASM controller interface.
     /// If present, used to build the [`crate::channels::ChannelManifest`] for this robot.
     pub channels: Option<ChannelConfig>,
+    /// Daemon REST/WebSocket configuration for agent tools.
+    pub daemon: Option<DaemonConfig>,
 }
 
 /// Robot identity metadata.
@@ -119,6 +121,74 @@ pub struct SafetyConfig {
     pub max_contact_force_n: Option<f64>,
     /// Workspace boundaries (free-form TOML table).
     pub workspace_bounds_m: Option<toml::Value>,
+}
+
+/// Daemon configuration for REST and WebSocket robot control.
+///
+/// Configures how the agent's generic tools map to the daemon's specific
+/// REST endpoints via body templates with `{{channel_name}}` placeholders.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonConfig {
+    /// Base URL of the daemon (e.g. `http://localhost:8000`).
+    pub base_url: String,
+    /// WebSocket config for Layer 2 WASM controller bridge.
+    pub websocket: Option<WebSocketConfig>,
+    /// GET endpoint for reading robot state.
+    pub get_state: Option<EndpointConfig>,
+    /// POST endpoint for setting motor mode. Path may contain `{{mode}}`.
+    pub set_motors: Option<EndpointConfig>,
+    /// POST endpoint for interpolated motion. Body template with `{{channel_name}}` + `{{duration}}`.
+    pub move_to: Option<MoveToConfig>,
+    /// POST endpoint for playing named animations.
+    pub play_animation: Option<PlayAnimationConfig>,
+    /// POST endpoint for stopping motion.
+    pub stop_motion: Option<EndpointConfig>,
+}
+
+/// WebSocket configuration for real-time control and sensor streaming.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSocketConfig {
+    /// WebSocket path (e.g. `/ws/sdk`).
+    pub path: String,
+    /// Message type for `set_target` commands (e.g. `set_full_target`).
+    pub set_target_type: Option<String>,
+    /// Body template for `set_target` WebSocket messages.
+    pub set_target_body: Option<String>,
+}
+
+/// Generic REST endpoint configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EndpointConfig {
+    /// HTTP method (GET, POST, PUT, DELETE).
+    pub method: String,
+    /// URL path (may contain `{{placeholder}}` variables).
+    pub path: String,
+    /// Optional request body template.
+    pub body: Option<String>,
+}
+
+/// Configuration for the `move_to` tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveToConfig {
+    /// HTTP method.
+    pub method: String,
+    /// URL path.
+    pub path: String,
+    /// Body template with `{{channel_name}}` placeholders for channel values
+    /// and `{{duration}}` for the motion duration.
+    pub body: String,
+}
+
+/// Configuration for the `play_animation` tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlayAnimationConfig {
+    /// HTTP method.
+    pub method: String,
+    /// URL path prefix. Animation name appended: `{prefix}/{name}`.
+    pub path_prefix: String,
+    /// List of available animation names.
+    #[serde(default)]
+    pub available_moves: Vec<String>,
 }
 
 impl RobotManifest {
@@ -380,5 +450,72 @@ limits = [-3.14, 3.14]
                     .all(|c| c.interface_type == crate::channels::InterfaceType::Position)
             );
         }
+    }
+
+    #[test]
+    fn daemon_config_parses() {
+        let toml_str = r#"
+[robot]
+name = "test"
+description = "test"
+
+[daemon]
+base_url = "http://localhost:8000"
+
+[daemon.get_state]
+method = "GET"
+path = "/api/state/full"
+
+[daemon.set_motors]
+method = "POST"
+path = "/api/motors/set_mode/{{mode}}"
+
+[daemon.move_to]
+method = "POST"
+path = "/api/move/goto"
+body = '{"pitch": {{head/pitch}}, "duration": {{duration}}}'
+
+[daemon.play_animation]
+method = "POST"
+path_prefix = "/api/move/play"
+available_moves = ["wake_up", "goto_sleep"]
+
+[daemon.stop_motion]
+method = "POST"
+path = "/api/motors/set_mode/disabled"
+"#;
+        let manifest: RobotManifest = toml::from_str(toml_str).unwrap();
+        let daemon = manifest.daemon.unwrap();
+        assert_eq!(daemon.base_url, "http://localhost:8000");
+        assert!(daemon.move_to.is_some());
+        assert_eq!(daemon.play_animation.as_ref().unwrap().available_moves.len(), 2);
+        assert_eq!(daemon.get_state.as_ref().unwrap().method, "GET");
+    }
+
+    #[test]
+    fn daemon_config_optional() {
+        let manifest: RobotManifest = toml::from_str(EXAMPLE_TOML).unwrap();
+        assert!(manifest.daemon.is_none());
+    }
+
+    #[test]
+    fn websocket_config_parses() {
+        let toml_str = r#"
+[robot]
+name = "test"
+description = "test"
+
+[daemon]
+base_url = "http://localhost:8000"
+
+[daemon.websocket]
+path = "/ws/sdk"
+set_target_type = "set_full_target"
+set_target_body = '{"type": "set_full_target", "head": [1,0,0,0]}'
+"#;
+        let manifest: RobotManifest = toml::from_str(toml_str).unwrap();
+        let ws = manifest.daemon.unwrap().websocket.unwrap();
+        assert_eq!(ws.path, "/ws/sdk");
+        assert_eq!(ws.set_target_type.unwrap(), "set_full_target");
     }
 }
