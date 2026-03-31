@@ -1,4 +1,5 @@
 pub mod bash;
+pub mod daemon;
 pub mod deploy_controller;
 pub mod env_start;
 pub mod env_stop;

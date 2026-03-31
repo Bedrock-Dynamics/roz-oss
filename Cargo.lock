@@ -5749,6 +5749,7 @@ dependencies = [
  "chrono",
  "directories",
  "parking_lot",
+ "reqwest 0.12.28",
  "rmcp",
  "roz-agent",
  "roz-copper",

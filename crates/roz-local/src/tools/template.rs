@@ -6,6 +6,7 @@
 //! from corrupting longer ones (e.g. `{{head}}` vs `{{head/position.x}}`).
 
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 
 /// Render a body template by replacing `{{key}}` placeholders with values.
 ///
@@ -14,10 +15,10 @@ use std::collections::HashMap;
 ///
 /// Unresolved placeholders are left as-is (the daemon will reject them,
 /// giving a clear error).
-pub fn render_template(template: &str, values: &HashMap<String, String>) -> String {
+pub fn render_template<S: BuildHasher>(template: &str, values: &HashMap<String, String, S>) -> String {
     let mut result = template.to_string();
     let mut keys: Vec<&String> = values.keys().collect();
-    keys.sort_by(|a, b| b.len().cmp(&a.len()));
+    keys.sort_by_key(|b| std::cmp::Reverse(b.len()));
     for key in keys {
         result = result.replace(&format!("{{{{{key}}}}}"), &values[key]);
     }
