@@ -1,0 +1,321 @@
+//! Headless integration tests for CLI client-side tool execution.
+//!
+//! These verify that tools from `robot.toml` are discovered, registered,
+//! and their schemas are correctly built -- without requiring a live daemon
+//! or cloud server.
+
+use std::fs;
+
+use roz_cli::tui::local_tools;
+use tempfile::TempDir;
+
+const REACHY_MINI_ROBOT_TOML: &str = r#"
+[robot]
+name = "reachy-mini"
+description = "Pollen Robotics Reachy Mini -- 5-DoF expressive head + mobile base"
+
+[channels]
+robot_id = "reachy_mini"
+robot_class = "expressive"
+control_rate_hz = 50
+
+[[channels.commands]]
+name = "head/antenna.left"
+type = "position"
+unit = "rad"
+limits = [-0.3, 0.3]
+
+[[channels.commands]]
+name = "head/antenna.right"
+type = "position"
+unit = "rad"
+limits = [-0.3, 0.3]
+
+[[channels.commands]]
+name = "head/orientation.roll"
+type = "position"
+unit = "rad"
+limits = [-0.26, 0.26]
+
+[[channels.commands]]
+name = "head/orientation.pitch"
+type = "position"
+unit = "rad"
+limits = [-0.35, 0.17]
+
+[[channels.commands]]
+name = "head/orientation.yaw"
+type = "position"
+unit = "rad"
+limits = [-1.13, 1.13]
+
+[[channels.states]]
+name = "head/antenna.left"
+type = "position"
+unit = "rad"
+limits = [-0.3, 0.3]
+
+[[channels.states]]
+name = "head/antenna.right"
+type = "position"
+unit = "rad"
+limits = [-0.3, 0.3]
+
+[[channels.states]]
+name = "head/orientation.roll"
+type = "position"
+unit = "rad"
+limits = [-0.26, 0.26]
+
+[[channels.states]]
+name = "head/orientation.pitch"
+type = "position"
+unit = "rad"
+limits = [-0.35, 0.17]
+
+[[channels.states]]
+name = "head/orientation.yaw"
+type = "position"
+unit = "rad"
+limits = [-1.13, 1.13]
+
+[daemon]
+base_url = "http://localhost:8000"
+
+[daemon.get_state]
+method = "GET"
+path = "/api/state/full"
+
+[daemon.set_motors]
+method = "POST"
+path = "/api/motors/set_mode/{{mode}}"
+
+[daemon.move_to]
+method = "POST"
+path = "/api/move/goto"
+body = '{"left_antenna": {{head/antenna.left}}, "right_antenna": {{head/antenna.right}}, "roll": {{head/orientation.roll}}, "pitch": {{head/orientation.pitch}}, "yaw": {{head/orientation.yaw}}, "duration": {{duration}}}'
+
+[daemon.play_animation]
+method = "POST"
+path_prefix = "/api/move/play"
+available_moves = ["wake_up", "goto_sleep"]
+
+[daemon.stop_motion]
+method = "POST"
+path = "/api/motors/set_mode/disabled"
+"#;
+
+// ---------------------------------------------------------------------------
+// Tool discovery
+// ---------------------------------------------------------------------------
+
+#[test]
+fn discovers_daemon_tools_from_robot_toml() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
+
+    let dispatcher = local_tools::build_local_dispatcher(dir.path()).expect("should build dispatcher from robot.toml");
+
+    let schemas = dispatcher.schemas();
+    let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
+
+    assert!(names.contains(&"get_robot_state"), "should have get_robot_state");
+    assert!(names.contains(&"set_motors"), "should have set_motors");
+    assert!(names.contains(&"move_to"), "should have move_to");
+    assert!(names.contains(&"play_animation"), "should have play_animation");
+    assert_eq!(schemas.len(), 4, "should have exactly 4 daemon tools");
+}
+
+#[test]
+fn no_dispatcher_without_robot_toml() {
+    let dir = TempDir::new().unwrap();
+    assert!(
+        local_tools::build_local_dispatcher(dir.path()).is_none(),
+        "should return None when robot.toml is missing"
+    );
+}
+
+#[test]
+fn no_dispatcher_without_daemon_section() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("robot.toml"),
+        "[robot]\nname = \"test\"\ndescription = \"no daemon\"\n",
+    )
+    .unwrap();
+
+    assert!(
+        local_tools::build_local_dispatcher(dir.path()).is_none(),
+        "should return None when [daemon] is missing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Schema generation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn builds_tool_schemas_from_robot_toml() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
+
+    let schemas = local_tools::build_tool_schemas(dir.path());
+    let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
+
+    assert!(names.contains(&"get_robot_state"));
+    assert!(names.contains(&"set_motors"));
+    assert!(names.contains(&"move_to"));
+    assert!(names.contains(&"play_animation"));
+}
+
+#[test]
+fn move_to_schema_has_channel_properties() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
+
+    let schemas = local_tools::build_tool_schemas(dir.path());
+    let move_to = schemas
+        .iter()
+        .find(|s| s.name == "move_to")
+        .expect("move_to schema should exist");
+
+    let props = move_to.parameters["properties"]
+        .as_object()
+        .expect("move_to should have properties");
+
+    // Verify all command channels appear as properties
+    assert!(props.contains_key("head/antenna.left"));
+    assert!(props.contains_key("head/antenna.right"));
+    assert!(props.contains_key("head/orientation.roll"));
+    assert!(props.contains_key("head/orientation.pitch"));
+    assert!(props.contains_key("head/orientation.yaw"));
+    assert!(props.contains_key("duration_secs"));
+
+    // Verify channel property has type and limit description
+    let pitch = &props["head/orientation.pitch"];
+    assert_eq!(pitch["type"], "number");
+    let desc = pitch["description"].as_str().expect("should have description");
+    assert!(desc.contains("rad"), "should mention unit");
+    assert!(desc.contains("-0.350"), "should mention lower limit");
+    assert!(desc.contains("0.170"), "should mention upper limit");
+
+    // duration_secs is required
+    let required = move_to.parameters["required"]
+        .as_array()
+        .expect("should have required array");
+    assert!(
+        required.iter().filter_map(|v| v.as_str()).any(|n| n == "duration_secs"),
+        "duration_secs should be required"
+    );
+}
+
+#[test]
+fn set_motors_schema_has_mode_parameter() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
+
+    let schemas = local_tools::build_tool_schemas(dir.path());
+    let set_motors = schemas
+        .iter()
+        .find(|s| s.name == "set_motors")
+        .expect("set_motors should exist");
+
+    let props = set_motors.parameters["properties"]
+        .as_object()
+        .expect("set_motors should have properties");
+    assert!(props.contains_key("mode"), "set_motors should have mode parameter");
+}
+
+#[test]
+fn play_animation_schema_mentions_available_moves() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
+
+    let schemas = local_tools::build_tool_schemas(dir.path());
+    let play = schemas
+        .iter()
+        .find(|s| s.name == "play_animation")
+        .expect("play_animation should exist");
+
+    let props = play.parameters["properties"]
+        .as_object()
+        .expect("play_animation should have properties");
+    let name_desc = props["name"]["description"]
+        .as_str()
+        .expect("name param should have description");
+    assert!(
+        name_desc.contains("wake_up"),
+        "description should list available moves, got: {name_desc}"
+    );
+    assert!(
+        name_desc.contains("goto_sleep"),
+        "description should list available moves, got: {name_desc}"
+    );
+}
+
+#[test]
+fn schemas_empty_for_missing_robot_toml() {
+    let dir = TempDir::new().unwrap();
+    let schemas = local_tools::build_tool_schemas(dir.path());
+    assert!(schemas.is_empty(), "should return empty vec for missing robot.toml");
+}
+
+// ---------------------------------------------------------------------------
+// Proto schema conversion
+// ---------------------------------------------------------------------------
+
+#[test]
+fn proto_schema_conversion_roundtrips() {
+    use roz_cli::tui::convert::{struct_to_value, value_to_struct};
+
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
+
+    let schemas = local_tools::build_tool_schemas(dir.path());
+    for schema in &schemas {
+        // Convert to proto struct and back
+        let prost_struct = value_to_struct(schema.parameters.clone());
+        let roundtripped = struct_to_value(prost_struct);
+
+        // The "type" field should survive the roundtrip
+        assert_eq!(
+            roundtripped["type"], "object",
+            "parameters type should roundtrip for tool: {}",
+            schema.name
+        );
+
+        // Properties should be present
+        assert!(
+            roundtripped.get("properties").is_some(),
+            "properties should roundtrip for tool: {}",
+            schema.name
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tool execution against real daemon (requires external service)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires Reachy Mini daemon on localhost:8000"]
+async fn get_robot_state_executes_against_daemon() {
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
+
+    let dispatcher = local_tools::build_local_dispatcher(dir.path()).expect("should build dispatcher");
+
+    let ctx = local_tools::default_context();
+    let call = roz_core::tools::ToolCall {
+        id: "test-call".into(),
+        tool: "get_robot_state".into(),
+        params: serde_json::json!({}),
+    };
+
+    let result = dispatcher.dispatch(&call, &ctx).await;
+    assert!(result.is_success(), "get_robot_state should succeed: {result:?}");
+
+    // The output should be valid JSON
+    let output = &result.output;
+    assert!(output.is_object(), "get_robot_state should return a JSON object");
+}

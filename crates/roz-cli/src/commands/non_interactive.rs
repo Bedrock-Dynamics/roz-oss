@@ -34,12 +34,14 @@ async fn execute_cloud(config: &ProviderConfig, task: &str) -> anyhow::Result<()
     text_tx.send(task.to_string()).await?;
     text_tx.close();
 
+    // Discover local daemon tools for client-side execution
+    let local_tool_opts = crate::tui::providers::cloud::build_local_tool_opts(std::path::Path::new("."));
+
     // Spawn gRPC session in background
     let config_clone = config.clone();
-    let session =
-        tokio::spawn(
-            async move { crate::tui::providers::cloud::stream_session(&config_clone, text_rx, event_tx).await },
-        );
+    let session = tokio::spawn(async move {
+        crate::tui::providers::cloud::stream_session(&config_clone, text_rx, event_tx, local_tool_opts).await
+    });
 
     // Collect streaming response
     let mut response = String::new();

@@ -41,13 +41,13 @@ mod tests {
     #[test]
     fn ollama_is_free() {
         let cost = calculate_cost("llama3", 10000, 5000);
-        assert_eq!(cost, 0.0);
+        assert!(cost.abs() < f64::EPSILON);
     }
 
     #[test]
     fn unknown_model_is_free() {
         let cost = calculate_cost("custom-model", 1000, 500);
-        assert_eq!(cost, 0.0);
+        assert!(cost.abs() < f64::EPSILON);
     }
 
     #[test]
