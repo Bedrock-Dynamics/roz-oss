@@ -47,6 +47,28 @@ pub fn build_local_tool_opts(project_dir: &std::path::Path) -> LocalToolOpts {
     }
 }
 
+/// Load project context for the cloud agent session.
+///
+/// Returns the robot.toml system prompt and AGENTS.md / ROBOT.md content
+/// as separate string blocks for the `StartSession.project_context` field.
+fn load_cloud_project_context() -> Vec<String> {
+    let project_dir = std::path::Path::new(".");
+    let mut ctx = vec![];
+    // Robot system prompt from robot.toml
+    let robot_toml = project_dir.join("robot.toml");
+    if let Ok(manifest) = roz_core::manifest::RobotManifest::load(&robot_toml) {
+        let prompt = manifest.to_system_prompt();
+        if !prompt.is_empty() {
+            ctx.push(prompt);
+        }
+    }
+    // AGENTS.md / ROBOT.md
+    if let Some(project_ctx) = crate::tui::context::load_project_context() {
+        ctx.push(project_ctx);
+    }
+    ctx
+}
+
 /// Execute a tool locally and send the result back to the server via gRPC.
 ///
 /// Spawned as a tokio task for each incoming `ToolRequest`.
@@ -58,6 +80,11 @@ async fn execute_tool_locally(
 ) {
     let tool_name = tool_request.tool_name;
     let tool_call_id = tool_request.tool_call_id;
+
+    // Security: log when the cloud agent triggers a destructive local tool.
+    if matches!(tool_name.as_str(), "bash" | "write_file" | "execute_code") {
+        tracing::info!(tool = %tool_name, "cloud agent executing destructive tool locally");
+    }
 
     let params_json = tool_request
         .parameters
@@ -145,7 +172,10 @@ pub async fn stream_session(
     // Extract tool schemas for StartSession
     let tool_schemas = local_tools.proto_schemas.clone();
 
-    // Send StartSession with registered tool schemas
+    // Load project context for the cloud agent (robot.toml + AGENTS.md / ROBOT.md)
+    let project_context = load_cloud_project_context();
+
+    // Send StartSession with registered tool schemas and project context
     req_tx
         .send(SessionRequest {
             request: Some(session_request::Request::Start(StartSession {
@@ -153,6 +183,7 @@ pub async fn stream_session(
                 host_id: config.host.clone(),
                 model: Some(config.model.clone()),
                 tools: tool_schemas,
+                project_context,
                 ..Default::default()
             })),
         })

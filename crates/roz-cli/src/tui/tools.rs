@@ -39,6 +39,31 @@ pub fn build_all_tools(project_dir: &Path) -> (ToolDispatcher, Vec<ToolSchema>) 
     (dispatcher, schemas)
 }
 
+/// Build system prompt blocks: constitution + robot.toml + project context.
+///
+/// Reuses `context::load_project_context_from()` for AGENTS.md/ROBOT.md,
+/// prepends the constitution, and adds robot.toml system prompt if present.
+pub fn build_system_prompt(project_dir: &Path, tool_names: &[&str]) -> Vec<String> {
+    let mode = roz_agent::agent_loop::AgentLoopMode::React;
+    let mut blocks = vec![roz_agent::constitution::build_constitution(mode, tool_names)];
+
+    // Robot system prompt from robot.toml
+    let robot_toml = project_dir.join("robot.toml");
+    if let Ok(manifest) = RobotManifest::load(&robot_toml) {
+        let prompt = manifest.to_system_prompt();
+        if !prompt.is_empty() {
+            blocks.push(prompt);
+        }
+    }
+
+    // Project context: AGENTS.md, ROBOT.md (existing loader)
+    if let Some(context) = super::context::load_project_context_from(project_dir) {
+        blocks.push(context);
+    }
+
+    blocks
+}
+
 /// Default `ToolContext` for local execution (no tenant/task context).
 pub fn default_context() -> ToolContext {
     ToolContext {
@@ -418,5 +443,55 @@ available_moves = ["wake_up", "goto_sleep"]
         let ctx = default_context();
         assert_eq!(ctx.task_id, "local");
         assert_eq!(ctx.tenant_id, "local");
+    }
+
+    #[test]
+    fn build_system_prompt_includes_constitution() {
+        let dir = TempDir::new().unwrap();
+        let prompt = build_system_prompt(dir.path(), &["bash", "read_file"]);
+        assert!(!prompt.is_empty());
+        assert!(
+            prompt[0].contains("SAFETY-CRITICAL"),
+            "first block should be constitution"
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_includes_robot_toml() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("robot.toml"),
+            "[robot]\nname = \"test-bot\"\ndescription = \"A test robot\"\n",
+        )
+        .unwrap();
+        let prompt = build_system_prompt(dir.path(), &[]);
+        assert!(prompt.len() >= 2, "should have constitution + robot prompt");
+        assert!(prompt[1].contains("test-bot"));
+    }
+
+    #[test]
+    fn build_system_prompt_includes_project_context() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("AGENTS.md"), "Be helpful and safe.").unwrap();
+        let prompt = build_system_prompt(dir.path(), &[]);
+        assert!(prompt.len() >= 2, "should have constitution + project context");
+        assert!(prompt.iter().any(|b| b.contains("Be helpful and safe.")));
+    }
+
+    #[test]
+    fn build_system_prompt_all_blocks() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("robot.toml"),
+            "[robot]\nname = \"all-bot\"\ndescription = \"Full test\"\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("AGENTS.md"), "Agent instructions.").unwrap();
+        let prompt = build_system_prompt(dir.path(), &["bash"]);
+        // constitution + robot.toml + AGENTS.md = 3 blocks
+        assert_eq!(prompt.len(), 3);
+        assert!(prompt[0].contains("SAFETY-CRITICAL"));
+        assert!(prompt[1].contains("all-bot"));
+        assert!(prompt[2].contains("Agent instructions."));
     }
 }
