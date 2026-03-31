@@ -483,12 +483,26 @@ impl LocalRuntime {
             dispatcher.register_with_category(Box::new(DelegationTool::new(spatial_model)), ToolCategory::Pure);
         }
 
+        // Load robot.toml (unconditional — daemon tools don't need Copper)
+        let robot_toml_path = self.project_dir.join("robot.toml");
+        let robot_manifest = roz_core::manifest::RobotManifest::load(&robot_toml_path).ok();
+
+        // Register daemon REST tools if [daemon] section present
+        if let Some(ref rm) = robot_manifest {
+            if let Some(ref daemon) = rm.daemon {
+                let channel_manifest = rm.channel_manifest();
+                for (tool, category) in crate::tools::daemon::daemon_tools(daemon, channel_manifest.as_ref()) {
+                    dispatcher.register_with_category(tool, category);
+                }
+            }
+        }
+
         // Lazily spawn Copper controller when simulation is active
         if self.mcp.has_connections() && self.copper_handle.is_none() {
             self.copper_handle = Some(CopperHandle::spawn(1.5));
         }
 
-        // Register deploy_controller tool when controller is available
+        // Register deploy_controller when controller is available
         if self.copper_handle.is_some() {
             dispatcher.register_with_category(
                 Box::new(crate::tools::deploy_controller::DeployControllerTool),
@@ -500,15 +514,11 @@ impl LocalRuntime {
         let mut extensions = roz_agent::dispatch::Extensions::new();
         if let Some(ref handle) = self.copper_handle {
             extensions.insert(handle.cmd_tx());
-            // Load channel manifest from robot.toml if present in project directory.
-            let robot_toml_path = self.project_dir.join("robot.toml");
-            if let Ok(robot_manifest) = roz_core::manifest::RobotManifest::load(&robot_toml_path) {
-                if let Some(channel_manifest) = robot_manifest.channel_manifest() {
+            // Inject channel manifest for deploy_controller
+            if let Some(ref rm) = robot_manifest {
+                if let Some(channel_manifest) = rm.channel_manifest() {
                     extensions.insert(channel_manifest);
                 }
-            } else {
-                // No robot.toml — deploy_controller will error if called without a manifest.
-                tracing::debug!("no robot.toml found, skipping channel manifest injection");
             }
         }
 
@@ -516,6 +526,13 @@ impl LocalRuntime {
         let names = dispatcher.tool_names();
         let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let mut system_prompt = vec![build_constitution(mode, &name_refs)];
+
+        // Add robot system prompt if available
+        if let Some(ref rm) = robot_manifest {
+            system_prompt.push(rm.to_system_prompt());
+        }
+
+        // Add AGENTS.md
         let agents_md_path = self.project_dir.join("AGENTS.md");
         if let Ok(agents_content) = std::fs::read_to_string(&agents_md_path)
             && !agents_content.is_empty()
