@@ -193,7 +193,10 @@ mod tests {
 
     fn test_ctx() -> ToolContext {
         let mut ext = crate::dispatch::Extensions::new();
-        ext.insert(roz_core::channels::ChannelManifest::ur5());
+        ext.insert(roz_core::channels::ChannelManifest::generic_velocity(
+            6,
+            std::f64::consts::PI,
+        ));
         ToolContext {
             task_id: "test-task".to_string(),
             tenant_id: "test-tenant".to_string(),

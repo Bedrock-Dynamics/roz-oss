@@ -19,10 +19,13 @@ use roz_agent::tools::execute_code::{EXECUTE_CODE_TOOL_NAME, ExecuteCodeTool};
 use serde_json::json;
 use std::time::Duration;
 
-/// Build extensions with a UR5 manifest for execute_code tests.
+/// Build extensions with a generic 6-joint velocity manifest for execute_code tests.
 fn test_extensions() -> Extensions {
     let mut ext = Extensions::new();
-    ext.insert(roz_core::channels::ChannelManifest::ur5());
+    ext.insert(roz_core::channels::ChannelManifest::generic_velocity(
+        6,
+        std::f64::consts::PI,
+    ));
     ext
 }
 
@@ -373,8 +376,8 @@ Respond with ONLY the WAT code. No explanation, no markdown fences, just raw WAT
     eprintln!("Extracted WAT:\n{wat}");
     assert!(wat.contains("(module"), "response must contain a WAT module");
 
-    // Compile with UR5 manifest (6 command channels, velocity limits).
-    let manifest = roz_core::channels::ChannelManifest::ur5();
+    // Compile with a 6-joint velocity manifest.
+    let manifest = roz_core::channels::ChannelManifest::generic_velocity(6, std::f64::consts::PI);
     let host = roz_copper::wit_host::HostContext::with_manifest(manifest);
     let mut task = roz_copper::wasm::CuWasmTask::from_source_with_host(wat.as_bytes(), host)
         .expect("Claude-generated WAT should compile");

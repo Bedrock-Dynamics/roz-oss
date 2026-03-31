@@ -17,7 +17,10 @@ async fn real_claude_writes_wat_and_deploys_controller() {
     // 2. Build Extensions with cmd_tx + manifest
     let mut extensions = roz_agent::dispatch::Extensions::new();
     extensions.insert(handle.cmd_tx());
-    extensions.insert(roz_core::channels::ChannelManifest::ur5());
+    extensions.insert(roz_core::channels::ChannelManifest::generic_velocity(
+        6,
+        std::f64::consts::PI,
+    ));
 
     // 3. Create real Claude model
     let model = roz_agent::model::create_model("claude-sonnet-4-6", "", "", 120, "anthropic", Some(&api_key)).unwrap();
@@ -30,7 +33,7 @@ async fn real_claude_writes_wat_and_deploys_controller() {
     );
 
     // 5. Robot context in system prompt
-    let manifest = roz_core::channels::ChannelManifest::ur5();
+    let manifest = roz_core::channels::ChannelManifest::generic_velocity(6, std::f64::consts::PI);
     let robot_context = format!(
         "You are a robot controller engineer. You write WAT code for WASM controllers.\n\n\
          Available WASM host functions:\n\

@@ -502,9 +502,7 @@ impl LocalRuntime {
             extensions.insert(handle.cmd_tx());
             // Load channel manifest from robot.toml if present in project directory.
             let robot_toml_path = self.project_dir.join("robot.toml");
-            if let Ok(robot_manifest) =
-                roz_copper::manifest::RobotManifest::load(&robot_toml_path)
-            {
+            if let Ok(robot_manifest) = roz_copper::manifest::RobotManifest::load(&robot_toml_path) {
                 if let Some(channel_manifest) = robot_manifest.channel_manifest() {
                     extensions.insert(channel_manifest);
                 }

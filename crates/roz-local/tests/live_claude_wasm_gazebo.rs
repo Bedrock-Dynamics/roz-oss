@@ -14,7 +14,6 @@ use roz_copper::handle::CopperHandle;
 use roz_copper::io::ActuatorSink;
 use roz_copper::io_grpc::{GrpcActuatorSink, GrpcSensorSource};
 use roz_copper::io_log::TeeActuatorSink;
-use roz_core::channels::ChannelManifest;
 use roz_local::mcp::{McpManager, McpToolExecutor};
 
 const BRIDGE_CONTROL_URL: &str = "http://127.0.0.1:9094";
@@ -109,7 +108,11 @@ async fn full_vertical_claude_wasm_gazebo() {
         .connect()
         .await
         .expect("gRPC channel to bridge should connect");
-    let manifest = ChannelManifest::ur5();
+    let manifest = {
+        let toml_str = include_str!("../../../examples/ur5/robot.toml");
+        let robot: roz_copper::manifest::RobotManifest = toml::from_str(toml_str).unwrap();
+        robot.channel_manifest().unwrap()
+    };
     let grpc_sink = Arc::new(GrpcActuatorSink::from_manifest(
         channel,
         &manifest,

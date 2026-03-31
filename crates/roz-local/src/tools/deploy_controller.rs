@@ -148,7 +148,10 @@ mod tests {
         let (tx, rx) = mpsc::channel(16);
         let mut ext = Extensions::new();
         ext.insert(tx);
-        ext.insert(roz_core::channels::ChannelManifest::ur5());
+        ext.insert(roz_core::channels::ChannelManifest::generic_velocity(
+            6,
+            std::f64::consts::PI,
+        ));
         let ctx = ToolContext {
             task_id: "test".into(),
             tenant_id: "test".into(),

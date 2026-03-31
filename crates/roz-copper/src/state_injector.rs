@@ -1,4 +1,4 @@
-//! Trait for injecting sensor data into the WASM controller's HostContext.
+//! Trait for injecting sensor data into the WASM controller's `HostContext`.
 //!
 //! Implementations bridge hardware-specific sensor APIs to the generic
 //! channel-based state interface. The controller loop calls `inject()`
@@ -47,9 +47,15 @@ mod tests {
         }
     }
 
+    fn load_reachy_mini_manifest() -> ChannelManifest {
+        let toml_str = include_str!("../../../examples/reachy-mini/robot.toml");
+        let robot: crate::manifest::RobotManifest = toml::from_str(toml_str).unwrap();
+        robot.channel_manifest().unwrap()
+    }
+
     #[test]
     fn fake_injector_writes_state_values() {
-        let manifest = ChannelManifest::reachy_mini();
+        let manifest = load_reachy_mini_manifest();
         let mut ctx = HostContext::with_manifest(manifest);
         assert!(ctx.state_values.iter().all(|&v| v == 0.0));
 
@@ -65,7 +71,7 @@ mod tests {
 
     #[test]
     fn null_injector_is_noop() {
-        let manifest = ChannelManifest::reachy_mini();
+        let manifest = load_reachy_mini_manifest();
         let mut ctx = HostContext::with_manifest(manifest);
         let mut injector = NullStateInjector;
         injector.inject(&mut ctx);

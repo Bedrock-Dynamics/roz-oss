@@ -367,7 +367,14 @@ limits = [-3.14, 3.14]
 
             // Verify head/orientation.yaw has max_delta_from body/yaw
             assert_eq!(ch.commands[5].name, "head/orientation.yaw");
-            assert_eq!(ch.commands[5].max_delta_from, Some((6, 1.1345)));
+            // 65 degrees in radians = 1.1344640137963142
+            let expected_delta = 65.0_f64.to_radians();
+            let (idx, delta) = ch.commands[5].max_delta_from.unwrap();
+            assert_eq!(idx, 6);
+            assert!(
+                (delta - expected_delta).abs() < 1e-10,
+                "max_delta_from delta should be 65 deg in radians: got {delta}, expected {expected_delta}"
+            );
 
             // All channels are position type
             assert!(

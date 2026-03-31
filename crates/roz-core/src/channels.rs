@@ -5,8 +5,6 @@
 //! channels. The WASM controller reads/writes by index; the safety filter
 //! clamps per-channel; the actuator sink routes to the native protocol.
 
-use std::f64::consts::{PI, TAU};
-
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -78,225 +76,6 @@ pub struct ChannelManifest {
 }
 
 impl ChannelManifest {
-    /// UR5 arm: 6 velocity command channels, 12 state channels (6 position + 6 velocity).
-    pub fn ur5() -> Self {
-        let joint_names = [
-            "shoulder_pan_joint",
-            "shoulder_lift_joint",
-            "elbow_joint",
-            "wrist_1_joint",
-            "wrist_2_joint",
-            "wrist_3_joint",
-        ];
-        let vel_limit = PI; // rad/s
-        let pos_limit = TAU; // rad
-
-        let commands: Vec<ChannelDescriptor> = joint_names
-            .iter()
-            .enumerate()
-            .map(|(i, name)| ChannelDescriptor {
-                name: format!("{name}/velocity"),
-                interface_type: InterfaceType::Velocity,
-                unit: "rad/s".into(),
-                limits: (-vel_limit, vel_limit),
-                default: 0.0,
-                max_rate_of_change: Some(0.5), // 50 rad/s^2 at 100 Hz
-                position_state_index: Some(i), // pairs with position state at same index
-                max_delta_from: None,
-            })
-            .collect();
-
-        // Position state channels first (indices 0-5), then velocity states (indices 6-11).
-        let mut states: Vec<ChannelDescriptor> = joint_names
-            .iter()
-            .map(|name| ChannelDescriptor {
-                name: format!("{name}/position"),
-                interface_type: InterfaceType::Position,
-                unit: "rad".into(),
-                limits: (-pos_limit, pos_limit),
-                default: 0.0,
-                max_rate_of_change: None,
-                position_state_index: None,
-                max_delta_from: None,
-            })
-            .collect();
-
-        states.extend(joint_names.iter().map(|name| ChannelDescriptor {
-            name: format!("{name}/velocity"),
-            interface_type: InterfaceType::Velocity,
-            unit: "rad/s".into(),
-            limits: (-vel_limit, vel_limit),
-            default: 0.0,
-            max_rate_of_change: None,
-            position_state_index: None,
-            max_delta_from: None,
-        }));
-
-        Self {
-            robot_id: "ur5".into(),
-            robot_class: "manipulator".into(),
-            control_rate_hz: 100,
-            commands,
-            states,
-        }
-    }
-
-    /// Quadcopter: 4 body velocity command channels (vx, vy, vz, `yaw_rate`), 4 body state channels.
-    pub fn quadcopter() -> Self {
-        Self {
-            robot_id: "quadcopter".into(),
-            robot_class: "drone".into(),
-            control_rate_hz: 100,
-            commands: vec![
-                ChannelDescriptor {
-                    name: "body/velocity.x".into(),
-                    interface_type: InterfaceType::Velocity,
-                    unit: "m/s".into(),
-                    limits: (-5.0, 5.0),
-                    default: 0.0,
-                    max_rate_of_change: Some(2.0),
-                    position_state_index: None,
-                    max_delta_from: None,
-                },
-                ChannelDescriptor {
-                    name: "body/velocity.y".into(),
-                    interface_type: InterfaceType::Velocity,
-                    unit: "m/s".into(),
-                    limits: (-5.0, 5.0),
-                    default: 0.0,
-                    max_rate_of_change: Some(2.0),
-                    position_state_index: None,
-                    max_delta_from: None,
-                },
-                ChannelDescriptor {
-                    name: "body/velocity.z".into(),
-                    interface_type: InterfaceType::Velocity,
-                    unit: "m/s".into(),
-                    limits: (-3.0, 3.0),
-                    default: 0.0,
-                    max_rate_of_change: Some(1.5),
-                    position_state_index: None,
-                    max_delta_from: None,
-                },
-                ChannelDescriptor {
-                    name: "body/yaw_rate".into(),
-                    interface_type: InterfaceType::Velocity,
-                    unit: "rad/s".into(),
-                    limits: (-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2),
-                    default: 0.0,
-                    max_rate_of_change: Some(1.0),
-                    position_state_index: None,
-                    max_delta_from: None,
-                },
-            ],
-            states: vec![
-                ChannelDescriptor {
-                    name: "body/position.x".into(),
-                    interface_type: InterfaceType::Position,
-                    unit: "m".into(),
-                    limits: (-1000.0, 1000.0),
-                    default: 0.0,
-                    max_rate_of_change: None,
-                    position_state_index: None,
-                    max_delta_from: None,
-                },
-                ChannelDescriptor {
-                    name: "body/position.y".into(),
-                    interface_type: InterfaceType::Position,
-                    unit: "m".into(),
-                    limits: (-1000.0, 1000.0),
-                    default: 0.0,
-                    max_rate_of_change: None,
-                    position_state_index: None,
-                    max_delta_from: None,
-                },
-                ChannelDescriptor {
-                    name: "body/position.z".into(),
-                    interface_type: InterfaceType::Position,
-                    unit: "m".into(),
-                    limits: (0.0, 500.0),
-                    default: 0.0,
-                    max_rate_of_change: None,
-                    position_state_index: None,
-                    max_delta_from: None,
-                },
-                ChannelDescriptor {
-                    name: "body/yaw".into(),
-                    interface_type: InterfaceType::Position,
-                    unit: "rad".into(),
-                    limits: (-PI, PI),
-                    default: 0.0,
-                    max_rate_of_change: None,
-                    position_state_index: None,
-                    max_delta_from: None,
-                },
-            ],
-        }
-    }
-
-    /// Differential drive: 2 twist command channels (linear.x, angular.z), 3 odometry state channels.
-    pub fn diff_drive() -> Self {
-        Self {
-            robot_id: "diff_drive".into(),
-            robot_class: "mobile".into(),
-            control_rate_hz: 100,
-            commands: vec![
-                ChannelDescriptor {
-                    name: "base/linear.x".into(),
-                    interface_type: InterfaceType::Velocity,
-                    unit: "m/s".into(),
-                    limits: (-1.0, 1.0),
-                    default: 0.0,
-                    max_rate_of_change: Some(0.5),
-                    position_state_index: None,
-                    max_delta_from: None,
-                },
-                ChannelDescriptor {
-                    name: "base/angular.z".into(),
-                    interface_type: InterfaceType::Velocity,
-                    unit: "rad/s".into(),
-                    limits: (-2.0, 2.0),
-                    default: 0.0,
-                    max_rate_of_change: Some(1.0),
-                    position_state_index: None,
-                    max_delta_from: None,
-                },
-            ],
-            states: vec![
-                ChannelDescriptor {
-                    name: "base/odom.x".into(),
-                    interface_type: InterfaceType::Position,
-                    unit: "m".into(),
-                    limits: (-1000.0, 1000.0),
-                    default: 0.0,
-                    max_rate_of_change: None,
-                    position_state_index: None,
-                    max_delta_from: None,
-                },
-                ChannelDescriptor {
-                    name: "base/odom.y".into(),
-                    interface_type: InterfaceType::Position,
-                    unit: "m".into(),
-                    limits: (-1000.0, 1000.0),
-                    default: 0.0,
-                    max_rate_of_change: None,
-                    position_state_index: None,
-                    max_delta_from: None,
-                },
-                ChannelDescriptor {
-                    name: "base/odom.yaw".into(),
-                    interface_type: InterfaceType::Position,
-                    unit: "rad".into(),
-                    limits: (-PI, PI),
-                    default: 0.0,
-                    max_rate_of_change: None,
-                    position_state_index: None,
-                    max_delta_from: None,
-                },
-            ],
-        }
-    }
-
     /// Number of command channels.
     pub const fn command_count(&self) -> usize {
         self.commands.len()
@@ -316,117 +95,6 @@ impl ChannelManifest {
             .iter()
             .filter(|s| s.interface_type == InterfaceType::Position)
             .count()
-    }
-
-    /// Reachy Mini (Pollen Robotics): 9 position command channels, 9 position state channels.
-    ///
-    /// Cartesian head pose (x,y,z,roll,pitch,yaw) + body yaw + 2 antennas.
-    /// Position-controlled at 50 Hz via the daemon's `set_target()` API.
-    /// Joint limits from official Pollen Robotics documentation.
-    pub fn reachy_mini() -> Self {
-        let limit_40_deg = 40.0_f64.to_radians();
-        let limit_160_deg = 160.0_f64.to_radians();
-
-        let head_pos_names = ["head/position.x", "head/position.y", "head/position.z"];
-        let head_pos_limits = [
-            (-0.03, 0.03),   // x: ±30mm
-            (-0.03, 0.03),   // y: ±30mm
-            (-0.015, 0.015), // z: ±15mm
-        ];
-
-        let head_orient_names = [
-            "head/orientation.roll",
-            "head/orientation.pitch",
-            "head/orientation.yaw",
-        ];
-        let head_orient_limits = [
-            (-limit_40_deg, limit_40_deg), // roll: ±40 deg
-            (-limit_40_deg, limit_40_deg), // pitch: ±40 deg
-            (-PI, PI),                     // yaw: ±180 deg
-        ];
-
-        let mut commands = Vec::with_capacity(9);
-
-        for (name, limits) in head_pos_names.iter().zip(head_pos_limits.iter()) {
-            let idx = commands.len();
-            commands.push(ChannelDescriptor {
-                name: (*name).into(),
-                interface_type: InterfaceType::Position,
-                unit: "m".into(),
-                limits: *limits,
-                default: 0.0,
-                max_rate_of_change: None,
-                position_state_index: Some(idx),
-                max_delta_from: None,
-            });
-        }
-
-        for (name, limits) in head_orient_names.iter().zip(head_orient_limits.iter()) {
-            let idx = commands.len();
-            commands.push(ChannelDescriptor {
-                name: (*name).into(),
-                interface_type: InterfaceType::Position,
-                unit: "rad".into(),
-                limits: *limits,
-                default: 0.0,
-                max_rate_of_change: None,
-                position_state_index: Some(idx),
-                max_delta_from: None,
-            });
-        }
-
-        // Body yaw (index 6)
-        commands.push(ChannelDescriptor {
-            name: "body/yaw".into(),
-            interface_type: InterfaceType::Position,
-            unit: "rad".into(),
-            limits: (-limit_160_deg, limit_160_deg),
-            default: 0.0,
-            max_rate_of_change: None,
-            position_state_index: Some(6),
-            max_delta_from: None,
-        });
-
-        // Antennas (indices 7-8)
-        for name in ["left_antenna/position", "right_antenna/position"] {
-            let idx = commands.len();
-            commands.push(ChannelDescriptor {
-                name: name.into(),
-                interface_type: InterfaceType::Position,
-                unit: "rad".into(),
-                limits: (0.0, 120.0_f64.to_radians()),
-                default: 0.0,
-                max_rate_of_change: None,
-                position_state_index: Some(idx),
-                max_delta_from: None,
-            });
-        }
-
-        // Head yaw (index 5) constrained to <=65 deg from body yaw (index 6)
-        commands[5].max_delta_from = Some((6, 65.0_f64.to_radians()));
-
-        // State channels mirror commands
-        let states: Vec<ChannelDescriptor> = commands
-            .iter()
-            .map(|cmd| ChannelDescriptor {
-                name: cmd.name.clone(),
-                interface_type: cmd.interface_type,
-                unit: cmd.unit.clone(),
-                limits: cmd.limits,
-                default: cmd.default,
-                max_rate_of_change: None,
-                position_state_index: None,
-                max_delta_from: None,
-            })
-            .collect();
-
-        Self {
-            robot_id: "reachy_mini".into(),
-            robot_class: "expressive".into(),
-            control_rate_hz: 50,
-            commands,
-            states,
-        }
     }
 
     /// Generic N-joint velocity-only manifest for backward compatibility.
@@ -478,11 +146,13 @@ impl Default for ChannelManifest {
 
 #[cfg(test)]
 mod tests {
+    use std::f64::consts::PI;
+
     use super::*;
 
     #[test]
     fn manifest_serde_roundtrip() {
-        let manifest = ChannelManifest::ur5();
+        let manifest = ChannelManifest::generic_velocity(6, PI);
         let json = serde_json::to_string(&manifest).expect("serialization must succeed");
         let restored: ChannelManifest = serde_json::from_str(&json).expect("deserialization must succeed");
 
@@ -503,45 +173,19 @@ mod tests {
     }
 
     #[test]
-    fn ur5_manifest_has_correct_channels() {
-        let m = ChannelManifest::ur5();
+    fn generic_velocity_has_correct_channels() {
+        let m = ChannelManifest::generic_velocity(6, PI);
 
-        assert_eq!(m.command_count(), 6, "UR5 must have 6 velocity command channels");
-        assert_eq!(
-            m.state_count(),
-            12,
-            "UR5 must have 12 state channels (6 position + 6 velocity)"
-        );
+        assert_eq!(m.command_count(), 6, "generic_velocity(6) must have 6 command channels");
+        assert_eq!(m.state_count(), 0, "generic_velocity has no state channels");
 
-        // Every command channel must be Velocity and reference its matching position state.
         for (i, cmd) in m.commands.iter().enumerate() {
             assert_eq!(
                 cmd.interface_type,
                 InterfaceType::Velocity,
                 "command {i} must be Velocity"
             );
-            assert_eq!(
-                cmd.position_state_index,
-                Some(i),
-                "command {i} must pair with position state index {i}"
-            );
-        }
-
-        // First 6 state channels are Position, next 6 are Velocity.
-        for (i, state) in m.states[..6].iter().enumerate() {
-            assert_eq!(
-                state.interface_type,
-                InterfaceType::Position,
-                "state {i} must be Position"
-            );
-        }
-        for (i, state) in m.states[6..].iter().enumerate() {
-            assert_eq!(
-                state.interface_type,
-                InterfaceType::Velocity,
-                "state {} must be Velocity",
-                i + 6
-            );
+            assert_eq!(cmd.limits, (-PI, PI), "command {i} must have symmetric PI limits");
         }
 
         assert_eq!(m.robot_class, "manipulator");
@@ -549,68 +193,17 @@ mod tests {
     }
 
     #[test]
-    fn quadcopter_manifest_has_4_commands() {
-        let m = ChannelManifest::quadcopter();
-
-        assert_eq!(
-            m.command_count(),
-            4,
-            "quadcopter must have 4 body velocity command channels"
-        );
-        assert_eq!(m.state_count(), 4);
-        assert_eq!(m.robot_class, "drone");
-
-        // All 4 command channels must be Velocity.
-        for (i, cmd) in m.commands.iter().enumerate() {
-            assert_eq!(
-                cmd.interface_type,
-                InterfaceType::Velocity,
-                "command {i} must be Velocity"
-            );
-        }
+    fn default_manifest_is_empty() {
+        let m = ChannelManifest::default();
+        assert_eq!(m.command_count(), 0);
+        assert_eq!(m.state_count(), 0);
+        assert_eq!(m.control_rate_hz, 100);
     }
 
     #[test]
-    fn diff_drive_manifest_has_2_commands() {
-        let m = ChannelManifest::diff_drive();
-
-        assert_eq!(m.command_count(), 2, "diff_drive must have 2 twist command channels");
-        assert_eq!(m.state_count(), 3);
-        assert_eq!(m.robot_class, "mobile");
-
-        assert_eq!(m.commands[0].name, "base/linear.x");
-        assert_eq!(m.commands[1].name, "base/angular.z");
-    }
-
-    #[test]
-    fn reachy_mini_manifest_structure() {
-        let m = ChannelManifest::reachy_mini();
-        assert_eq!(m.robot_id, "reachy_mini");
-        assert_eq!(m.robot_class, "expressive");
-        assert_eq!(m.control_rate_hz, 50);
-        assert_eq!(m.commands.len(), 9);
-        assert_eq!(m.states.len(), 9);
-
-        assert_eq!(m.commands[0].name, "head/position.x");
-        assert_eq!(m.commands[5].name, "head/orientation.yaw");
-        assert_eq!(m.commands[6].name, "body/yaw");
-        assert_eq!(m.commands[7].name, "left_antenna/position");
-        assert_eq!(m.commands[8].name, "right_antenna/position");
-
-        // All position type
-        assert!(m.commands.iter().all(|c| c.interface_type == InterfaceType::Position));
-
-        // Head pitch ±40 deg
-        let limit_40 = 40.0_f64.to_radians();
-        assert!((m.commands[4].limits.1 - limit_40).abs() < 0.001);
-
-        // Body yaw ±160 deg
-        let limit_160 = 160.0_f64.to_radians();
-        assert!((m.commands[6].limits.1 - limit_160).abs() < 0.001);
-
-        // State/command pairing
-        for (i, cmd) in m.commands.iter().enumerate() {
-            assert_eq!(cmd.position_state_index, Some(i));
-        }
+    fn position_state_count_filters_correctly() {
+        let m = ChannelManifest::generic_velocity(4, 1.0);
+        // generic_velocity has no state channels at all.
+        assert_eq!(m.position_state_count(), 0);
     }
 }

@@ -83,7 +83,10 @@ async fn agent_deploys_sin_controller_and_arm_oscillates() {
 
     let mut extensions = Extensions::new();
     extensions.insert(handle.cmd_tx());
-    extensions.insert(roz_core::channels::ChannelManifest::ur5());
+    extensions.insert(roz_core::channels::ChannelManifest::generic_velocity(
+        6,
+        std::f64::consts::PI,
+    ));
 
     // -- 4. ToolDispatcher with deploy_controller registered. ---------------
 

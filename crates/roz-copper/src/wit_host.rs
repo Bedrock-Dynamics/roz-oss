@@ -533,10 +533,10 @@ fn register_config_functions(linker: &mut Linker<HostContext>) -> anyhow::Result
             if copy_len == 0 {
                 return 0;
             }
-            if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
-                if memory.write(&mut caller, ptr as usize, &config[..copy_len]).is_ok() {
-                    return copy_len as i32;
-                }
+            if let Some(memory) = caller.get_export("memory").and_then(wasmtime::Extern::into_memory)
+                && memory.write(&mut caller, ptr as usize, &config[..copy_len]).is_ok()
+            {
+                return copy_len as i32;
             }
             0 // write failed
         },
@@ -1410,8 +1410,8 @@ mod tests {
                 )
             )
         "#;
-        // Use UR5 manifest (6 commands) to test backward-compat joint count.
-        let host = HostContext::with_manifest(ChannelManifest::ur5());
+        // Use generic_velocity(6, PI) to test backward-compat joint count.
+        let host = HostContext::with_manifest(ChannelManifest::generic_velocity(6, std::f64::consts::PI));
         let (_engine, mut store, instance) = instantiate_with_host(wat, host).unwrap();
 
         let process = instance.get_typed_func::<u64, ()>(&mut store, "process").unwrap();

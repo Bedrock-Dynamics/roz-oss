@@ -178,9 +178,9 @@ impl SafetyFilterTask {
 
                 match desc.interface_type {
                     InterfaceType::Velocity => {
-                        if pos >= upper - POSITION_LIMIT_MARGIN && v > 0.0 {
-                            v = 0.0;
-                        } else if pos <= lower + POSITION_LIMIT_MARGIN && v < 0.0 {
+                        if (pos >= upper - POSITION_LIMIT_MARGIN && v > 0.0)
+                            || (pos <= lower + POSITION_LIMIT_MARGIN && v < 0.0)
+                        {
                             v = 0.0;
                         }
                     }
@@ -205,7 +205,7 @@ impl SafetyFilterTask {
                 };
                 let delta = v - other_val;
                 if delta.abs() > max_delta {
-                    v = other_val + delta.signum() * max_delta;
+                    v = delta.signum().mul_add(max_delta, other_val);
                 }
             }
 
@@ -430,10 +430,16 @@ mod tests {
         assert_eq!(clamped.values, vec![0.0, 0.0]);
     }
 
+    fn load_ur5_manifest() -> ChannelManifest {
+        let toml_str = include_str!("../../../examples/ur5/robot.toml");
+        let robot: crate::manifest::RobotManifest = toml::from_str(toml_str).unwrap();
+        robot.channel_manifest().unwrap()
+    }
+
     #[test]
     fn clamp_frame_rate_of_change_limiting() {
         // UR5 manifest has max_rate_of_change = Some(0.5) for velocity commands.
-        let manifest = ChannelManifest::ur5();
+        let manifest = load_ur5_manifest();
         let mut filter = SafetyFilterTask::new(std::f64::consts::PI, 0.0, None);
 
         // Request a large velocity jump from default (0.0).
@@ -451,7 +457,7 @@ mod tests {
 
     #[test]
     fn clamp_frame_position_limit_enforcement() {
-        let manifest = ChannelManifest::ur5();
+        let manifest = load_ur5_manifest();
         let mut filter = SafetyFilterTask::new(std::f64::consts::PI, 0.0, None);
 
         // Inject position near upper limit for joint 0 (state channel 0).
