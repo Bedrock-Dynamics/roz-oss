@@ -108,16 +108,16 @@ pub fn build_all_tools_with_copper(project_dir: &Path) -> AllTools {
             Some(sensor as Box<dyn roz_copper::io::SensorSource>),
         );
 
+        // Build deploy_controller tool before moving manifest into Extensions.
+        let deploy_tool = roz_local::tools::deploy_controller::DeployControllerTool::new(&channel_manifest);
+
         // Inject into Extensions for tool access.
         extensions.insert(handle.cmd_tx());
         extensions.insert(channel_manifest);
         extensions.insert(Arc::clone(handle.state()) as Arc<ArcSwap<roz_copper::channels::ControllerState>>);
 
         // Register controller tools.
-        dispatcher.register_with_category(
-            Box::new(roz_local::tools::deploy_controller::DeployControllerTool),
-            ToolCategory::Physical,
-        );
+        dispatcher.register_with_category(Box::new(deploy_tool), ToolCategory::Physical);
         dispatcher.register_with_category(
             Box::new(roz_local::tools::stop_controller::StopControllerTool),
             ToolCategory::Physical,

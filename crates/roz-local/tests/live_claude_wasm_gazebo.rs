@@ -48,10 +48,10 @@ async fn try_connect_sensor() -> Option<GrpcSensorSource> {
 }
 
 /// Build the tool dispatcher with `deploy_controller` + MCP tools.
-fn build_dispatcher(mcp: &Arc<McpManager>) -> ToolDispatcher {
+fn build_dispatcher(mcp: &Arc<McpManager>, manifest: &roz_core::channels::ChannelManifest) -> ToolDispatcher {
     let mut dispatcher = ToolDispatcher::new(Duration::from_secs(60));
     dispatcher.register_with_category(
-        Box::new(roz_local::tools::deploy_controller::DeployControllerTool),
+        Box::new(roz_local::tools::deploy_controller::DeployControllerTool::new(manifest)),
         roz_core::tools::ToolCategory::Physical,
     );
     for tool_info in mcp.all_tools() {
@@ -136,7 +136,7 @@ async fn full_vertical_claude_wasm_gazebo() {
     let mut extensions = Extensions::new();
     extensions.insert(handle.cmd_tx());
     extensions.insert(manifest.clone());
-    let dispatcher = build_dispatcher(&mcp);
+    let dispatcher = build_dispatcher(&mcp, &manifest);
     let model = roz_agent::model::create_model("claude-sonnet-4-6", "", "", 120, "anthropic", Some(&api_key)).unwrap();
     let safety = SafetyStack::new(vec![]);
     let spatial = Box::new(MockSpatialContextProvider::empty());
