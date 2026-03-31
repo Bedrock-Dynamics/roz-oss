@@ -39,7 +39,7 @@ fn load_quadcopter_manifest() -> ChannelManifest {
 
 const BRIDGE_URL: &str = "http://127.0.0.1:9090";
 
-/// WAT that sets command channel 2 (body/velocity.z) to 0.5 m/s on every tick.
+/// WAT that sets command channel 2 (velocity_z) to 0.5 m/s on every tick.
 const DRONE_VZ_WAT: &str = r#"
     (module
         (import "command" "set" (func $cmd (param i32 f64) (result i32)))

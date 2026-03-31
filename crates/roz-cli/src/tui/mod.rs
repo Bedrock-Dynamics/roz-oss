@@ -1,6 +1,7 @@
 mod agent;
 mod commands;
 pub mod context;
+pub mod convert;
 #[allow(dead_code)] // Formatters wired incrementally.
 pub mod format;
 mod history;
@@ -970,6 +971,9 @@ async fn provider_loop(
         let (text_tx, text_rx) = async_channel::unbounded::<String>();
         let event_tx_cloud = event_tx.clone();
 
+        // Build unified tool set (CLI built-ins + daemon tools from robot.toml).
+        let local_tool_opts = providers::cloud::build_local_tool_opts(std::path::Path::new("."));
+
         // Bridge: filter UserAction into plain text for the gRPC stream.
         let bridge = tokio::spawn({
             let msg_rx = msg_rx.clone();
@@ -988,7 +992,7 @@ async fn provider_loop(
             }
         });
 
-        if let Err(e) = providers::cloud::stream_session(&config, text_rx, event_tx_cloud).await {
+        if let Err(e) = providers::cloud::stream_session(&config, text_rx, event_tx_cloud, local_tool_opts).await {
             let display = classify_error_message(&e.to_string(), &config);
             let _ = event_tx.send(AgentEvent::Error(display)).await;
         }
@@ -1021,24 +1025,15 @@ async fn provider_loop(
         }
     };
 
-    let dispatcher = tools::build_dispatcher();
+    let (dispatcher, _schemas) = tools::build_all_tools(std::path::Path::new("."));
     let safety = roz_agent::safety::SafetyStack::new(vec![]); // no-op for BYOK
     let spatial = roz_agent::spatial_provider::NullSpatialContextProvider;
 
     let mut agent_loop = roz_agent::agent_loop::AgentLoop::new(model, dispatcher, safety, Box::new(spatial));
 
     // Build the system prompt once at session start (stable across turns for cache hits).
-    // Block 0: constitution (always present).
-    // Block 1: project context from AGENTS.md / ROBOT.md (if found).
-    let system_prompt = {
-        let constitution =
-            roz_agent::constitution::build_constitution(roz_agent::agent_loop::AgentLoopMode::React, &[]);
-        let mut blocks = vec![constitution];
-        if let Some(project_ctx) = context::load_project_context() {
-            blocks.push(project_ctx);
-        }
-        blocks
-    };
+    // Unified builder: constitution + robot.toml + AGENTS.md / ROBOT.md.
+    let system_prompt = tools::build_system_prompt(std::path::Path::new("."), &[]);
 
     let _ = event_tx
         .send(AgentEvent::Connected {

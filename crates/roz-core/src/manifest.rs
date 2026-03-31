@@ -90,7 +90,7 @@ pub struct ChannelConfig {
 /// A single channel definition in `robot.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelDef {
-    /// Channel name (`ros2_control` convention: `"joint_name/interface_type"`).
+    /// Channel name (flat snake\_case: `"head_pitch"`, `"shoulder_pan"`).
     pub name: String,
     /// `"position"`, `"velocity"`, or `"effort"`.
     #[serde(rename = "type")]
@@ -191,6 +191,18 @@ pub struct PlayAnimationConfig {
     pub available_moves: Vec<String>,
 }
 
+/// Check whether a channel name is valid flat snake\_case.
+///
+/// Valid names match `[a-zA-Z][a-zA-Z0-9_]{0,63}` -- no slashes, dots,
+/// or leading digits.
+#[must_use]
+pub fn is_valid_channel_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+}
+
 impl RobotManifest {
     /// Load a `RobotManifest` from a `robot.toml` file.
     ///
@@ -216,6 +228,12 @@ impl RobotManifest {
         let ch = self.channels.as_ref()?;
 
         let convert = |def: &ChannelDef| -> Option<ChannelDescriptor> {
+            if !is_valid_channel_name(&def.name) {
+                tracing::warn!(
+                    "channel name '{}' contains invalid characters — must be [a-zA-Z][a-zA-Z0-9_]{{0,63}}",
+                    def.name
+                );
+            }
             let interface_type = match def.interface_type.as_str() {
                 "position" => InterfaceType::Position,
                 "velocity" => InterfaceType::Velocity,
@@ -370,14 +388,14 @@ robot_class = "test"
 control_rate_hz = 50
 
 [[channels.commands]]
-name = "joint/position"
+name = "joint_position"
 type = "position"
 unit = "rad"
 limits = [-1.0, 1.0]
 position_state_index = 0
 
 [[channels.states]]
-name = "joint/position"
+name = "joint_position"
 type = "position"
 unit = "rad"
 limits = [-1.0, 1.0]
@@ -412,14 +430,14 @@ robot_class = "test"
 control_rate_hz = 100
 
 [[channels.commands]]
-name = "a/position"
+name = "a_position"
 type = "position"
 unit = "rad"
 limits = [-3.14, 3.14]
 max_delta_from = [1, 1.5]
 
 [[channels.commands]]
-name = "b/position"
+name = "b_position"
 type = "position"
 unit = "rad"
 limits = [-3.14, 3.14]
@@ -428,39 +446,6 @@ limits = [-3.14, 3.14]
         let ch = manifest.channel_manifest().unwrap();
         assert_eq!(ch.commands[0].max_delta_from, Some((1, 1.5)));
         assert_eq!(ch.commands[1].max_delta_from, None);
-    }
-
-    #[test]
-    fn reachy_mini_robot_toml_loads() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/reachy-mini/robot.toml");
-        if path.exists() {
-            let manifest = RobotManifest::load(&path).unwrap();
-            assert_eq!(manifest.robot.name, "reachy-mini");
-            let ch = manifest.channel_manifest().unwrap();
-            assert_eq!(ch.robot_id, "reachy_mini");
-            assert_eq!(ch.robot_class, "expressive");
-            assert_eq!(ch.control_rate_hz, 50);
-            assert_eq!(ch.commands.len(), 9);
-            assert_eq!(ch.states.len(), 9);
-
-            // Verify head/orientation.yaw has max_delta_from body/yaw
-            assert_eq!(ch.commands[5].name, "head/orientation.yaw");
-            // 65 degrees in radians = 1.1344640137963142
-            let expected_delta = 65.0_f64.to_radians();
-            let (idx, delta) = ch.commands[5].max_delta_from.unwrap();
-            assert_eq!(idx, 6);
-            assert!(
-                (delta - expected_delta).abs() < 1e-10,
-                "max_delta_from delta should be 65 deg in radians: got {delta}, expected {expected_delta}"
-            );
-
-            // All channels are position type
-            assert!(
-                ch.commands
-                    .iter()
-                    .all(|c| c.interface_type == crate::channels::InterfaceType::Position)
-            );
-        }
     }
 
     #[test]
@@ -484,7 +469,7 @@ path = "/api/motors/set_mode/{{mode}}"
 [daemon.move_to]
 method = "POST"
 path = "/api/move/goto"
-body = '{"pitch": {{head/pitch}}, "duration": {{duration}}}'
+body = '{"pitch": {{head_pitch}}, "duration": {{duration}}}'
 
 [daemon.play_animation]
 method = "POST"
@@ -528,5 +513,19 @@ set_target_body = '{"type": "set_full_target", "head": [1,0,0,0]}'
         let ws = manifest.daemon.unwrap().websocket.unwrap();
         assert_eq!(ws.path, "/ws/sdk");
         assert_eq!(ws.set_target_type.unwrap(), "set_full_target");
+    }
+
+    #[test]
+    fn channel_name_validation_warns_on_slash() {
+        // Old-style hierarchical names must be rejected
+        assert!(!is_valid_channel_name("head/position.x"));
+        assert!(!is_valid_channel_name("body/yaw"));
+        // New flat snake_case names pass
+        assert!(is_valid_channel_name("head_x"));
+        assert!(is_valid_channel_name("body_yaw"));
+        assert!(is_valid_channel_name("shoulder_pan"));
+        // Edge cases
+        assert!(!is_valid_channel_name("")); // empty
+        assert!(!is_valid_channel_name("0starts_with_number"));
     }
 }

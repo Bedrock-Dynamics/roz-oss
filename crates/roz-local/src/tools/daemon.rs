@@ -447,7 +447,7 @@ mod tests {
             control_rate_hz: 50,
             commands: vec![
                 ChannelDescriptor {
-                    name: "head/orientation.pitch".into(),
+                    name: "head_pitch".into(),
                     interface_type: InterfaceType::Position,
                     unit: "rad".into(),
                     limits: (-0.35, 0.17),
@@ -457,7 +457,7 @@ mod tests {
                     max_delta_from: None,
                 },
                 ChannelDescriptor {
-                    name: "head/orientation.yaw".into(),
+                    name: "head_yaw".into(),
                     interface_type: InterfaceType::Position,
                     unit: "rad".into(),
                     limits: (-1.13, 1.13),
@@ -488,7 +488,7 @@ mod tests {
             move_to: Some(MoveToConfig {
                 method: "POST".into(),
                 path: "/api/move/goto".into(),
-                body: r#"{"pitch": {{head/orientation.pitch}}, "yaw": {{head/orientation.yaw}}, "duration": {{duration}}}"#.into(),
+                body: r#"{"pitch": {{head_pitch}}, "yaw": {{head_yaw}}, "duration": {{duration}}}"#.into(),
             }),
             play_animation: Some(PlayAnimationConfig {
                 method: "POST".into(),
@@ -522,17 +522,17 @@ mod tests {
         let schema = build_move_to_schema(&manifest);
 
         assert_eq!(schema.name, "move_to");
-        assert!(schema.description.contains("head/orientation.pitch"));
-        assert!(schema.description.contains("head/orientation.yaw"));
+        assert!(schema.description.contains("head_pitch"));
+        assert!(schema.description.contains("head_yaw"));
 
         let props = schema.parameters["properties"].as_object().unwrap();
-        assert!(props.contains_key("head/orientation.pitch"));
-        assert!(props.contains_key("head/orientation.yaw"));
+        assert!(props.contains_key("head_pitch"));
+        assert!(props.contains_key("head_yaw"));
         assert!(props.contains_key("duration_secs"));
         assert_eq!(props.len(), 3); // 2 channels + duration_secs
 
         // Check channel property has type and description with limits
-        let pitch = &props["head/orientation.pitch"];
+        let pitch = &props["head_pitch"];
         assert_eq!(pitch["type"], "number");
         let desc = pitch["description"].as_str().unwrap();
         assert!(desc.contains("rad"));
@@ -592,8 +592,8 @@ mod tests {
 
         let mut template_values = HashMap::new();
         template_values.insert("duration".to_string(), "1.5".to_string());
-        template_values.insert("head/orientation.pitch".to_string(), "0.1".to_string());
-        template_values.insert("head/orientation.yaw".to_string(), "-0.5".to_string());
+        template_values.insert("head_pitch".to_string(), "0.1".to_string());
+        template_values.insert("head_yaw".to_string(), "-0.5".to_string());
 
         let rendered = render_template(&move_cfg.body, &template_values);
         let parsed: Value = serde_json::from_str(&rendered).expect("rendered body must be valid JSON");
@@ -639,7 +639,7 @@ mod tests {
         assert!(result.is_error());
         let err = result.error.unwrap();
         assert!(err.contains("Unknown channel 'bogus_channel'"), "got: {err}");
-        assert!(err.contains("head/orientation.pitch"));
+        assert!(err.contains("head_pitch"));
     }
 
     // -----------------------------------------------------------------------
@@ -731,8 +731,8 @@ mod tests {
         // The HTTP call will fail (localhost:1), proving we got past validation.
         let params = json!({
             "duration_secs": 1.0,
-            "head/orientation.pitch": 99.0,
-            "head/orientation.yaw": -99.0,
+            "head_pitch": 99.0,
+            "head_yaw": -99.0,
         });
         let result = tool.execute(params, &test_ctx()).await;
         // Connection error means we got past validation + template rendering

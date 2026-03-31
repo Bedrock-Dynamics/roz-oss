@@ -1,22 +1,80 @@
-use async_trait::async_trait;
-use roz_agent::dispatch::ToolContext;
-use roz_core::tools::{ToolResult, ToolSchema};
-use serde_json::{Value, json};
+use std::path::Path;
 use std::time::Duration;
 
-use roz_agent::dispatch::{ToolDispatcher, ToolExecutor};
+use async_trait::async_trait;
+use roz_agent::dispatch::{Extensions, ToolContext, ToolDispatcher, ToolExecutor};
 use roz_agent::tools::execute_code::ExecuteCodeTool;
+use roz_core::manifest::RobotManifest;
+use roz_core::tools::{ToolCategory, ToolResult, ToolSchema};
+use serde_json::{Value, json};
 
-/// Build a `ToolDispatcher` with all CLI built-in tools registered.
-pub fn build_dispatcher() -> ToolDispatcher {
+/// Build a `ToolDispatcher` with **all** tools for CLI sessions:
+/// 6 built-in tools + daemon tools from `robot.toml` (if present).
+///
+/// Returns the dispatcher and the combined schema vec paired with categories
+/// (used for cloud `RegisterTools` with correct `ToolCategoryHint` and for
+/// BYOK system-prompt tool catalogs alike).
+pub fn build_all_tools(project_dir: &Path) -> (ToolDispatcher, Vec<(ToolSchema, ToolCategory)>) {
     let mut dispatcher = ToolDispatcher::new(Duration::from_secs(120));
+
+    // CLI built-ins: Physical tools have real-world side effects.
     dispatcher.register(Box::new(BashTool));
-    dispatcher.register(Box::new(ReadFileTool));
     dispatcher.register(Box::new(WriteFileTool));
-    dispatcher.register(Box::new(ListFilesTool));
-    dispatcher.register(Box::new(SearchTool));
     dispatcher.register(Box::new(ExecuteCodeTool));
-    dispatcher
+
+    // CLI built-ins: Pure tools are read-only / side-effect-free.
+    dispatcher.register_with_category(Box::new(ReadFileTool), ToolCategory::Pure);
+    dispatcher.register_with_category(Box::new(ListFilesTool), ToolCategory::Pure);
+    dispatcher.register_with_category(Box::new(SearchTool), ToolCategory::Pure);
+
+    // Daemon tools from robot.toml (if present)
+    let robot_toml = project_dir.join("robot.toml");
+    if let Ok(manifest) = RobotManifest::load(&robot_toml)
+        && let Some(daemon) = manifest.daemon.as_ref()
+    {
+        let channels = manifest.channel_manifest();
+        for (tool, category) in roz_local::tools::daemon::daemon_tools(daemon, channels.as_ref()) {
+            dispatcher.register_with_category(tool, category);
+        }
+    }
+
+    let schemas = dispatcher.schemas_with_categories();
+    (dispatcher, schemas)
+}
+
+/// Build system prompt blocks: constitution + robot.toml + project context.
+///
+/// Reuses `context::load_project_context_from()` for AGENTS.md/ROBOT.md,
+/// prepends the constitution, and adds robot.toml system prompt if present.
+pub fn build_system_prompt(project_dir: &Path, tool_names: &[&str]) -> Vec<String> {
+    let mode = roz_agent::agent_loop::AgentLoopMode::React;
+    let mut blocks = vec![roz_agent::constitution::build_constitution(mode, tool_names)];
+
+    // Robot system prompt from robot.toml
+    let robot_toml = project_dir.join("robot.toml");
+    if let Ok(manifest) = RobotManifest::load(&robot_toml) {
+        let prompt = manifest.to_system_prompt();
+        if !prompt.is_empty() {
+            blocks.push(prompt);
+        }
+    }
+
+    // Project context: AGENTS.md, ROBOT.md (existing loader)
+    if let Some(context) = super::context::load_project_context_from(project_dir) {
+        blocks.push(context);
+    }
+
+    blocks
+}
+
+/// Default `ToolContext` for local execution (no tenant/task context).
+pub fn default_context() -> ToolContext {
+    ToolContext {
+        task_id: "local".into(),
+        tenant_id: "local".into(),
+        call_id: String::new(),
+        extensions: Extensions::default(),
+    }
 }
 
 // -- Bash --------------------------------------------------------------------
@@ -249,5 +307,194 @@ impl ToolExecutor for SearchTool {
         } else {
             Ok(ToolResult::success(json!(result)))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    const MINIMAL_ROBOT_TOML: &str = r#"
+[robot]
+name = "test-bot"
+description = "A test robot"
+
+[daemon]
+base_url = "http://localhost:8000"
+
+[daemon.get_state]
+method = "GET"
+path = "/api/state/full"
+
+[daemon.set_motors]
+method = "POST"
+path = "/api/motors/set_mode/{{mode}}"
+
+[daemon.play_animation]
+method = "POST"
+path_prefix = "/api/move/play"
+available_moves = ["wake_up", "goto_sleep"]
+"#;
+
+    const ROBOT_TOML_WITH_CHANNELS: &str = r#"
+[robot]
+name = "test-bot"
+description = "A test robot"
+
+[channels]
+robot_id = "test"
+robot_class = "expressive"
+control_rate_hz = 50
+
+[[channels.commands]]
+name = "head_pitch"
+type = "position"
+unit = "rad"
+limits = [-0.35, 0.17]
+
+[[channels.states]]
+name = "head_pitch"
+type = "position"
+unit = "rad"
+limits = [-0.35, 0.17]
+
+[daemon]
+base_url = "http://localhost:8000"
+
+[daemon.get_state]
+method = "GET"
+path = "/api/state/full"
+
+[daemon.set_motors]
+method = "POST"
+path = "/api/motors/set_mode/{{mode}}"
+
+[daemon.move_to]
+method = "POST"
+path = "/api/move/goto"
+body = '{"pitch": {{head_pitch}}, "duration": {{duration}}}'
+
+[daemon.play_animation]
+method = "POST"
+path_prefix = "/api/move/play"
+available_moves = ["wake_up", "goto_sleep"]
+"#;
+
+    #[test]
+    fn build_all_tools_includes_builtins_without_robot_toml() {
+        let dir = TempDir::new().unwrap();
+        let (dispatcher, schemas) = build_all_tools(dir.path());
+        // 6 CLI built-ins: bash, read_file, write_file, list_files, search, execute_code
+        assert_eq!(dispatcher.schemas().len(), 6);
+        assert_eq!(schemas.len(), 6);
+        let names: Vec<&str> = schemas.iter().map(|(s, _)| s.name.as_str()).collect();
+        assert!(names.contains(&"bash"));
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"write_file"));
+        assert!(names.contains(&"list_files"));
+        assert!(names.contains(&"search"));
+        assert!(names.contains(&"execute_code"));
+    }
+
+    #[test]
+    fn build_all_tools_includes_daemon_tools_when_robot_toml_present() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("robot.toml"), MINIMAL_ROBOT_TOML).unwrap();
+        let (_dispatcher, schemas) = build_all_tools(dir.path());
+        // 6 CLI built-ins + 3 daemon tools (get_robot_state, set_motors, play_animation)
+        assert_eq!(schemas.len(), 9);
+        let names: Vec<&str> = schemas.iter().map(|(s, _)| s.name.as_str()).collect();
+        assert!(names.contains(&"bash"));
+        assert!(names.contains(&"get_robot_state"));
+        assert!(names.contains(&"set_motors"));
+        assert!(names.contains(&"play_animation"));
+    }
+
+    #[test]
+    fn build_all_tools_includes_move_to_with_channels() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("robot.toml"), ROBOT_TOML_WITH_CHANNELS).unwrap();
+        let (_dispatcher, schemas) = build_all_tools(dir.path());
+        // 6 built-ins + 4 daemon tools (get_robot_state, set_motors, move_to, play_animation)
+        assert_eq!(schemas.len(), 10);
+        let names: Vec<&str> = schemas.iter().map(|(s, _)| s.name.as_str()).collect();
+        assert!(names.contains(&"move_to"));
+        // Verify move_to has channel properties
+        let move_to = schemas.iter().map(|(s, _)| s).find(|s| s.name == "move_to").unwrap();
+        let props = move_to.parameters["properties"].as_object().unwrap();
+        assert!(props.contains_key("head_pitch"));
+        assert!(props.contains_key("duration_secs"));
+    }
+
+    #[test]
+    fn build_all_tools_no_daemon_when_no_daemon_section() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("robot.toml"),
+            "[robot]\nname = \"test\"\ndescription = \"test\"\n",
+        )
+        .unwrap();
+        let (_dispatcher, schemas) = build_all_tools(dir.path());
+        // Only CLI built-ins
+        assert_eq!(schemas.len(), 6);
+    }
+
+    #[test]
+    fn default_context_has_local_ids() {
+        let ctx = default_context();
+        assert_eq!(ctx.task_id, "local");
+        assert_eq!(ctx.tenant_id, "local");
+    }
+
+    #[test]
+    fn build_system_prompt_includes_constitution() {
+        let dir = TempDir::new().unwrap();
+        let prompt = build_system_prompt(dir.path(), &["bash", "read_file"]);
+        assert!(!prompt.is_empty());
+        assert!(
+            prompt[0].contains("SAFETY-CRITICAL"),
+            "first block should be constitution"
+        );
+    }
+
+    #[test]
+    fn build_system_prompt_includes_robot_toml() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("robot.toml"),
+            "[robot]\nname = \"test-bot\"\ndescription = \"A test robot\"\n",
+        )
+        .unwrap();
+        let prompt = build_system_prompt(dir.path(), &[]);
+        assert!(prompt.len() >= 2, "should have constitution + robot prompt");
+        assert!(prompt[1].contains("test-bot"));
+    }
+
+    #[test]
+    fn build_system_prompt_includes_project_context() {
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("AGENTS.md"), "Be helpful and safe.").unwrap();
+        let prompt = build_system_prompt(dir.path(), &[]);
+        assert!(prompt.len() >= 2, "should have constitution + project context");
+        assert!(prompt.iter().any(|b| b.contains("Be helpful and safe.")));
+    }
+
+    #[test]
+    fn build_system_prompt_all_blocks() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("robot.toml"),
+            "[robot]\nname = \"all-bot\"\ndescription = \"Full test\"\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("AGENTS.md"), "Agent instructions.").unwrap();
+        let prompt = build_system_prompt(dir.path(), &["bash"]);
+        // constitution + robot.toml + AGENTS.md = 3 blocks
+        assert_eq!(prompt.len(), 3);
+        assert!(prompt[0].contains("SAFETY-CRITICAL"));
+        assert!(prompt[1].contains("all-bot"));
+        assert!(prompt[2].contains("Agent instructions."));
     }
 }

@@ -486,7 +486,7 @@ mod tests {
             robot_class: "test".into(),
             control_rate_hz: 50,
             commands: vec![ChannelDescriptor {
-                name: "joint/position".into(),
+                name: "joint_position".into(),
                 interface_type: InterfaceType::Position,
                 unit: "rad".into(),
                 limits: (-0.698, 0.698), // +/-40 degrees
@@ -496,7 +496,7 @@ mod tests {
                 max_delta_from: None,
             }],
             states: vec![ChannelDescriptor {
-                name: "joint/position".into(),
+                name: "joint_position".into(),
                 interface_type: InterfaceType::Position,
                 unit: "rad".into(),
                 limits: (-0.698, 0.698),
@@ -534,7 +534,7 @@ mod tests {
             robot_class: "test".into(),
             control_rate_hz: 100,
             commands: vec![ChannelDescriptor {
-                name: "joint/velocity".into(),
+                name: "joint_velocity".into(),
                 interface_type: InterfaceType::Velocity,
                 unit: "rad/s".into(),
                 limits: (-1.5, 1.5),
@@ -544,7 +544,7 @@ mod tests {
                 max_delta_from: None,
             }],
             states: vec![ChannelDescriptor {
-                name: "joint/position".into(),
+                name: "joint_position".into(),
                 interface_type: InterfaceType::Position,
                 unit: "rad".into(),
                 limits: (-std::f64::consts::TAU, std::f64::consts::TAU),

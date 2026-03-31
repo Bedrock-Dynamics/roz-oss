@@ -3,7 +3,7 @@
 //! Substitutes `{{key}}` placeholders with values from a map.
 //! No conditionals, no loops — just string replacement.
 //! Keys are sorted by length descending to prevent shorter keys
-//! from corrupting longer ones (e.g. `{{head}}` vs `{{head/position.x}}`).
+//! from corrupting longer ones (e.g. `{{head}}` vs `{{head_position_x}}`).
 
 use std::collections::HashMap;
 use std::hash::BuildHasher;
@@ -11,7 +11,7 @@ use std::hash::BuildHasher;
 /// Render a body template by replacing `{{key}}` placeholders with values.
 ///
 /// Keys are sorted by length descending before substitution to prevent
-/// `{{head}}` from corrupting `{{head/position.x}}`.
+/// `{{head}}` from corrupting `{{head_position_x}}`.
 ///
 /// Unresolved placeholders are left as-is (the daemon will reject them,
 /// giving a clear error).
@@ -37,11 +37,11 @@ mod tests {
     }
 
     #[test]
-    fn renders_channel_names_with_slashes() {
+    fn renders_channel_names_with_underscores() {
         let mut values = HashMap::new();
-        values.insert("head/orientation.pitch".into(), "0.35".into());
+        values.insert("head_pitch".into(), "0.35".into());
         values.insert("duration".into(), "1.5".into());
-        let template = r#"{"pitch": {{head/orientation.pitch}}, "duration": {{duration}}}"#;
+        let template = r#"{"pitch": {{head_pitch}}, "duration": {{duration}}}"#;
         let result = render_template(template, &values);
         assert_eq!(result, r#"{"pitch": 0.35, "duration": 1.5}"#);
     }
@@ -63,10 +63,10 @@ mod tests {
     fn long_keys_sorted_before_short_keys() {
         let mut values = HashMap::new();
         values.insert("head".into(), "WRONG".into());
-        values.insert("head/position.x".into(), "0.01".into());
-        let template = "{{head/position.x}} and {{head}}";
+        values.insert("head_position_x".into(), "0.01".into());
+        let template = "{{head_position_x}} and {{head}}";
         let result = render_template(template, &values);
-        // head/position.x should be replaced first (longer), then head
+        // head_position_x should be replaced first (longer), then head
         assert_eq!(result, "0.01 and WRONG");
     }
 

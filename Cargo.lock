@@ -5666,6 +5666,7 @@ dependencies = [
  "toml 0.8.23",
  "tonic 0.13.1",
  "tonic-build",
+ "tracing",
  "unicode-width 0.1.14",
  "uuid",
  "webbrowser",

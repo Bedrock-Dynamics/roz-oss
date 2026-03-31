@@ -34,12 +34,14 @@ async fn execute_cloud(config: &ProviderConfig, task: &str) -> anyhow::Result<()
     text_tx.send(task.to_string()).await?;
     text_tx.close();
 
+    // Build unified tool set (CLI built-ins + daemon tools from robot.toml)
+    let local_tool_opts = crate::tui::providers::cloud::build_local_tool_opts(std::path::Path::new("."));
+
     // Spawn gRPC session in background
     let config_clone = config.clone();
-    let session =
-        tokio::spawn(
-            async move { crate::tui::providers::cloud::stream_session(&config_clone, text_rx, event_tx).await },
-        );
+    let session = tokio::spawn(async move {
+        crate::tui::providers::cloud::stream_session(&config_clone, text_rx, event_tx, local_tool_opts).await
+    });
 
     // Collect streaming response
     let mut response = String::new();
@@ -105,16 +107,12 @@ async fn execute_byok(config: &ProviderConfig, task: &str) -> anyhow::Result<()>
 
     let model = roz_agent::model::create_model(&config.model, "", "", 120, proxy_provider, Some(api_key))?;
 
-    let dispatcher = crate::tui::tools::build_dispatcher();
+    let (dispatcher, _schemas) = crate::tui::tools::build_all_tools(std::path::Path::new("."));
     let safety = roz_agent::safety::SafetyStack::new(vec![]);
     let spatial = roz_agent::spatial_provider::NullSpatialContextProvider;
     let mut agent_loop = roz_agent::agent_loop::AgentLoop::new(model, dispatcher, safety, Box::new(spatial));
 
-    let constitution = roz_agent::constitution::build_constitution(roz_agent::agent_loop::AgentLoopMode::React, &[]);
-    let mut system_prompt = vec![constitution];
-    if let Some(ctx) = crate::tui::context::load_project_context() {
-        system_prompt.push(ctx);
-    }
+    let system_prompt = crate::tui::tools::build_system_prompt(std::path::Path::new("."), &[]);
 
     let input = roz_agent::agent_loop::AgentInput {
         task_id: uuid::Uuid::new_v4().to_string(),
