@@ -488,12 +488,12 @@ impl LocalRuntime {
         let robot_manifest = roz_core::manifest::RobotManifest::load(&robot_toml_path).ok();
 
         // Register daemon REST tools if [daemon] section present
-        if let Some(ref rm) = robot_manifest {
-            if let Some(ref daemon) = rm.daemon {
-                let channel_manifest = rm.channel_manifest();
-                for (tool, category) in crate::tools::daemon::daemon_tools(daemon, channel_manifest.as_ref()) {
-                    dispatcher.register_with_category(tool, category);
-                }
+        if let Some(ref rm) = robot_manifest
+            && let Some(ref daemon) = rm.daemon
+        {
+            let channel_manifest = rm.channel_manifest();
+            for (tool, category) in crate::tools::daemon::daemon_tools(daemon, channel_manifest.as_ref()) {
+                dispatcher.register_with_category(tool, category);
             }
         }
 
@@ -515,10 +515,10 @@ impl LocalRuntime {
         if let Some(ref handle) = self.copper_handle {
             extensions.insert(handle.cmd_tx());
             // Inject channel manifest for deploy_controller
-            if let Some(ref rm) = robot_manifest {
-                if let Some(channel_manifest) = rm.channel_manifest() {
-                    extensions.insert(channel_manifest);
-                }
+            if let Some(ref rm) = robot_manifest
+                && let Some(channel_manifest) = rm.channel_manifest()
+            {
+                extensions.insert(channel_manifest);
             }
         }
 
