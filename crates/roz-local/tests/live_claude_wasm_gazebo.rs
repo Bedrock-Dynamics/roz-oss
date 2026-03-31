@@ -110,7 +110,7 @@ async fn full_vertical_claude_wasm_gazebo() {
         .expect("gRPC channel to bridge should connect");
     let manifest = {
         let toml_str = include_str!("../../../examples/ur5/robot.toml");
-        let robot: roz_copper::manifest::RobotManifest = toml::from_str(toml_str).unwrap();
+        let robot: roz_core::manifest::RobotManifest = toml::from_str(toml_str).unwrap();
         robot.channel_manifest().unwrap()
     };
     let grpc_sink = Arc::new(GrpcActuatorSink::from_manifest(

@@ -13,6 +13,7 @@ pub mod errors;
 pub mod frames;
 pub mod hazards;
 pub mod lease;
+pub mod manifest;
 pub mod matching;
 pub mod messages;
 pub mod phases;

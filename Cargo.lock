@@ -5651,7 +5651,6 @@ dependencies = [
  "reqwest 0.12.28",
  "reqwest-eventsource",
  "roz-agent",
- "roz-copper",
  "roz-core",
  "roz-local",
  "serde",
@@ -5718,6 +5717,7 @@ dependencies = [
  "serde_yaml",
  "sha2 0.10.9",
  "thiserror 2.0.18",
+ "toml 0.8.23",
  "uuid",
 ]
 

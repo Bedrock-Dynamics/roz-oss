@@ -179,7 +179,7 @@ rate_hz = 100
 e_stop_behavior = "hold_position"
 max_contact_force_n = 80.0
 "#;
-    let manifest: roz_copper::manifest::RobotManifest = toml::from_str(toml_str).unwrap();
+    let manifest: roz_core::manifest::RobotManifest = toml::from_str(toml_str).unwrap();
     let prompt = manifest.to_system_prompt();
 
     assert!(prompt.contains("test-arm"), "prompt should contain robot name");
