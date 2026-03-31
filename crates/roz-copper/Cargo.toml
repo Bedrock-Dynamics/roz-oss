@@ -34,6 +34,8 @@ roz-nats = { path = "../roz-nats" }
 roz-core = { path = "../roz-core" }
 parking_lot.workspace = true
 tokio = { workspace = true, features = ["full"] }
+tokio-tungstenite.workspace = true
+futures.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 wasmtime = "43"

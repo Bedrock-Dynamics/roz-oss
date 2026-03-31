@@ -23,6 +23,7 @@ pub mod handle;
 pub mod io;
 pub mod io_grpc;
 pub mod io_log;
+pub mod io_ws;
 pub mod manifest;
 pub mod mcap_export;
 pub mod safety_filter;
