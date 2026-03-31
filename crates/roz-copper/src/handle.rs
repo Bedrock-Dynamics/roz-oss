@@ -39,6 +39,10 @@ pub struct CopperHandle {
     thread: Option<std::thread::JoinHandle<()>>,
     /// Bridge task handle.
     bridge: Option<tokio::task::JoinHandle<()>>,
+    /// E-stop notification receiver. The controller loop sends a reason string
+    /// through this channel when a WASM error or watchdog timeout occurs.
+    /// The supervisor/adapter should drain this and call `emergency_stop` on hardware.
+    estop_rx: Option<mpsc::Receiver<String>>,
 }
 
 impl CopperHandle {
@@ -64,6 +68,9 @@ impl CopperHandle {
         // Shutdown flag.
         let shutdown = Arc::new(AtomicBool::new(false));
 
+        // E-stop notification channel.
+        let (estop_tx, estop_rx) = mpsc::channel::<String>(4);
+
         // Spawn bridge task (tokio → std forwarding).
         let bridge = crate::channels::spawn_command_bridge(agent_rx, copper_tx);
 
@@ -82,6 +89,7 @@ impl CopperHandle {
                     None,
                     AGENT_WATCHDOG_TIMEOUT,
                     Some(&emergency_rx),
+                    &estop_tx,
                 );
             })
             .expect("failed to spawn copper controller thread");
@@ -93,6 +101,7 @@ impl CopperHandle {
             shutdown,
             thread: Some(thread),
             bridge: Some(bridge),
+            estop_rx: Some(estop_rx),
         }
     }
 
@@ -124,6 +133,9 @@ impl CopperHandle {
         // Shutdown flag.
         let shutdown = Arc::new(AtomicBool::new(false));
 
+        // E-stop notification channel.
+        let (estop_tx, estop_rx) = mpsc::channel::<String>(4);
+
         // Spawn bridge task (tokio → std forwarding).
         let bridge = crate::channels::spawn_command_bridge(agent_rx, copper_tx);
 
@@ -153,6 +165,7 @@ impl CopperHandle {
                             Some(&mut *s),
                             AGENT_WATCHDOG_TIMEOUT,
                             Some(&emergency_rx),
+                            &estop_tx,
                         );
                     }
                     None => {
@@ -165,6 +178,7 @@ impl CopperHandle {
                             None,
                             AGENT_WATCHDOG_TIMEOUT,
                             Some(&emergency_rx),
+                            &estop_tx,
                         );
                     }
                 }
@@ -178,6 +192,7 @@ impl CopperHandle {
             shutdown,
             thread: Some(thread),
             bridge: Some(bridge),
+            estop_rx: Some(estop_rx),
         }
     }
 
@@ -200,6 +215,16 @@ impl CopperHandle {
     /// Get the shared state handle (for `CopperSpatialProvider`).
     pub const fn state(&self) -> &Arc<ArcSwap<ControllerState>> {
         &self.state
+    }
+
+    /// Take the e-stop receiver (can only be called once).
+    ///
+    /// The supervisor or hardware adapter should drain this channel and
+    /// call `emergency_stop()` / `disable_motors()` on the hardware when
+    /// a message arrives. Messages are reason strings describing the error
+    /// (e.g. `"controller_error: e-stop requested by WASM module"`).
+    pub const fn take_estop_rx(&mut self) -> Option<mpsc::Receiver<String>> {
+        self.estop_rx.take()
     }
 
     /// Cleanly shut down the Copper thread and bridge task.

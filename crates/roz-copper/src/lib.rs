@@ -26,6 +26,7 @@ pub mod io_log;
 pub mod manifest;
 pub mod mcap_export;
 pub mod safety_filter;
+pub mod state_injector;
 pub mod tasks;
 pub mod wasm;
 pub mod wit_host;

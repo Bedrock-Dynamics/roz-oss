@@ -62,6 +62,7 @@ async fn wasm_controller_with_live_gazebo_sensor() {
     let (_emergency_tx, emergency_rx) = std::sync::mpsc::sync_channel(1);
     let state = Arc::new(ArcSwap::from_pointee(ControllerState::default()));
     let shutdown = Arc::new(AtomicBool::new(false));
+    let (estop_tx, _estop_rx) = tokio::sync::mpsc::channel::<String>(4);
 
     let s = Arc::clone(&state);
     let sd = Arc::clone(&shutdown);
@@ -77,6 +78,7 @@ async fn wasm_controller_with_live_gazebo_sensor() {
             Some(&mut sensor),
             Duration::from_secs(60),
             Some(&emergency_rx),
+            &estop_tx,
         );
     });
 

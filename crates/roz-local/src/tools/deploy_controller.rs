@@ -56,9 +56,21 @@ impl TypedToolExecutor for DeployControllerTool {
         input: Self::Input,
         ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
+        // 0. Read manifest from extensions — no UR5 fallback.
+        let manifest = ctx
+            .extensions
+            .get::<roz_core::channels::ChannelManifest>()
+            .cloned()
+            .ok_or_else(|| {
+                Box::<dyn std::error::Error + Send + Sync>::from(
+                    "no ChannelManifest in ToolContext — configure the robot type before deploying controllers",
+                )
+            })?;
+
         // 1. Compile and verify — CPU-bound; run on blocking thread pool.
         let code_bytes = input.code.as_bytes().to_vec();
-        let outcome = tokio::task::spawn_blocking(move || verify_wasm(&code_bytes))
+        let verify_manifest = manifest.clone();
+        let outcome = tokio::task::spawn_blocking(move || verify_wasm(&code_bytes, &verify_manifest))
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 Box::new(std::io::Error::other(format!("verification task panicked: {e}")))
@@ -77,7 +89,6 @@ impl TypedToolExecutor for DeployControllerTool {
         })?;
 
         // 3. Deploy
-        let manifest = roz_core::channels::ChannelManifest::ur5();
         cmd_tx
             .send(ControllerCommand::LoadWasm(input.code.into_bytes(), manifest))
             .await
@@ -101,9 +112,8 @@ impl TypedToolExecutor for DeployControllerTool {
 /// compilation or tick failure.
 ///
 /// Designed to run inside `spawn_blocking` because wasmtime is CPU-bound.
-fn verify_wasm(code: &[u8]) -> VerifyOutcome {
-    let manifest = roz_core::channels::ChannelManifest::ur5();
-    let host_ctx = roz_copper::wit_host::HostContext::with_manifest(manifest);
+fn verify_wasm(code: &[u8], manifest: &roz_core::channels::ChannelManifest) -> VerifyOutcome {
+    let host_ctx = roz_copper::wit_host::HostContext::with_manifest(manifest.clone());
 
     let mut task = match roz_copper::wasm::CuWasmTask::from_source_with_host(code, host_ctx) {
         Ok(t) => t,
@@ -138,6 +148,10 @@ mod tests {
         let (tx, rx) = mpsc::channel(16);
         let mut ext = Extensions::new();
         ext.insert(tx);
+        ext.insert(roz_core::channels::ChannelManifest::generic_velocity(
+            6,
+            std::f64::consts::PI,
+        ));
         let ctx = ToolContext {
             task_id: "test".into(),
             tenant_id: "test".into(),

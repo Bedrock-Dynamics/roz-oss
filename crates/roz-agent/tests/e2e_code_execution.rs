@@ -11,13 +11,23 @@
 //! Run: cargo test -p roz-agent --test e2e_code_execution
 
 use roz_agent::agent_loop::{AgentInput, AgentLoop, AgentLoopMode};
-use roz_agent::dispatch::ToolDispatcher;
+use roz_agent::dispatch::{Extensions, ToolDispatcher};
 use roz_agent::model::types::*;
 use roz_agent::safety::SafetyStack;
 use roz_agent::spatial_provider::MockSpatialContextProvider;
 use roz_agent::tools::execute_code::{EXECUTE_CODE_TOOL_NAME, ExecuteCodeTool};
 use serde_json::json;
 use std::time::Duration;
+
+/// Build extensions with a generic 6-joint velocity manifest for execute_code tests.
+fn test_extensions() -> Extensions {
+    let mut ext = Extensions::new();
+    ext.insert(roz_core::channels::ChannelManifest::generic_velocity(
+        6,
+        std::f64::consts::PI,
+    ));
+    ext
+}
 
 fn build_input(user_message: &str) -> AgentInput {
     build_input_with_prompt(
@@ -95,7 +105,7 @@ async fn agent_generates_code_and_wasm_executes() {
 
     let safety = SafetyStack::new(vec![]);
     let spatial = Box::new(MockSpatialContextProvider::empty());
-    let mut agent = AgentLoop::new(model, dispatcher, safety, spatial);
+    let mut agent = AgentLoop::new(model, dispatcher, safety, spatial).with_extensions(test_extensions());
 
     let input = build_input("Wave the arm back and forth");
     let output = agent.run(input).await.expect("agent loop should complete");
@@ -154,7 +164,7 @@ async fn agent_handles_wasm_compilation_failure() {
     dispatcher.register(Box::new(ExecuteCodeTool));
     let safety = SafetyStack::new(vec![]);
     let spatial = Box::new(MockSpatialContextProvider::empty());
-    let mut agent = AgentLoop::new(model, dispatcher, safety, spatial);
+    let mut agent = AgentLoop::new(model, dispatcher, safety, spatial).with_extensions(test_extensions());
 
     let input = build_input("Write a controller");
     let output = agent
@@ -185,7 +195,7 @@ async fn live_model_generates_and_executes_wasm() {
     dispatcher.register(Box::new(ExecuteCodeTool));
     let safety = SafetyStack::new(vec![]);
     let spatial = Box::new(MockSpatialContextProvider::empty());
-    let mut agent = AgentLoop::new(model, dispatcher, safety, spatial);
+    let mut agent = AgentLoop::new(model, dispatcher, safety, spatial).with_extensions(test_extensions());
 
     let input = AgentInput {
         task_id: "live-test".to_string(),
@@ -366,8 +376,8 @@ Respond with ONLY the WAT code. No explanation, no markdown fences, just raw WAT
     eprintln!("Extracted WAT:\n{wat}");
     assert!(wat.contains("(module"), "response must contain a WAT module");
 
-    // Compile with UR5 manifest (6 command channels, velocity limits).
-    let manifest = roz_core::channels::ChannelManifest::ur5();
+    // Compile with a 6-joint velocity manifest.
+    let manifest = roz_core::channels::ChannelManifest::generic_velocity(6, std::f64::consts::PI);
     let host = roz_copper::wit_host::HostContext::with_manifest(manifest);
     let mut task = roz_copper::wasm::CuWasmTask::from_source_with_host(wat.as_bytes(), host)
         .expect("Claude-generated WAT should compile");

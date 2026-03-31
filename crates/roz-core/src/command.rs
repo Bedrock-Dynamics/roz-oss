@@ -169,6 +169,16 @@ impl CommandFrame {
     pub fn zero(n: usize) -> Self {
         Self { values: vec![0.0; n] }
     }
+
+    /// Create a frame with each channel set to its manifest default.
+    ///
+    /// Use this for safe-stop instead of `zero()` on position-controlled robots,
+    /// where zero means "go to mechanical origin" rather than "stop."
+    pub fn from_defaults(manifest: &crate::channels::ChannelManifest) -> Self {
+        Self {
+            values: manifest.commands.iter().map(|c| c.default).collect(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -460,5 +470,56 @@ mod tests {
 
         let next3 = next2.transition(CommandEvent::ReportProgress).unwrap();
         assert_eq!(next3, CommandState::Progress);
+    }
+
+    #[test]
+    fn command_frame_from_defaults_uses_manifest() {
+        use crate::channels::{ChannelDescriptor, ChannelManifest, InterfaceType};
+
+        let manifest = ChannelManifest {
+            robot_id: "test".into(),
+            robot_class: "test".into(),
+            control_rate_hz: 50,
+            commands: vec![
+                ChannelDescriptor {
+                    name: "a".into(),
+                    interface_type: InterfaceType::Position,
+                    unit: "rad".into(),
+                    limits: (-1.0, 1.0),
+                    default: 0.5, // non-zero default
+                    max_rate_of_change: None,
+                    position_state_index: None,
+                    max_delta_from: None,
+                },
+                ChannelDescriptor {
+                    name: "b".into(),
+                    interface_type: InterfaceType::Velocity,
+                    unit: "rad/s".into(),
+                    limits: (-1.5, 1.5),
+                    default: 0.0,
+                    max_rate_of_change: None,
+                    position_state_index: None,
+                    max_delta_from: None,
+                },
+            ],
+            states: vec![],
+        };
+        let frame = CommandFrame::from_defaults(&manifest);
+        assert_eq!(frame.values.len(), 2);
+        assert!(
+            (frame.values[0] - 0.5).abs() < f64::EPSILON,
+            "should use channel default 0.5"
+        );
+        assert!(
+            (frame.values[1] - 0.0).abs() < f64::EPSILON,
+            "should use channel default 0.0"
+        );
+    }
+
+    #[test]
+    fn command_frame_from_defaults_empty_manifest() {
+        let manifest = crate::channels::ChannelManifest::default();
+        let frame = CommandFrame::from_defaults(&manifest);
+        assert!(frame.values.is_empty());
     }
 }

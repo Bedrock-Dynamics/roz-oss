@@ -40,6 +40,9 @@ impl SpatialContextProvider for CopperSpatialProvider {
         if let Some(ref output) = current.last_output {
             properties.insert("last_output".to_string(), output.clone());
         }
+        if let Some(ref reason) = current.estop_reason {
+            properties.insert("estop_reason".to_string(), serde_json::Value::from(reason.as_str()));
+        }
 
         let controller_entity = EntityState {
             id: "copper_controller".to_string(),
@@ -76,6 +79,7 @@ mod tests {
             running: true,
             last_output: Some(serde_json::json!({"velocity": [0.1, -0.2]})),
             entities: vec![],
+            estop_reason: None,
         }));
 
         let provider = CopperSpatialProvider::new(Arc::clone(&state));
@@ -120,6 +124,7 @@ mod tests {
             running: true,
             last_output: None,
             entities: vec![arm_entity],
+            estop_reason: None,
         }));
 
         let provider = CopperSpatialProvider::new(state);

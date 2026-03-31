@@ -1,0 +1,70 @@
+[robot]
+name = "quadcopter"
+description = "Generic quadcopter — 4-DOF body velocity control"
+
+[safety]
+e_stop_behavior = "hold_position"
+watchdog_timeout_ms = 500
+
+[channels]
+robot_id = "quadcopter"
+robot_class = "drone"
+control_rate_hz = 100
+
+# 4 body velocity command channels.
+# FRAC_PI_2 = 1.5707963267948966
+
+[[channels.commands]]
+name = "body/velocity.x"
+type = "velocity"
+unit = "m/s"
+limits = [-5.0, 5.0]
+max_rate_of_change = 2.0
+
+[[channels.commands]]
+name = "body/velocity.y"
+type = "velocity"
+unit = "m/s"
+limits = [-5.0, 5.0]
+max_rate_of_change = 2.0
+
+[[channels.commands]]
+name = "body/velocity.z"
+type = "velocity"
+unit = "m/s"
+limits = [-3.0, 3.0]
+max_rate_of_change = 1.5
+
+[[channels.commands]]
+name = "body/yaw_rate"
+type = "velocity"
+unit = "rad/s"
+limits = [-1.5707963267948966, 1.5707963267948966]
+max_rate_of_change = 1.0
+
+# 4 body position state channels.
+# PI = 3.141592653589793
+
+[[channels.states]]
+name = "body/position.x"
+type = "position"
+unit = "m"
+limits = [-1000.0, 1000.0]
+
+[[channels.states]]
+name = "body/position.y"
+type = "position"
+unit = "m"
+limits = [-1000.0, 1000.0]
+
+[[channels.states]]
+name = "body/position.z"
+type = "position"
+unit = "m"
+limits = [0.0, 500.0]
+
+[[channels.states]]
+name = "body/yaw"
+type = "position"
+unit = "rad"
+limits = [-3.141592653589793, 3.141592653589793]

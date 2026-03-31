@@ -31,6 +31,12 @@ use roz_copper::io_grpc::{GrpcActuatorSink, GrpcSensorSource};
 use roz_copper::io_log::{LogActuatorSink, TeeActuatorSink};
 use roz_core::channels::ChannelManifest;
 
+fn load_quadcopter_manifest() -> ChannelManifest {
+    let toml_str = include_str!("../../../examples/quadcopter/robot.toml");
+    let robot: roz_copper::manifest::RobotManifest = toml::from_str(toml_str).unwrap();
+    robot.channel_manifest().unwrap()
+}
+
 const BRIDGE_URL: &str = "http://127.0.0.1:9090";
 
 /// WAT that sets command channel 2 (body/velocity.z) to 0.5 m/s on every tick.
@@ -83,7 +89,7 @@ async fn drone_wasm_velocity_through_bridge() {
         }
     };
 
-    let manifest = ChannelManifest::quadcopter();
+    let manifest = load_quadcopter_manifest();
     let grpc_channel = tonic::transport::Channel::from_shared(BRIDGE_URL.to_string())
         .expect("valid URI")
         .connect()
@@ -106,6 +112,7 @@ async fn drone_wasm_velocity_through_bridge() {
     let (_emergency_tx, emergency_rx) = std::sync::mpsc::sync_channel(1);
     let state = Arc::new(ArcSwap::from_pointee(roz_copper::channels::ControllerState::default()));
     let shutdown = Arc::new(AtomicBool::new(false));
+    let (estop_tx, _estop_rx) = tokio::sync::mpsc::channel::<String>(4);
 
     let s = Arc::clone(&state);
     let sd = Arc::clone(&shutdown);
@@ -120,6 +127,7 @@ async fn drone_wasm_velocity_through_bridge() {
             Some(&mut sensor_owned),
             Duration::from_secs(60),
             Some(&emergency_rx),
+            &estop_tx,
         );
     });
 
@@ -146,7 +154,7 @@ async fn drone_wasm_velocity_through_bridge() {
     // Load WASM — starts producing velocity commands at 100Hz.
     tx.send(ControllerCommand::LoadWasm(
         DRONE_VZ_WAT.as_bytes().to_vec(),
-        ChannelManifest::quadcopter(),
+        load_quadcopter_manifest(),
     ))
     .expect("send LoadWasm");
 

@@ -40,8 +40,9 @@ pub fn build_agent_input(inv: &TaskInvocation) -> AgentInput {
     };
 
     // Inject robot controller interface context.
-    // For now, always inject UR5 manifest. In production, fetch from bridge.
-    let manifest = roz_core::channels::ChannelManifest::ur5();
+    // TODO(reachy-mini): Read manifest from EnvironmentConfig in task invocation.
+    // Empty manifest means no channel documentation in system prompt.
+    let manifest = roz_core::channels::ChannelManifest::default();
     let robot_context = format!(
         "## Robot Controller Interface\n\
          Robot: {} ({})\n\
@@ -295,9 +296,10 @@ mod tests {
             input.system_prompt[1].contains("## Robot Controller Interface"),
             "second block should be robot context"
         );
+        // Default manifest has empty robot_id (no hardcoded UR5).
         assert!(
-            input.system_prompt[1].contains("ur5"),
-            "robot context should reference ur5"
+            !input.system_prompt[1].contains("ur5"),
+            "robot context should NOT hardcode ur5"
         );
         assert_eq!(input.max_cycles, DEFAULT_MAX_CYCLES);
         assert_eq!(input.max_tokens, DEFAULT_MAX_TOKENS);

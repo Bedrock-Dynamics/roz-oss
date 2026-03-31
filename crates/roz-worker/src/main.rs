@@ -78,6 +78,8 @@ async fn execute_task(
     let mut extensions = roz_agent::dispatch::Extensions::new();
     if let Some(ref handle) = copper_handle {
         extensions.insert(handle.cmd_tx());
+        // TODO: Load ChannelManifest from EnvironmentConfig in task invocation.
+        extensions.insert(roz_core::channels::ChannelManifest::default());
         dispatcher.register_with_category(
             Box::new(roz_local::tools::deploy_controller::DeployControllerTool),
             roz_core::tools::ToolCategory::Physical,
