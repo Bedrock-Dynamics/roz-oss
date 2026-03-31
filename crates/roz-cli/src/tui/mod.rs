@@ -1032,17 +1032,8 @@ async fn provider_loop(
     let mut agent_loop = roz_agent::agent_loop::AgentLoop::new(model, dispatcher, safety, Box::new(spatial));
 
     // Build the system prompt once at session start (stable across turns for cache hits).
-    // Block 0: constitution (always present).
-    // Block 1: project context from AGENTS.md / ROBOT.md (if found).
-    let system_prompt = {
-        let constitution =
-            roz_agent::constitution::build_constitution(roz_agent::agent_loop::AgentLoopMode::React, &[]);
-        let mut blocks = vec![constitution];
-        if let Some(project_ctx) = context::load_project_context() {
-            blocks.push(project_ctx);
-        }
-        blocks
-    };
+    // Unified builder: constitution + robot.toml + AGENTS.md / ROBOT.md.
+    let system_prompt = tools::build_system_prompt(std::path::Path::new("."), &[]);
 
     let _ = event_tx
         .send(AgentEvent::Connected {
