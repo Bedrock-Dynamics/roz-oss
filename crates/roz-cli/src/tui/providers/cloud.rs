@@ -24,13 +24,24 @@ pub struct LocalToolOpts {
 }
 
 /// Convert `roz_core::tools::ToolSchema` to the proto `ToolSchema` message.
-fn core_schema_to_proto(schema: &roz_core::tools::ToolSchema) -> roz_v1::ToolSchema {
+///
+/// Uses the actual `ToolCategory` from the dispatcher instead of hardcoding
+/// all tools as `Physical`. Pure tools (e.g. `get_robot_state`, `read_file`)
+/// are tagged `ToolCategoryPure` so the server can optimise dispatch.
+fn core_schema_to_proto(
+    schema: &roz_core::tools::ToolSchema,
+    category: roz_core::tools::ToolCategory,
+) -> roz_v1::ToolSchema {
+    let proto_category = match category {
+        roz_core::tools::ToolCategory::Physical => roz_v1::ToolCategoryHint::ToolCategoryPhysical,
+        roz_core::tools::ToolCategory::Pure => roz_v1::ToolCategoryHint::ToolCategoryPure,
+    };
     roz_v1::ToolSchema {
         name: schema.name.clone(),
         description: schema.description.clone(),
         parameters_schema: Some(value_to_struct(schema.parameters.clone())),
         timeout_ms: 30_000,
-        category: roz_v1::ToolCategoryHint::ToolCategoryPhysical.into(),
+        category: proto_category.into(),
     }
 }
 
@@ -40,7 +51,10 @@ fn core_schema_to_proto(schema: &roz_core::tools::ToolSchema) -> roz_v1::ToolSch
 /// daemon tools from `robot.toml` are added when available.
 pub fn build_local_tool_opts(project_dir: &std::path::Path) -> LocalToolOpts {
     let (dispatcher, core_schemas) = tools::build_all_tools(project_dir);
-    let proto_schemas = core_schemas.iter().map(core_schema_to_proto).collect();
+    let proto_schemas = core_schemas
+        .iter()
+        .map(|(schema, category)| core_schema_to_proto(schema, *category))
+        .collect();
     LocalToolOpts {
         proto_schemas,
         dispatcher,
@@ -81,9 +95,15 @@ async fn execute_tool_locally(
     let tool_name = tool_request.tool_name;
     let tool_call_id = tool_request.tool_call_id;
 
-    // Security: log when the cloud agent triggers a destructive local tool.
-    if matches!(tool_name.as_str(), "bash" | "write_file" | "execute_code") {
-        tracing::info!(tool = %tool_name, "cloud agent executing destructive tool locally");
+    // Security: log when the cloud agent triggers a Physical tool locally.
+    // Physical tools have real-world side effects (actuation, file writes, code
+    // execution) and must always be auditable. Check the dispatcher's category
+    // instead of maintaining a hardcoded list.
+    {
+        let d = dispatcher.lock().await;
+        if d.category(&tool_name) == roz_core::tools::ToolCategory::Physical {
+            tracing::info!(tool = %tool_name, "cloud agent executing physical tool locally");
+        }
     }
 
     let params_json = tool_request
@@ -307,5 +327,106 @@ fn format_value(v: &prost_types::Value) -> String {
         Some(Kind::BoolValue(b)) => format!("{b}"),
         Some(Kind::NullValue(_)) => "null".to_string(),
         _ => "...".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use roz_core::tools::{ToolCategory, ToolSchema};
+    use serde_json::json;
+
+    fn test_schema(name: &str) -> ToolSchema {
+        ToolSchema {
+            name: name.to_string(),
+            description: format!("Test tool {name}"),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    #[test]
+    fn core_schema_to_proto_maps_physical_category() {
+        let schema = test_schema("move_to");
+        let proto = core_schema_to_proto(&schema, ToolCategory::Physical);
+        assert_eq!(proto.name, "move_to");
+        assert_eq!(
+            proto.category,
+            i32::from(roz_v1::ToolCategoryHint::ToolCategoryPhysical)
+        );
+    }
+
+    #[test]
+    fn core_schema_to_proto_maps_pure_category() {
+        let schema = test_schema("get_robot_state");
+        let proto = core_schema_to_proto(&schema, ToolCategory::Pure);
+        assert_eq!(proto.name, "get_robot_state");
+        assert_eq!(proto.category, i32::from(roz_v1::ToolCategoryHint::ToolCategoryPure));
+    }
+
+    /// Regression test: previously all tools were hardcoded to Physical.
+    #[test]
+    fn build_local_tool_opts_preserves_categories() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("robot.toml"),
+            r#"
+[robot]
+name = "test"
+description = "test"
+
+[channels]
+robot_id = "test"
+robot_class = "test"
+control_rate_hz = 50
+
+[[channels.commands]]
+name = "head_pitch"
+type = "position"
+unit = "rad"
+limits = [-0.35, 0.17]
+
+[[channels.states]]
+name = "head_pitch"
+type = "position"
+unit = "rad"
+limits = [-0.35, 0.17]
+
+[daemon]
+base_url = "http://localhost:8000"
+
+[daemon.get_state]
+method = "GET"
+path = "/api/state/full"
+
+[daemon.move_to]
+method = "POST"
+path = "/api/move/goto"
+body = '{"pitch": {{head_pitch}}, "duration": {{duration}}}'
+"#,
+        )
+        .unwrap();
+
+        let opts = build_local_tool_opts(dir.path());
+
+        let get_state = opts.proto_schemas.iter().find(|s| s.name == "get_robot_state").unwrap();
+        assert_eq!(
+            get_state.category,
+            i32::from(roz_v1::ToolCategoryHint::ToolCategoryPure),
+            "get_robot_state should be Pure"
+        );
+
+        let move_to = opts.proto_schemas.iter().find(|s| s.name == "move_to").unwrap();
+        assert_eq!(
+            move_to.category,
+            i32::from(roz_v1::ToolCategoryHint::ToolCategoryPhysical),
+            "move_to should be Physical"
+        );
+
+        let read_file = opts.proto_schemas.iter().find(|s| s.name == "read_file").unwrap();
+        assert_eq!(
+            read_file.category,
+            i32::from(roz_v1::ToolCategoryHint::ToolCategoryPure),
+            "read_file should be Pure"
+        );
     }
 }

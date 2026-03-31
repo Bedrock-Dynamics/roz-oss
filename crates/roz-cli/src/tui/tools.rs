@@ -5,24 +5,27 @@ use async_trait::async_trait;
 use roz_agent::dispatch::{Extensions, ToolContext, ToolDispatcher, ToolExecutor};
 use roz_agent::tools::execute_code::ExecuteCodeTool;
 use roz_core::manifest::RobotManifest;
-use roz_core::tools::{ToolResult, ToolSchema};
+use roz_core::tools::{ToolCategory, ToolResult, ToolSchema};
 use serde_json::{Value, json};
 
 /// Build a `ToolDispatcher` with **all** tools for CLI sessions:
 /// 6 built-in tools + daemon tools from `robot.toml` (if present).
 ///
-/// Returns the dispatcher and the combined schema vec (used for cloud
-/// `RegisterTools` and for BYOK system-prompt tool catalogs alike).
-pub fn build_all_tools(project_dir: &Path) -> (ToolDispatcher, Vec<ToolSchema>) {
+/// Returns the dispatcher and the combined schema vec paired with categories
+/// (used for cloud `RegisterTools` with correct `ToolCategoryHint` and for
+/// BYOK system-prompt tool catalogs alike).
+pub fn build_all_tools(project_dir: &Path) -> (ToolDispatcher, Vec<(ToolSchema, ToolCategory)>) {
     let mut dispatcher = ToolDispatcher::new(Duration::from_secs(120));
 
-    // CLI built-ins
+    // CLI built-ins: Physical tools have real-world side effects.
     dispatcher.register(Box::new(BashTool));
-    dispatcher.register(Box::new(ReadFileTool));
     dispatcher.register(Box::new(WriteFileTool));
-    dispatcher.register(Box::new(ListFilesTool));
-    dispatcher.register(Box::new(SearchTool));
     dispatcher.register(Box::new(ExecuteCodeTool));
+
+    // CLI built-ins: Pure tools are read-only / side-effect-free.
+    dispatcher.register_with_category(Box::new(ReadFileTool), ToolCategory::Pure);
+    dispatcher.register_with_category(Box::new(ListFilesTool), ToolCategory::Pure);
+    dispatcher.register_with_category(Box::new(SearchTool), ToolCategory::Pure);
 
     // Daemon tools from robot.toml (if present)
     let robot_toml = project_dir.join("robot.toml");
@@ -35,7 +38,7 @@ pub fn build_all_tools(project_dir: &Path) -> (ToolDispatcher, Vec<ToolSchema>) 
         }
     }
 
-    let schemas = dispatcher.schemas();
+    let schemas = dispatcher.schemas_with_categories();
     (dispatcher, schemas)
 }
 
@@ -386,7 +389,7 @@ available_moves = ["wake_up", "goto_sleep"]
         // 6 CLI built-ins: bash, read_file, write_file, list_files, search, execute_code
         assert_eq!(dispatcher.schemas().len(), 6);
         assert_eq!(schemas.len(), 6);
-        let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
+        let names: Vec<&str> = schemas.iter().map(|(s, _)| s.name.as_str()).collect();
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"write_file"));
@@ -402,7 +405,7 @@ available_moves = ["wake_up", "goto_sleep"]
         let (_dispatcher, schemas) = build_all_tools(dir.path());
         // 6 CLI built-ins + 3 daemon tools (get_robot_state, set_motors, play_animation)
         assert_eq!(schemas.len(), 9);
-        let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
+        let names: Vec<&str> = schemas.iter().map(|(s, _)| s.name.as_str()).collect();
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"get_robot_state"));
         assert!(names.contains(&"set_motors"));
@@ -416,10 +419,10 @@ available_moves = ["wake_up", "goto_sleep"]
         let (_dispatcher, schemas) = build_all_tools(dir.path());
         // 6 built-ins + 4 daemon tools (get_robot_state, set_motors, move_to, play_animation)
         assert_eq!(schemas.len(), 10);
-        let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
+        let names: Vec<&str> = schemas.iter().map(|(s, _)| s.name.as_str()).collect();
         assert!(names.contains(&"move_to"));
         // Verify move_to has channel properties
-        let move_to = schemas.iter().find(|s| s.name == "move_to").unwrap();
+        let move_to = schemas.iter().map(|(s, _)| s).find(|s| s.name == "move_to").unwrap();
         let props = move_to.parameters["properties"].as_object().unwrap();
         assert!(props.contains_key("head_pitch"));
         assert!(props.contains_key("duration_secs"));

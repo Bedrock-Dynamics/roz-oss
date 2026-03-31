@@ -46,6 +46,10 @@ fn roz_headless_in(task: &str, timeout: Duration, working_dir: Option<&std::path
         .spawn()
         .expect("failed to spawn roz binary");
 
+    // Capture the PID before moving the child into the thread so we can
+    // kill it on timeout without `unsafe` (workspace denies unsafe).
+    let pid = child.id();
+
     // Run wait_with_output on a dedicated thread so we can enforce a timeout.
     let join_handle = std::thread::spawn(move || child.wait_with_output());
 
@@ -63,9 +67,8 @@ fn roz_headless_in(task: &str, timeout: Duration, working_dir: Option<&std::path
             };
         }
         if start.elapsed() >= timeout {
-            // The thread holds the child -- we cannot kill it from here without
-            // unsafe. Instead, report the timeout and let the thread be leaked
-            // (it will be cleaned up when the test process exits).
+            // Kill the subprocess via `kill -TERM <pid>` to avoid leaking it.
+            let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).status();
             return HeadlessResult {
                 success: false,
                 stdout: String::new(),
@@ -414,15 +417,13 @@ fn headless_multiple_tool_calls() {
 #[test]
 #[ignore = "requires authenticated roz CLI"]
 fn headless_timeout_works() {
-    // Give an impossible task with a very short timeout
-    let result = roz_headless(
-        "Write a 10,000 word essay about the history of robotics.",
-        Duration::from_secs(5),
-    );
-    // Should fail due to timeout, not hang forever
+    // 1-second timeout is too short for any cloud round-trip (gRPC handshake
+    // alone takes longer), making this deterministic regardless of prompt.
+    let result = roz_headless("Say hello", Duration::from_secs(1));
+    assert!(!result.success, "should fail with 1s timeout");
     assert!(
-        !result.success || result.stderr.contains("timed out"),
-        "should timeout or fail, not hang.\nstdout: {}\nstderr: {}",
+        result.stderr.contains("timed out"),
+        "stderr should mention timeout.\nstdout: {}\nstderr: {}",
         result.stdout,
         result.stderr
     );

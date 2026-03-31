@@ -283,6 +283,19 @@ impl ToolDispatcher {
             .collect()
     }
 
+    /// Returns schemas paired with their categories for only the enabled tools.
+    ///
+    /// Used by the CLI's cloud provider to build proto `ToolSchema` messages
+    /// with the correct `ToolCategoryHint` instead of hardcoding all tools
+    /// as `Physical`.
+    pub fn schemas_with_categories(&self) -> Vec<(ToolSchema, ToolCategory)> {
+        self.tools
+            .values()
+            .filter(|e| e.enabled)
+            .map(|e| (e.executor.schema(), e.category))
+            .collect()
+    }
+
     /// Returns schemas for only the enabled tools whose names appear in `names`.
     ///
     /// Tools not present in `names` are excluded even if they are enabled.

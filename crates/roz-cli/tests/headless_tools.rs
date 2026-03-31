@@ -115,7 +115,7 @@ fn discovers_all_tools_from_robot_toml() {
     fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
 
     let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
-    let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
+    let names: Vec<&str> = schemas.iter().map(|(s, _)| s.name.as_str()).collect();
 
     // CLI built-ins
     assert!(names.contains(&"bash"), "should have bash");
@@ -136,7 +136,11 @@ fn discovers_all_tools_from_robot_toml() {
 fn builtins_only_without_robot_toml() {
     let dir = TempDir::new().unwrap();
     let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
-    assert_eq!(schemas.len(), 6, "should have exactly 6 CLI built-in tools");
+    assert_eq!(
+        schemas.len(),
+        6,
+        "should have exactly 6 CLI built-in tools (with categories)"
+    );
 }
 
 #[test]
@@ -152,7 +156,7 @@ fn builtins_only_without_daemon_section() {
     assert_eq!(
         schemas.len(),
         6,
-        "should have only CLI built-ins when [daemon] is missing"
+        "should have only CLI built-ins (with categories) when [daemon] is missing"
     );
 }
 
@@ -166,7 +170,7 @@ fn builds_tool_schemas_from_robot_toml() {
     fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
 
     let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
-    let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
+    let names: Vec<&str> = schemas.iter().map(|(s, _)| s.name.as_str()).collect();
 
     assert!(names.contains(&"get_robot_state"));
     assert!(names.contains(&"set_motors"));
@@ -182,6 +186,7 @@ fn move_to_schema_has_channel_properties() {
     let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
     let move_to = schemas
         .iter()
+        .map(|(s, _)| s)
         .find(|s| s.name == "move_to")
         .expect("move_to schema should exist");
 
@@ -223,6 +228,7 @@ fn set_motors_schema_has_mode_parameter() {
     let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
     let set_motors = schemas
         .iter()
+        .map(|(s, _)| s)
         .find(|s| s.name == "set_motors")
         .expect("set_motors should exist");
 
@@ -240,6 +246,7 @@ fn play_animation_schema_mentions_available_moves() {
     let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
     let play = schemas
         .iter()
+        .map(|(s, _)| s)
         .find(|s| s.name == "play_animation")
         .expect("play_animation should exist");
 
@@ -263,7 +270,7 @@ fn play_animation_schema_mentions_available_moves() {
 fn schemas_include_builtins_for_missing_robot_toml() {
     let dir = TempDir::new().unwrap();
     let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
-    assert_eq!(schemas.len(), 6, "should have 6 CLI built-in schemas");
+    assert_eq!(schemas.len(), 6, "should have 6 CLI built-in schemas (with categories)");
 }
 
 // ---------------------------------------------------------------------------
@@ -278,7 +285,7 @@ fn proto_schema_conversion_roundtrips() {
     fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
 
     let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
-    for schema in &schemas {
+    for (schema, _category) in &schemas {
         // Convert to proto struct and back
         let prost_struct = value_to_struct(schema.parameters.clone());
         let roundtripped = struct_to_value(prost_struct);
@@ -297,6 +304,126 @@ fn proto_schema_conversion_roundtrips() {
             schema.name
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tool category correctness (would have caught hardcoded Physical bug)
+// ---------------------------------------------------------------------------
+
+/// Verify that `get_robot_state` is Pure and actuation tools are Physical.
+///
+/// This test would have caught the bug where `core_schema_to_proto` hardcoded
+/// `ToolCategoryPhysical` for every tool -- `get_robot_state`, `read_file`,
+/// `list_files`, and `search` should be `Pure`.
+#[test]
+fn tool_categories_are_correct_for_all_tools() {
+    use roz_core::tools::ToolCategory;
+
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
+
+    let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
+
+    for (schema, category) in &schemas {
+        match schema.name.as_str() {
+            // Pure tools: read-only / no physical side effects
+            "get_robot_state" | "read_file" | "list_files" | "search" => {
+                assert_eq!(
+                    *category,
+                    ToolCategory::Pure,
+                    "{} should be Pure, got Physical",
+                    schema.name
+                );
+            }
+            // Physical tools: actuation / real-world side effects
+            "bash" | "write_file" | "execute_code" | "move_to" | "set_motors" | "play_animation" => {
+                assert_eq!(
+                    *category,
+                    ToolCategory::Physical,
+                    "{} should be Physical, got Pure",
+                    schema.name
+                );
+            }
+            other => panic!("unexpected tool in schema list: {other}"),
+        }
+    }
+}
+
+/// Verify that `schemas_with_categories` on the dispatcher matches `build_all_tools`.
+///
+/// This ensures the proto conversion path (which uses the category from
+/// `build_all_tools`) will produce correct `ToolCategoryHint` values.
+#[test]
+fn dispatcher_categories_match_schema_categories() {
+    use roz_core::tools::ToolCategory;
+
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
+
+    let (dispatcher, schemas) = tools::build_all_tools(dir.path());
+
+    // Every schema's category should match what the dispatcher reports
+    for (schema, category) in &schemas {
+        let dispatcher_category = dispatcher.category(&schema.name);
+        assert_eq!(
+            *category, dispatcher_category,
+            "category mismatch for '{}': build_all_tools says {:?}, dispatcher says {:?}",
+            schema.name, category, dispatcher_category
+        );
+    }
+
+    // Spot-check: get_robot_state must be Pure, move_to must be Physical
+    assert_eq!(dispatcher.category("get_robot_state"), ToolCategory::Pure);
+    assert_eq!(dispatcher.category("move_to"), ToolCategory::Physical);
+}
+
+/// Verify that all Physical-category tools would be logged (not just bash/write_file/execute_code).
+///
+/// This test documents the set of Physical tools so any future additions
+/// are caught and verified.
+#[test]
+fn physical_tool_set_matches_expectations() {
+    use roz_core::tools::ToolCategory;
+
+    let dir = TempDir::new().unwrap();
+    fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
+
+    let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
+
+    let physical_names: Vec<&str> = schemas
+        .iter()
+        .filter(|(_, cat)| *cat == ToolCategory::Physical)
+        .map(|(s, _)| s.name.as_str())
+        .collect();
+
+    // All actuation/destructive tools must be Physical
+    assert!(physical_names.contains(&"bash"), "bash should be Physical");
+    assert!(physical_names.contains(&"write_file"), "write_file should be Physical");
+    assert!(
+        physical_names.contains(&"execute_code"),
+        "execute_code should be Physical"
+    );
+    assert!(physical_names.contains(&"move_to"), "move_to should be Physical");
+    assert!(physical_names.contains(&"set_motors"), "set_motors should be Physical");
+    assert!(
+        physical_names.contains(&"play_animation"),
+        "play_animation should be Physical"
+    );
+
+    // Pure tools must NOT be in the Physical set
+    assert!(
+        !physical_names.contains(&"get_robot_state"),
+        "get_robot_state should NOT be Physical"
+    );
+    assert!(
+        !physical_names.contains(&"read_file"),
+        "read_file should NOT be Physical"
+    );
+    assert!(
+        !physical_names.contains(&"list_files"),
+        "list_files should NOT be Physical"
+    );
+    assert!(!physical_names.contains(&"search"), "search should NOT be Physical");
 }
 
 // ---------------------------------------------------------------------------
