@@ -313,3 +313,117 @@ fn headless_play_animation() {
         json["response"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Client-side tool execution tests (no daemon needed)
+// ---------------------------------------------------------------------------
+
+/// Cloud agent executes bash tool client-side.
+/// This is the key regression test for client-side tool execution.
+#[test]
+#[ignore = "requires authenticated roz CLI"]
+fn headless_cloud_bash_tool() {
+    let result = roz_headless(
+        "Use the bash tool to run 'echo roz_e2e_test_marker'. Report the exact output.",
+        Duration::from_secs(45),
+    );
+    assert!(result.success, "stderr: {}", result.stderr);
+    let json = parse_output(&result);
+    let response = json["response"].as_str().unwrap_or("").to_lowercase();
+    assert!(
+        response.contains("roz_e2e_test_marker"),
+        "agent should report the bash output containing our marker.\nGot: {}",
+        json["response"]
+    );
+}
+
+/// Cloud agent reads a file via `read_file` tool executed client-side.
+#[test]
+#[ignore = "requires authenticated roz CLI"]
+fn headless_cloud_read_file() {
+    // Create a temp file with known content
+    let dir = tempfile::TempDir::new().unwrap();
+    let test_file = dir.path().join("roz_test_file.txt");
+    std::fs::write(&test_file, "roz_file_content_12345").unwrap();
+
+    let task = format!(
+        "Use the read_file tool to read the file at '{}' and tell me its exact contents.",
+        test_file.display()
+    );
+    let result = roz_headless(&task, Duration::from_secs(45));
+    assert!(result.success, "stderr: {}", result.stderr);
+    let json = parse_output(&result);
+    let response = json["response"].as_str().unwrap_or("");
+    assert!(
+        response.contains("roz_file_content_12345"),
+        "agent should report the file contents.\nGot: {}",
+        json["response"]
+    );
+}
+
+/// Cloud agent handles tool errors gracefully (doesn't hang).
+#[test]
+#[ignore = "requires authenticated roz CLI"]
+fn headless_tool_error_handled() {
+    let result = roz_headless(
+        "Use the read_file tool to read '/nonexistent/roz_e2e_test_path.txt'. Report what happened.",
+        Duration::from_secs(45),
+    );
+    assert!(
+        result.success,
+        "roz should exit successfully even on tool errors.\nstderr: {}",
+        result.stderr
+    );
+    let json = parse_output(&result);
+    let response = json["response"].as_str().unwrap_or("").to_lowercase();
+    assert!(
+        response.contains("error")
+            || response.contains("not found")
+            || response.contains("no such")
+            || response.contains("does not exist"),
+        "agent should report the file error.\nGot: {}",
+        json["response"]
+    );
+}
+
+/// Cloud agent can chain multiple tool calls in one session.
+#[test]
+#[ignore = "requires authenticated roz CLI"]
+fn headless_multiple_tool_calls() {
+    let result = roz_headless(
+        "First use bash to run 'echo step1_done', then use bash to run 'echo step2_done'. \
+         Report both outputs.",
+        Duration::from_secs(60),
+    );
+    assert!(result.success, "stderr: {}", result.stderr);
+    let json = parse_output(&result);
+    let response = json["response"].as_str().unwrap_or("").to_lowercase();
+    assert!(
+        response.contains("step1_done") && response.contains("step2_done"),
+        "agent should report both bash outputs.\nGot: {}",
+        json["response"]
+    );
+    let cycles = json["cycles"].as_u64().unwrap_or(0);
+    assert!(
+        cycles >= 2,
+        "should have at least 2 cycles for 2 tool calls, got {cycles}"
+    );
+}
+
+/// Verify the timeout mechanism works -- a long-running task gets killed.
+#[test]
+#[ignore = "requires authenticated roz CLI"]
+fn headless_timeout_works() {
+    // Give an impossible task with a very short timeout
+    let result = roz_headless(
+        "Write a 10,000 word essay about the history of robotics.",
+        Duration::from_secs(5),
+    );
+    // Should fail due to timeout, not hang forever
+    assert!(
+        !result.success || result.stderr.contains("timed out"),
+        "should timeout or fail, not hang.\nstdout: {}\nstderr: {}",
+        result.stdout,
+        result.stderr
+    );
+}
