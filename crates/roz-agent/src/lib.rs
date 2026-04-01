@@ -8,6 +8,7 @@ pub mod drift;
 pub mod error;
 pub mod meter;
 pub mod model;
+pub mod prompt_assembler;
 pub mod provenance;
 pub mod safety;
 pub mod skills;
