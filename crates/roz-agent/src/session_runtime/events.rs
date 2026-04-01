@@ -13,6 +13,15 @@ pub struct EventEmitter {
     correlation_id: CorrelationId,
 }
 
+impl Clone for EventEmitter {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            correlation_id: self.correlation_id.clone(),
+        }
+    }
+}
+
 impl EventEmitter {
     /// Create a new emitter with the given channel capacity.
     #[must_use]

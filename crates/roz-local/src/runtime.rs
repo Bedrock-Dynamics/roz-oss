@@ -726,6 +726,24 @@ impl LocalRuntime {
     ///
     /// The non-streaming `run_turn()` is unchanged — `exec` mode continues to use it.
     pub fn run_turn_streaming(&mut self, user_message: &str) -> Result<TurnHandle, RuntimeError> {
+        // SessionRuntime lifecycle: emit TurnStarted, track state
+        self.session_runtime.state.turn_index += 1;
+        self.session_runtime.state.activity = roz_core::session::activity::RuntimeActivity::Planning;
+        self.session_runtime.emitter.new_correlation();
+        self.session_runtime
+            .emitter
+            .emit(roz_core::session::event::SessionEvent::TurnStarted {
+                turn_index: self.session_runtime.state.turn_index,
+            });
+        self.session_runtime
+            .emitter
+            .emit(roz_core::session::event::SessionEvent::ActivityChanged {
+                state: roz_core::session::activity::RuntimeActivity::Planning,
+                reason: "streaming turn started".into(),
+                robot_safe: true,
+                unblock_event: None,
+            });
+
         let model = (self.model_factory)().map_err(RuntimeError::Model)?;
         let mode = self.current_mode();
         let (dispatcher, extensions, system_prompt) = self.prepare_turn(mode);
@@ -763,6 +781,11 @@ impl LocalRuntime {
         let cancel_clone = cancel.clone();
         let project_dir = self.project_dir.clone();
         let session_id = self.session_id.clone();
+
+        // Clone event emitter for the streaming task to emit completion events
+        let emitter = self.session_runtime.emitter.clone();
+        let turn_index = self.session_runtime.state.turn_index;
+
         let join = tokio::spawn(async move {
             let result = tokio::select! {
                 biased;
@@ -776,6 +799,23 @@ impl LocalRuntime {
             if let Ok(ref output) = result {
                 let store = SessionStore::new(&project_dir);
                 let _ = store.save(&session_id, &output.messages);
+            }
+            // Emit turn completion/failure event
+            match &result {
+                Ok(_) => {
+                    emitter.emit(roz_core::session::event::SessionEvent::ActivityChanged {
+                        state: roz_core::session::activity::RuntimeActivity::Idle,
+                        reason: format!("streaming turn {turn_index} completed"),
+                        robot_safe: true,
+                        unblock_event: None,
+                    });
+                }
+                Err(e) => {
+                    emitter.emit(roz_core::session::event::SessionEvent::SessionFailed {
+                        failure: roz_core::session::activity::RuntimeFailureKind::ModelError,
+                    });
+                    tracing::error!("streaming turn failed: {e}");
+                }
             }
             result
         });

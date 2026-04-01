@@ -99,12 +99,14 @@ impl TurnExecutor for NoopExecutor {
 ///
 /// Message history stays inside `AgentLoop` per-turn and is not held here.
 pub struct SessionRuntime {
-    pub(crate) state: SessionState,
-    pub(crate) emitter: EventEmitter,
+    /// Mutable session state — surfaces update `activity`/`turn_index` directly.
+    pub state: SessionState,
+    /// Event emitter — surfaces emit lifecycle events directly.
+    pub emitter: EventEmitter,
     /// Assembles system prompt blocks each turn cycle.
-    pub(crate) prompt_assembler: PromptAssembler,
+    pub prompt_assembler: PromptAssembler,
     /// Determines recovery actions on failure (spec Section 29).
-    pub(crate) recovery_config: RecoveryConfig,
+    pub recovery_config: RecoveryConfig,
 }
 
 impl SessionRuntime {

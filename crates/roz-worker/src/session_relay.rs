@@ -179,6 +179,15 @@ async fn handle_edge_session(
         Box::new(crate::camera::snapshot::CameraSpatialProvider::new());
     let mut agent = AgentLoop::new(model, dispatcher, safety, spatial).with_extensions(extensions);
 
+    // SessionRuntime for canonical lifecycle tracking
+    let session_config = roz_agent::session_runtime::SessionConfig {
+        session_id: session_id.to_string(),
+        tenant_id: "edge".to_string(),
+        mode: roz_core::session::control::SessionMode::EdgeCanonical,
+        blueprint_toml: String::new(),
+    };
+    let mut session_runtime = roz_agent::session_runtime::SessionRuntime::new(&session_config);
+
     tracing::info!(session_id, ?session_mode, "edge session mode resolved");
 
     // Process subsequent messages on this session's dedicated subscription.
@@ -202,6 +211,16 @@ async fn handle_edge_session(
         match msg_type {
             "user_message" => {
                 let user_text = envelope["text"].as_str().unwrap_or("").to_string();
+
+                // SessionRuntime lifecycle
+                session_runtime.state.turn_index += 1;
+                session_runtime.state.activity = roz_core::session::activity::RuntimeActivity::Planning;
+                session_runtime.emitter.new_correlation();
+                session_runtime
+                    .emitter
+                    .emit(roz_core::session::event::SessionEvent::TurnStarted {
+                        turn_index: session_runtime.state.turn_index,
+                    });
 
                 let agent_cancel = CancellationToken::new();
                 let input = AgentInput {
@@ -281,6 +300,17 @@ async fn handle_edge_session(
                             nats.publish(response_subject.clone(), serde_json::to_vec(&text_delta)?.into())
                                 .await?;
                         }
+
+                        // SessionRuntime: turn completed
+                        session_runtime.state.activity = roz_core::session::activity::RuntimeActivity::Idle;
+                        session_runtime
+                            .emitter
+                            .emit(roz_core::session::event::SessionEvent::ActivityChanged {
+                                state: roz_core::session::activity::RuntimeActivity::Idle,
+                                reason: "turn completed".into(),
+                                robot_safe: true,
+                                unblock_event: None,
+                            });
 
                         // Send turn complete with usage.
                         let turn_complete = serde_json::json!({

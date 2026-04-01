@@ -94,6 +94,8 @@ struct Session {
     pub worker_name: Option<String>,
     /// Whether this session runs on the edge worker (true) or cloud server (false).
     is_edge: bool,
+    /// Canonical session lifecycle tracker. All turns emit events through this.
+    runtime: roz_agent::session_runtime::SessionRuntime,
 }
 
 /// State for an active agent turn, shared between the session loop and relay tasks.
@@ -771,6 +773,16 @@ async fn run_session_loop(
                     .message_id
                     .filter(|id| !id.is_empty())
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+                // SessionRuntime lifecycle: emit TurnStarted
+                sess.runtime.state.turn_index += 1;
+                sess.runtime.state.activity = roz_core::session::activity::RuntimeActivity::Planning;
+                sess.runtime.emitter.new_correlation();
+                sess.runtime
+                    .emitter
+                    .emit(roz_core::session::event::SessionEvent::TurnStarted {
+                        turn_index: sess.runtime.state.turn_index,
+                    });
 
                 tracing::info!(
                     session_id = %sess.id,
@@ -1739,6 +1751,18 @@ async fn handle_start(
         }
     }
 
+    let session_config = roz_agent::session_runtime::SessionConfig {
+        session_id: session_id.to_string(),
+        tenant_id: tenant_id.to_string(),
+        mode: if is_edge {
+            roz_core::session::control::SessionMode::EdgeCanonical
+        } else {
+            roz_core::session::control::SessionMode::ServerCanonical
+        },
+        blueprint_toml: String::new(),
+    };
+    let session_rt = roz_agent::session_runtime::SessionRuntime::new(&session_config);
+
     *session = Some(Session {
         id: session_id,
         tenant_id,
@@ -1756,6 +1780,7 @@ async fn handle_start(
         host_id: start.host_id,
         worker_name,
         is_edge,
+        runtime: session_rt,
     });
 
     true

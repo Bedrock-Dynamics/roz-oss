@@ -20,7 +20,7 @@ use roz_core::embodiment::limits::JointSafetyLimits;
 
 use crate::channels::{ControllerCommand, ControllerState};
 use crate::evidence_collector::EvidenceCollector;
-use crate::safety_filter::{HotPathSafetyFilter, SafetyFilterTask};
+use crate::safety_filter::HotPathSafetyFilter;
 use crate::tick_builder::{TickInputBuilder, TickSensorData};
 use crate::tick_contract::{DerivedFeatures, DigestSet};
 use crate::wasm::CuWasmTask;
@@ -154,19 +154,20 @@ fn drain_commands(
     wasm_task: &mut Option<CuWasmTask>,
     running: &mut bool,
     tick_period: &mut Duration,
-    safety_filter: &mut SafetyFilterTask,
     tick_builder: &mut Option<TickInputBuilder>,
     hot_path_filter: &mut Option<HotPathSafetyFilter>,
+    evidence_collector: &mut Option<EvidenceCollector>,
 ) -> bool {
     // Emergency channel first (bypasses tokio bridge).
     if let Some(erx) = emergency_rx {
         while let Ok(cmd) = erx.try_recv() {
             if let Some(load) = handle_command(cmd, wasm_task, running) {
                 *tick_period = load.period;
-                safety_filter.set_tick_period(load.period.as_secs_f64());
                 let (builder, filter) = build_tick_infrastructure(&load.manifest);
+                let channel_names: Vec<String> = load.manifest.commands.iter().map(|c| c.name.clone()).collect();
                 *tick_builder = Some(builder);
                 *hot_path_filter = Some(filter);
+                *evidence_collector = Some(EvidenceCollector::new("controller", &channel_names));
             }
         }
     }
@@ -177,10 +178,11 @@ fn drain_commands(
         received = true;
         if let Some(load) = handle_command(cmd, wasm_task, running) {
             *tick_period = load.period;
-            safety_filter.set_tick_period(load.period.as_secs_f64());
             let (builder, filter) = build_tick_infrastructure(&load.manifest);
+            let channel_names: Vec<String> = load.manifest.commands.iter().map(|c| c.name.clone()).collect();
             *tick_builder = Some(builder);
             *hot_path_filter = Some(filter);
+            *evidence_collector = Some(EvidenceCollector::new("controller", &channel_names));
         }
     }
     received
@@ -237,44 +239,40 @@ fn check_watchdog(
 /// 2. Call `tick_with_contract(tick, Some(&input))`
 /// 3. Parse `TickOutput` for commands and e-stop
 /// 4. Run commands through `HotPathSafetyFilter`
-/// 5. Fall back to `SafetyFilterTask::clamp_frame` for actuator output
+/// 5. Record evidence via `EvidenceCollector`
 #[allow(clippy::too_many_arguments)]
 fn tick_wasm(
     task: &mut CuWasmTask,
     tick: u64,
     running: &mut bool,
     last_output: &mut Option<serde_json::Value>,
-    safety_filter: &mut SafetyFilterTask,
+    hot_path_filter: &mut HotPathSafetyFilter,
+    evidence: &mut EvidenceCollector,
     estop_tx: &tokio::sync::mpsc::Sender<String>,
     estop_reason: &mut Option<String>,
-    tick_builder: Option<&TickInputBuilder>,
-    hot_path_filter: Option<&mut HotPathSafetyFilter>,
-    evidence: Option<&mut EvidenceCollector>,
+    tick_builder: &TickInputBuilder,
     sensor_positions: &[f64],
     sensor_velocities: &[f64],
     tick_start: Instant,
 ) -> Option<CommandFrame> {
-    // Build tick input if we have a builder.
-    let tick_input = tick_builder.map(|builder| {
-        builder.build(TickSensorData {
-            tick,
-            time_ns: u64::try_from(tick_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            positions: sensor_positions,
-            velocities: sensor_velocities,
-            efforts: None,
-            watched_poses: &[],
-            wrench: None,
-            contact: None,
-            features: DerivedFeatures::default(),
-        })
+    let tick_input = tick_builder.build(TickSensorData {
+        tick,
+        time_ns: u64::try_from(tick_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        positions: sensor_positions,
+        velocities: sensor_velocities,
+        efforts: None,
+        watched_poses: &[],
+        wrench: None,
+        contact: None,
+        features: DerivedFeatures::default(),
     });
 
-    match task.tick_with_contract(tick, tick_input.as_ref()) {
+    match task.tick_with_contract(tick, Some(&tick_input)) {
         Ok(tick_output) => {
             let ctx = task.host_context();
             let raw_values = &ctx.command_values;
 
-            // No command channels configured — nothing to clamp or send.
+            // No command channels configured — nothing to filter or send.
             if raw_values.is_empty() {
                 return None;
             }
@@ -290,41 +288,44 @@ fn tick_wasm(
                 return None;
             }
 
-            let raw_frame = CommandFrame {
-                values: raw_values.clone(),
-            };
-            let manifest = &ctx.manifest;
-            let clamped = safety_filter.clamp_frame(&raw_frame, manifest);
+            // HotPathSafetyFilter is the SOLE safety pipeline.
+            let filter_result = hot_path_filter.filter(
+                raw_values,
+                if ctx.state_values.is_empty() {
+                    None
+                } else {
+                    Some(&ctx.state_values)
+                },
+                None,
+            );
 
-            // Run through structured safety filter and record evidence.
-            if let Some(filter) = hot_path_filter {
-                let filter_result = filter.filter(
-                    &clamped.values,
-                    if ctx.state_values.is_empty() {
-                        None
-                    } else {
-                        Some(&ctx.state_values)
-                    },
-                    None,
-                );
+            // Record evidence every tick.
+            let output = tick_output.unwrap_or_default();
+            evidence.record_tick(tick_start.elapsed(), &output, &filter_result.interventions);
 
-                if let Some(collector) = evidence {
-                    let output = tick_output.unwrap_or_default();
-                    collector.record_tick(tick_start.elapsed(), &output, &filter_result.interventions);
-                }
-
-                if !filter_result.interventions.is_empty() {
-                    tracing::debug!(
-                        tick,
-                        count = filter_result.interventions.len(),
-                        "tick contract safety interventions"
-                    );
-                }
+            if filter_result.estop {
+                tracing::warn!(tick, "safety filter triggered e-stop");
+                *running = false;
+                let reason = "safety_filter_estop".to_string();
+                let _ = estop_tx.try_send(reason.clone());
+                *estop_reason = Some(reason);
             }
+
+            if !filter_result.interventions.is_empty() {
+                tracing::debug!(
+                    tick,
+                    count = filter_result.interventions.len(),
+                    "safety filter interventions"
+                );
+            }
+
+            let clamped = CommandFrame {
+                values: filter_result.commands,
+            };
 
             *last_output = Some(serde_json::json!({
                 "values": clamped.values,
-                "channel_count": manifest.command_count(),
+                "channel_count": ctx.manifest.command_count(),
             }));
             Some(clamped)
         }
@@ -332,6 +333,7 @@ fn tick_wasm(
             let msg = e.to_string();
             tracing::error!(tick, error = %msg, "WASM tick failed, halting");
             *running = false;
+            evidence.record_trap();
 
             let reason = format!("controller_error: {msg}");
             let _ = estop_tx.try_send(reason.clone());
@@ -446,7 +448,6 @@ pub fn run_controller_loop(
     emergency_rx: Option<&std::sync::mpsc::Receiver<ControllerCommand>>,
     estop_tx: &tokio::sync::mpsc::Sender<String>,
 ) {
-    let mut safety_filter = SafetyFilterTask::new(max_velocity, 50.0, None);
     let mut wasm_task: Option<CuWasmTask> = None;
     let mut running = false;
     let mut tick: u64 = 0;
@@ -481,9 +482,9 @@ pub fn run_controller_loop(
             &mut wasm_task,
             &mut running,
             &mut tick_period,
-            &mut safety_filter,
             &mut tick_builder,
             &mut hot_path_filter,
+            &mut evidence_collector,
         );
         if received {
             last_agent_contact = Instant::now();
@@ -521,23 +522,24 @@ pub fn run_controller_loop(
             ctx.state_values.extend_from_slice(&sensor_joint_positions);
             ctx.state_values.extend_from_slice(&sensor_joint_velocities);
             ctx.sim_time_ns = sensor_sim_time_ns;
-            safety_filter.update_positions(&sensor_joint_positions);
-
-            if let Some(ref clamped) = tick_wasm(
-                task,
-                tick,
-                &mut running,
-                &mut last_output,
-                &mut safety_filter,
-                estop_tx,
-                &mut estop_reason,
-                tick_builder.as_ref(),
-                hot_path_filter.as_mut(),
-                evidence_collector.as_mut(),
-                &sensor_joint_positions,
-                &sensor_joint_velocities,
-                tick_start,
-            ) {
+            // Only tick when full infrastructure is loaded (controller + manifest).
+            if let (Some(builder), Some(filter), Some(collector)) =
+                (&mut tick_builder, &mut hot_path_filter, &mut evidence_collector)
+                && let Some(ref clamped) = tick_wasm(
+                    task,
+                    tick,
+                    &mut running,
+                    &mut last_output,
+                    filter,
+                    collector,
+                    estop_tx,
+                    &mut estop_reason,
+                    builder,
+                    &sensor_joint_positions,
+                    &sensor_joint_velocities,
+                    tick_start,
+                )
+            {
                 last_velocity_count = clamped.values.len();
 
                 if let Some(sink) = actuator
@@ -615,7 +617,6 @@ pub fn run_controller_loop_with_gazebo(
     emergency_rx: Option<&std::sync::mpsc::Receiver<ControllerCommand>>,
     estop_tx: &tokio::sync::mpsc::Sender<String>,
 ) {
-    let mut safety_filter = SafetyFilterTask::new(max_velocity, 50.0, None);
     let mut wasm_task: Option<CuWasmTask> = None;
     let mut running = false;
     let mut tick: u64 = 0;
@@ -650,9 +651,9 @@ pub fn run_controller_loop_with_gazebo(
             &mut wasm_task,
             &mut running,
             &mut tick_period,
-            &mut safety_filter,
             &mut tick_builder,
             &mut hot_path_filter,
+            &mut evidence_collector,
         );
         if received {
             last_agent_contact = Instant::now();
@@ -683,27 +684,29 @@ pub fn run_controller_loop_with_gazebo(
         }
 
         // --- Tick WASM controller via tick contract ---
-        if running && let Some(ref mut task) = wasm_task {
-            if let Some(ref clamped) = tick_wasm(
+        if running
+            && let Some(ref mut task) = wasm_task
+            && let (Some(builder), Some(filter), Some(collector)) =
+                (&mut tick_builder, &mut hot_path_filter, &mut evidence_collector)
+            && let Some(ref clamped) = tick_wasm(
                 task,
                 tick,
                 &mut running,
                 &mut last_output,
-                &mut safety_filter,
+                filter,
+                collector,
                 estop_tx,
                 &mut estop_reason,
-                tick_builder.as_ref(),
-                hot_path_filter.as_mut(),
-                evidence_collector.as_mut(),
-                &[], // Gazebo loop doesn't track joint positions separately
-                &[], // Gazebo loop doesn't track joint velocities separately
+                builder,
+                &[], // Gazebo loop: positions come via sensor frame
+                &[], // Gazebo loop: velocities come via sensor frame
                 tick_start,
-            ) {
-                last_velocity_count = clamped.values.len();
+            )
+        {
+            last_velocity_count = clamped.values.len();
 
-                if let Err(e) = gazebo.joint_publisher.send(clamped) {
-                    tracing::warn!(error = %e, "failed to send joint command to Gazebo");
-                }
+            if let Err(e) = gazebo.joint_publisher.send(clamped) {
+                tracing::warn!(error = %e, "failed to send joint command to Gazebo");
             }
         }
 
