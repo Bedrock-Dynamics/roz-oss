@@ -159,6 +159,7 @@ fn drain_commands(
     tick_builder: &mut Option<TickInputBuilder>,
     hot_path_filter: &mut Option<HotPathSafetyFilter>,
     evidence_collector: &mut Option<EvidenceCollector>,
+    controller_promoted: &mut bool,
 ) -> bool {
     // Emergency channel first (bypasses tokio bridge).
     if let Some(erx) = emergency_rx {
@@ -170,6 +171,7 @@ fn drain_commands(
                 *tick_builder = Some(builder);
                 *hot_path_filter = Some(filter);
                 *evidence_collector = Some(EvidenceCollector::new("controller", &channel_names));
+                *controller_promoted = true;
             }
         }
     }
@@ -185,6 +187,7 @@ fn drain_commands(
             *tick_builder = Some(builder);
             *hot_path_filter = Some(filter);
             *evidence_collector = Some(EvidenceCollector::new("controller", &channel_names));
+            *controller_promoted = true;
         }
     }
     received
@@ -205,7 +208,14 @@ fn check_watchdog(
     estop_tx: &tokio::sync::mpsc::Sender<String>,
     estop_reason: &mut Option<String>,
     last_output: &mut Option<serde_json::Value>,
+    controller_promoted: bool,
 ) -> bool {
+    // Promoted controllers run autonomously — the agent watchdog does not
+    // apply. Per spec: "Cloud connectivity not required for already-promoted
+    // local-safe execution unless runtime says so."
+    if controller_promoted {
+        return false;
+    }
     if !*running || last_agent_contact.elapsed() <= timeout {
         return false;
     }
@@ -472,6 +482,10 @@ pub fn run_controller_loop(
     let mut hot_path_filter: Option<HotPathSafetyFilter> = None;
     let mut evidence_collector: Option<EvidenceCollector> = None;
 
+    // Whether a controller has been promoted to Active. When true, the agent
+    // watchdog is disabled — the controller runs autonomously per spec.
+    let mut controller_promoted = false;
+
     tracing::info!(max_velocity, ?watchdog_timeout, "copper controller loop started");
 
     while !shutdown.load(Ordering::Relaxed) {
@@ -487,6 +501,7 @@ pub fn run_controller_loop(
             &mut tick_builder,
             &mut hot_path_filter,
             &mut evidence_collector,
+            &mut controller_promoted,
         );
         if received {
             last_agent_contact = Instant::now();
@@ -514,6 +529,7 @@ pub fn run_controller_loop(
             estop_tx,
             &mut estop_reason,
             &mut last_output,
+            controller_promoted,
         );
 
         // --- Tick WASM controller via tick contract ---
@@ -636,6 +652,7 @@ pub fn run_controller_loop_with_gazebo(
     let mut tick_builder: Option<TickInputBuilder> = None;
     let mut hot_path_filter: Option<HotPathSafetyFilter> = None;
     let mut evidence_collector: Option<EvidenceCollector> = None;
+    let mut controller_promoted = false;
 
     tracing::info!(
         max_velocity,
@@ -656,6 +673,7 @@ pub fn run_controller_loop_with_gazebo(
             &mut tick_builder,
             &mut hot_path_filter,
             &mut evidence_collector,
+            &mut controller_promoted,
         );
         if received {
             last_agent_contact = Instant::now();

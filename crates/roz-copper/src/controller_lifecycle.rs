@@ -87,8 +87,14 @@ impl ControllerLifecycle {
 
     /// Load a new controller artifact. Resets state to `VerifiedOnly`.
     ///
-    /// Loading a new artifact clears any previously submitted evidence.
+    /// If a controller is currently in `Active` state, it is saved as the
+    /// last-known-good before being replaced. Loading a new artifact clears
+    /// any previously submitted evidence.
     pub fn load_artifact(&mut self, artifact: ControllerArtifact) -> Result<(), LifecycleError> {
+        // Save the currently active controller as last-known-good before replacing.
+        if self.current_state == Some(DeploymentState::Active) {
+            self.last_known_good = self.current_artifact.take();
+        }
         self.current_artifact = Some(artifact);
         self.current_state = Some(DeploymentState::VerifiedOnly);
         self.evidence = None;
@@ -166,10 +172,8 @@ impl ControllerLifecycle {
         let next = next_promotion_state(current);
         let new_state = current.transition(next).map_err(LifecycleError::InvalidTransition)?;
 
-        // If promoting to Active, save current artifact as last-known-good first.
-        if new_state == DeploymentState::Active {
-            self.last_known_good = self.current_artifact.clone();
-        }
+        // Last-known-good is saved when load_artifact() replaces an Active controller.
+        // No snapshot needed here — the LKG was already set at load time.
 
         // Consume the evidence bundle (it is now bound to this promotion).
         self.evidence = None;
@@ -391,27 +395,32 @@ mod tests {
     }
 
     #[test]
-    fn promote_to_active_saves_last_known_good() {
+    fn load_new_artifact_saves_active_as_lkg() {
         let mut lc = ControllerLifecycle::new();
-        lc.load_artifact(make_artifact("ctrl-1")).unwrap();
         let (m, c, mn) = good_digests();
 
+        // Promote ctrl-1 to active.
+        lc.load_artifact(make_artifact("ctrl-1")).unwrap();
         lc.submit_evidence(make_clean_evidence("ctrl-1")).unwrap();
         lc.promote(m, c, mn).unwrap(); // → shadow
-
         lc.submit_evidence(make_clean_evidence("ctrl-1")).unwrap();
         lc.promote(m, c, mn).unwrap(); // → canary
-
-        assert!(lc.last_known_good().is_none(), "lkg should not be set before active");
-
         lc.submit_evidence(make_clean_evidence("ctrl-1")).unwrap();
         lc.promote(m, c, mn).unwrap(); // → active
 
+        assert!(lc.last_known_good().is_none(), "no LKG until a replacement is loaded");
+
+        // Load ctrl-2 — ctrl-1 should become the LKG.
+        lc.load_artifact(make_artifact("ctrl-2")).unwrap();
         assert!(
             lc.last_known_good().is_some(),
-            "lkg should be set after promoting to active"
+            "ctrl-1 should be LKG after loading ctrl-2"
         );
         assert_eq!(lc.last_known_good().unwrap().controller_id, "ctrl-1");
+
+        // Current should be ctrl-2 in VerifiedOnly state.
+        assert_eq!(lc.current_artifact().unwrap().controller_id, "ctrl-2");
+        assert_eq!(lc.current_state(), Some(DeploymentState::VerifiedOnly));
     }
 
     #[test]
