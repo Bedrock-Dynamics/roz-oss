@@ -29,5 +29,6 @@ pub mod mcap_export;
 pub mod safety_filter;
 pub mod state_injector;
 pub mod tasks;
+pub mod tick_contract;
 pub mod wasm;
 pub mod wit_host;
