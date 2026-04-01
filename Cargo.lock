@@ -5928,6 +5928,7 @@ name = "roz-zenoh"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "roz-core",
  "serde",
  "serde_json",
  "tempfile",

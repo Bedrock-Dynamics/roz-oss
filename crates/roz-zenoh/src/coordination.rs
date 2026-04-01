@@ -5,8 +5,12 @@
 
 use serde::{Deserialize, Serialize};
 
+/// A peer identifier in a multi-robot coordination session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerId(pub String);
+
 /// Shared robot pose for co-located coordination.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RobotPose {
     /// Unique identifier for this robot.
     pub robot_id: String,
