@@ -207,12 +207,18 @@ impl SessionRuntime {
             return Err(SessionRuntimeError::SessionPaused);
         }
 
-        // 2. Increment turn index, emit TurnStarted
+        // 2. Increment turn index, emit TurnStarted + ActivityChanged
         self.state.turn_index += 1;
         self.state.activity = RuntimeActivity::Planning;
         self.emitter.new_correlation();
         self.emitter.emit(SessionEvent::TurnStarted {
             turn_index: self.state.turn_index,
+        });
+        self.emitter.emit(SessionEvent::ActivityChanged {
+            state: RuntimeActivity::Planning,
+            reason: format!("turn {} started", self.state.turn_index),
+            robot_safe: true,
+            unblock_event: None,
         });
 
         // 3. Build system blocks via PromptAssembler
@@ -241,10 +247,16 @@ impl SessionRuntime {
                 SessionRuntimeError::SessionFailed(failure)
             })?;
 
-        // 5. Update snapshot from output
+        // 5. Update snapshot from output, emit ActivityChanged(Idle)
         self.state.snapshot.turn_index = self.state.turn_index;
         self.state.snapshot.updated_at = chrono::Utc::now();
         self.state.activity = RuntimeActivity::Idle;
+        self.emitter.emit(SessionEvent::ActivityChanged {
+            state: RuntimeActivity::Idle,
+            reason: format!("turn {} completed", self.state.turn_index),
+            robot_safe: true,
+            unblock_event: None,
+        });
 
         Ok(output)
     }
@@ -567,7 +579,7 @@ mod tests {
         let env = rx.recv().await.unwrap();
         assert!(matches!(env.event, SessionEvent::SessionStarted { .. }));
 
-        // Turn 1
+        // Turn 1 — emits TurnStarted + ActivityChanged(Planning) + ActivityChanged(Idle)
         rt.run_turn(
             TurnInput {
                 user_message: "pick up the cube".into(),
@@ -578,8 +590,12 @@ mod tests {
         .unwrap();
         let env = rx.recv().await.unwrap();
         assert!(matches!(env.event, SessionEvent::TurnStarted { turn_index: 1 }));
+        let env = rx.recv().await.unwrap();
+        assert!(matches!(env.event, SessionEvent::ActivityChanged { .. }));
+        let env = rx.recv().await.unwrap();
+        assert!(matches!(env.event, SessionEvent::ActivityChanged { .. }));
 
-        // Turn 2
+        // Turn 2 — emits TurnStarted + ActivityChanged(Planning) + ActivityChanged(Idle)
         rt.run_turn(
             TurnInput {
                 user_message: "place it on the shelf".into(),
@@ -590,6 +606,10 @@ mod tests {
         .unwrap();
         let env = rx.recv().await.unwrap();
         assert!(matches!(env.event, SessionEvent::TurnStarted { turn_index: 2 }));
+        let env = rx.recv().await.unwrap();
+        assert!(matches!(env.event, SessionEvent::ActivityChanged { .. }));
+        let env = rx.recv().await.unwrap();
+        assert!(matches!(env.event, SessionEvent::ActivityChanged { .. }));
 
         // Complete
         rt.complete_session("task completed successfully").await.unwrap();

@@ -171,6 +171,9 @@ pub struct EmbodimentModel {
     pub tcps: Vec<ToolCenterPoint>,
     pub sensor_mounts: Vec<SensorMount>,
     pub workspace_zones: Vec<WorkspaceZone>,
+    /// Channel bindings mapping physical names to control interface indices.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channel_bindings: Vec<crate::embodiment::binding::ChannelBinding>,
 }
 
 impl EmbodimentModel {
@@ -335,6 +338,7 @@ mod tests {
                 zone_type: ZoneType::Allowed,
                 margin_m: 0.1,
             }],
+            channel_bindings: vec![],
         }
     }
 

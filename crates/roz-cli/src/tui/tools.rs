@@ -63,7 +63,7 @@ pub struct AllTools {
 /// When `robot.toml` has both `[daemon.websocket]` and `[channels]`, this:
 /// 1. Creates a WebSocket bridge (`WsActuatorSink` + `WsSensorSource`)
 /// 2. Spawns `CopperHandle::spawn_with_io()` with the bridge
-/// 3. Registers `deploy_controller`, `stop_controller`, `get_controller_status`
+/// 3. Registers `promote_controller`, `stop_controller`, `get_controller_status`
 /// 4. Injects `cmd_tx`, `ChannelManifest`, and `ControllerState` into Extensions
 ///
 /// Falls back to the plain `build_all_tools` tool set when conditions aren't met.
@@ -111,8 +111,8 @@ pub fn build_all_tools_with_copper(project_dir: &Path) -> AllTools {
             Some(sensor as Box<dyn roz_copper::io::SensorSource>),
         );
 
-        // Build deploy_controller tool before moving manifest into Extensions.
-        let deploy_tool = roz_local::tools::deploy_controller::DeployControllerTool::new(&channel_manifest);
+        // Build promote_controller tool before moving manifest into Extensions.
+        let promote_tool = roz_local::tools::promote_controller::PromoteControllerTool::new(&channel_manifest);
 
         // Inject into Extensions for tool access.
         extensions.insert(handle.cmd_tx());
@@ -120,7 +120,7 @@ pub fn build_all_tools_with_copper(project_dir: &Path) -> AllTools {
         extensions.insert(Arc::clone(handle.state()) as Arc<ArcSwap<roz_copper::channels::ControllerState>>);
 
         // Register controller tools.
-        dispatcher.register_with_category(Box::new(deploy_tool), ToolCategory::Physical);
+        dispatcher.register_with_category(Box::new(promote_tool), ToolCategory::Physical);
         dispatcher.register_with_category(
             Box::new(roz_local::tools::stop_controller::StopControllerTool),
             ToolCategory::Physical,
@@ -579,7 +579,7 @@ available_moves = ["wake_up", "goto_sleep"]
         // No websocket section -> no copper handle, no controller tools.
         assert!(all.copper_handle.is_none());
         let names: Vec<&str> = all.schemas.iter().map(|(s, _)| s.name.as_str()).collect();
-        assert!(!names.contains(&"deploy_controller"));
+        assert!(!names.contains(&"promote_controller"));
         assert!(!names.contains(&"stop_controller"));
         assert!(!names.contains(&"get_controller_status"));
     }
@@ -603,7 +603,7 @@ path = "/ws/sdk"
         let all = build_all_tools_with_copper(dir.path());
         assert!(all.copper_handle.is_none());
         let names: Vec<&str> = all.schemas.iter().map(|(s, _)| s.name.as_str()).collect();
-        assert!(!names.contains(&"deploy_controller"));
+        assert!(!names.contains(&"promote_controller"));
     }
 
     #[test]
@@ -661,7 +661,7 @@ set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
 
         // Controller tools registered.
         let names: Vec<&str> = all.schemas.iter().map(|(s, _)| s.name.as_str()).collect();
-        assert!(names.contains(&"deploy_controller"), "missing deploy_controller");
+        assert!(names.contains(&"promote_controller"), "missing promote_controller");
         assert!(names.contains(&"stop_controller"), "missing stop_controller");
         assert!(
             names.contains(&"get_controller_status"),
@@ -690,7 +690,7 @@ set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
         let deploy_cat = all
             .schemas
             .iter()
-            .find(|(s, _)| s.name == "deploy_controller")
+            .find(|(s, _)| s.name == "promote_controller")
             .map(|(_, c)| c);
         assert_eq!(deploy_cat, Some(&ToolCategory::Physical));
 

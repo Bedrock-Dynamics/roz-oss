@@ -313,18 +313,23 @@ mod tests {
         let handle =
             CopperHandle::spawn_with_io(1.5, Some(Arc::clone(&sink) as Arc<dyn crate::io::ActuatorSink>), None);
 
-        // WASM that calls command::set(0, 0.5).
-        let wat = r#"
-            (module
-                (import "command" "set" (func $set (param i32 f64) (result i32)))
+        // WASM that uses tick contract: writes a TickOutput with command_values=[0.5].
+        let output_json = br#"{"command_values":[0.5],"estop":false,"metrics":[]}"#;
+        let len = output_json.len();
+        let data_hex: String = output_json.iter().map(|b| format!("\\{b:02x}")).collect();
+        let wat = format!(
+            r#"(module
+                (import "tick" "set_output" (func $sout (param i32 i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 256) "{data_hex}")
                 (func (export "process") (param i64)
-                    (drop (call $set (i32.const 0) (f64.const 0.5)))
+                    (call $sout (i32.const 256) (i32.const {len}))
                 )
-            )
-        "#;
+            )"#
+        );
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
         handle
-            .send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
+            .send(ControllerCommand::LoadWasm(wat.into_bytes(), manifest))
             .await
             .unwrap();
 
@@ -333,7 +338,7 @@ mod tests {
 
         let commands = sink.commands();
         assert!(!commands.is_empty(), "sink should have received command frames");
-        // The first channel should carry the 0.5 value (clamped to max_velocity=1.5).
+        // The first channel should carry the 0.5 value.
         assert!(
             commands
                 .iter()
@@ -351,12 +356,8 @@ mod tests {
             let handle = CopperHandle::spawn(1.5);
             state = Arc::clone(handle.state());
 
-            let wat = r#"
-                (module
-                    (import "motor" "set_velocity" (func $sv (param f64) (result i32)))
-                    (func (export "process") (param i64) (drop (call $sv (f64.const 0.5))))
-                )
-            "#;
+            // Minimal tick-contract WASM (no-op controller).
+            let wat = r#"(module (func (export "process") (param i64) nop))"#;
             let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
             handle
                 .send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))

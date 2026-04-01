@@ -48,6 +48,9 @@ pub struct ControllerEvidenceBundle {
     pub compiler_version: String,
 
     pub created_at: DateTime<Utc>,
+    /// Freshness of the state data used during this evidence collection run.
+    #[serde(default)]
+    pub state_freshness: crate::session::snapshot::FreshnessState,
 }
 
 impl ControllerEvidenceBundle {
@@ -103,6 +106,7 @@ mod tests {
             execution_mode: ExecutionMode::Verify,
             compiler_version: "wasmtime-22.0".into(),
             created_at: Utc::now(),
+            state_freshness: crate::session::snapshot::FreshnessState::Unknown,
         }
     }
 

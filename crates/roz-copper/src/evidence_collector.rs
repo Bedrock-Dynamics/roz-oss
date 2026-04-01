@@ -222,6 +222,7 @@ impl EvidenceCollector {
             execution_mode,
             compiler_version: compiler_version.to_string(),
             created_at: Utc::now(),
+            state_freshness: roz_core::session::snapshot::FreshnessState::Unknown,
         }
     }
 }

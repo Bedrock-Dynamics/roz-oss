@@ -73,16 +73,16 @@ async fn execute_task(
         Box::new(roz_agent::spatial_provider::NullSpatialContextProvider)
     };
 
-    // When Copper is active, register the deploy_controller tool and inject the
+    // When Copper is active, register the promote_controller tool and inject the
     // command channel into Extensions so tool implementations can reach it.
     let mut extensions = roz_agent::dispatch::Extensions::new();
     if let Some(ref handle) = copper_handle {
         extensions.insert(handle.cmd_tx());
         // TODO: Load ChannelManifest from EnvironmentConfig in task invocation.
         let manifest = roz_core::channels::ChannelManifest::default();
-        let deploy_tool = roz_local::tools::deploy_controller::DeployControllerTool::new(&manifest);
+        let promote_tool = roz_local::tools::promote_controller::PromoteControllerTool::new(&manifest);
         extensions.insert(manifest);
-        dispatcher.register_with_category(Box::new(deploy_tool), roz_core::tools::ToolCategory::Physical);
+        dispatcher.register_with_category(Box::new(promote_tool), roz_core::tools::ToolCategory::Physical);
     }
 
     // Register camera perception tools when cameras are available.

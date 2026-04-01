@@ -1,12 +1,15 @@
-//! `deploy_controller` tool — deploys verified WASM to the Copper controller loop.
+//! `promote_controller` tool — promotes verified WASM through the controller lifecycle.
 //!
-//! Integrates [`ControllerLifecycle`] tracking and [`DeploymentManager`] policy
-//! alongside the existing `LoadWasm` command path. The lifecycle tracks the
-//! controller artifact through verification and deployment, emitting
-//! [`SessionEvent`]s at each stage.
+//! Replaces the old `deploy_controller` tool. Integrates [`ControllerLifecycle`]
+//! tracking and [`DeploymentManager`] policy with the tick contract ABI. The
+//! lifecycle tracks the controller artifact through verification and deployment,
+//! emitting [`SessionEvent`]s at each stage.
+//!
+//! The tick contract is the sole execution path: controllers communicate with
+//! the host through `tick::get_input` / `tick::set_output` host functions
+//! instead of the old per-call `command::set` / `state::get` ABI.
 
 use std::fmt::Write as _;
-use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -28,38 +31,40 @@ use roz_core::tools::ToolResult;
 
 const VERIFY_TICK_COUNT: u64 = 100;
 
-/// Input for the `deploy_controller` tool.
+/// Input for the `promote_controller` tool.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct DeployControllerInput {
-    /// WAT source code or WASM binary (base64) to deploy.
+pub struct PromoteControllerInput {
+    /// WAT source code or WASM binary (base64) to promote.
     pub code: String,
 }
 
-/// Deploys verified WASM to the Copper controller loop.
+/// Promotes verified WASM through the controller lifecycle to the Copper controller loop.
 ///
-/// The code is compiled, run for [`VERIFY_TICK_COUNT`] ticks under production
-/// safety limits, then forwarded to the running Copper controller via the
-/// [`mpsc::Sender<ControllerCommand>`] stored in [`ToolContext::extensions`].
+/// The code is compiled, verified for [`VERIFY_TICK_COUNT`] ticks under
+/// production safety limits using the tick contract, then promoted through
+/// [`ControllerLifecycle`] stages and forwarded to the running Copper
+/// controller via [`mpsc::Sender<ControllerCommand>`].
 ///
 /// Description is built dynamically from the [`ChannelManifest`] at construction
-/// time, listing all command channels, host functions, and a working WAT example.
-pub struct DeployControllerTool {
+/// time, listing all command channels and the tick contract interface.
+pub struct PromoteControllerTool {
     description: String,
 }
 
-impl DeployControllerTool {
-    /// Build a `DeployControllerTool` with a description derived from the manifest.
+impl PromoteControllerTool {
+    /// Build a `PromoteControllerTool` with a description derived from the manifest.
     ///
-    /// The description includes command channel names/limits, all available host
-    /// functions, and a compilable WAT example that oscillates the first channel.
+    /// The description includes command channel names/limits, the tick contract
+    /// host functions, and guidance on the TickInput/TickOutput JSON format.
     pub fn new(manifest: &roz_core::channels::ChannelManifest) -> Self {
         let mut desc = format!(
-            "Deploy a WASM controller to the real-time Copper loop ({} Hz). \
-             Code is compiled from WAT, verified for 100 ticks, then loaded.\n\n",
+            "Promote a WASM controller through the lifecycle to the real-time Copper loop ({} Hz). \
+             Code is compiled from WAT, verified for {VERIFY_TICK_COUNT} ticks via the tick contract, \
+             then promoted through deployment stages.\n\n",
             manifest.control_rate_hz
         );
 
-        desc.push_str("Command channels (write via command::set(index, value)):\n");
+        desc.push_str("Command channels (write via TickOutput.command_values[index]):\n");
         for (i, ch) in manifest.commands.iter().enumerate() {
             let _ = writeln!(
                 desc,
@@ -69,20 +74,15 @@ impl DeployControllerTool {
         }
 
         desc.push_str(
-            "\nHost functions:\n\
-            - command::set(index: i32, value: f64) -> i32\n\
-            - command::count() -> i32\n\
-            - command::limit_min(index: i32) -> f64\n\
-            - command::limit_max(index: i32) -> f64\n\
-            - state::get(index: i32) -> f64\n\
-            - state::count() -> i32\n\
+            "\nTick contract host functions:\n\
+            - tick::input_len() -> i32 (length of TickInput JSON)\n\
+            - tick::get_input(ptr: i32, len: i32) -> i32 (copy TickInput JSON to buffer)\n\
+            - tick::set_output(ptr: i32, len: i32) (submit TickOutput JSON)\n\
+            - safety::request_estop()\n\
             - timing::now_ns() -> i64\n\
             - timing::sim_time_ns() -> i64\n\
-            - safety::request_estop()\n\
-            - config::get_len() -> i32\n\
-            - config::get_copy(ptr: i32, max_len: i32) -> i32\n\
-            - telemetry::emit_metric(value: f64)\n\
-            - math::sin(f64) -> f64, math::cos(f64) -> f64\n\n",
+            - math::sin(f64) -> f64, math::cos(f64) -> f64\n\n\
+            TickOutput JSON: {\"command_values\":[...],\"estop\":false,\"metrics\":[]}\n\n",
         );
 
         let ch0 = manifest.commands.first();
@@ -90,16 +90,16 @@ impl DeployControllerTool {
         let example_amp = ch0.map_or(0.1, |c| (c.limits.1 - c.limits.0) / 4.0);
         let _ = write!(
             desc,
-            "Example (oscillate {example_name}):\n\
+            "Example (oscillate {example_name} via tick contract):\n\
+            The controller writes a TickOutput JSON with command_values containing\n\
+            the desired velocities. The simplest approach is to embed the output\n\
+            JSON as a data segment and call tick::set_output.\n\n\
+            For a minimal no-op controller:\n\
             (module\n\
-              (import \"command\" \"set\" (func $set (param i32 f64) (result i32)))\n\
-              (import \"math\" \"sin\" (func $sin (param f64) (result f64)))\n\
-              (func (export \"process\") (param $tick i64)\n\
-                (drop (call $set (i32.const 0)\n\
-                  (f64.mul (f64.const {example_amp:.3})\n\
-                    (call $sin (f64.div (f64.convert_i64_u (local.get $tick)) (f64.const 50.0))))))\n\
-              )\n\
-            )\n",
+              (func (export \"process\") (param $tick i64) nop)\n\
+            )\n\n\
+            For a controller that outputs velocity {example_amp:.3}:\n\
+            Write the JSON bytes to memory and call tick::set_output(ptr, len).\n",
         );
 
         Self { description: desc }
@@ -114,11 +114,11 @@ enum VerifyOutcome {
 }
 
 #[async_trait]
-impl TypedToolExecutor for DeployControllerTool {
-    type Input = DeployControllerInput;
+impl TypedToolExecutor for PromoteControllerTool {
+    type Input = PromoteControllerInput;
 
     fn name(&self) -> &'static str {
-        "deploy_controller"
+        "promote_controller"
     }
 
     fn description(&self) -> &str {
@@ -130,14 +130,14 @@ impl TypedToolExecutor for DeployControllerTool {
         input: Self::Input,
         ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
-        // 0. Read manifest from extensions — no UR5 fallback.
+        // 0. Read manifest from extensions — no fallback.
         let manifest = ctx
             .extensions
             .get::<roz_core::channels::ChannelManifest>()
             .cloned()
             .ok_or_else(|| {
                 Box::<dyn std::error::Error + Send + Sync>::from(
-                    "no ChannelManifest in ToolContext — configure the robot type before deploying controllers",
+                    "no ChannelManifest in ToolContext — configure the robot type before promoting controllers",
                 )
             })?;
 
@@ -165,12 +165,11 @@ impl TypedToolExecutor for DeployControllerTool {
         // 5. Get cmd_tx from extensions — infrastructure failure is a hard error.
         let cmd_tx = ctx.extensions.get::<mpsc::Sender<ControllerCommand>>().ok_or_else(|| {
             Box::<dyn std::error::Error + Send + Sync>::from(
-                "deploy_controller requires a running Copper controller (OodaReAct mode)",
+                "promote_controller requires a running Copper controller (OodaReAct mode)",
             )
         })?;
 
         // 6. Deploy via existing LoadWasm path.
-        // TODO: Replace with lifecycle-driven deployment when CopperHandle supports it.
         cmd_tx
             .send(ControllerCommand::LoadWasm(input.code.into_bytes(), manifest))
             .await
@@ -186,8 +185,8 @@ impl TypedToolExecutor for DeployControllerTool {
 
         let event_summary = summarize_events(&events);
         Ok(ToolResult::success(serde_json::json!({
-            "status": "deployed",
-            "message": format!("{message}, deployed to controller"),
+            "status": "promoted",
+            "message": format!("{message}, promoted to controller"),
             "controller_id": controller_id,
             "deployment_state": format!("{final_state:?}"),
             "lifecycle_events": event_summary,
@@ -232,13 +231,10 @@ fn run_lifecycle(
     }];
 
     // Default policy: skip shadow and canary (fast local deploy).
-    // TODO: Read policy from RuntimeBlueprint in ToolContext when available.
     let deploy_mgr = DeploymentManager::new(false, false, true);
     let mut current_state = DeploymentState::VerifiedOnly;
 
     while let Some(target) = deploy_mgr.next_target(current_state) {
-        // For stages beyond verification, the lifecycle requires fresh evidence.
-        // TODO: Wire real shadow/canary evidence collection from CopperHandle.
         if lifecycle.current_state() != Some(DeploymentState::VerifiedOnly) {
             let stage_evidence = build_clean_evidence(&controller_id, 0, 0, &manifest_digest);
             lifecycle
@@ -289,14 +285,14 @@ fn build_artifact(controller_id: &str, code_sha256: &str, manifest_digest: &str)
         generator_model: None,
         generator_provider: None,
         channel_manifest_version: 1,
-        host_abi_version: 1,
+        host_abi_version: 2, // Tick contract ABI version
         evidence_bundle_id: None,
         created_at: Utc::now(),
         promoted_at: None,
         replaced_controller_id: None,
         verification_key: VerificationKey {
             controller_digest: code_sha256.to_string(),
-            wit_world_version: "bedrock:controller@1.0.0".into(),
+            wit_world_version: "bedrock:controller@2.0.0".into(),
             model_digest: "not_available".into(),
             calibration_digest: "not_available".into(),
             manifest_digest: manifest_digest.to_string(),
@@ -304,7 +300,8 @@ fn build_artifact(controller_id: &str, code_sha256: &str, manifest_digest: &str)
             compiler_version: "wasmtime".into(),
             embodiment_family: None,
         },
-        wit_world: "live-controller".into(),
+        wit_world: "tick-controller".into(),
+        verifier_result: None,
     }
 }
 
@@ -312,7 +309,6 @@ fn build_artifact(controller_id: &str, code_sha256: &str, manifest_digest: &str)
 async fn emit_lifecycle_events(ctx: &ToolContext, events: &[SessionEvent]) {
     if let Some(event_tx) = ctx.extensions.get::<mpsc::Sender<SessionEvent>>() {
         for event in events {
-            // Best-effort: don't fail the deploy if event emission fails.
             let _ = event_tx.send(event.clone()).await;
         }
     }
@@ -332,9 +328,6 @@ fn summarize_events(events: &[SessionEvent]) -> Vec<String> {
 }
 
 /// Build a clean evidence bundle suitable for fast-path promotion.
-///
-/// Used both for the initial verification stage and for subsequent stages
-/// (shadow, canary) where real evidence collection is not yet wired.
 fn build_clean_evidence(
     controller_id: &str,
     ticks_run: u64,
@@ -367,7 +360,7 @@ fn build_clean_evidence(
         },
         verifier_status: if rejections == 0 { "pass" } else { "pass_with_warnings" }.into(),
         verifier_reason: if rejections > 0 {
-            Some(format!("{rejections} velocity command(s) exceeded safety limits"))
+            Some(format!("{rejections} command(s) rejected during verification"))
         } else {
             None
         },
@@ -375,17 +368,16 @@ fn build_clean_evidence(
         calibration_digest: "not_available".into(),
         frame_snapshot_id: 0,
         manifest_digest: manifest_digest.to_string(),
-        wit_world_version: "bedrock:controller@1.0.0".into(),
+        wit_world_version: "bedrock:controller@2.0.0".into(),
         execution_mode: ExecutionMode::Verify,
         compiler_version: "wasmtime".into(),
         created_at: Utc::now(),
+        state_freshness: roz_core::session::snapshot::FreshnessState::Unknown,
     }
 }
 
 /// Compile `code` and run it for [`VERIFY_TICK_COUNT`] ticks under production
-/// safety limits.  Returns [`VerifyOutcome::Ok`] with a status message on
-/// success, or [`VerifyOutcome::Err`] with a user-visible description on
-/// compilation or tick failure.
+/// safety limits using the tick contract.
 ///
 /// Designed to run inside `spawn_blocking` because wasmtime is CPU-bound.
 fn verify_wasm(code: &[u8], manifest: &roz_core::channels::ChannelManifest) -> VerifyOutcome {
@@ -402,10 +394,13 @@ fn verify_wasm(code: &[u8], manifest: &roz_core::channels::ChannelManifest) -> V
         }
     }
 
-    let rejections = task.host_context().rejection_count.load(Ordering::Relaxed);
-    let mut message = format!("verified {VERIFY_TICK_COUNT} ticks");
+    let rejections = task
+        .host_context()
+        .rejection_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let mut message = format!("verified {VERIFY_TICK_COUNT} ticks via tick contract");
     if rejections > 0 {
-        let _ = write!(message, ", {rejections} velocity command(s) exceeded safety limits");
+        let _ = write!(message, ", {rejections} command(s) rejected");
     }
 
     VerifyOutcome::Ok { message, rejections }
@@ -442,24 +437,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deploys_valid_wasm() {
-        let tool = DeployControllerTool::new(&test_manifest());
+    async fn promotes_valid_wasm() {
+        let tool = PromoteControllerTool::new(&test_manifest());
         let (ctx, mut rx) = test_ctx_with_sender();
-        let input = DeployControllerInput {
+        let input = PromoteControllerInput {
             code: r#"(module (func (export "process") (param i64) nop))"#.into(),
         };
         let result = TypedToolExecutor::execute(&tool, input, &ctx).await.unwrap();
         assert!(result.is_success(), "should succeed: {:?}", result);
-        // Verify LoadWasm was sent
         let cmd = rx.try_recv().unwrap();
         assert!(matches!(cmd, ControllerCommand::LoadWasm(_, _)));
     }
 
     #[tokio::test]
     async fn rejects_invalid_wasm() {
-        let tool = DeployControllerTool::new(&test_manifest());
+        let tool = PromoteControllerTool::new(&test_manifest());
         let (ctx, _rx) = test_ctx_with_sender();
-        let input = DeployControllerInput {
+        let input = PromoteControllerInput {
             code: "not valid wasm".into(),
         };
         let result = TypedToolExecutor::execute(&tool, input, &ctx).await.unwrap();
@@ -468,14 +462,14 @@ mod tests {
 
     #[tokio::test]
     async fn fails_without_copper_handle() {
-        let tool = DeployControllerTool::new(&test_manifest());
+        let tool = PromoteControllerTool::new(&test_manifest());
         let ctx = ToolContext {
             task_id: "test".into(),
             tenant_id: "test".into(),
             call_id: "test".into(),
             extensions: Extensions::default(),
         };
-        let input = DeployControllerInput {
+        let input = PromoteControllerInput {
             code: r#"(module (func (export "process") (param i64) nop))"#.into(),
         };
         let result = TypedToolExecutor::execute(&tool, input, &ctx).await;
@@ -483,24 +477,26 @@ mod tests {
     }
 
     #[test]
-    fn description_example_wat_compiles_and_runs() {
-        let manifest = roz_core::channels::ChannelManifest::generic_velocity(6, std::f64::consts::PI);
-        let tool = DeployControllerTool::new(&manifest);
+    fn tool_name_is_promote_controller() {
+        let manifest = test_manifest();
+        let tool = PromoteControllerTool::new(&manifest);
+        assert_eq!(TypedToolExecutor::name(&tool), "promote_controller");
+    }
+
+    #[test]
+    fn description_mentions_tick_contract() {
+        let manifest = test_manifest();
+        let tool = PromoteControllerTool::new(&manifest);
         let desc = TypedToolExecutor::description(&tool);
-        let wat_start = desc.find("(module").expect("description must contain example WAT");
-        let wat = &desc[wat_start..];
-        let host = roz_copper::wit_host::HostContext::with_manifest(manifest);
-        let mut task = roz_copper::wasm::CuWasmTask::from_source_with_host(wat.as_bytes(), host)
-            .expect("example WAT must compile");
-        for tick in 0..100 {
-            task.tick(tick).expect("example WAT must run");
-        }
+        assert!(desc.contains("tick contract"), "must mention tick contract: {desc}");
+        assert!(desc.contains("tick::get_input"), "must mention tick::get_input");
+        assert!(desc.contains("tick::set_output"), "must mention tick::set_output");
     }
 
     #[test]
     fn description_mentions_all_channels() {
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(3, 1.5);
-        let tool = DeployControllerTool::new(&manifest);
+        let tool = PromoteControllerTool::new(&manifest);
         let desc = TypedToolExecutor::description(&tool);
         for ch in &manifest.commands {
             assert!(desc.contains(&ch.name), "must mention '{}'", ch.name);

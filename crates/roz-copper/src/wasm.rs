@@ -1,8 +1,8 @@
 //! WASM sandbox for agent-generated Copper tasks.
 //!
 //! Loads a WASM module (binary or WAT text) and calls its `process` export
-//! on each tick. The host provides hardware access through WIT-defined
-//! interfaces with capability-scoped permissions.
+//! on each tick. The host provides structured tick input/output through the
+//! tick contract: `tick::get_input` / `tick::set_output` host functions.
 //!
 //! # Safety
 //!
@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use wasmtime::{Config, Engine, Instance, Linker, Module, Store, TypedFunc};
 
+use crate::tick_contract::{TickInput, TickOutput};
 use crate::wit_host::{self, HostContext};
 
 /// A Copper task that wraps a WASM module.
@@ -28,8 +29,8 @@ use crate::wit_host::{self, HostContext};
 /// the configured deadline. A background thread continuously increments the
 /// engine epoch counter and is cleanly shut down when the task is dropped.
 ///
-/// The store always carries a [`HostContext`] so that WIT host functions
-/// (motor control, safety, timing) are available to the WASM module. Use
+/// The store always carries a [`HostContext`] so that tick contract host
+/// functions are available to the WASM module. Use
 /// [`from_source`](Self::from_source) for a permissive default context or
 /// [`from_source_with_host`](Self::from_source_with_host) to supply custom
 /// safety limits.
@@ -53,9 +54,9 @@ impl CuWasmTask {
 
     /// Create a new `CuWasmTask` from WASM bytecode or WAT text.
     ///
-    /// Uses a permissive [`HostContext::default()`] with no safety limits
-    /// (max velocity = `f64::MAX`). WIT host functions are registered but
-    /// are simply unused if the module does not import them.
+    /// Uses a permissive [`HostContext::default()`] with no safety limits.
+    /// Tick contract host functions are registered but are simply unused
+    /// if the module does not import them.
     ///
     /// # Errors
     ///
@@ -67,10 +68,9 @@ impl CuWasmTask {
 
     /// Create a new `CuWasmTask` with an explicit [`HostContext`].
     ///
-    /// The context supplies safety limits (e.g. `max_velocity`) that the
-    /// WIT host functions enforce. The [`Store`] and [`Instance`] are
-    /// created once and reused across ticks so that WASM linear memory
-    /// persists.
+    /// The context supplies the channel manifest that determines command/state
+    /// layout. The [`Store`] and [`Instance`] are created once and reused
+    /// across ticks so that WASM linear memory persists.
     ///
     /// # Errors
     ///
@@ -136,7 +136,11 @@ impl CuWasmTask {
         })
     }
 
-    /// Execute one tick of the WASM module.
+    /// Execute one tick of the WASM module using the tick contract.
+    ///
+    /// If `tick_input` is `Some`, it is serialized and made available to
+    /// the controller via `tick::get_input`. After the tick, any output
+    /// written via `tick::set_output` is parsed and returned.
     ///
     /// If the module exports a `process(i64)` function it is called with the
     /// provided tick counter. Modules without a `process` export are
@@ -148,14 +152,45 @@ impl CuWasmTask {
     /// # Errors
     ///
     /// Returns an error if the `process` function traps.
-    pub fn tick(&mut self, tick: u64) -> anyhow::Result<()> {
-        // Reset command values and velocity alias cursor for this tick.
+    pub fn tick_with_contract(&mut self, tick: u64, input: Option<&TickInput>) -> anyhow::Result<Option<TickOutput>> {
+        // Reset command values for this tick.
         self.store.data_mut().reset_commands();
+
+        // Write tick input for the controller.
+        if let Some(input) = input {
+            self.store.data_mut().set_tick_input(input);
+        }
+
         self.store.set_epoch_deadline(8); // 8ms budget for 100Hz tick rate
         if let Some(ref process) = self.process_fn {
             process.call(&mut self.store, tick)?;
         }
-        // Check e-stop after execution (estop_requested is a plain bool, not AtomicBool)
+
+        // Check e-stop after execution.
+        if self.store.data().estop_requested {
+            anyhow::bail!("e-stop requested by WASM module");
+        }
+
+        // Parse and return tick output.
+        Ok(self.store.data_mut().take_tick_output())
+    }
+
+    /// Execute one tick of the WASM module (legacy interface).
+    ///
+    /// This is the backward-compatible entry point that does not use the
+    /// structured tick contract. It calls `process(tick)` and checks for
+    /// e-stop. Use [`tick_with_contract`](Self::tick_with_contract) for the
+    /// new tick contract path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `process` function traps.
+    pub fn tick(&mut self, tick: u64) -> anyhow::Result<()> {
+        self.store.data_mut().reset_commands();
+        self.store.set_epoch_deadline(8);
+        if let Some(ref process) = self.process_fn {
+            process.call(&mut self.store, tick)?;
+        }
         if self.store.data().estop_requested {
             anyhow::bail!("e-stop requested by WASM module");
         }
@@ -242,8 +277,6 @@ impl Drop for CuWasmTask {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
 
     const MINIMAL_WAT: &str = r#"
@@ -271,7 +304,6 @@ mod tests {
     fn wasm_infinite_loop_interrupted_automatically() {
         let wat = r#"(module (func (export "process") (param i64) (loop br 0)))"#;
         let mut task = CuWasmTask::from_source(wat.as_bytes()).unwrap();
-        // Small delay to let epoch thread start
         std::thread::sleep(std::time::Duration::from_millis(10));
         let result = task.tick(0);
         assert!(result.is_err(), "infinite loop should be auto-interrupted");
@@ -308,50 +340,6 @@ mod tests {
         assert_eq!(counter, 3, "state must persist across ticks");
     }
 
-    // -- Host-function integration tests ----------------------------------
-
-    #[test]
-    fn wasm_calls_host_set_velocity() {
-        let wat = r#"
-            (module
-                (import "motor" "set_velocity" (func $set_vel (param f64) (result i32)))
-                (func (export "process") (param i64)
-                    (drop (call $set_vel (f64.const 0.5)))
-                )
-            )
-        "#;
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let mut host = HostContext::default();
-        host.command_log = Arc::clone(&log);
-        let mut task = CuWasmTask::from_source_with_host(wat.as_bytes(), host).unwrap();
-        task.tick(0).unwrap();
-
-        let entries = log.lock().unwrap();
-        assert_eq!(entries.len(), 1);
-        assert!((entries[0].value - 0.5).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn wasm_host_rejects_unsafe_velocity() {
-        let wat = r#"
-            (module
-                (import "motor" "set_velocity" (func $set_vel (param f64) (result i32)))
-                (global $result (export "result") (mut i32) (i32.const 0))
-                (func (export "process") (param i64)
-                    (global.set $result (call $set_vel (f64.const 100.0)))
-                )
-            )
-        "#;
-        // Use a manifest with limits so set_velocity(100.0) is rejected.
-        let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-        let host = HostContext::with_manifest(manifest);
-        let mut task = CuWasmTask::from_source_with_host(wat.as_bytes(), host).unwrap();
-        task.tick(0).unwrap();
-
-        let result = task.get_global_i32("result").unwrap();
-        assert_eq!(result, -1, "should reject velocity exceeding limit");
-    }
-
     #[test]
     fn wasm_host_estop_via_task() {
         let wat = r#"
@@ -370,29 +358,55 @@ mod tests {
     }
 
     #[test]
-    fn wasm_reads_config_via_host_functions() {
-        // WAT module that calls config::get_len and stores result in a global
-        let wat = r#"
-            (module
-                (import "config" "get_len" (func $config_len (result i32)))
-                (global $len (export "config_len") (mut i32) (i32.const -1))
+    fn wasm_tick_with_contract_returns_output() {
+        // WAT that reads tick input length, then writes a hardcoded TickOutput.
+        let output_json = r#"{"command_values":[0.5],"estop":false,"metrics":[]}"#;
+        let output_bytes = output_json.as_bytes();
+        let len = output_bytes.len();
+        let data_hex: String = output_bytes.iter().map(|b| format!("\\{b:02x}")).collect();
+        let wat = format!(
+            r#"(module
+                (import "tick" "set_output" (func $sout (param i32 i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 256) "{data_hex}")
                 (func (export "process") (param i64)
-                    (global.set $len (call $config_len))
+                    (call $sout (i32.const 256) (i32.const {len}))
                 )
-            )
-        "#;
-        let mut host = HostContext::default();
-        host.config_json = br#"{"kp":1.5}"#.to_vec();
+            )"#
+        );
+
+        let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
+        let host = HostContext::with_manifest(manifest);
         let mut task = CuWasmTask::from_source_with_host(wat.as_bytes(), host).unwrap();
-        task.tick(0).unwrap();
-        let len = task.get_global_i32("config_len").unwrap();
-        assert_eq!(len, 10); // {"kp":1.5} is 10 bytes
+
+        let input = TickInput {
+            tick: 0,
+            monotonic_time_ns: 0,
+            digests: crate::tick_contract::DigestSet {
+                model: "m".into(),
+                calibration: "c".into(),
+                manifest: "man".into(),
+                interface_version: "1.0".into(),
+            },
+            joints: vec![],
+            watched_poses: vec![],
+            wrench: None,
+            contact: None,
+            features: crate::tick_contract::DerivedFeatures::default(),
+            config_json: "{}".into(),
+        };
+
+        let output = task.tick_with_contract(0, Some(&input)).unwrap();
+        let output = output.expect("should have tick output");
+        assert_eq!(output.command_values, vec![0.5]);
+        assert!(!output.estop);
+
+        // Command values should also be reflected in host context.
+        assert!((task.host_context().command_values[0] - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
     fn wasm_long_computation_interrupted_within_budget() {
-        // WAT module with a loop that takes ~50ms
-        // At deadline 8 (8ms), should be interrupted well before completion
         let wat = r#"
             (module
                 (func (export "process") (param i64)

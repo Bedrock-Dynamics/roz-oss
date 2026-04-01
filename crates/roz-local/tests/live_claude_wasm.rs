@@ -1,4 +1,4 @@
-//! THE REAL DEMO: Real Claude writes WAT -> `deploy_controller` -> Copper ticks -> oscillation.
+//! THE REAL DEMO: Real Claude writes WAT -> `promote_controller` -> Copper ticks -> oscillation.
 //! Requires: `ANTHROPIC_API_KEY`
 
 #[tokio::test]
@@ -23,10 +23,10 @@ async fn real_claude_writes_wat_and_deploys_controller() {
     // 3. Create real Claude model
     let model = roz_agent::model::create_model("claude-sonnet-4-6", "", "", 120, "anthropic", Some(&api_key)).unwrap();
 
-    // 4. Create dispatcher with deploy_controller
+    // 4. Create dispatcher with promote_controller
     let mut dispatcher = roz_agent::dispatch::ToolDispatcher::new(std::time::Duration::from_secs(60));
     dispatcher.register_with_category(
-        Box::new(roz_local::tools::deploy_controller::DeployControllerTool::new(
+        Box::new(roz_local::tools::promote_controller::PromoteControllerTool::new(
             &manifest,
         )),
         roz_core::tools::ToolCategory::Physical,
@@ -41,7 +41,7 @@ async fn real_claude_writes_wat_and_deploys_controller() {
          The module must export: (func (export \"process\") (param i64))\n\
          The i64 parameter is the tick counter (0, 1, 2, ...).\n\n\
          Command channels: {} velocity channels.\n\
-         Use the deploy_controller tool to deploy the code.\n\
+         Use the promote_controller tool to deploy the code.\n\
          Pass the WAT source code as the 'code' parameter.",
         manifest.commands.len(),
     );

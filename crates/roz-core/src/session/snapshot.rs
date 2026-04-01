@@ -10,7 +10,7 @@ use crate::edge_health::EdgeTransportHealth;
 use crate::trust::TrustPosture;
 
 /// How fresh a piece of data is.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FreshnessState {
     /// Data is current and reliable.
@@ -18,6 +18,7 @@ pub enum FreshnessState {
     /// Data exists but may be outdated.
     Stale { since: DateTime<Utc> },
     /// No data available.
+    #[default]
     Unknown,
 }
 

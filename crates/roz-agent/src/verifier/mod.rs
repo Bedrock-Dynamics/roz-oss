@@ -122,6 +122,7 @@ mod tests {
             execution_mode: ExecutionMode::Verify,
             compiler_version: "wasmtime-22.0".into(),
             created_at: Utc::now(),
+            state_freshness: roz_core::session::snapshot::FreshnessState::Unknown,
         }
     }
 

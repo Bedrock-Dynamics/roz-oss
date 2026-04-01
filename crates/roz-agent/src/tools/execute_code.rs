@@ -317,7 +317,9 @@ mod tests {
     /// those commands rejected by the production safety limit (1.5 rad/s).
     /// Verification completes successfully but reports the rejections.
     #[tokio::test]
-    async fn verify_with_production_limits_rejects_excessive_velocity() {
+    async fn verify_with_production_limits_rejects_old_abi() {
+        // Old ABI modules that import motor::set_velocity should fail to compile
+        // (import cannot be satisfied with the tick contract host functions).
         let wat = r#"
             (module
                 (import "motor" "set_velocity" (func $sv (param f64) (result i32)))
@@ -332,24 +334,15 @@ mod tests {
             verify_first: true,
         };
         let result = TypedToolExecutor::execute(&tool, input, &test_ctx()).await.unwrap();
-        assert!(result.is_success(), "verification should succeed even with rejections");
-        let output_str = result.output.to_string();
-        assert!(
-            output_str.contains("Warning") && output_str.contains("rejected"),
-            "output should warn about rejected velocity commands, got: {output_str}"
-        );
+        assert!(result.is_error(), "old ABI imports should fail to link");
     }
 
-    /// A WASM module that calls `set_velocity(0.5)` should pass verification
-    /// under the production limit (1.5 rad/s) with no warnings.
+    /// A minimal tick-contract WASM module should pass verification.
     #[tokio::test]
-    async fn verify_with_production_limits_accepts_safe_velocity() {
+    async fn verify_with_production_limits_accepts_tick_contract_module() {
         let wat = r#"
             (module
-                (import "motor" "set_velocity" (func $sv (param f64) (result i32)))
-                (func (export "process") (param i64)
-                    (drop (call $sv (f64.const 0.5)))
-                )
+                (func (export "process") (param i64) nop)
             )
         "#;
         let tool = ExecuteCodeTool;
@@ -358,11 +351,11 @@ mod tests {
             verify_first: true,
         };
         let result = TypedToolExecutor::execute(&tool, input, &test_ctx()).await.unwrap();
-        assert!(result.is_success(), "safe velocity should pass verification");
+        assert!(result.is_success(), "tick contract module should pass verification");
         let output_str = result.output.to_string();
         assert!(
             !output_str.contains("Warning") && !output_str.contains("rejected"),
-            "safe velocity should not produce warnings, got: {output_str}"
+            "clean tick contract module should not produce warnings, got: {output_str}"
         );
     }
 }

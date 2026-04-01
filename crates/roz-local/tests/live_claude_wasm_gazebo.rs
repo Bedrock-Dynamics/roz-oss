@@ -1,4 +1,4 @@
-//! FULL VERTICAL: Claude writes WAT -> `deploy_controller` -> `CopperHandle` with
+//! FULL VERTICAL: Claude writes WAT -> `promote_controller` -> `CopperHandle` with
 //! real `GrpcActuatorSink` + `GrpcSensorSource` -> bridge -> verify.
 //!
 //! Requires: `ANTHROPIC_API_KEY` + ros2-manipulator on ports 8094/9094
@@ -47,11 +47,13 @@ async fn try_connect_sensor() -> Option<GrpcSensorSource> {
     }
 }
 
-/// Build the tool dispatcher with `deploy_controller` + MCP tools.
+/// Build the tool dispatcher with `promote_controller` + MCP tools.
 fn build_dispatcher(mcp: &Arc<McpManager>, manifest: &roz_core::channels::ChannelManifest) -> ToolDispatcher {
     let mut dispatcher = ToolDispatcher::new(Duration::from_secs(60));
     dispatcher.register_with_category(
-        Box::new(roz_local::tools::deploy_controller::DeployControllerTool::new(manifest)),
+        Box::new(roz_local::tools::promote_controller::PromoteControllerTool::new(
+            manifest,
+        )),
         roz_core::tools::ToolCategory::Physical,
     );
     for tool_info in mcp.all_tools() {
@@ -73,7 +75,7 @@ fn robot_system_prompt(n_channels: usize) -> String {
          The module must export: (func (export \"process\") (param i64))\n\
          The i64 parameter is the tick counter (0, 1, 2, ...).\n\n\
          Command channels: {n_channels} velocity channels.\n\
-         Use the deploy_controller tool to deploy the code.\n\
+         Use the promote_controller tool to deploy the code.\n\
          Pass the WAT source code as the 'code' parameter.\n\
          You also have MCP tools to read joint state from the robot.",
     )
@@ -177,7 +179,7 @@ async fn full_vertical_claude_wasm_gazebo() {
     println!("Command frames captured: {}", cmds.len());
     assert!(
         !cmds.is_empty(),
-        "Copper should have produced command frames after deploy_controller"
+        "Copper should have produced command frames after promote_controller"
     );
 
     let ch0: Vec<f64> = cmds.iter().filter_map(|c| c.values.first().copied()).collect();

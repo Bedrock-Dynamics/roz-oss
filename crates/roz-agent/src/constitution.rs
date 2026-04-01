@@ -453,7 +453,7 @@ pub fn build_constitution(mode: AgentLoopMode, tool_names: &[&str]) -> String {
     if has("env_start") {
         tiers.push(TIER3_8_SIMULATION);
     }
-    if has("execute_code") || has("deploy_controller") {
+    if has("execute_code") || has("promote_controller") {
         tiers.push(TIER3_9_WASM);
     }
     if has("spawn_worker") {
@@ -500,7 +500,7 @@ pub fn build_worker_constitution(mode: AgentLoopMode, tool_names: &[&str]) -> St
     if has("env_start") {
         tiers.push(TIER3_8_SIMULATION);
     }
-    if has("execute_code") || has("deploy_controller") {
+    if has("execute_code") || has("promote_controller") {
         tiers.push(TIER3_9_WASM);
     }
     // No TIER3_10_MULTI_AGENT — workers cannot spawn.
@@ -804,10 +804,10 @@ mod tests {
             "execute_code should trigger WASM tier"
         );
 
-        let with_deploy = build_constitution(AgentLoopMode::React, &["deploy_controller"]);
+        let with_promote = build_constitution(AgentLoopMode::React, &["promote_controller"]);
         assert!(
-            with_deploy.contains("WASM CONTROLLER DEPLOYMENT"),
-            "deploy_controller should trigger WASM tier"
+            with_promote.contains("WASM CONTROLLER DEPLOYMENT"),
+            "promote_controller should trigger WASM tier"
         );
     }
 

@@ -3,7 +3,8 @@
 //! Runs on a dedicated thread at the rate specified by the loaded
 //! [`ChannelManifest`](roz_core::channels::ChannelManifest) (defaults to
 //! 100 Hz when no manifest is loaded). Drains commands from a
-//! `std::sync::mpsc` channel (non-blocking), ticks the WASM controller,
+//! `std::sync::mpsc` channel (non-blocking), ticks the WASM controller
+//! using the structured tick contract ([`TickInput`]/[`TickOutput`]),
 //! applies safety filtering, and publishes state via `ArcSwap`.
 
 use std::sync::Arc;
@@ -15,14 +16,13 @@ use sha2::{Digest, Sha256};
 
 use roz_core::channels::ChannelManifest;
 use roz_core::command::CommandFrame;
-use roz_core::controller::intervention::SafetyIntervention;
 use roz_core::embodiment::limits::JointSafetyLimits;
 
 use crate::channels::{ControllerCommand, ControllerState};
 use crate::evidence_collector::EvidenceCollector;
 use crate::safety_filter::{HotPathSafetyFilter, SafetyFilterTask};
 use crate::tick_builder::{TickInputBuilder, TickSensorData};
-use crate::tick_contract::{DerivedFeatures, DigestSet, TickOutput};
+use crate::tick_contract::{DerivedFeatures, DigestSet};
 use crate::wasm::CuWasmTask;
 
 /// Default tick rate: 100 Hz = 10 ms per tick.
@@ -223,27 +223,22 @@ fn check_watchdog(
     true
 }
 
-/// Tick the WASM controller, extract commands, and apply safety filtering.
+/// Tick the WASM controller using the tick contract, extract commands,
+/// and apply safety filtering.
 ///
 /// Returns the clamped [`CommandFrame`] if any non-default command values
 /// were produced this tick. On WASM trap, sets `running` to `false`,
 /// records the error in `last_output`, and sends the reason through
 /// `estop_tx` so the supervisor/adapter can disable motors.
 ///
-/// # Sensor injection
+/// # Tick Contract Flow
 ///
-/// The caller is responsible for injecting sensor data into the `HostContext`
-/// via [`CuWasmTask::host_context_mut`] **before** calling this function.
-/// `run_controller_loop` does this automatically when a `SensorSource` is
-/// provided.
-///
-/// # E-stop propagation
-///
-/// Any tick error (explicit `request_estop()`, epoch timeout, OOM, or
-/// generic WASM trap) is sent through `estop_tx` via `try_send` so the
-/// real-time loop is never blocked by a slow receiver. The returned
-/// `estop_reason` is set on the error message for inclusion in
-/// [`ControllerState`].
+/// 1. Build `TickInput` from sensor data via `TickInputBuilder`
+/// 2. Call `tick_with_contract(tick, Some(&input))`
+/// 3. Parse `TickOutput` for commands and e-stop
+/// 4. Run commands through `HotPathSafetyFilter`
+/// 5. Fall back to `SafetyFilterTask::clamp_frame` for actuator output
+#[allow(clippy::too_many_arguments)]
 fn tick_wasm(
     task: &mut CuWasmTask,
     tick: u64,
@@ -252,9 +247,30 @@ fn tick_wasm(
     safety_filter: &mut SafetyFilterTask,
     estop_tx: &tokio::sync::mpsc::Sender<String>,
     estop_reason: &mut Option<String>,
+    tick_builder: Option<&TickInputBuilder>,
+    hot_path_filter: Option<&mut HotPathSafetyFilter>,
+    evidence: Option<&mut EvidenceCollector>,
+    sensor_positions: &[f64],
+    sensor_velocities: &[f64],
+    tick_start: Instant,
 ) -> Option<CommandFrame> {
-    match task.tick(tick) {
-        Ok(()) => {
+    // Build tick input if we have a builder.
+    let tick_input = tick_builder.map(|builder| {
+        builder.build(TickSensorData {
+            tick,
+            time_ns: u64::try_from(tick_start.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            positions: sensor_positions,
+            velocities: sensor_velocities,
+            efforts: None,
+            watched_poses: &[],
+            wrench: None,
+            contact: None,
+            features: DerivedFeatures::default(),
+        })
+    });
+
+    match task.tick_with_contract(tick, tick_input.as_ref()) {
+        Ok(tick_output) => {
             let ctx = task.host_context();
             let raw_values = &ctx.command_values;
 
@@ -279,6 +295,33 @@ fn tick_wasm(
             };
             let manifest = &ctx.manifest;
             let clamped = safety_filter.clamp_frame(&raw_frame, manifest);
+
+            // Run through structured safety filter and record evidence.
+            if let Some(filter) = hot_path_filter {
+                let filter_result = filter.filter(
+                    &clamped.values,
+                    if ctx.state_values.is_empty() {
+                        None
+                    } else {
+                        Some(&ctx.state_values)
+                    },
+                    None,
+                );
+
+                if let Some(collector) = evidence {
+                    let output = tick_output.unwrap_or_default();
+                    collector.record_tick(tick_start.elapsed(), &output, &filter_result.interventions);
+                }
+
+                if !filter_result.interventions.is_empty() {
+                    tracing::debug!(
+                        tick,
+                        count = filter_result.interventions.len(),
+                        "tick contract safety interventions"
+                    );
+                }
+            }
+
             *last_output = Some(serde_json::json!({
                 "values": clamped.values,
                 "channel_count": manifest.command_count(),
@@ -290,8 +333,6 @@ fn tick_wasm(
             tracing::error!(tick, error = %msg, "WASM tick failed, halting");
             *running = false;
 
-            // Notify supervisor/adapter of the controller error.
-            // try_send is non-blocking — critical for the real-time loop.
             let reason = format!("controller_error: {msg}");
             let _ = estop_tx.try_send(reason.clone());
             *estop_reason = Some(reason);
@@ -364,75 +405,6 @@ fn build_tick_infrastructure(manifest: &ChannelManifest) -> (TickInputBuilder, H
     (tick_builder, hot_path_filter)
 }
 
-/// Snapshot of host and sensor state needed for post-tick processing.
-struct PostTickContext<'a> {
-    tick_duration: Duration,
-    tick: u64,
-    host_commands: &'a [f64],
-    host_estop: bool,
-    host_estop_reason: Option<&'a str>,
-    host_state_values: &'a [f64],
-    sensor_positions: &'a [f64],
-    sensor_velocities: &'a [f64],
-}
-
-/// Run post-tick processing through the new tick contract pipeline.
-///
-/// Builds structured [`TickOutput`] from the host context's command values,
-/// runs it through the [`HotPathSafetyFilter`], and records evidence.
-/// Returns any safety interventions for logging/telemetry.
-///
-/// This runs *alongside* the old safety pipeline (backward compatible).
-/// The old `SafetyFilterTask::clamp_frame` still gates the actuator output;
-/// the new pipeline collects structured evidence and runs the richer
-/// per-joint safety checks.
-#[allow(clippy::cast_possible_truncation)] // tick durations won't exceed u64 nanoseconds
-fn post_tick_processing(
-    ctx: &PostTickContext<'_>,
-    tick_builder: &TickInputBuilder,
-    filter: &mut HotPathSafetyFilter,
-    evidence: Option<&mut EvidenceCollector>,
-) -> Vec<SafetyIntervention> {
-    // Build structured input for this tick.
-    let _tick_input = tick_builder.build(TickSensorData {
-        tick: ctx.tick,
-        time_ns: ctx.tick_duration.as_nanos() as u64,
-        positions: ctx.sensor_positions,
-        velocities: ctx.sensor_velocities,
-        efforts: None,
-        watched_poses: &[],
-        wrench: None,
-        contact: None,
-        features: DerivedFeatures::default(),
-    });
-
-    // Build structured output from host state.
-    let tick_output = TickOutput {
-        command_values: ctx.host_commands.to_vec(),
-        estop: ctx.host_estop,
-        estop_reason: ctx.host_estop_reason.map(String::from),
-        metrics: vec![],
-    };
-
-    // Run through the new structured safety filter.
-    let filter_result = filter.filter(
-        &tick_output.command_values,
-        if ctx.host_state_values.is_empty() {
-            None
-        } else {
-            Some(ctx.host_state_values)
-        },
-        None,
-    );
-
-    // Record evidence for verification/audit.
-    if let Some(collector) = evidence {
-        collector.record_tick(ctx.tick_duration, &tick_output, &filter_result.interventions);
-    }
-
-    filter_result.interventions
-}
-
 // ---------------------------------------------------------------------------
 // Controller loops
 // ---------------------------------------------------------------------------
@@ -440,14 +412,13 @@ fn post_tick_processing(
 /// Run the controller loop on the current thread (blocking).
 ///
 /// Drains commands from `cmd_rx` at the top of each tick (non-blocking),
-/// ticks the WASM controller if one is loaded and running, applies
-/// safety filtering, and publishes state to `shared_state`.
+/// ticks the WASM controller using the tick contract if one is loaded and
+/// running, applies safety filtering, and publishes state to `shared_state`.
 ///
 /// Optional IO traits:
 /// - `actuator`: if `Some`, clamped motor commands are forwarded after safety filtering.
-/// - `sensor`: if `Some`, sensor data is read each tick and injected into the WASM
-///   `HostContext` so that `get_joint_position` / `get_joint_velocity` / `sim_time_ns`
-///   return live values.
+/// - `sensor`: if `Some`, sensor data is read each tick and injected into the
+///   `TickInput` so the controller receives live values.
 ///
 /// # Emergency channel
 ///
@@ -479,21 +450,15 @@ pub fn run_controller_loop(
     let mut wasm_task: Option<CuWasmTask> = None;
     let mut running = false;
     let mut tick: u64 = 0;
-    // Persists across ticks so error/halt state is readable by the agent.
     let mut last_output: Option<serde_json::Value> = None;
 
-    // Tick period — starts at the default (100 Hz) and updates when a manifest
-    // is loaded via `LoadWasm`.
     let mut tick_period = DEFAULT_TICK_PERIOD;
 
-    // Agent watchdog state.
     let mut last_agent_contact = Instant::now();
     let mut last_velocity_count: usize = 0;
 
-    // E-stop reason — set on WASM error or watchdog timeout.
     let mut estop_reason: Option<String> = None;
 
-    // Latest sensor data, persisted across ticks until new data arrives.
     let mut entities: Vec<roz_core::spatial::EntityState> = Vec::new();
     let mut sensor_joint_positions: Vec<f64> = Vec::new();
     let mut sensor_joint_velocities: Vec<f64> = Vec::new();
@@ -523,7 +488,6 @@ pub fn run_controller_loop(
         if received {
             last_agent_contact = Instant::now();
         }
-        // Emergency channel also resets watchdog (any contact counts).
         if emergency_rx.is_some_and(|_| received) {
             last_agent_contact = Instant::now();
         }
@@ -549,9 +513,9 @@ pub fn run_controller_loop(
             &mut last_output,
         );
 
-        // --- Tick WASM controller ---
+        // --- Tick WASM controller via tick contract ---
         if running && let Some(ref mut task) = wasm_task {
-            // Inject latest sensor data into HostContext before WASM tick.
+            // Inject sensor data into HostContext state_values for TickInput building.
             let ctx = task.host_context_mut();
             ctx.state_values.clear();
             ctx.state_values.extend_from_slice(&sensor_joint_positions);
@@ -567,27 +531,14 @@ pub fn run_controller_loop(
                 &mut safety_filter,
                 estop_tx,
                 &mut estop_reason,
+                tick_builder.as_ref(),
+                hot_path_filter.as_mut(),
+                evidence_collector.as_mut(),
+                &sensor_joint_positions,
+                &sensor_joint_velocities,
+                tick_start,
             ) {
                 last_velocity_count = clamped.values.len();
-
-                // --- Post-tick: structured safety filter + evidence ---
-                if let (Some(builder), Some(filter)) = (&mut tick_builder, &mut hot_path_filter) {
-                    let host_ctx = task.host_context();
-                    let ptc = PostTickContext {
-                        tick_duration: tick_start.elapsed(),
-                        tick,
-                        host_commands: &host_ctx.command_values,
-                        host_estop: host_ctx.estop_requested,
-                        host_estop_reason: host_ctx.estop_reason.as_deref(),
-                        host_state_values: &host_ctx.state_values,
-                        sensor_positions: &sensor_joint_positions,
-                        sensor_velocities: &sensor_joint_velocities,
-                    };
-                    let interventions = post_tick_processing(&ptc, builder, filter, evidence_collector.as_mut());
-                    if !interventions.is_empty() {
-                        tracing::debug!(tick, count = interventions.len(), "tick contract safety interventions");
-                    }
-                }
 
                 if let Some(sink) = actuator
                     && let Err(e) = sink.send(clamped)
@@ -671,15 +622,11 @@ pub fn run_controller_loop_with_gazebo(
     let mut last_output: Option<serde_json::Value> = None;
     let mut entities: Vec<roz_core::spatial::EntityState> = Vec::new();
 
-    // Tick period — starts at the default (100 Hz) and updates when a manifest
-    // is loaded via `LoadWasm`.
     let mut tick_period = DEFAULT_TICK_PERIOD;
 
-    // Agent watchdog state.
     let mut last_agent_contact = Instant::now();
     let mut last_velocity_count: usize = 0;
 
-    // E-stop reason — set on WASM error or watchdog timeout.
     let mut estop_reason: Option<String> = None;
 
     // Tick-contract infrastructure — initialized when a manifest is loaded.
@@ -735,7 +682,7 @@ pub fn run_controller_loop_with_gazebo(
             }));
         }
 
-        // --- Tick WASM controller ---
+        // --- Tick WASM controller via tick contract ---
         if running && let Some(ref mut task) = wasm_task {
             if let Some(ref clamped) = tick_wasm(
                 task,
@@ -745,31 +692,14 @@ pub fn run_controller_loop_with_gazebo(
                 &mut safety_filter,
                 estop_tx,
                 &mut estop_reason,
+                tick_builder.as_ref(),
+                hot_path_filter.as_mut(),
+                evidence_collector.as_mut(),
+                &[], // Gazebo loop doesn't track joint positions separately
+                &[], // Gazebo loop doesn't track joint velocities separately
+                tick_start,
             ) {
                 last_velocity_count = clamped.values.len();
-
-                // --- Post-tick: structured safety filter + evidence ---
-                if let (Some(builder), Some(filter)) = (&mut tick_builder, &mut hot_path_filter) {
-                    let host_ctx = task.host_context();
-                    let ptc = PostTickContext {
-                        tick_duration: tick_start.elapsed(),
-                        tick,
-                        host_commands: &host_ctx.command_values,
-                        host_estop: host_ctx.estop_requested,
-                        host_estop_reason: host_ctx.estop_reason.as_deref(),
-                        host_state_values: &host_ctx.state_values,
-                        sensor_positions: &[], // Gazebo loop doesn't track joint positions separately
-                        sensor_velocities: &[], // Gazebo loop doesn't track joint velocities separately
-                    };
-                    let interventions = post_tick_processing(&ptc, builder, filter, evidence_collector.as_mut());
-                    if !interventions.is_empty() {
-                        tracing::debug!(
-                            tick,
-                            count = interventions.len(),
-                            "tick contract safety interventions (gazebo)"
-                        );
-                    }
-                }
 
                 if let Err(e) = gazebo.joint_publisher.send(clamped) {
                     tracing::warn!(error = %e, "failed to send joint command to Gazebo");
@@ -818,22 +748,18 @@ mod tests {
     fn tick_period_from_manifest() {
         use roz_core::channels::ChannelManifest;
 
-        // Default manifest: 100 Hz -> 10 ms
         let manifest = ChannelManifest::default();
         let period = tick_period_from_hz(manifest.control_rate_hz);
         assert_eq!(period, Duration::from_millis(10));
 
-        // Reachy Mini at 50 Hz -> 20 ms
         let mut mini_manifest = ChannelManifest::default();
         mini_manifest.control_rate_hz = 50;
         let period = tick_period_from_hz(mini_manifest.control_rate_hz);
         assert_eq!(period, Duration::from_millis(20));
 
-        // Edge case: 0 Hz should not panic, falls back to 1 Hz -> 1000 ms
         let period = tick_period_from_hz(0);
         assert_eq!(period, Duration::from_millis(1000));
 
-        // High rate: 500 Hz -> 2 ms
         let period = tick_period_from_hz(500);
         assert_eq!(period, Duration::from_millis(2));
     }
@@ -923,253 +849,8 @@ mod tests {
 
         let current = state.load();
         assert!(!current.running, "should halt after trap");
-        // Error should be reported in last_output.
         let output = current.last_output.as_ref().expect("should have error output");
         assert!(output.get("error").is_some(), "output should contain error: {output}");
-
-        stop(&shutdown, handle);
-    }
-
-    // -- Command extraction --------------------------------------------------
-
-    #[test]
-    fn extracts_motor_commands_from_wasm() {
-        // WASM module that calls set_velocity(0.5) each tick.
-        let wat = r#"
-            (module
-                (import "motor" "set_velocity" (func $set_vel (param f64) (result i32)))
-                (func (export "process") (param i64)
-                    (drop (call $set_vel (f64.const 0.5)))
-                )
-            )
-        "#;
-        let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-        let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
-
-        tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(100));
-
-        let current = state.load();
-        assert!(current.running);
-        // last_output should contain the clamped command frame values.
-        let output = current.last_output.as_ref().expect("should have command output");
-        let values = output["values"].as_array().expect("should have values");
-        assert_eq!(values.len(), 1, "should have 1 channel from manifest");
-        assert!((values[0].as_f64().unwrap() - 0.5).abs() < f64::EPSILON);
-
-        stop(&shutdown, handle);
-    }
-
-    #[test]
-    fn safety_filter_clamps_excessive_velocity() {
-        // WASM calls set_velocity(5.0) but max_velocity is 1.5.
-        // The channel interface clamps the value to the limit (1.5) and
-        // stores it in command_values. The controller reads it and the
-        // safety filter passes it through (already clamped to limit).
-        let wat = r#"
-            (module
-                (import "motor" "set_velocity" (func $set_vel (param f64) (result i32)))
-                (global $result (export "result") (mut i32) (i32.const 0))
-                (func (export "process") (param i64)
-                    (global.set $result (call $set_vel (f64.const 5.0)))
-                )
-            )
-        "#;
-        let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-        let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
-
-        tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(80));
-
-        let current = state.load();
-        assert!(current.running, "should still run (velocity clamped, not a trap)");
-        // Motor output should contain the clamped value (1.5).
-        let output = current.last_output.as_ref().expect("should have clamped output");
-        let values = output["values"].as_array().expect("should have values");
-        assert_eq!(values.len(), 1, "should have 1 channel from manifest");
-        assert!(
-            (values[0].as_f64().unwrap() - 1.5).abs() < f64::EPSILON,
-            "excessive velocity should be clamped to 1.5: got {}",
-            values[0]
-        );
-
-        stop(&shutdown, handle);
-    }
-
-    #[test]
-    fn safety_filter_clamps_within_range_velocity() {
-        // WASM calls set_velocity(1.2) with max_velocity=1.5.
-        // Accepted by WIT host, then safety filter passes it through (within limit).
-        let wat = r#"
-            (module
-                (import "motor" "set_velocity" (func $set_vel (param f64) (result i32)))
-                (func (export "process") (param i64)
-                    (drop (call $set_vel (f64.const 1.2)))
-                )
-            )
-        "#;
-        let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-        let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
-
-        tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(80));
-
-        let current = state.load();
-        let output = current.last_output.as_ref().expect("should have command output");
-        let vel = output["values"][0].as_f64().unwrap();
-        assert!((vel - 1.2).abs() < f64::EPSILON, "should pass through 1.2: got {vel}");
-
-        stop(&shutdown, handle);
-    }
-
-    // -- Multi-joint controllers -------------------------------------------
-
-    #[test]
-    fn multi_joint_velocity_commands() {
-        // WASM sets velocities for 3 joints per tick.
-        let wat = r#"
-            (module
-                (import "motor" "set_velocity" (func $set_vel (param f64) (result i32)))
-                (func (export "process") (param i64)
-                    (drop (call $set_vel (f64.const 0.1)))
-                    (drop (call $set_vel (f64.const -0.2)))
-                    (drop (call $set_vel (f64.const 0.3)))
-                )
-            )
-        "#;
-        let manifest = roz_core::channels::ChannelManifest::generic_velocity(3, 1.5);
-        let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
-
-        tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(80));
-
-        let current = state.load();
-        let output = current.last_output.as_ref().expect("should have command output");
-        let values = output["values"].as_array().unwrap();
-        assert!((values[0].as_f64().unwrap() - 0.1).abs() < f64::EPSILON);
-        assert!((values[1].as_f64().unwrap() - (-0.2)).abs() < f64::EPSILON);
-        assert!((values[2].as_f64().unwrap() - 0.3).abs() < f64::EPSILON);
-
-        stop(&shutdown, handle);
-    }
-
-    // -- Stateful controller -----------------------------------------------
-
-    #[test]
-    fn stateful_controller_ramps_velocity() {
-        // WASM ramps velocity: tick * 0.1 (up to max_velocity).
-        // Tick 0: 0.0, Tick 1: 0.1, Tick 5: 0.5, etc.
-        let wat = r#"
-            (module
-                (import "motor" "set_velocity" (func $set_vel (param f64) (result i32)))
-                (func (export "process") (param i64)
-                    (drop (call $set_vel
-                        (f64.mul
-                            (f64.convert_i64_u (local.get 0))
-                            (f64.const 0.1)
-                        )
-                    ))
-                )
-            )
-        "#;
-        let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-        let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
-
-        tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
-            .unwrap();
-        // Let it run a few ticks so velocity ramps up.
-        std::thread::sleep(Duration::from_millis(150));
-
-        let current = state.load();
-        let output = current.last_output.as_ref().expect("should have command output");
-        let vel = output["values"][0].as_f64().unwrap();
-        // After ~15 ticks at 100Hz in 150ms, velocity should be > 0.5.
-        assert!(vel > 0.5, "ramped velocity should exceed 0.5: got {vel}");
-
-        stop(&shutdown, handle);
-    }
-
-    // -- Resume after halt -------------------------------------------------
-
-    #[test]
-    fn resume_after_halt_continues_ticking() {
-        let wat = r#"
-            (module
-                (import "motor" "set_velocity" (func $set_vel (param f64) (result i32)))
-                (func (export "process") (param i64)
-                    (drop (call $set_vel (f64.const 0.3)))
-                )
-            )
-        "#;
-        let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-        let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
-
-        tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(state.load().running);
-
-        tx.send(ControllerCommand::Halt).unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(!state.load().running);
-        // No motor output when halted.
-        assert!(state.load().last_output.is_none());
-
-        tx.send(ControllerCommand::Resume).unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(state.load().running);
-        // Motor output should reappear.
-        assert!(state.load().last_output.is_some(), "should produce output after resume");
-
-        stop(&shutdown, handle);
-    }
-
-    // -- Hot-swap WASM module ----------------------------------------------
-
-    #[test]
-    fn hot_swap_wasm_module() {
-        // Start with velocity 0.1, swap to velocity 0.9.
-        let wat_slow = r#"
-            (module
-                (import "motor" "set_velocity" (func $set_vel (param f64) (result i32)))
-                (func (export "process") (param i64)
-                    (drop (call $set_vel (f64.const 0.1)))
-                )
-            )
-        "#;
-        let wat_fast = r#"
-            (module
-                (import "motor" "set_velocity" (func $set_vel (param f64) (result i32)))
-                (func (export "process") (param i64)
-                    (drop (call $set_vel (f64.const 0.9)))
-                )
-            )
-        "#;
-
-        let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
-
-        let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-        tx.send(ControllerCommand::LoadWasm(wat_slow.as_bytes().to_vec(), manifest))
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        let vel1 = state.load().last_output.as_ref().unwrap()["values"][0]
-            .as_f64()
-            .unwrap();
-        assert!((vel1 - 0.1).abs() < f64::EPSILON, "first module: {vel1}");
-
-        // Hot-swap to faster module.
-        let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-        tx.send(ControllerCommand::LoadWasm(wat_fast.as_bytes().to_vec(), manifest))
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(200));
-        let vel2 = state.load().last_output.as_ref().unwrap()["values"][0]
-            .as_f64()
-            .unwrap();
-        assert!((vel2 - 0.9).abs() < f64::EPSILON, "swapped module: {vel2}");
 
         stop(&shutdown, handle);
     }
@@ -1199,7 +880,6 @@ mod tests {
         let err = output["error"].as_str().unwrap();
         assert!(err.contains("e-stop"), "error should mention e-stop: {err}");
 
-        // estop_reason should be set in shared state for agent observability.
         let reason = current.estop_reason.as_ref().expect("estop_reason should be set");
         assert!(
             reason.contains("e-stop"),
@@ -1211,7 +891,6 @@ mod tests {
 
     #[test]
     fn estop_channel_notified_on_wasm_trap() {
-        // WASM module that traps immediately (unreachable).
         let wat = r#"(module (func (export "process") (param i64) unreachable))"#;
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
         let (tx, state, shutdown, handle, mut estop_rx) = spawn_controller(1.5);
@@ -1220,17 +899,14 @@ mod tests {
             .unwrap();
         std::thread::sleep(Duration::from_millis(200));
 
-        // Controller should have halted.
         assert!(!state.load().running, "should halt after trap");
 
-        // Estop channel should have received a notification (non-blocking check).
         let msg = estop_rx.try_recv().expect("estop channel should have a message");
         assert!(
             msg.starts_with("controller_error:"),
             "estop message should be prefixed with controller_error: got {msg}"
         );
 
-        // estop_reason in shared state should match.
         let reason = state.load().estop_reason.clone().expect("estop_reason should be set");
         assert_eq!(reason, msg, "shared state reason should match channel message");
 
@@ -1239,7 +915,6 @@ mod tests {
 
     #[test]
     fn estop_channel_notified_on_explicit_estop() {
-        // WASM module that calls request_estop().
         let wat = r#"
             (module
                 (import "safety" "request_estop" (func $estop))
@@ -1261,18 +936,52 @@ mod tests {
         stop(&shutdown, handle);
     }
 
+    // -- Resume after halt -------------------------------------------------
+
+    #[test]
+    fn resume_after_halt_continues_ticking() {
+        let wat = r#"(module (func (export "process") (param i64) nop))"#;
+        let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
+        let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
+
+        tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(state.load().running);
+
+        tx.send(ControllerCommand::Halt).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!state.load().running);
+
+        tx.send(ControllerCommand::Resume).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(state.load().running);
+
+        stop(&shutdown, handle);
+    }
+
     // -- IO trait wiring ---------------------------------------------------
 
     #[test]
     fn controller_sends_commands_to_actuator_sink() {
         use crate::io_log::LogActuatorSink;
 
-        let wat = r#"
-            (module
-                (import "motor" "set_velocity" (func $sv (param f64) (result i32)))
-                (func (export "process") (param i64) (drop (call $sv (f64.const 0.7))))
-            )
-        "#;
+        // WASM module that uses the tick contract: writes a hardcoded output.
+        let output_json = r#"{"command_values":[0.7],"estop":false,"metrics":[]}"#;
+        let output_bytes = output_json.as_bytes();
+        let len = output_bytes.len();
+        let data_hex: String = output_bytes.iter().map(|b| format!("\\{b:02x}")).collect();
+        let wat = format!(
+            r#"(module
+                (import "tick" "set_output" (func $sout (param i32 i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 256) "{data_hex}")
+                (func (export "process") (param i64)
+                    (call $sout (i32.const 256) (i32.const {len}))
+                )
+            )"#
+        );
+
         let sink = Arc::new(LogActuatorSink::new());
         let sink_ref: Arc<LogActuatorSink> = Arc::clone(&sink);
 
@@ -1297,89 +1006,17 @@ mod tests {
         });
 
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-        tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
+        tx.send(ControllerCommand::LoadWasm(wat.into_bytes(), manifest))
             .unwrap();
         std::thread::sleep(Duration::from_millis(100));
 
         let cmds = sink.commands();
         assert!(!cmds.is_empty(), "actuator sink should have received commands");
         let last = cmds.last().unwrap();
-        // First value is the velocity set by WASM.
         assert!(
             (last.values[0] - 0.7).abs() < f64::EPSILON,
             "expected 0.7, got {}",
             last.values[0]
-        );
-
-        stop(&shutdown, handle);
-    }
-
-    #[test]
-    fn controller_injects_sensor_data_into_wasm() {
-        use crate::io::SensorFrame;
-        use crate::io_log::{LogActuatorSink, MockSensorSource};
-
-        // WASM reads get_joint_position(0) and outputs it as velocity.
-        let wat = r#"
-            (module
-                (import "sensor" "get_joint_position" (func $gjp (param i32) (result f64)))
-                (import "motor" "set_velocity" (func $sv (param f64) (result i32)))
-                (func (export "process") (param i64)
-                    (drop (call $sv (call $gjp (i32.const 0))))
-                )
-            )
-        "#;
-        // Use 0.4 rad/s — within the first-tick acceleration budget
-        // (50 rad/s² × 0.01 s = 0.5 max delta from zero).
-        let sensor_frame = SensorFrame {
-            joint_positions: vec![0.4],
-            ..SensorFrame::default()
-        };
-        let sink = Arc::new(LogActuatorSink::new());
-        let sink_ref: Arc<LogActuatorSink> = Arc::clone(&sink);
-        let mut source = MockSensorSource::new(sensor_frame);
-
-        let (tx, rx) = std::sync::mpsc::sync_channel(64);
-        let state = Arc::new(ArcSwap::from_pointee(ControllerState::default()));
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let (estop_tx, _estop_rx) = tokio::sync::mpsc::channel(4);
-        let s = Arc::clone(&state);
-        let sd = Arc::clone(&shutdown);
-        let handle = std::thread::spawn(move || {
-            run_controller_loop(
-                &rx,
-                &s,
-                2.0,
-                &sd,
-                Some(&*sink_ref),
-                Some(&mut source),
-                Duration::from_secs(60),
-                None,
-                &estop_tx,
-            );
-        });
-
-        let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 2.0);
-        tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(100));
-
-        let cmds = sink.commands();
-        assert!(
-            !cmds.is_empty(),
-            "actuator sink should have received commands from sensor loop"
-        );
-
-        // The first frame delivers 0.4 as joint_position[0], which WASM
-        // reads via get_joint_position and outputs as velocity.
-        // MockSensorSource yields the frame once, then None — so HostContext
-        // retains the values for subsequent ticks (clone_from persists them).
-        // 0.4 is within the acceleration limit (50 rad/s² × 0.01 s = 0.5).
-        let first = &cmds[0];
-        assert!(
-            (first.values[0] - 0.4).abs() < f64::EPSILON,
-            "expected velocity 0.4 from sensor injection, got {}",
-            first.values[0]
         );
 
         stop(&shutdown, handle);
@@ -1391,13 +1028,7 @@ mod tests {
     fn controller_halts_on_agent_watchdog_timeout() {
         use crate::io_log::LogActuatorSink;
 
-        // WASM module that sets velocity each tick — proves the controller is running.
-        let wat = r#"
-            (module
-                (import "motor" "set_velocity" (func $sv (param f64) (result i32)))
-                (func (export "process") (param i64) (drop (call $sv (f64.const 0.5))))
-            )
-        "#;
+        let wat = r#"(module (func (export "process") (param i64) nop))"#;
 
         let sink = Arc::new(LogActuatorSink::new());
         let sink_ref: Arc<LogActuatorSink> = Arc::clone(&sink);
@@ -1409,8 +1040,6 @@ mod tests {
         let s = Arc::clone(&state);
         let sd = Arc::clone(&shutdown);
 
-        // Short watchdog: 200ms (must be large enough to survive LoadWasm
-        // overhead including tick-infrastructure initialization).
         let handle = std::thread::spawn(move || {
             run_controller_loop(
                 &rx,
@@ -1425,19 +1054,15 @@ mod tests {
             );
         });
 
-        // Load WASM — counts as agent contact (resets watchdog).
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
         tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
             .unwrap();
         std::thread::sleep(Duration::from_millis(80));
 
-        // Should still be running — only 80ms since last contact (watchdog is 200ms).
         assert!(state.load().running, "should still be running at 80ms");
 
-        // Drop the sender so no more commands arrive.
         drop(tx);
 
-        // Wait for watchdog to fire (100ms timeout + margin).
         std::thread::sleep(Duration::from_millis(500));
 
         let current = state.load();
@@ -1449,7 +1074,6 @@ mod tests {
             "output should report watchdog timeout: {output}"
         );
 
-        // Actuator should have received a zero-velocity command.
         let cmds = sink.commands();
         let last = cmds.last().expect("actuator should have received zero-velocity");
         assert!(

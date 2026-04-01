@@ -276,6 +276,7 @@ mod tests {
             replaced_controller_id: None,
             verification_key: make_verification_key(),
             wit_world: "live-controller".into(),
+            verifier_result: None,
         }
     }
 
@@ -314,6 +315,7 @@ mod tests {
             execution_mode: ExecutionMode::Verify,
             compiler_version: "wasmtime-22.0".into(),
             created_at: Utc::now(),
+            state_freshness: roz_core::session::snapshot::FreshnessState::Unknown,
         }
     }
 

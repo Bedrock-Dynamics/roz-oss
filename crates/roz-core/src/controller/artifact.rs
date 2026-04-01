@@ -50,6 +50,9 @@ pub struct ControllerArtifact {
     pub replaced_controller_id: Option<String>,
     pub verification_key: VerificationKey,
     pub wit_world: String,
+    /// Result from the last verifier run (if any).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifier_result: Option<crate::controller::verification::VerifierVerdict>,
 }
 
 /// Full digest set for verification and promotion gating.
@@ -127,6 +130,7 @@ mod tests {
             replaced_controller_id: None,
             verification_key: sample_key(),
             wit_world: "live-controller".into(),
+            verifier_result: None,
         };
         let json = serde_json::to_string(&artifact).unwrap();
         let back: ControllerArtifact = serde_json::from_str(&json).unwrap();

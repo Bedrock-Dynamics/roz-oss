@@ -627,16 +627,16 @@ impl LocalRuntime {
         }
 
         // Build Extensions with cmd_tx + manifest if controller is running,
-        // and register deploy_controller with a dynamic description from the manifest.
+        // and register promote_controller with a dynamic description from the manifest.
         let mut extensions = roz_agent::dispatch::Extensions::new();
         if let Some(ref handle) = self.copper_handle {
             extensions.insert(handle.cmd_tx());
-            // Inject channel manifest and register deploy_controller
+            // Inject channel manifest and register promote_controller
             if let Some(ref rm) = robot_manifest
                 && let Some(channel_manifest) = rm.channel_manifest()
             {
-                let deploy_tool = crate::tools::deploy_controller::DeployControllerTool::new(&channel_manifest);
-                dispatcher.register_with_category(Box::new(deploy_tool), ToolCategory::Physical);
+                let promote_tool = crate::tools::promote_controller::PromoteControllerTool::new(&channel_manifest);
+                dispatcher.register_with_category(Box::new(promote_tool), ToolCategory::Physical);
                 extensions.insert(channel_manifest);
             }
         }
