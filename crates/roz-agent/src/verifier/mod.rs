@@ -1,5 +1,6 @@
 //! Verifier module — runs rule-based checks against controller evidence.
 
+pub mod llm_verifier;
 pub mod rule_checks;
 
 use roz_core::controller::evidence::ControllerEvidenceBundle;
