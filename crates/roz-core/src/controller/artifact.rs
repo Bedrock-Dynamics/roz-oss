@@ -70,11 +70,26 @@ pub struct VerificationKey {
 
 impl VerificationKey {
     /// Check if this key matches the current runtime state.
+    /// All 7 digest fields must match — any change invalidates the key.
     #[must_use]
-    pub fn matches_runtime(&self, model_digest: &str, calibration_digest: &str, manifest_digest: &str) -> bool {
-        self.model_digest == model_digest
+    #[allow(clippy::too_many_arguments)]
+    pub fn matches_runtime(
+        &self,
+        controller_digest: &str,
+        wit_world_version: &str,
+        model_digest: &str,
+        calibration_digest: &str,
+        manifest_digest: &str,
+        execution_mode: ExecutionMode,
+        compiler_version: &str,
+    ) -> bool {
+        self.controller_digest == controller_digest
+            && self.wit_world_version == wit_world_version
+            && self.model_digest == model_digest
             && self.calibration_digest == calibration_digest
             && self.manifest_digest == manifest_digest
+            && self.execution_mode == execution_mode
+            && self.compiler_version == compiler_version
     }
 }
 
@@ -127,25 +142,113 @@ mod tests {
     #[test]
     fn verification_key_matches_current_runtime() {
         let key = sample_key();
-        assert!(key.matches_runtime("model_sha", "cal_sha", "man_sha"));
+        assert!(key.matches_runtime(
+            "ctrl_sha",
+            "bedrock:controller@1.0.0",
+            "model_sha",
+            "cal_sha",
+            "man_sha",
+            ExecutionMode::Live,
+            "wasmtime-22.0",
+        ));
     }
 
     #[test]
     fn verification_key_rejects_changed_model() {
         let key = sample_key();
-        assert!(!key.matches_runtime("different_model", "cal_sha", "man_sha"));
+        assert!(!key.matches_runtime(
+            "ctrl_sha",
+            "bedrock:controller@1.0.0",
+            "different_model",
+            "cal_sha",
+            "man_sha",
+            ExecutionMode::Live,
+            "wasmtime-22.0",
+        ));
     }
 
     #[test]
     fn verification_key_rejects_changed_calibration() {
         let key = sample_key();
-        assert!(!key.matches_runtime("model_sha", "new_cal", "man_sha"));
+        assert!(!key.matches_runtime(
+            "ctrl_sha",
+            "bedrock:controller@1.0.0",
+            "model_sha",
+            "new_cal",
+            "man_sha",
+            ExecutionMode::Live,
+            "wasmtime-22.0",
+        ));
     }
 
     #[test]
     fn verification_key_rejects_changed_manifest() {
         let key = sample_key();
-        assert!(!key.matches_runtime("model_sha", "cal_sha", "new_man"));
+        assert!(!key.matches_runtime(
+            "ctrl_sha",
+            "bedrock:controller@1.0.0",
+            "model_sha",
+            "cal_sha",
+            "new_man",
+            ExecutionMode::Live,
+            "wasmtime-22.0",
+        ));
+    }
+
+    #[test]
+    fn verification_key_rejects_changed_controller_digest() {
+        let key = sample_key();
+        assert!(!key.matches_runtime(
+            "different_ctrl",
+            "bedrock:controller@1.0.0",
+            "model_sha",
+            "cal_sha",
+            "man_sha",
+            ExecutionMode::Live,
+            "wasmtime-22.0",
+        ));
+    }
+
+    #[test]
+    fn verification_key_rejects_changed_wit_version() {
+        let key = sample_key();
+        assert!(!key.matches_runtime(
+            "ctrl_sha",
+            "bedrock:controller@2.0.0",
+            "model_sha",
+            "cal_sha",
+            "man_sha",
+            ExecutionMode::Live,
+            "wasmtime-22.0",
+        ));
+    }
+
+    #[test]
+    fn verification_key_rejects_changed_execution_mode() {
+        let key = sample_key();
+        assert!(!key.matches_runtime(
+            "ctrl_sha",
+            "bedrock:controller@1.0.0",
+            "model_sha",
+            "cal_sha",
+            "man_sha",
+            ExecutionMode::Shadow,
+            "wasmtime-22.0",
+        ));
+    }
+
+    #[test]
+    fn verification_key_rejects_changed_compiler() {
+        let key = sample_key();
+        assert!(!key.matches_runtime(
+            "ctrl_sha",
+            "bedrock:controller@1.0.0",
+            "model_sha",
+            "cal_sha",
+            "man_sha",
+            ExecutionMode::Live,
+            "wasmtime-23.0",
+        ));
     }
 
     #[test]
