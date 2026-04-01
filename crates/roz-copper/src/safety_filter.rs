@@ -1,5 +1,8 @@
 use roz_core::channels::{ChannelManifest, InterfaceType};
 use roz_core::command::{CommandFrame, MotorCommand};
+use roz_core::controller::intervention::{InterventionKind, SafetyIntervention};
+use roz_core::embodiment::limits::{ForceSafetyLimits, JointSafetyLimits};
+use roz_core::embodiment::workspace::WorkspaceEnvelope;
 
 /// Copper task that clamps motor commands to safety limits.
 ///
@@ -215,6 +218,167 @@ impl SafetyFilterTask {
         self.prev_velocities.clone_from(&clamped_so_far);
 
         CommandFrame { values: clamped_so_far }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HotPathSafetyFilter — intervention-recording filter for roz-core types
+// ---------------------------------------------------------------------------
+
+/// Result of running the safety filter on a tick output.
+#[derive(Debug, Clone)]
+pub struct FilterResult {
+    pub commands: Vec<f64>,
+    pub interventions: Vec<SafetyIntervention>,
+    pub estop: bool,
+}
+
+/// Hot-path safety filter applied to every tick output.
+///
+/// Runs AFTER the controller's `process()` call, before commands reach
+/// hardware. It clamps, rejects, and records interventions using the
+/// canonical [`SafetyIntervention`] type from `roz-core`.
+pub struct HotPathSafetyFilter {
+    joint_limits: Vec<JointSafetyLimits>,
+    force_limits: Option<ForceSafetyLimits>,
+    #[allow(dead_code)]
+    workspace_bounds: Option<WorkspaceEnvelope>,
+    previous_commands: Vec<f64>,
+    tick_period_s: f64,
+}
+
+impl HotPathSafetyFilter {
+    /// Create a new hot-path safety filter.
+    #[must_use]
+    pub const fn new(
+        joint_limits: Vec<JointSafetyLimits>,
+        force_limits: Option<ForceSafetyLimits>,
+        tick_period_s: f64,
+    ) -> Self {
+        Self {
+            joint_limits,
+            force_limits,
+            workspace_bounds: None,
+            previous_commands: Vec::new(),
+            tick_period_s,
+        }
+    }
+
+    /// Set the workspace bounds for future workspace boundary checks.
+    pub fn set_workspace_bounds(&mut self, bounds: WorkspaceEnvelope) {
+        self.workspace_bounds = Some(bounds);
+    }
+
+    /// Filter a tick output. Returns clamped commands and any interventions.
+    pub fn filter(
+        &mut self,
+        commands: &[f64],
+        current_positions: Option<&[f64]>,
+        wrench: Option<&(f64, f64, f64, f64, f64, f64)>,
+    ) -> FilterResult {
+        let mut result_commands = commands.to_vec();
+        let mut interventions = Vec::new();
+        let mut estop = false;
+
+        for (i, &cmd) in commands.iter().enumerate() {
+            if let Some(limits) = self.joint_limits.get(i) {
+                // 1. NaN/Inf rejection
+                if cmd.is_nan() || cmd.is_infinite() {
+                    result_commands[i] = 0.0;
+                    interventions.push(SafetyIntervention {
+                        channel: limits.joint_name.clone(),
+                        raw_value: if cmd.is_nan() { 0.0 } else { cmd },
+                        clamped_value: 0.0,
+                        kind: InterventionKind::NanReject,
+                        reason: "NaN/Inf output replaced with zero".into(),
+                    });
+                    continue;
+                }
+
+                // 2. Velocity clamping
+                let clamped_vel = limits.clamp_velocity(cmd);
+                if (clamped_vel - cmd).abs() > f64::EPSILON {
+                    interventions.push(SafetyIntervention {
+                        channel: limits.joint_name.clone(),
+                        raw_value: cmd,
+                        clamped_value: clamped_vel,
+                        kind: InterventionKind::VelocityClamp,
+                        reason: format!("velocity {cmd} exceeds limit {}", limits.max_velocity),
+                    });
+                    result_commands[i] = clamped_vel;
+                }
+
+                // 3. Acceleration limiting (requires previous commands)
+                if !self.previous_commands.is_empty() && i < self.previous_commands.len() {
+                    let prev = self.previous_commands[i];
+                    let accel = (result_commands[i] - prev) / self.tick_period_s;
+                    let clamped_accel = limits.clamp_acceleration(accel);
+                    if (clamped_accel - accel).abs() > f64::EPSILON {
+                        let new_cmd = clamped_accel.mul_add(self.tick_period_s, prev);
+                        interventions.push(SafetyIntervention {
+                            channel: limits.joint_name.clone(),
+                            raw_value: result_commands[i],
+                            clamped_value: new_cmd,
+                            kind: InterventionKind::AccelerationLimit,
+                            reason: format!("acceleration {accel:.2} exceeds limit {}", limits.max_acceleration),
+                        });
+                        result_commands[i] = new_cmd;
+                    }
+                }
+
+                // 4. Position limit check (if current positions available)
+                if let Some(positions) = current_positions
+                    && let Some(&pos) = positions.get(i)
+                    && ((pos <= limits.position_min && result_commands[i] < 0.0)
+                        || (pos >= limits.position_max && result_commands[i] > 0.0))
+                {
+                    interventions.push(SafetyIntervention {
+                        channel: limits.joint_name.clone(),
+                        raw_value: result_commands[i],
+                        clamped_value: 0.0,
+                        kind: InterventionKind::PositionLimit,
+                        reason: format!(
+                            "position {pos} at limit [{}, {}]",
+                            limits.position_min, limits.position_max
+                        ),
+                    });
+                    result_commands[i] = 0.0;
+                }
+            }
+        }
+
+        // 5. Force/torque limit check
+        if let (Some(fl), Some(w)) = (&self.force_limits, wrench) {
+            let force_mag = (w.2.mul_add(w.2, w.0.mul_add(w.0, w.1 * w.1))).sqrt();
+            if force_mag > fl.max_contact_force_n {
+                estop = true;
+                interventions.push(SafetyIntervention {
+                    channel: "force_torque".into(),
+                    raw_value: force_mag,
+                    clamped_value: 0.0,
+                    kind: InterventionKind::ForceLimit,
+                    reason: format!(
+                        "contact force {force_mag:.1}N exceeds limit {}N",
+                        fl.max_contact_force_n
+                    ),
+                });
+                result_commands.fill(0.0);
+            }
+        }
+
+        // Store for next tick's acceleration limiting
+        self.previous_commands.clone_from(&result_commands);
+
+        FilterResult {
+            commands: result_commands,
+            interventions,
+            estop,
+        }
+    }
+
+    /// Reset the filter state (e.g., on controller swap).
+    pub fn reset(&mut self) {
+        self.previous_commands.clear();
     }
 }
 
@@ -665,6 +829,175 @@ mod tests {
         assert!(
             (clamped2.values[0] - 50.0_f64.to_radians()).abs() < 0.01,
             "head yaw within delta should pass through"
+        );
+    }
+
+    // -- HotPathSafetyFilter tests --------------------------------------------
+
+    fn sample_limits(name: &str) -> JointSafetyLimits {
+        JointSafetyLimits {
+            joint_name: name.into(),
+            max_velocity: 2.0,
+            max_acceleration: 10.0,
+            max_jerk: 100.0,
+            position_min: -3.14,
+            position_max: 3.14,
+            max_torque: Some(40.0),
+        }
+    }
+
+    fn sample_force_limits() -> ForceSafetyLimits {
+        ForceSafetyLimits {
+            max_contact_force_n: 80.0,
+            max_contact_torque_nm: 10.0,
+            force_rate_limit: 200.0,
+        }
+    }
+
+    #[test]
+    fn hotpath_nan_rejection() {
+        let mut filter = HotPathSafetyFilter::new(vec![sample_limits("j0")], None, 0.01);
+        let result = filter.filter(&[f64::NAN], None, None);
+        assert_eq!(result.commands, vec![0.0]);
+        assert_eq!(result.interventions.len(), 1);
+        assert_eq!(result.interventions[0].kind, InterventionKind::NanReject);
+        assert_eq!(result.interventions[0].clamped_value, 0.0);
+        assert!(!result.estop);
+    }
+
+    #[test]
+    fn hotpath_inf_rejection() {
+        let mut filter = HotPathSafetyFilter::new(vec![sample_limits("j0")], None, 0.01);
+        let result = filter.filter(&[f64::INFINITY], None, None);
+        assert_eq!(result.commands, vec![0.0]);
+        assert_eq!(result.interventions.len(), 1);
+        assert_eq!(result.interventions[0].kind, InterventionKind::NanReject);
+        // Inf is stored as raw_value (unlike NaN which can't be serialized)
+        assert_eq!(result.interventions[0].raw_value, f64::INFINITY);
+    }
+
+    #[test]
+    fn hotpath_velocity_clamping() {
+        let mut filter = HotPathSafetyFilter::new(vec![sample_limits("j0")], None, 0.01);
+        let result = filter.filter(&[5.0], None, None);
+        assert_eq!(result.commands, vec![2.0]);
+        assert_eq!(result.interventions.len(), 1);
+        assert_eq!(result.interventions[0].kind, InterventionKind::VelocityClamp);
+        assert_eq!(result.interventions[0].raw_value, 5.0);
+        assert_eq!(result.interventions[0].clamped_value, 2.0);
+    }
+
+    #[test]
+    fn hotpath_velocity_within_limits() {
+        let mut filter = HotPathSafetyFilter::new(vec![sample_limits("j0")], None, 0.01);
+        let result = filter.filter(&[1.5], None, None);
+        assert_eq!(result.commands, vec![1.5]);
+        assert!(result.interventions.is_empty());
+        assert!(!result.estop);
+    }
+
+    #[test]
+    fn hotpath_acceleration_limiting() {
+        let mut filter = HotPathSafetyFilter::new(vec![sample_limits("j0")], None, 0.01);
+        // First tick: set baseline at 0.0
+        let _ = filter.filter(&[0.0], None, None);
+        // Second tick: jump to 2.0 — accel = 2.0/0.01 = 200, limit = 10
+        // Clamped accel = 10, new_cmd = 0.0 + 10 * 0.01 = 0.1
+        let result = filter.filter(&[2.0], None, None);
+        assert_eq!(result.interventions.len(), 1);
+        assert_eq!(result.interventions[0].kind, InterventionKind::AccelerationLimit);
+        assert!((result.commands[0] - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn hotpath_position_limit_stop() {
+        let mut filter = HotPathSafetyFilter::new(vec![sample_limits("j0")], None, 0.01);
+        // Position at max (3.14) + positive velocity → should be zeroed
+        let positions = [3.14];
+        let result = filter.filter(&[1.0], Some(&positions), None);
+        assert_eq!(result.commands, vec![0.0]);
+        assert_eq!(result.interventions.len(), 1);
+        assert_eq!(result.interventions[0].kind, InterventionKind::PositionLimit);
+    }
+
+    #[test]
+    fn hotpath_position_limit_allows_retreat() {
+        let mut filter = HotPathSafetyFilter::new(vec![sample_limits("j0")], None, 0.01);
+        // Position at max (3.14) + negative velocity → should be allowed (retreating)
+        let positions = [3.14];
+        let result = filter.filter(&[-1.0], Some(&positions), None);
+        assert_eq!(result.commands, vec![-1.0]);
+        assert!(result.interventions.is_empty());
+    }
+
+    #[test]
+    fn hotpath_force_limit_estop() {
+        let mut filter = HotPathSafetyFilter::new(vec![sample_limits("j0")], Some(sample_force_limits()), 0.01);
+        // Force magnitude = sqrt(60^2 + 60^2 + 0^2) ≈ 84.9 > 80
+        let wrench = (60.0, 60.0, 0.0, 0.0, 0.0, 0.0);
+        let result = filter.filter(&[1.0], None, Some(&wrench));
+        assert!(result.estop);
+        assert_eq!(result.commands, vec![0.0]);
+        assert!(
+            result
+                .interventions
+                .iter()
+                .any(|i| i.kind == InterventionKind::ForceLimit)
+        );
+    }
+
+    #[test]
+    fn hotpath_force_within_limits() {
+        let mut filter = HotPathSafetyFilter::new(vec![sample_limits("j0")], Some(sample_force_limits()), 0.01);
+        // Force magnitude = sqrt(30^2 + 30^2 + 0^2) ≈ 42.4 < 80
+        let wrench = (30.0, 30.0, 0.0, 0.0, 0.0, 0.0);
+        let result = filter.filter(&[1.0], None, Some(&wrench));
+        assert!(!result.estop);
+        assert!(result.interventions.is_empty());
+        assert_eq!(result.commands, vec![1.0]);
+    }
+
+    #[test]
+    fn hotpath_multiple_violations() {
+        let limits = vec![sample_limits("j0"), sample_limits("j1")];
+        let mut filter = HotPathSafetyFilter::new(limits, None, 0.01);
+        // NaN on channel 0, over-speed on channel 1
+        let result = filter.filter(&[f64::NAN, 5.0], None, None);
+        assert_eq!(result.commands[0], 0.0); // NaN → 0
+        assert_eq!(result.commands[1], 2.0); // 5.0 → clamped to 2.0
+        assert_eq!(result.interventions.len(), 2);
+        assert_eq!(result.interventions[0].kind, InterventionKind::NanReject);
+        assert_eq!(result.interventions[1].kind, InterventionKind::VelocityClamp);
+    }
+
+    #[test]
+    fn hotpath_no_accel_limit_on_first_tick() {
+        let mut filter = HotPathSafetyFilter::new(vec![sample_limits("j0")], None, 0.01);
+        // First tick, no previous commands — should only apply velocity clamping
+        let result = filter.filter(&[1.5], None, None);
+        assert_eq!(result.commands, vec![1.5]);
+        assert!(result.interventions.is_empty());
+    }
+
+    #[test]
+    fn hotpath_reset_clears_previous() {
+        let mut filter = HotPathSafetyFilter::new(vec![sample_limits("j0")], None, 0.01);
+        // Set up history
+        let _ = filter.filter(&[0.0], None, None);
+        // Jump should be accel-limited
+        let result = filter.filter(&[2.0], None, None);
+        assert!(!result.interventions.is_empty());
+        // Reset
+        filter.reset();
+        // After reset, same jump should NOT be accel-limited (no history)
+        let result = filter.filter(&[2.0], None, None);
+        // Only velocity clamping should apply (2.0 is within max_velocity of 2.0)
+        assert!(
+            !result
+                .interventions
+                .iter()
+                .any(|i| i.kind == InterventionKind::AccelerationLimit),
+            "acceleration limit should not apply after reset"
         );
     }
 }
