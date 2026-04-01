@@ -16,6 +16,7 @@ pub mod channels;
 pub mod ci;
 pub mod controller;
 pub mod controller_adapter;
+pub mod controller_lifecycle;
 pub mod evidence_collector;
 #[cfg(feature = "gazebo")]
 pub mod gazebo_cmd;
