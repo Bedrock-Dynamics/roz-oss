@@ -11,8 +11,10 @@ use roz_agent::error::AgentError;
 use roz_agent::model::create_model;
 use roz_agent::model::types::{Message, Model, StreamChunk};
 use roz_agent::safety::stack::SafetyStack;
+use roz_agent::session_runtime::{SessionConfig, SessionRuntime};
 use roz_agent::spatial_provider::{NullSpatialContextProvider, SpatialContextProvider};
 use roz_copper::handle::CopperHandle;
+use roz_core::session::control::SessionMode;
 use roz_core::tools::ToolCategory;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -206,6 +208,10 @@ pub struct LocalRuntime {
     /// Running Copper controller handle — spawned lazily when simulation is active.
     /// Must not be dropped while the controller is in use (drop sends Halt).
     copper_handle: Option<CopperHandle>,
+    /// Session lifecycle runtime — tracks events and state alongside the existing `AgentLoop` path.
+    /// Does not replace `AgentLoop` yet; runs in parallel for lifecycle tracking.
+    #[allow(dead_code, reason = "wired for event emission; full execution migration pending")]
+    session_runtime: SessionRuntime,
 }
 
 impl LocalRuntime {
@@ -247,6 +253,14 @@ impl LocalRuntime {
             )
         });
 
+        let session_config = SessionConfig {
+            session_id: session_id.clone(),
+            tenant_id: "local".to_string(),
+            mode: SessionMode::LocalCanonical,
+            blueprint_toml: String::new(),
+        };
+        let session_runtime = SessionRuntime::new(&session_config);
+
         Ok(Self {
             manifest,
             project_dir: project_dir.to_path_buf(),
@@ -260,6 +274,7 @@ impl LocalRuntime {
             effective_model_name,
             permission_mode: resolve_permission_mode(),
             copper_handle: None,
+            session_runtime,
         })
     }
 
@@ -282,6 +297,14 @@ impl LocalRuntime {
         let base_url = resolve_base_url(&manifest.model.base_url);
         let effective_model_name = resolve_model_name(&manifest.model.provider, &manifest.model.name, &base_url);
 
+        let session_config = SessionConfig {
+            session_id: session_id.clone(),
+            tenant_id: "local".to_string(),
+            mode: SessionMode::LocalCanonical,
+            blueprint_toml: String::new(),
+        };
+        let session_runtime = SessionRuntime::new(&session_config);
+
         Ok(Self {
             manifest,
             project_dir: project_dir.to_path_buf(),
@@ -295,6 +318,7 @@ impl LocalRuntime {
             effective_model_name,
             permission_mode: resolve_permission_mode(),
             copper_handle: None,
+            session_runtime,
         })
     }
 

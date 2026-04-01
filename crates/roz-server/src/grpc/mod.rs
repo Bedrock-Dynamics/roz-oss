@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod convert;
+pub mod event_mapper;
 pub mod tasks;
 
 /// Generated protobuf types and gRPC service stubs for roz API v1.
