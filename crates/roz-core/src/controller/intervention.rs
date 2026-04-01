@@ -2,35 +2,89 @@
 
 use serde::{Deserialize, Serialize};
 
-/// What kind of safety intervention was applied.
-///
-/// Placeholder — full implementation in a later task.
+/// What kind of safety intervention occurred.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InterventionKind {
-    /// Controller output was clamped to a safe range.
-    Clamp,
-    /// Controller output was zeroed / halted.
-    Zero,
-    /// Emergency stop signal was asserted.
-    EStop,
-    /// A specific joint was locked.
-    JointLock,
+    VelocityClamp,
+    AccelerationLimit,
+    PositionLimit,
+    NanReject,
+    JerkLimit,
+    ForceLimit,
+    TorqueLimit,
+    WorkspaceBoundary,
+    TickOverrun,
+    ContactForceExceeded,
+    SlipDetected,
+    TactileOverload,
 }
 
-/// A single safety intervention applied to a controller output channel.
-///
-/// Placeholder — full implementation in a later task.
+/// A structured record of a safety filter intervention.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SafetyIntervention {
-    /// The DOF or output channel that was modified (e.g. `"joint_0_velocity"`).
     pub channel: String,
-    /// Raw value produced by the controller before clamping.
     pub raw_value: f64,
-    /// Value after the safety intervention was applied.
     pub clamped_value: f64,
-    /// The kind of intervention that was applied.
     pub kind: InterventionKind,
-    /// Human-readable explanation of why the intervention was triggered.
     pub reason: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intervention_serde_roundtrip() {
+        let intervention = SafetyIntervention {
+            channel: "shoulder_pitch".into(),
+            raw_value: 5.0,
+            clamped_value: 2.0,
+            kind: InterventionKind::VelocityClamp,
+            reason: "exceeded max_velocity 2.0 rad/s".into(),
+        };
+        let json = serde_json::to_string(&intervention).unwrap();
+        let back: SafetyIntervention = serde_json::from_str(&json).unwrap();
+        assert_eq!(intervention, back);
+    }
+
+    #[test]
+    fn all_intervention_kinds_serde() {
+        let kinds = vec![
+            InterventionKind::VelocityClamp,
+            InterventionKind::AccelerationLimit,
+            InterventionKind::PositionLimit,
+            InterventionKind::NanReject,
+            InterventionKind::JerkLimit,
+            InterventionKind::ForceLimit,
+            InterventionKind::TorqueLimit,
+            InterventionKind::WorkspaceBoundary,
+            InterventionKind::TickOverrun,
+            InterventionKind::ContactForceExceeded,
+            InterventionKind::SlipDetected,
+            InterventionKind::TactileOverload,
+        ];
+        assert_eq!(kinds.len(), 12, "all 12 intervention kinds must be tested");
+        for k in kinds {
+            let json = serde_json::to_string(&k).unwrap();
+            let back: InterventionKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(k, back);
+        }
+    }
+
+    #[test]
+    fn nan_intervention_records_zero_clamp() {
+        let intervention = SafetyIntervention {
+            channel: "elbow".into(),
+            raw_value: f64::NAN,
+            clamped_value: 0.0,
+            kind: InterventionKind::NanReject,
+            reason: "NaN output converted to 0.0".into(),
+        };
+        let json = serde_json::to_string(&intervention).unwrap();
+        // NaN serializes as null in JSON
+        assert!(json.contains("null") || json.contains("NaN"));
+        // But we can still construct and use the struct
+        assert_eq!(intervention.clamped_value, 0.0);
+    }
 }
