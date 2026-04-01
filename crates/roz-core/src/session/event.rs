@@ -8,7 +8,6 @@ use super::activity::{RuntimeActivity, RuntimeFailureKind, SafePauseState};
 use super::control::SessionMode;
 use super::feedback::ApprovalOutcome;
 use crate::controller::intervention::SafetyIntervention;
-use crate::controller::verification::VerifierVerdict;
 use crate::edge_health::EdgeTransportHealth;
 use crate::trust::TrustPosture;
 
@@ -108,7 +107,7 @@ pub enum SessionEvent {
     },
     ToolUnavailable {
         tool_name: String,
-        reason: String,
+        reason: crate::trust::UnavailableReason,
     },
 
     // -- Approval --
@@ -130,12 +129,13 @@ pub enum SessionEvent {
     },
     VerificationFinished {
         target: String,
-        verdict: VerifierVerdict,
+        verdict: crate::controller::verification::VerifierVerdict,
+        evidence: Option<crate::controller::evidence::ControllerEvidenceBundle>,
     },
 
     // -- Resumability --
     ResumeSummaryReady {
-        summary: String,
+        snapshot: super::snapshot::SessionSnapshot,
     },
 
     // -- Trust & telemetry --
