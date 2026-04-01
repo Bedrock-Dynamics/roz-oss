@@ -119,7 +119,7 @@ pub struct FrameNode {
 }
 
 /// A tree of coordinate frames with transform lookup.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FrameTree {
     frames: BTreeMap<String, FrameNode>,
     root: Option<String>,
