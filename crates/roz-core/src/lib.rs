@@ -26,6 +26,7 @@ pub mod skills;
 pub mod spatial;
 pub mod tasks;
 pub mod team;
+pub mod template;
 pub mod timebase;
 pub mod tools;
 pub mod wal;

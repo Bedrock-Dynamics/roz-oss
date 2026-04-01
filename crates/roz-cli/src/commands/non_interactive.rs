@@ -107,10 +107,12 @@ async fn execute_byok(config: &ProviderConfig, task: &str) -> anyhow::Result<()>
 
     let model = roz_agent::model::create_model(&config.model, "", "", 120, proxy_provider, Some(api_key))?;
 
-    let (dispatcher, _schemas) = crate::tui::tools::build_all_tools(std::path::Path::new("."));
+    let all_tools = crate::tui::tools::build_all_tools_with_copper(std::path::Path::new("."));
+    let _copper_handle = all_tools.copper_handle; // kept alive for session lifetime
     let safety = roz_agent::safety::SafetyStack::new(vec![]);
     let spatial = roz_agent::spatial_provider::NullSpatialContextProvider;
-    let mut agent_loop = roz_agent::agent_loop::AgentLoop::new(model, dispatcher, safety, Box::new(spatial));
+    let mut agent_loop = roz_agent::agent_loop::AgentLoop::new(model, all_tools.dispatcher, safety, Box::new(spatial))
+        .with_extensions(all_tools.extensions);
 
     let system_prompt = crate::tui::tools::build_system_prompt(std::path::Path::new("."), &[]);
 
@@ -149,9 +151,10 @@ async fn execute_byok(config: &ProviderConfig, task: &str) -> anyhow::Result<()>
             println!("{}", serde_json::to_string_pretty(&json)?);
         }
         Err(e) => {
+            let display = crate::tui::provider::classify_error_message(&e.to_string(), config);
             let json = serde_json::json!({
                 "status": "error",
-                "error": e.to_string(),
+                "error": display,
             });
             println!("{}", serde_json::to_string_pretty(&json)?);
             std::process::exit(1);

@@ -81,17 +81,16 @@ async fn agent_deploys_sin_controller_and_arm_oscillates() {
 
     // -- 3. Extensions: inject cmd_tx so deploy_controller can reach Copper. --
 
+    let manifest = roz_core::channels::ChannelManifest::generic_velocity(6, std::f64::consts::PI);
+
     let mut extensions = Extensions::new();
     extensions.insert(handle.cmd_tx());
-    extensions.insert(roz_core::channels::ChannelManifest::generic_velocity(
-        6,
-        std::f64::consts::PI,
-    ));
+    extensions.insert(manifest.clone());
 
     // -- 4. ToolDispatcher with deploy_controller registered. ---------------
 
     let mut dispatcher = ToolDispatcher::new(Duration::from_secs(30));
-    dispatcher.register_with_category(Box::new(DeployControllerTool), ToolCategory::Physical);
+    dispatcher.register_with_category(Box::new(DeployControllerTool::new(&manifest)), ToolCategory::Physical);
 
     // -- 5. AgentLoop with MockModel + extensions. -------------------------
 

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use roz_agent::dispatch::ToolDispatcher;
+use roz_agent::dispatch::{Extensions, ToolDispatcher};
 use roz_core::tools::ToolCall;
 use tokio::sync::Mutex;
 use tokio_stream::wrappers::ReceiverStream;
@@ -21,6 +21,10 @@ pub struct LocalToolOpts {
     pub proto_schemas: Vec<roz_v1::ToolSchema>,
     /// Local dispatcher for executing tools client-side.
     pub dispatcher: ToolDispatcher,
+    /// Shared extensions for tool context (e.g. `cmd_tx`, `ChannelManifest`).
+    pub extensions: Extensions,
+    /// Kept alive to prevent the Copper controller thread from halting on drop.
+    pub _copper_handle: Option<roz_copper::handle::CopperHandle>,
 }
 
 /// Convert `roz_core::tools::ToolSchema` to the proto `ToolSchema` message.
@@ -45,19 +49,23 @@ fn core_schema_to_proto(
     }
 }
 
-/// Build `LocalToolOpts` from the unified tool set.
+/// Build `LocalToolOpts` from the unified tool set, optionally spawning Copper.
 ///
 /// Always returns a valid `LocalToolOpts` -- CLI built-ins are always present,
-/// daemon tools from `robot.toml` are added when available.
+/// daemon tools from `robot.toml` are added when available, and the Copper WASM
+/// pipeline is spawned when `[daemon.websocket]` + `[channels]` are present.
 pub fn build_local_tool_opts(project_dir: &std::path::Path) -> LocalToolOpts {
-    let (dispatcher, core_schemas) = tools::build_all_tools(project_dir);
-    let proto_schemas = core_schemas
+    let all = tools::build_all_tools_with_copper(project_dir);
+    let proto_schemas = all
+        .schemas
         .iter()
         .map(|(schema, category)| core_schema_to_proto(schema, *category))
         .collect();
     LocalToolOpts {
         proto_schemas,
-        dispatcher,
+        dispatcher: all.dispatcher,
+        extensions: all.extensions,
+        _copper_handle: all.copper_handle,
     }
 }
 
@@ -89,6 +97,7 @@ fn load_cloud_project_context() -> Vec<String> {
 async fn execute_tool_locally(
     tool_request: roz_v1::ToolRequest,
     dispatcher: Arc<Mutex<ToolDispatcher>>,
+    extensions: Extensions,
     req_tx: tokio::sync::mpsc::Sender<SessionRequest>,
     event_tx: async_channel::Sender<AgentEvent>,
 ) {
@@ -110,7 +119,7 @@ async fn execute_tool_locally(
         .parameters
         .map_or_else(|| serde_json::Value::Object(serde_json::Map::new()), struct_to_value);
 
-    let ctx = tools::default_context();
+    let ctx = tools::default_context_with(extensions);
     let call = ToolCall {
         id: tool_call_id.clone(),
         tool: tool_name.clone(),
@@ -161,6 +170,7 @@ async fn execute_tool_locally(
 /// Unlike BYOK providers (per-turn), Cloud maintains a persistent bidirectional
 /// stream. The server runs the agent loop; tools registered via `LocalToolOpts`
 /// execute client-side and their results are sent back on the gRPC stream.
+#[allow(clippy::too_many_lines)]
 pub async fn stream_session(
     config: &ProviderConfig,
     msg_rx: async_channel::Receiver<String>,
@@ -243,6 +253,7 @@ pub async fn stream_session(
 
     // Wrap the dispatcher in an Arc for sharing with tool execution tasks
     let dispatcher = Arc::new(Mutex::new(local_tools.dispatcher));
+    let extensions = local_tools.extensions;
 
     // Receive and map server events
     while let Some(resp) = stream.message().await? {
@@ -270,6 +281,7 @@ pub async fn stream_session(
                     tokio::spawn(execute_tool_locally(
                         t,
                         dispatcher.clone(),
+                        extensions.clone(),
                         tx.clone(),
                         event_tx.clone(),
                     ));

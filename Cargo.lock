@@ -5630,6 +5630,7 @@ name = "roz-cli"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-channel",
  "async-trait",
  "base64 0.22.1",
@@ -5651,6 +5652,7 @@ dependencies = [
  "reqwest 0.12.28",
  "reqwest-eventsource",
  "roz-agent",
+ "roz-copper",
  "roz-core",
  "roz-local",
  "serde",
@@ -5682,6 +5684,7 @@ dependencies = [
  "cu29-derive",
  "cu29-helpers",
  "cu29-unifiedlog",
+ "futures",
  "gz-transport-rs",
  "mcap",
  "parking_lot",
@@ -5693,6 +5696,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tokio-tungstenite 0.28.0",
  "toml 0.8.23",
  "tonic 0.13.1",
  "tonic-build",
@@ -5747,6 +5751,7 @@ dependencies = [
 name = "roz-local"
 version = "0.2.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "chrono",
  "directories",

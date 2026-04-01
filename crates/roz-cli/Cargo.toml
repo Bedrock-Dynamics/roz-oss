@@ -18,6 +18,8 @@ path = "src/main.rs"
 roz-core = { path = "../roz-core" }
 roz-agent = { path = "../roz-agent" }
 roz-local = { path = "../roz-local" }
+roz-copper = { path = "../roz-copper", default-features = false }
+arc-swap.workspace = true
 clap = { workspace = true, features = ["env"] }
 tokio = { workspace = true, features = ["full"] }
 serde.workspace = true

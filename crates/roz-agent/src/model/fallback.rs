@@ -38,16 +38,22 @@ impl FallbackModel {
     }
 
     pub(crate) fn is_fallback_eligible(e: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
-        e.downcast_ref::<reqwest::Error>().is_some_and(|req_err| {
-            // HTTP-level: rate limited, overloaded, or gateway unavailable.
-            req_err
+        // 1. Direct reqwest status codes / network errors.
+        if let Some(req_err) = e.downcast_ref::<reqwest::Error>() {
+            return req_err
                 .status()
                 .is_some_and(|s| FALLBACK_STATUS_CODES.contains(&s.as_u16()))
-            // Network-level: gateway completely unreachable or timed out.
-            // Handles the "PAIG is down" case where no HTTP response arrives.
-            || req_err.is_connect()
-            || req_err.is_timeout()
-        })
+                || req_err.is_connect()
+                || req_err.is_timeout();
+        }
+        // 2. String errors from gateways (e.g., Pydantic AI returns 403 "temporarily
+        //    blocked" instead of 429). Uses the same heuristic as AgentError::is_retryable().
+        let msg = e.to_string();
+        msg.contains("temporarily blocked")
+            || msg.contains("rate_limit")
+            || msg.contains("overloaded")
+            || msg.contains("error 503")
+            || msg.contains("error 529")
     }
 }
 

@@ -15,14 +15,14 @@ control_rate_hz = 100
 # PI = 3.141592653589793
 
 [[channels.commands]]
-name = "base/linear.x"
+name = "linear_x"
 type = "velocity"
 unit = "m/s"
 limits = [-1.0, 1.0]
 max_rate_of_change = 0.5
 
 [[channels.commands]]
-name = "base/angular.z"
+name = "angular_z"
 type = "velocity"
 unit = "rad/s"
 limits = [-2.0, 2.0]
@@ -31,19 +31,19 @@ max_rate_of_change = 1.0
 # 3 odometry state channels.
 
 [[channels.states]]
-name = "base/odom.x"
+name = "odom_x"
 type = "position"
 unit = "m"
 limits = [-1000.0, 1000.0]
 
 [[channels.states]]
-name = "base/odom.y"
+name = "odom_y"
 type = "position"
 unit = "m"
 limits = [-1000.0, 1000.0]
 
 [[channels.states]]
-name = "base/odom.yaw"
+name = "odom_yaw"
 type = "position"
 unit = "rad"
 limits = [-3.141592653589793, 3.141592653589793]

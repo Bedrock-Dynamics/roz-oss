@@ -79,11 +79,10 @@ async fn execute_task(
     if let Some(ref handle) = copper_handle {
         extensions.insert(handle.cmd_tx());
         // TODO: Load ChannelManifest from EnvironmentConfig in task invocation.
-        extensions.insert(roz_core::channels::ChannelManifest::default());
-        dispatcher.register_with_category(
-            Box::new(roz_local::tools::deploy_controller::DeployControllerTool),
-            roz_core::tools::ToolCategory::Physical,
-        );
+        let manifest = roz_core::channels::ChannelManifest::default();
+        let deploy_tool = roz_local::tools::deploy_controller::DeployControllerTool::new(&manifest);
+        extensions.insert(manifest);
+        dispatcher.register_with_category(Box::new(deploy_tool), roz_core::tools::ToolCategory::Physical);
     }
 
     // Register camera perception tools when cameras are available.

@@ -512,22 +512,17 @@ impl LocalRuntime {
             self.copper_handle = Some(CopperHandle::spawn(1.5));
         }
 
-        // Register deploy_controller when controller is available
-        if self.copper_handle.is_some() {
-            dispatcher.register_with_category(
-                Box::new(crate::tools::deploy_controller::DeployControllerTool),
-                ToolCategory::Physical,
-            );
-        }
-
-        // Build Extensions with cmd_tx + manifest if controller is running
+        // Build Extensions with cmd_tx + manifest if controller is running,
+        // and register deploy_controller with a dynamic description from the manifest.
         let mut extensions = roz_agent::dispatch::Extensions::new();
         if let Some(ref handle) = self.copper_handle {
             extensions.insert(handle.cmd_tx());
-            // Inject channel manifest for deploy_controller
+            // Inject channel manifest and register deploy_controller
             if let Some(ref rm) = robot_manifest
                 && let Some(channel_manifest) = rm.channel_manifest()
             {
+                let deploy_tool = crate::tools::deploy_controller::DeployControllerTool::new(&channel_manifest);
+                dispatcher.register_with_category(Box::new(deploy_tool), ToolCategory::Physical);
                 extensions.insert(channel_manifest);
             }
         }
