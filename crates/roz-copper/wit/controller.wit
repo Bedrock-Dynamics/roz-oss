@@ -1,0 +1,116 @@
+package bedrock:controller@1.0.0;
+
+world live-controller {
+    import bedrock:control/runtime;
+    import bedrock:control/control;
+    export bedrock:control/control;
+}
+
+world management-controller {
+    import bedrock:control/runtime;
+    import bedrock:control/control;
+    import bedrock:control/telemetry;
+    import bedrock:control/management;
+    export bedrock:control/control;
+    export bedrock:control/management;
+}
+
+interface runtime {
+    enum execution-mode { live, replay, verify, shadow, canary }
+    execution-mode: func() -> execution-mode;
+}
+
+interface control {
+    record digest-set {
+        model: string,
+        calibration: string,
+        manifest: string,
+        interface-version: string,
+    }
+
+    record joint-state {
+        name: string,
+        position: f64,
+        velocity: f64,
+        effort: option<f64>,
+    }
+
+    record pose {
+        frame: string,
+        translation: tuple<f64, f64, f64>,
+        rotation: tuple<f64, f64, f64, f64>,
+    }
+
+    record wrench {
+        force: tuple<f64, f64, f64>,
+        torque: tuple<f64, f64, f64>,
+    }
+
+    record contact-state {
+        in-contact: bool,
+        contact-force: option<f64>,
+        contact-location: option<string>,
+        slip-detected: bool,
+        contact-confidence: f64,
+    }
+
+    record derived-features {
+        calibration-valid: bool,
+        workspace-margin: option<f64>,
+        collision-margin: option<f64>,
+        force-margin: option<f64>,
+        observation-confidence: option<f64>,
+        active-perception-available: bool,
+        alerts: list<string>,
+    }
+
+    record tick-input {
+        tick: u64,
+        monotonic-time-ns: u64,
+        digests: digest-set,
+        joints: list<joint-state>,
+        watched-poses: list<pose>,
+        wrench: option<wrench>,
+        contact: option<contact-state>,
+        features: derived-features,
+        config-json: string,
+    }
+
+    record metric {
+        name: string,
+        value: f64,
+    }
+
+    record tick-output {
+        command-values: list<f64>,
+        estop: bool,
+        estop-reason: option<string>,
+        metrics: list<metric>,
+    }
+
+    process: func(input: tick-input) -> tick-output;
+}
+
+interface telemetry {
+    use control.{metric};
+
+    record controller-state {
+        tick: u64,
+        internal-state-json: string,
+        custom-metrics: list<metric>,
+    }
+
+    get-state: func() -> controller-state;
+}
+
+interface management {
+    record controller-description {
+        name: string,
+        version: string,
+        required-capabilities: list<string>,
+    }
+
+    configure: func(config-json: string) -> result<_, string>;
+    get-config: func() -> string;
+    describe: func() -> controller-description;
+}
