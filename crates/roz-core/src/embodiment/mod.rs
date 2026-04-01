@@ -12,13 +12,23 @@ pub mod prediction;
 pub mod safety_overlay;
 pub mod workspace;
 
+// Stub modules are exported here for consistent public API; items will be populated by
+// subsequent tasks. Allow unused imports until the stubs are filled in.
+#[allow(unused_imports)]
 pub use binding::*;
+#[allow(unused_imports)]
 pub use calibration::*;
+#[allow(unused_imports)]
 pub use contact::*;
+#[allow(unused_imports)]
 pub use frame_tree::*;
 pub use limits::*;
+#[allow(unused_imports)]
 pub use model::*;
+#[allow(unused_imports)]
 pub use perception::*;
+#[allow(unused_imports)]
 pub use prediction::*;
+#[allow(unused_imports)]
 pub use safety_overlay::*;
 pub use workspace::*;
