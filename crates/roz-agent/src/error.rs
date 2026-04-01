@@ -80,15 +80,39 @@ impl AgentError {
     /// and all non-HTTP errors (safety, tool dispatch, max cycles).
     pub fn is_retryable(&self) -> bool {
         match self {
+            // 1. Direct reqwest status codes
             Self::Http(e) => e.status().is_none_or(|s| matches!(s.as_u16(), 429 | 500 | 502 | 503)),
-            Self::Model(e) => e.downcast_ref::<reqwest::Error>().is_some_and(|inner| {
-                inner
-                    .status()
-                    .is_none_or(|s| matches!(s.as_u16(), 429 | 500 | 502 | 503))
-            }),
+            Self::Model(e) => {
+                // 2. Reqwest inner (BYOK, OpenAI direct)
+                if let Some(inner) = e.downcast_ref::<reqwest::Error>() {
+                    return inner
+                        .status()
+                        .is_none_or(|s| matches!(s.as_u16(), 429 | 500 | 502 | 503));
+                }
+                // 3. Message heuristics (last resort — all providers/gateways)
+                is_retryable_message(&e.to_string())
+            }
+            // 4. Stream errors also need classification
+            Self::Stream { message, .. } => is_retryable_message(message),
             _ => false,
         }
     }
+}
+
+/// Provider-agnostic heuristic for transient errors embedded in error messages.
+///
+/// Only used when the error is NOT a `reqwest::Error` (which is classified by
+/// HTTP status code directly). Covers:
+/// - Pydantic AI gateway: `"Anthropic API error 403 Forbidden: All providers are temporarily blocked."`
+/// - Anthropic stream errors: `"Anthropic API error 429: {...rate_limit_error...}"`
+/// - Anthropic overload: `"Stream error [overloaded_error]: Service temporarily overloaded"`
+/// - Anthropic 529: `"Anthropic API error 529: ..."`
+fn is_retryable_message(msg: &str) -> bool {
+    msg.contains("temporarily blocked")
+        || msg.contains("rate_limit")
+        || msg.contains("overloaded")
+        || msg.contains("error 503")
+        || msg.contains("error 529")
 }
 
 #[cfg(test)]
@@ -167,5 +191,76 @@ mod tests {
         );
         let err = AgentError::Model(Box::new(reqwest_err));
         assert!(err.is_retryable(), "connection error in Model should be retryable");
+    }
+
+    // -- Provider-agnostic message heuristic tests --
+
+    #[test]
+    fn gateway_403_temporarily_blocked_is_retryable() {
+        // Pydantic AI gateway returns 403 instead of 429 for rate limits.
+        let err = AgentError::Model(
+            "Anthropic API error 403 Forbidden: All providers are temporarily blocked. Please try again shortly."
+                .into(),
+        );
+        assert!(err.is_retryable(), "gateway 'temporarily blocked' should be retryable");
+    }
+
+    #[test]
+    fn anthropic_rate_limit_error_string_is_retryable() {
+        // Anthropic stream path wraps as string, not reqwest error.
+        let err = AgentError::Model(
+            r#"Anthropic API error 429: {"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}}"#
+                .into(),
+        );
+        assert!(err.is_retryable(), "rate_limit_error in message should be retryable");
+    }
+
+    #[test]
+    fn anthropic_overloaded_error_string_is_retryable() {
+        let err = AgentError::Model(
+            r#"Anthropic API error 529: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#
+                .into(),
+        );
+        assert!(err.is_retryable(), "overloaded_error should be retryable");
+    }
+
+    #[test]
+    fn stream_overloaded_is_retryable() {
+        let err = AgentError::Stream {
+            error_type: "overloaded_error".into(),
+            message: "Service temporarily overloaded".into(),
+        };
+        assert!(err.is_retryable(), "stream overloaded should be retryable");
+    }
+
+    #[test]
+    fn stream_rate_limit_is_retryable() {
+        let err = AgentError::Stream {
+            error_type: "rate_limit_error".into(),
+            message: "You have exceeded your rate_limit".into(),
+        };
+        assert!(err.is_retryable(), "stream rate_limit should be retryable");
+    }
+
+    #[test]
+    fn real_403_forbidden_is_not_retryable() {
+        // A real 403 (permissions) should NOT be retried.
+        let err = AgentError::Model("Anthropic API error 403 Forbidden: Access denied".into());
+        assert!(!err.is_retryable(), "real 403 should not be retryable");
+    }
+
+    #[test]
+    fn auth_error_is_not_retryable() {
+        let err = AgentError::Model("Anthropic API error 401: authentication_error".into());
+        assert!(!err.is_retryable(), "auth error should not be retryable");
+    }
+
+    #[test]
+    fn stream_parse_error_is_not_retryable() {
+        let err = AgentError::Stream {
+            error_type: "parse".into(),
+            message: "invalid json".into(),
+        };
+        assert!(!err.is_retryable(), "parse error should not be retryable");
     }
 }

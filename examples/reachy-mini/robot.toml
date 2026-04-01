@@ -145,8 +145,9 @@ limits = [0.0, 2.0943951023931953]
 base_url = "http://localhost:8000"
 
 [daemon.websocket]
-path = "/ws/sdk"
-set_target_type = "set_full_target"
+path = "/api/move/ws/set_target"
+set_target_type = "set_target"
+set_target_body = '{"target_head_pose": {"x": {{head_x}}, "y": {{head_y}}, "z": {{head_z}}, "roll": {{head_roll}}, "pitch": {{head_pitch}}, "yaw": {{head_yaw}}}, "target_antennas": [{{right_antenna}}, {{left_antenna}}], "target_body_yaw": {{body_yaw}}}'
 
 [daemon.get_state]
 method = "GET"

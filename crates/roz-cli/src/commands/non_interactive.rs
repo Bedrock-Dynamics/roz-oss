@@ -151,9 +151,10 @@ async fn execute_byok(config: &ProviderConfig, task: &str) -> anyhow::Result<()>
             println!("{}", serde_json::to_string_pretty(&json)?);
         }
         Err(e) => {
+            let display = crate::tui::provider::classify_error_message(&e.to_string(), config);
             let json = serde_json::json!({
                 "status": "error",
-                "error": e.to_string(),
+                "error": display,
             });
             println!("{}", serde_json::to_string_pretty(&json)?);
             std::process::exit(1);

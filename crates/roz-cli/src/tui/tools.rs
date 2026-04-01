@@ -87,7 +87,10 @@ pub fn build_all_tools_with_copper(project_dir: &Path) -> AllTools {
                 .replace("https://", "wss://"),
             ws_config.path,
         );
-        let body_template = ws_config.set_target_body.clone().unwrap_or_default();
+        let body_template = ws_config
+            .set_target_body
+            .clone()
+            .expect("robot.toml [daemon.websocket] must have set_target_body when [channels] is present");
 
         let bridge_config = roz_copper::io_ws::WsBridgeConfig {
             url: ws_url,

@@ -282,8 +282,15 @@ impl std::fmt::Display for ProviderError {
 pub fn classify_error_message(msg: &str, config: &ProviderConfig) -> String {
     if msg.contains("401") || msg.contains("Unauthorized") || msg.contains("authentication_error") {
         ProviderError::classify(401, msg, config).to_string()
-    } else if msg.contains("429") || msg.contains("rate_limit") {
-        ProviderError::classify(429, msg, config).to_string()
+    } else if msg.contains("429") || msg.contains("rate_limit") || msg.contains("temporarily blocked") {
+        if config.provider == Provider::Cloud {
+            format!(
+                "rate limited (cloud). To use your own key: roz --model anthropic/{}",
+                config.model
+            )
+        } else {
+            ProviderError::classify(429, msg, config).to_string()
+        }
     } else if msg.contains("402") || msg.contains("billing") {
         ProviderError::classify(402, msg, config).to_string()
     } else {

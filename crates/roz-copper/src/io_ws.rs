@@ -128,6 +128,13 @@ pub fn create_ws_bridge(
     config: WsBridgeConfig,
     runtime: &tokio::runtime::Handle,
 ) -> (Arc<WsActuatorSink>, Box<WsSensorSource>, JoinHandle<()>) {
+    assert!(
+        !config.body_template.is_empty() || config.channel_names.is_empty(),
+        "WsBridgeConfig has {} command channels but no body_template — \
+         commands will never reach the daemon. Add set_target_body to [daemon.websocket] in robot.toml",
+        config.channel_names.len(),
+    );
+
     let (tx, rx) = std::sync::mpsc::sync_channel(4);
 
     let sensor_state = Arc::new(ArcSwap::from_pointee(SensorState::default()));
@@ -535,5 +542,64 @@ mod tests {
     #[test]
     fn parse_invalid_json_returns_none() {
         assert!(parse_sensor_message("not json").is_none());
+    }
+
+    #[test]
+    fn render_frame_produces_valid_json() {
+        let config = WsBridgeConfig {
+            url: String::new(),
+            set_target_type: "set_full_target".into(),
+            body_template: r#"{"type": "set_full_target", "head_pose": {"x": {{head_x}}, "y": {{head_y}}, "z": {{head_z}}, "roll": {{head_roll}}, "pitch": {{head_pitch}}, "yaw": {{head_yaw}}}, "antennas": [{{right_antenna}}, {{left_antenna}}], "body_yaw": {{body_yaw}}}"#.into(),
+            channel_names: vec![
+                "head_x".into(), "head_y".into(), "head_z".into(),
+                "head_roll".into(), "head_pitch".into(), "head_yaw".into(),
+                "body_yaw".into(), "left_antenna".into(), "right_antenna".into(),
+            ],
+            channel_defaults: vec![0.0; 9],
+        };
+        let frame = CommandFrame {
+            values: vec![0.0, 0.0, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0, 0.0],
+        };
+        let msg = render_frame(&config, &frame);
+
+        // Must be valid JSON
+        let parsed: serde_json::Value = serde_json::from_str(&msg)
+            .unwrap_or_else(|e| panic!("rendered frame is not valid JSON: {e}\n  output: {msg}"));
+
+        // Must have the type field
+        assert_eq!(parsed["type"], "set_full_target", "missing or wrong type field");
+
+        // Must not have unsubstituted placeholders
+        assert!(!msg.contains("{{"), "unsubstituted placeholder in: {msg}");
+    }
+
+    #[test]
+    fn render_frame_empty_template_produces_empty_string() {
+        let config = WsBridgeConfig {
+            url: String::new(),
+            set_target_type: String::new(),
+            body_template: String::new(),
+            channel_names: vec![],
+            channel_defaults: vec![],
+        };
+        let frame = CommandFrame { values: vec![] };
+        assert_eq!(render_frame(&config, &frame), "");
+    }
+
+    #[test]
+    #[should_panic(expected = "body_template")]
+    fn create_ws_bridge_panics_on_empty_template_with_channels() {
+        let config = WsBridgeConfig {
+            url: "ws://localhost:9999/ws".into(),
+            set_target_type: "set_target".into(),
+            body_template: String::new(),
+            channel_names: vec!["joint_0".into()],
+            channel_defaults: vec![0.0],
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _bridge = create_ws_bridge(config, rt.handle());
     }
 }
