@@ -31,5 +31,6 @@ pub mod state_injector;
 pub mod tasks;
 pub mod tick_builder;
 pub mod tick_contract;
+pub mod tick_dispatch;
 pub mod wasm;
 pub mod wit_host;
