@@ -248,11 +248,11 @@ fn run_lifecycle(
                 })?;
         }
 
-        let new_state = lifecycle.promote("none", "none", &manifest_digest).map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
+        let new_state = lifecycle
+            .promote("not_available", "not_available", &manifest_digest)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 Box::new(std::io::Error::other(format!("promotion to {target:?} failed: {e}")))
-            },
-        )?;
+            })?;
 
         match new_state {
             DeploymentState::Shadow => {
@@ -297,8 +297,8 @@ fn build_artifact(controller_id: &str, code_sha256: &str, manifest_digest: &str)
         verification_key: VerificationKey {
             controller_digest: code_sha256.to_string(),
             wit_world_version: "bedrock:controller@1.0.0".into(),
-            model_digest: "none".into(),
-            calibration_digest: "none".into(),
+            model_digest: "not_available".into(),
+            calibration_digest: "not_available".into(),
             manifest_digest: manifest_digest.to_string(),
             execution_mode: ExecutionMode::Verify,
             compiler_version: "wasmtime".into(),
@@ -363,12 +363,16 @@ fn build_clean_evidence(
             idle_output_stable: true,
             runtime_jitter_us: 0.0,
             missed_tick_count: 0,
-            steady_state_reached: true,
+            steady_state_reached: ticks_run >= 50,
         },
-        verifier_status: "pass".into(),
-        verifier_reason: None,
-        model_digest: "none".into(),
-        calibration_digest: "none".into(),
+        verifier_status: if rejections == 0 { "pass" } else { "pass_with_warnings" }.into(),
+        verifier_reason: if rejections > 0 {
+            Some(format!("{rejections} velocity command(s) exceeded safety limits"))
+        } else {
+            None
+        },
+        model_digest: "not_available".into(),
+        calibration_digest: "not_available".into(),
         frame_snapshot_id: 0,
         manifest_digest: manifest_digest.to_string(),
         wit_world_version: "bedrock:controller@1.0.0".into(),

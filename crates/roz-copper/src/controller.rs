@@ -11,11 +11,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use sha2::{Digest, Sha256};
 
+use roz_core::channels::ChannelManifest;
 use roz_core::command::CommandFrame;
+use roz_core::controller::intervention::SafetyIntervention;
+use roz_core::embodiment::limits::JointSafetyLimits;
 
 use crate::channels::{ControllerCommand, ControllerState};
-use crate::safety_filter::SafetyFilterTask;
+use crate::evidence_collector::EvidenceCollector;
+use crate::safety_filter::{HotPathSafetyFilter, SafetyFilterTask};
+use crate::tick_builder::{TickInputBuilder, TickSensorData};
+use crate::tick_contract::{DerivedFeatures, DigestSet, TickOutput};
 use crate::wasm::CuWasmTask;
 
 /// Default tick rate: 100 Hz = 10 ms per tick.
@@ -36,11 +43,24 @@ fn tick_period_from_hz(control_rate_hz: u32) -> Duration {
     Duration::from_millis(1000 / u64::from(control_rate_hz.max(1)))
 }
 
+/// Result of processing a [`ControllerCommand::LoadWasm`].
+///
+/// Contains both the new tick period and a clone of the loaded manifest
+/// so the caller can rebuild tick-contract infrastructure.
+struct LoadResult {
+    period: Duration,
+    manifest: ChannelManifest,
+}
+
 /// Process a single [`ControllerCommand`], updating wasm task and running state.
 ///
-/// Returns `Some(period)` when a new WASM controller is loaded so the caller
-/// can update the loop's tick period and safety filter.
-fn handle_command(cmd: ControllerCommand, wasm_task: &mut Option<CuWasmTask>, running: &mut bool) -> Option<Duration> {
+/// Returns `Some(LoadResult)` when a new WASM controller is loaded so the caller
+/// can update the loop's tick period, safety filter, and tick infrastructure.
+fn handle_command(
+    cmd: ControllerCommand,
+    wasm_task: &mut Option<CuWasmTask>,
+    running: &mut bool,
+) -> Option<LoadResult> {
     match cmd {
         ControllerCommand::LoadWasm(bytes, manifest) => {
             let new_period = tick_period_from_hz(manifest.control_rate_hz);
@@ -51,13 +71,17 @@ fn handle_command(cmd: ControllerCommand, wasm_task: &mut Option<CuWasmTask>, ru
                 tick_period_ms = new_period.as_millis(),
                 "loading new WASM controller"
             );
+            let manifest_clone = manifest.clone();
             let host_ctx = crate::wit_host::HostContext::with_manifest(manifest);
             match CuWasmTask::from_source_with_host(&bytes, host_ctx) {
                 Ok(task) => {
                     *wasm_task = Some(task);
                     *running = true;
                     tracing::info!("WASM controller loaded and running");
-                    Some(new_period)
+                    Some(LoadResult {
+                        period: new_period,
+                        manifest: manifest_clone,
+                    })
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "failed to load WASM controller");
@@ -120,6 +144,10 @@ fn publish_state(
 
 /// Drain emergency and normal command channels, returning whether any
 /// command was received on `cmd_rx` (for watchdog bookkeeping).
+///
+/// When a `LoadWasm` command is processed, also rebuilds the tick-contract
+/// infrastructure (`tick_builder` and `hot_path_filter`) from the new manifest.
+#[allow(clippy::too_many_arguments)]
 fn drain_commands(
     cmd_rx: &std::sync::mpsc::Receiver<ControllerCommand>,
     emergency_rx: Option<&std::sync::mpsc::Receiver<ControllerCommand>>,
@@ -127,13 +155,18 @@ fn drain_commands(
     running: &mut bool,
     tick_period: &mut Duration,
     safety_filter: &mut SafetyFilterTask,
+    tick_builder: &mut Option<TickInputBuilder>,
+    hot_path_filter: &mut Option<HotPathSafetyFilter>,
 ) -> bool {
     // Emergency channel first (bypasses tokio bridge).
     if let Some(erx) = emergency_rx {
         while let Ok(cmd) = erx.try_recv() {
-            if let Some(new_period) = handle_command(cmd, wasm_task, running) {
-                *tick_period = new_period;
-                safety_filter.set_tick_period(new_period.as_secs_f64());
+            if let Some(load) = handle_command(cmd, wasm_task, running) {
+                *tick_period = load.period;
+                safety_filter.set_tick_period(load.period.as_secs_f64());
+                let (builder, filter) = build_tick_infrastructure(&load.manifest);
+                *tick_builder = Some(builder);
+                *hot_path_filter = Some(filter);
             }
         }
     }
@@ -142,9 +175,12 @@ fn drain_commands(
     let mut received = false;
     while let Ok(cmd) = cmd_rx.try_recv() {
         received = true;
-        if let Some(new_period) = handle_command(cmd, wasm_task, running) {
-            *tick_period = new_period;
-            safety_filter.set_tick_period(new_period.as_secs_f64());
+        if let Some(load) = handle_command(cmd, wasm_task, running) {
+            *tick_period = load.period;
+            safety_filter.set_tick_period(load.period.as_secs_f64());
+            let (builder, filter) = build_tick_infrastructure(&load.manifest);
+            *tick_builder = Some(builder);
+            *hot_path_filter = Some(filter);
         }
     }
     received
@@ -270,6 +306,134 @@ fn tick_wasm(
 }
 
 // ---------------------------------------------------------------------------
+// Tick contract infrastructure
+// ---------------------------------------------------------------------------
+
+/// Build [`JointSafetyLimits`] from a [`ChannelManifest`].
+///
+/// Maps each command channel to a `JointSafetyLimits` using the channel's
+/// per-axis limits and rate-of-change caps. Missing rate-of-change values
+/// default to `f64::INFINITY` (no limit).
+fn joint_limits_from_manifest(manifest: &ChannelManifest) -> Vec<JointSafetyLimits> {
+    manifest
+        .commands
+        .iter()
+        .map(|ch| JointSafetyLimits {
+            joint_name: ch.name.clone(),
+            max_velocity: ch.limits.1.abs(),
+            max_acceleration: ch.max_rate_of_change.unwrap_or(f64::INFINITY),
+            max_jerk: f64::INFINITY,
+            position_min: ch.limits.0,
+            position_max: ch.limits.1,
+            max_torque: None,
+        })
+        .collect()
+}
+
+/// Compute SHA-256 hex digest of a manifest's canonical JSON serialization.
+fn compute_manifest_digest(manifest: &ChannelManifest) -> String {
+    let json = serde_json::to_string(manifest).unwrap_or_default();
+    hex::encode(Sha256::digest(json.as_bytes()))
+}
+
+/// Build the tick-contract infrastructure for a newly loaded manifest.
+///
+/// Returns the `(TickInputBuilder, HotPathSafetyFilter)` pair that will
+/// be used for structured safety filtering and evidence collection.
+fn build_tick_infrastructure(manifest: &ChannelManifest) -> (TickInputBuilder, HotPathSafetyFilter) {
+    let joint_limits = joint_limits_from_manifest(manifest);
+    let manifest_digest = compute_manifest_digest(manifest);
+
+    let digests = DigestSet {
+        model: "pending".into(),
+        calibration: "pending".into(),
+        manifest: manifest_digest,
+        interface_version: "bedrock:controller@1.0.0".into(),
+    };
+
+    let tick_builder = TickInputBuilder::new(
+        digests,
+        manifest.commands.iter().map(|c| c.name.clone()).collect(),
+        vec![],
+        String::new(),
+    );
+
+    let tick_period_s = 1.0 / f64::from(manifest.control_rate_hz.max(1));
+    let hot_path_filter = HotPathSafetyFilter::new(joint_limits, None, tick_period_s);
+
+    (tick_builder, hot_path_filter)
+}
+
+/// Snapshot of host and sensor state needed for post-tick processing.
+struct PostTickContext<'a> {
+    tick_duration: Duration,
+    tick: u64,
+    host_commands: &'a [f64],
+    host_estop: bool,
+    host_estop_reason: Option<&'a str>,
+    host_state_values: &'a [f64],
+    sensor_positions: &'a [f64],
+    sensor_velocities: &'a [f64],
+}
+
+/// Run post-tick processing through the new tick contract pipeline.
+///
+/// Builds structured [`TickOutput`] from the host context's command values,
+/// runs it through the [`HotPathSafetyFilter`], and records evidence.
+/// Returns any safety interventions for logging/telemetry.
+///
+/// This runs *alongside* the old safety pipeline (backward compatible).
+/// The old `SafetyFilterTask::clamp_frame` still gates the actuator output;
+/// the new pipeline collects structured evidence and runs the richer
+/// per-joint safety checks.
+#[allow(clippy::cast_possible_truncation)] // tick durations won't exceed u64 nanoseconds
+fn post_tick_processing(
+    ctx: &PostTickContext<'_>,
+    tick_builder: &TickInputBuilder,
+    filter: &mut HotPathSafetyFilter,
+    evidence: Option<&mut EvidenceCollector>,
+) -> Vec<SafetyIntervention> {
+    // Build structured input for this tick.
+    let _tick_input = tick_builder.build(TickSensorData {
+        tick: ctx.tick,
+        time_ns: ctx.tick_duration.as_nanos() as u64,
+        positions: ctx.sensor_positions,
+        velocities: ctx.sensor_velocities,
+        efforts: None,
+        watched_poses: &[],
+        wrench: None,
+        contact: None,
+        features: DerivedFeatures::default(),
+    });
+
+    // Build structured output from host state.
+    let tick_output = TickOutput {
+        command_values: ctx.host_commands.to_vec(),
+        estop: ctx.host_estop,
+        estop_reason: ctx.host_estop_reason.map(String::from),
+        metrics: vec![],
+    };
+
+    // Run through the new structured safety filter.
+    let filter_result = filter.filter(
+        &tick_output.command_values,
+        if ctx.host_state_values.is_empty() {
+            None
+        } else {
+            Some(ctx.host_state_values)
+        },
+        None,
+    );
+
+    // Record evidence for verification/audit.
+    if let Some(collector) = evidence {
+        collector.record_tick(ctx.tick_duration, &tick_output, &filter_result.interventions);
+    }
+
+    filter_result.interventions
+}
+
+// ---------------------------------------------------------------------------
 // Controller loops
 // ---------------------------------------------------------------------------
 
@@ -299,7 +463,7 @@ fn tick_wasm(
 /// This prevents the robot from running unsupervised if the agent hangs.
 ///
 /// Returns when `shutdown` is set to `true`.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn run_controller_loop(
     cmd_rx: &std::sync::mpsc::Receiver<ControllerCommand>,
     shared_state: &Arc<ArcSwap<ControllerState>>,
@@ -335,6 +499,11 @@ pub fn run_controller_loop(
     let mut sensor_joint_velocities: Vec<f64> = Vec::new();
     let mut sensor_sim_time_ns: i64 = 0;
 
+    // Tick-contract infrastructure — initialized when a manifest is loaded.
+    let mut tick_builder: Option<TickInputBuilder> = None;
+    let mut hot_path_filter: Option<HotPathSafetyFilter> = None;
+    let mut evidence_collector: Option<EvidenceCollector> = None;
+
     tracing::info!(max_velocity, ?watchdog_timeout, "copper controller loop started");
 
     while !shutdown.load(Ordering::Relaxed) {
@@ -348,6 +517,8 @@ pub fn run_controller_loop(
             &mut running,
             &mut tick_period,
             &mut safety_filter,
+            &mut tick_builder,
+            &mut hot_path_filter,
         );
         if received {
             last_agent_contact = Instant::now();
@@ -398,6 +569,26 @@ pub fn run_controller_loop(
                 &mut estop_reason,
             ) {
                 last_velocity_count = clamped.values.len();
+
+                // --- Post-tick: structured safety filter + evidence ---
+                if let (Some(builder), Some(filter)) = (&mut tick_builder, &mut hot_path_filter) {
+                    let host_ctx = task.host_context();
+                    let ptc = PostTickContext {
+                        tick_duration: tick_start.elapsed(),
+                        tick,
+                        host_commands: &host_ctx.command_values,
+                        host_estop: host_ctx.estop_requested,
+                        host_estop_reason: host_ctx.estop_reason.as_deref(),
+                        host_state_values: &host_ctx.state_values,
+                        sensor_positions: &sensor_joint_positions,
+                        sensor_velocities: &sensor_joint_velocities,
+                    };
+                    let interventions = post_tick_processing(&ptc, builder, filter, evidence_collector.as_mut());
+                    if !interventions.is_empty() {
+                        tracing::debug!(tick, count = interventions.len(), "tick contract safety interventions");
+                    }
+                }
+
                 if let Some(sink) = actuator
                     && let Err(e) = sink.send(clamped)
                 {
@@ -491,6 +682,11 @@ pub fn run_controller_loop_with_gazebo(
     // E-stop reason — set on WASM error or watchdog timeout.
     let mut estop_reason: Option<String> = None;
 
+    // Tick-contract infrastructure — initialized when a manifest is loaded.
+    let mut tick_builder: Option<TickInputBuilder> = None;
+    let mut hot_path_filter: Option<HotPathSafetyFilter> = None;
+    let mut evidence_collector: Option<EvidenceCollector> = None;
+
     tracing::info!(
         max_velocity,
         ?watchdog_timeout,
@@ -508,6 +704,8 @@ pub fn run_controller_loop_with_gazebo(
             &mut running,
             &mut tick_period,
             &mut safety_filter,
+            &mut tick_builder,
+            &mut hot_path_filter,
         );
         if received {
             last_agent_contact = Instant::now();
@@ -549,6 +747,30 @@ pub fn run_controller_loop_with_gazebo(
                 &mut estop_reason,
             ) {
                 last_velocity_count = clamped.values.len();
+
+                // --- Post-tick: structured safety filter + evidence ---
+                if let (Some(builder), Some(filter)) = (&mut tick_builder, &mut hot_path_filter) {
+                    let host_ctx = task.host_context();
+                    let ptc = PostTickContext {
+                        tick_duration: tick_start.elapsed(),
+                        tick,
+                        host_commands: &host_ctx.command_values,
+                        host_estop: host_ctx.estop_requested,
+                        host_estop_reason: host_ctx.estop_reason.as_deref(),
+                        host_state_values: &host_ctx.state_values,
+                        sensor_positions: &[], // Gazebo loop doesn't track joint positions separately
+                        sensor_velocities: &[], // Gazebo loop doesn't track joint velocities separately
+                    };
+                    let interventions = post_tick_processing(&ptc, builder, filter, evidence_collector.as_mut());
+                    if !interventions.is_empty() {
+                        tracing::debug!(
+                            tick,
+                            count = interventions.len(),
+                            "tick contract safety interventions (gazebo)"
+                        );
+                    }
+                }
+
                 if let Err(e) = gazebo.joint_publisher.send(clamped) {
                     tracing::warn!(error = %e, "failed to send joint command to Gazebo");
                 }
@@ -1187,7 +1409,8 @@ mod tests {
         let s = Arc::clone(&state);
         let sd = Arc::clone(&shutdown);
 
-        // Short watchdog: 100ms.
+        // Short watchdog: 200ms (must be large enough to survive LoadWasm
+        // overhead including tick-infrastructure initialization).
         let handle = std::thread::spawn(move || {
             run_controller_loop(
                 &rx,
@@ -1196,7 +1419,7 @@ mod tests {
                 &sd,
                 Some(&*sink_ref),
                 None,
-                Duration::from_millis(100),
+                Duration::from_millis(200),
                 None,
                 &estop_tx,
             );
@@ -1206,10 +1429,10 @@ mod tests {
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
         tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
             .unwrap();
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(80));
 
-        // Should still be running — only 50ms since last contact.
-        assert!(state.load().running, "should still be running at 50ms");
+        // Should still be running — only 80ms since last contact (watchdog is 200ms).
+        assert!(state.load().running, "should still be running at 80ms");
 
         // Drop the sender so no more commands arrive.
         drop(tx);

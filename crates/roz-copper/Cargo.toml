@@ -38,6 +38,8 @@ tokio-tungstenite.workspace = true
 futures.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
+hex.workspace = true
+sha2.workspace = true
 tracing.workspace = true
 wasmtime = "43"
 
