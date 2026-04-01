@@ -97,6 +97,7 @@ mod tests {
                     properties: Default::default(),
                     timestamp_ns: *ts,
                     frame_id: None,
+                    ..Default::default()
                 })
                 .collect(),
             ..Default::default()

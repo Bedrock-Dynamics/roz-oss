@@ -87,6 +87,7 @@ mod tests {
                 properties,
                 timestamp_ns: None,
                 frame_id: None,
+                ..Default::default()
             }],
             ..Default::default()
         }

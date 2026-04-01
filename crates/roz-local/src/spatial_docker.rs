@@ -101,6 +101,7 @@ impl TelemetryData {
             properties,
             frame_id: None,
             timestamp_ns: None,
+            ..Default::default()
         });
 
         SpatialContext {
@@ -109,6 +110,7 @@ impl TelemetryData {
             constraints: vec![],
             alerts,
             screenshots: vec![],
+            ..Default::default()
         }
     }
 }
@@ -140,6 +142,7 @@ impl SpatialContextProvider for DockerSpatialProvider {
                                 properties,
                                 frame_id: None,
                                 timestamp_ns: None,
+                                ..Default::default()
                             }],
                             ..Default::default()
                         }

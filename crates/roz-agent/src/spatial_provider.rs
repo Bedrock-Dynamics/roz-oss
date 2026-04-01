@@ -71,6 +71,7 @@ mod tests {
                 properties: HashMap::new(),
                 timestamp_ns: None,
                 frame_id: None,
+                ..Default::default()
             }],
             relations: vec![],
             constraints: vec![],
@@ -80,6 +81,7 @@ mod tests {
                 source: "test".to_string(),
             }],
             screenshots: vec![],
+            ..Default::default()
         };
 
         let provider = MockSpatialContextProvider::new(ctx);

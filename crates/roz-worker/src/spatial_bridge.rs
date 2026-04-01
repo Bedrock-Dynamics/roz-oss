@@ -53,6 +53,7 @@ impl SpatialContextProvider for CopperSpatialProvider {
             properties,
             timestamp_ns: None,
             frame_id: None,
+            ..Default::default()
         };
 
         let mut entities = vec![controller_entity];
@@ -64,6 +65,7 @@ impl SpatialContextProvider for CopperSpatialProvider {
             constraints: vec![],
             alerts: vec![],
             screenshots: vec![],
+            ..Default::default()
         }
     }
 }
@@ -117,6 +119,7 @@ mod tests {
             properties: std::collections::HashMap::new(),
             timestamp_ns: Some(1_000_000_000),
             frame_id: Some("world".to_string()),
+            ..Default::default()
         };
 
         let state = Arc::new(ArcSwap::from_pointee(ControllerState {

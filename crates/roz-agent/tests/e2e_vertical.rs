@@ -212,11 +212,13 @@ async fn agent_loop_ooda_react_spatial() {
             properties: HashMap::new(),
             timestamp_ns: None,
             frame_id: None,
+            ..Default::default()
         }],
         relations: vec![],
         constraints: vec![],
         alerts: vec![],
         screenshots: vec![],
+        ..Default::default()
     };
     let spatial = Box::new(MockSpatialContextProvider::new(spatial_ctx));
     let mut agent_loop = AgentLoop::new(model, dispatcher, safety, spatial);
@@ -287,11 +289,13 @@ async fn agent_loop_safety_clamps_velocity() {
             properties: HashMap::new(),
             timestamp_ns: None,
             frame_id: None,
+            ..Default::default()
         }],
         relations: vec![],
         constraints: vec![],
         alerts: vec![],
         screenshots: vec![],
+        ..Default::default()
     };
     let spatial = Box::new(MockSpatialContextProvider::new(spatial_ctx));
     let mut agent_loop = AgentLoop::new(model, dispatcher, safety, spatial);

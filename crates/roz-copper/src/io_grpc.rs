@@ -301,6 +301,8 @@ fn entity_pose_to_state(ep: &proto::EntityPose) -> EntityState {
         properties: HashMap::new(),
         timestamp_ns: None,
         frame_id: Some("world".to_owned()),
+        last_observed_ns: None,
+        observation_confidence: 0.0,
     }
 }
 

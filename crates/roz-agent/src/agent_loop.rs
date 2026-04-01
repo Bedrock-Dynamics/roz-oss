@@ -2003,6 +2003,7 @@ mod tests {
                 properties: HashMap::new(),
                 timestamp_ns: None,
                 frame_id: None,
+                ..Default::default()
             }],
             relations: vec![],
             constraints: vec![],
@@ -2012,6 +2013,7 @@ mod tests {
                 source: "safety_monitor".to_string(),
             }],
             screenshots: vec![],
+            ..Default::default()
         };
 
         let spatial = Box::new(MockSpatialContextProvider::new(ctx));
@@ -2125,6 +2127,7 @@ mod tests {
                 properties: HashMap::new(),
                 timestamp_ns: None,
                 frame_id: None,
+                ..Default::default()
             }],
             relations: vec![],
             constraints: vec![],
@@ -2135,6 +2138,7 @@ mod tests {
                 data: "iVBORw0KGgoAAAANSUhEUg==".to_string(),
                 depth_data: None,
             }],
+            ..Default::default()
         };
 
         let spatial = Box::new(MockSpatialContextProvider::new(ctx));
@@ -2248,11 +2252,13 @@ mod tests {
                 properties: HashMap::new(),
                 timestamp_ns: None,
                 frame_id: None,
+                ..Default::default()
             }],
             relations: vec![],
             constraints: vec![],
             alerts: vec![],
             screenshots: vec![],
+            ..Default::default()
         };
 
         let spatial = Box::new(MockSpatialContextProvider::new(ctx));
@@ -2325,6 +2331,7 @@ mod tests {
                     properties: HashMap::new(),
                     timestamp_ns: None,
                     frame_id: None,
+                    ..Default::default()
                 },
                 EntityState {
                     id: "sensor_1".to_string(),
@@ -2335,6 +2342,7 @@ mod tests {
                     properties: HashMap::new(),
                     timestamp_ns: None,
                     frame_id: None,
+                    ..Default::default()
                 },
             ],
             relations: vec![],
@@ -2356,6 +2364,7 @@ mod tests {
                 source: "motor_driver".to_string(),
             }],
             screenshots: vec![],
+            ..Default::default()
         };
 
         let formatted = format_spatial_context(&ctx);

@@ -27,6 +27,7 @@ fn context_with_battery(pct: f64) -> SpatialContext {
             properties,
             timestamp_ns: None,
             frame_id: None,
+            ..Default::default()
         }],
         ..Default::default()
     }

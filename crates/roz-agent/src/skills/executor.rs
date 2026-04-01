@@ -292,11 +292,13 @@ mod tests {
                 properties: HashMap::new(),
                 timestamp_ns: None,
                 frame_id: None,
+                ..Default::default()
             }],
             relations: vec![],
             constraints: vec![],
             alerts: vec![],
             screenshots: vec![],
+            ..Default::default()
         };
         let spatial = Box::new(MockSpatialContextProvider::new(spatial_ctx));
         let mut agent_loop = AgentLoop::new(model, dispatcher, safety, spatial);

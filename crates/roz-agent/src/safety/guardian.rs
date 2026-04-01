@@ -270,6 +270,7 @@ mod tests {
                 properties: Default::default(),
                 timestamp_ns: None,
                 frame_id: None,
+                ..Default::default()
             }],
             ..Default::default()
         };
