@@ -34,6 +34,12 @@ pub struct SpatialContext {
     /// Zero or more simulation screenshots (one per camera).
     #[serde(default)]
     pub screenshots: Vec<SimScreenshot>,
+    /// Regions that have been recently observed (active perception tracking).
+    #[serde(default)]
+    pub observation_coverage: Vec<crate::embodiment::perception::CoverageRegion>,
+    /// Known occluded regions (active perception blind spots).
+    #[serde(default)]
+    pub occluded_regions: Vec<crate::embodiment::perception::OccludedRegion>,
 }
 
 /// The state of a single entity in 3-D space.
@@ -55,6 +61,12 @@ pub struct EntityState {
     /// Coordinate frame this observation is expressed in.
     #[serde(default)]
     pub frame_id: Option<String>,
+    /// When this entity was last directly observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_observed_ns: Option<u64>,
+    /// Confidence in this entity's state (0.0 = unknown, 1.0 = just observed).
+    #[serde(default)]
+    pub observation_confidence: f64,
 }
 
 /// A named spatial relationship between two entities.
@@ -114,6 +126,8 @@ mod tests {
                 },
                 timestamp_ns: None,
                 frame_id: None,
+                last_observed_ns: None,
+                observation_confidence: 0.0,
             }],
             relations: vec![SpatialRelation {
                 subject: "arm_1".to_string(),
@@ -133,6 +147,8 @@ mod tests {
                 source: "safety_monitor".to_string(),
             }],
             screenshots: vec![],
+            observation_coverage: vec![],
+            occluded_regions: vec![],
         };
 
         let serialized = serde_json::to_string(&ctx).unwrap();
@@ -211,6 +227,8 @@ mod tests {
                     depth_data: Some("AAAA//8=".to_string()),
                 },
             ],
+            observation_coverage: vec![],
+            occluded_regions: vec![],
         };
         let serialized = serde_json::to_string(&ctx).unwrap();
         let deserialized: SpatialContext = serde_json::from_str(&serialized).unwrap();
@@ -258,6 +276,8 @@ mod tests {
             properties: std::collections::HashMap::new(),
             timestamp_ns: None,
             frame_id: None,
+            last_observed_ns: None,
+            observation_confidence: 0.0,
         };
         let serialized = serde_json::to_string(&entity).unwrap();
         let deserialized: EntityState = serde_json::from_str(&serialized).unwrap();
@@ -281,6 +301,8 @@ mod tests {
             properties: HashMap::new(),
             timestamp_ns: Some(1_000_000_000),
             frame_id: Some("world".to_string()),
+            last_observed_ns: None,
+            observation_confidence: 0.0,
         };
         let json = serde_json::to_string(&state).unwrap();
         let parsed: EntityState = serde_json::from_str(&json).unwrap();
@@ -294,5 +316,42 @@ mod tests {
         let parsed: EntityState = serde_json::from_str(json).unwrap();
         assert!(parsed.timestamp_ns.is_none());
         assert!(parsed.frame_id.is_none());
+    }
+
+    #[test]
+    fn spatial_context_with_coverage_serde() {
+        let ctx = SpatialContext {
+            observation_coverage: vec![crate::embodiment::perception::CoverageRegion {
+                frame_id: "table".into(),
+                radius: 0.5,
+                confidence: 0.9,
+                last_observed_ns: 1_000_000,
+            }],
+            occluded_regions: vec![crate::embodiment::perception::OccludedRegion {
+                frame_id: "behind_box".into(),
+                reason: "box occludes view".into(),
+                since_ns: 500_000,
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&ctx).unwrap();
+        let back: SpatialContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.observation_coverage.len(), 1);
+        assert_eq!(back.occluded_regions.len(), 1);
+    }
+
+    #[test]
+    fn entity_state_observation_fields() {
+        let entity = EntityState {
+            id: "cup_3".into(),
+            kind: "object".into(),
+            last_observed_ns: Some(42_000_000),
+            observation_confidence: 0.85,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&entity).unwrap();
+        let back: EntityState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.last_observed_ns, Some(42_000_000));
+        assert!((back.observation_confidence - 0.85).abs() < f64::EPSILON);
     }
 }
