@@ -1,4 +1,5 @@
 pub mod agent_loop;
+pub mod blueprint_resolver;
 pub mod bt;
 pub mod constitution;
 pub mod context;
@@ -7,6 +8,7 @@ pub mod dispatch;
 pub mod drift;
 pub mod error;
 pub mod feedback;
+pub mod memory_store;
 pub mod meter;
 pub mod model;
 pub mod observability;

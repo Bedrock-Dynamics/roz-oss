@@ -30,6 +30,7 @@ pub mod io_log;
 pub mod io_ws;
 pub mod manifest;
 pub mod mcap_export;
+pub mod replay;
 pub mod safety_filter;
 pub mod state_injector;
 pub mod tasks;
