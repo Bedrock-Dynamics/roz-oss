@@ -15,6 +15,8 @@ pub mod channels;
 #[cfg(feature = "copper-runtime")]
 pub mod ci;
 pub mod controller;
+pub mod controller_adapter;
+pub mod evidence_collector;
 #[cfg(feature = "gazebo")]
 pub mod gazebo_cmd;
 #[cfg(feature = "gazebo")]
