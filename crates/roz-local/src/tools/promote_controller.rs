@@ -74,32 +74,41 @@ impl PromoteControllerTool {
         }
 
         desc.push_str(
-            "\nTick contract host functions:\n\
-            - tick::input_len() -> i32 (length of TickInput JSON)\n\
-            - tick::get_input(ptr: i32, len: i32) -> i32 (copy TickInput JSON to buffer)\n\
-            - tick::set_output(ptr: i32, len: i32) (submit TickOutput JSON)\n\
-            - safety::request_estop()\n\
-            - timing::now_ns() -> i64\n\
-            - timing::sim_time_ns() -> i64\n\
+            "\n## WIT Tick Contract\n\
+            Controllers are WIT components lowered to flat core-Wasm ABI.\n\
+            The single export is: process(tick: u64) -> ()\n\
+            Data exchange is ONLY through tick contract host functions:\n\n\
+            - tick::input_len() -> i32 (byte length of TickInput JSON)\n\
+            - tick::get_input(ptr: i32, len: i32) -> i32 (copy TickInput JSON to WASM memory)\n\
+            - tick::set_output(ptr: i32, len: i32) (submit TickOutput JSON from WASM memory)\n\
+            - safety::request_estop() (trigger immediate e-stop)\n\
+            - timing::now_ns() -> i64 (monotonic wall clock)\n\
+            - timing::sim_time_ns() -> i64 (simulation time from sensor)\n\
             - math::sin(f64) -> f64, math::cos(f64) -> f64\n\n\
-            TickOutput JSON: {\"command_values\":[...],\"estop\":false,\"metrics\":[]}\n\n",
+            There is NO per-call command::set / state::get. All sensor data arrives\n\
+            in TickInput; all commands leave in TickOutput. One call, one response.\n\n\
+            TickInput JSON fields: tick, monotonic_time_ns, digests, joints, \
+            watched_poses, wrench, contact, features, config_json.\n\n\
+            TickOutput JSON: {\"command_values\":[...],\"estop\":false,\"metrics\":[]}\n\
+            command_values is indexed by channel number (see channels above).\n\n",
         );
 
         let ch0 = manifest.commands.first();
-        let example_name = ch0.map_or("channel_0", |c| c.name.as_str());
         let example_amp = ch0.map_or(0.1, |c| (c.limits.1 - c.limits.0) / 4.0);
         let _ = write!(
             desc,
-            "Example (oscillate {example_name} via tick contract):\n\
-            The controller writes a TickOutput JSON with command_values containing\n\
-            the desired velocities. The simplest approach is to embed the output\n\
-            JSON as a data segment and call tick::set_output.\n\n\
-            For a minimal no-op controller:\n\
+            "## Authoring Pattern\n\
+            1. Embed output JSON as a data segment in WASM memory.\n\
+            2. In process(), optionally read TickInput via tick::get_input.\n\
+            3. Compute command_values based on sensor data + tick counter.\n\
+            4. Write TickOutput JSON to memory, call tick::set_output(ptr, len).\n\n\
+            Minimal no-op controller:\n\
             (module\n\
               (func (export \"process\") (param $tick i64) nop)\n\
             )\n\n\
-            For a controller that outputs velocity {example_amp:.3}:\n\
-            Write the JSON bytes to memory and call tick::set_output(ptr, len).\n",
+            Controller outputting constant velocity {example_amp:.3}:\n\
+            Embed the TickOutput JSON bytes at a fixed memory offset,\n\
+            then call (call $sout (i32.const <offset>) (i32.const <len>)).\n",
         );
 
         Self { description: desc }
@@ -169,9 +178,20 @@ impl TypedToolExecutor for PromoteControllerTool {
             )
         })?;
 
-        // 6. Deploy via existing LoadWasm path.
+        // 6. Deploy via LoadArtifact — the artifact carries digests and lifecycle metadata.
+        let deploy_artifact = build_artifact(
+            &controller_id,
+            &hex::encode(Sha256::digest(input.code.as_bytes())),
+            &hex::encode(Sha256::digest(
+                serde_json::to_string(&manifest).unwrap_or_default().as_bytes(),
+            )),
+        );
         cmd_tx
-            .send(ControllerCommand::LoadWasm(input.code.into_bytes(), manifest))
+            .send(ControllerCommand::LoadArtifact(
+                Box::new(deploy_artifact),
+                input.code.into_bytes(),
+                manifest,
+            ))
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 Box::new(std::io::Error::new(
@@ -389,7 +409,7 @@ fn verify_wasm(code: &[u8], manifest: &roz_core::channels::ChannelManifest) -> V
     };
 
     for tick in 0..VERIFY_TICK_COUNT {
-        if let Err(e) = task.tick(tick) {
+        if let Err(e) = task.tick_with_contract(tick, None) {
             return VerifyOutcome::Err(format!("verification failed on tick {tick}: {e}"));
         }
     }
@@ -446,7 +466,7 @@ mod tests {
         let result = TypedToolExecutor::execute(&tool, input, &ctx).await.unwrap();
         assert!(result.is_success(), "should succeed: {:?}", result);
         let cmd = rx.try_recv().unwrap();
-        assert!(matches!(cmd, ControllerCommand::LoadWasm(_, _)));
+        assert!(matches!(cmd, ControllerCommand::LoadArtifact(_, _, _)));
     }
 
     #[tokio::test]
@@ -488,9 +508,13 @@ mod tests {
         let manifest = test_manifest();
         let tool = PromoteControllerTool::new(&manifest);
         let desc = TypedToolExecutor::description(&tool);
-        assert!(desc.contains("tick contract"), "must mention tick contract: {desc}");
+        assert!(desc.contains("Tick Contract"), "must mention Tick Contract: {desc}");
         assert!(desc.contains("tick::get_input"), "must mention tick::get_input");
         assert!(desc.contains("tick::set_output"), "must mention tick::set_output");
+        assert!(
+            desc.contains("NO per-call command::set"),
+            "must explicitly negate legacy ABI"
+        );
     }
 
     #[test]

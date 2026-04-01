@@ -384,7 +384,7 @@ Respond with ONLY the WAT code. No explanation, no markdown fences, just raw WAT
 
     // Tick 100 times -- the real test is that it doesn't crash.
     for tick in 0..100_u64 {
-        task.tick(tick).expect("tick should not trap");
+        task.tick_with_contract(tick, None).expect("tick should not trap");
     }
 
     // Verify low rejection count (a few clamps are acceptable).

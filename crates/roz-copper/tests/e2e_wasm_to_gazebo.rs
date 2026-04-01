@@ -19,11 +19,41 @@ use roz_copper::channels::{ControllerCommand, ControllerState};
 use roz_copper::io::ActuatorSink;
 use roz_copper::io_log::LogActuatorSink;
 
+fn test_artifact() -> roz_core::controller::artifact::ControllerArtifact {
+    use roz_core::controller::artifact::*;
+    ControllerArtifact {
+        controller_id: "e2e-gazebo".into(),
+        sha256: "test".into(),
+        source_kind: SourceKind::LlmGenerated,
+        controller_class: ControllerClass::LowRiskCommandGenerator,
+        generator_model: None,
+        generator_provider: None,
+        channel_manifest_version: 1,
+        host_abi_version: 2,
+        evidence_bundle_id: None,
+        created_at: chrono::Utc::now(),
+        promoted_at: None,
+        replaced_controller_id: None,
+        verification_key: VerificationKey {
+            controller_digest: "test".into(),
+            wit_world_version: "bedrock:controller@1.0.0".into(),
+            model_digest: "test".into(),
+            calibration_digest: "test".into(),
+            manifest_digest: "test".into(),
+            execution_mode: ExecutionMode::Verify,
+            compiler_version: "wasmtime".into(),
+            embodiment_family: None,
+        },
+        wit_world: "tick-controller".into(),
+        verifier_result: None,
+    }
+}
+
 /// Full pipeline: WASM controller ticks → sensor reads Gazebo poses → motor commands captured.
 ///
 /// Proves: GrpcSensorSource delivers real EntityState from Gazebo,
-/// WASM host functions read sensor data, set_velocity produces CommandFrame,
-/// safety filter clamps, and actuator sink receives the output.
+/// tick contract delivers sensor data, TickOutput commands go through safety filter,
+/// and actuator sink receives the output.
 #[tokio::test]
 #[ignore]
 async fn wasm_controller_with_live_gazebo_sensor() {
@@ -40,22 +70,21 @@ async fn wasm_controller_with_live_gazebo_sensor() {
     // Use LogActuatorSink to capture command frames (don't send to bridge).
     let sink = Arc::new(LogActuatorSink::new());
 
-    // WASM that reads joint position and outputs a velocity based on it.
-    // Uses math::sin to create a smooth oscillation.
-    let wat = r#"
-        (module
-            (import "math" "sin" (func $sin (param f64) (result f64)))
-            (import "motor" "set_velocity" (func $sv (param f64) (result i32)))
+    // WASM that uses the tick contract to output velocity commands.
+    // Writes a hardcoded TickOutput JSON with command_values=[0.5].
+    let output_json = br#"{"command_values":[0.5],"estop":false,"metrics":[]}"#;
+    let len = output_json.len();
+    let data_hex: String = output_json.iter().map(|b| format!("\\{b:02x}")).collect();
+    let wat = format!(
+        r#"(module
+            (import "tick" "set_output" (func $sout (param i32 i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 256) "{data_hex}")
             (func (export "process") (param i64)
-                (drop (call $sv
-                    (f64.mul
-                        (call $sin (f64.mul (f64.convert_i64_u (local.get 0)) (f64.const 0.1)))
-                        (f64.const 0.5)
-                    )
-                ))
+                (call $sout (i32.const 256) (i32.const {len}))
             )
-        )
-    "#;
+        )"#
+    );
 
     // Set up controller.
     let (tx, rx) = std::sync::mpsc::sync_channel(64);
@@ -82,10 +111,14 @@ async fn wasm_controller_with_live_gazebo_sensor() {
         );
     });
 
-    // Load WASM controller.
+    // Load WASM controller via artifact.
     let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-    tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
-        .unwrap();
+    tx.send(ControllerCommand::LoadArtifact(
+        Box::new(test_artifact()),
+        wat.into_bytes(),
+        manifest,
+    ))
+    .unwrap();
 
     // Let it tick for 500ms (~50 ticks at 100Hz).
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -117,31 +150,17 @@ async fn wasm_controller_with_live_gazebo_sensor() {
         "should have entities from Gazebo sensor stream"
     );
 
-    // Verify command frames were produced (from WASM sin oscillation).
+    // Verify command frames were produced.
     let cmds = sink.commands();
     println!("Command frames captured: {}", cmds.len());
     assert!(!cmds.is_empty(), "should have produced command frames");
-
-    // Verify velocities oscillate (sin wave should produce both positive and negative).
-    let velocities: Vec<f64> = cmds.iter().map(|c| c.values[0]).collect();
-    let has_positive = velocities.iter().any(|&v| v > 0.1);
-    let has_negative = velocities.iter().any(|&v| v < -0.1);
-    println!(
-        "Velocity range: [{:.3}, {:.3}]",
-        velocities.iter().cloned().fold(f64::INFINITY, f64::min),
-        velocities.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
-    );
-    assert!(
-        has_positive && has_negative,
-        "sin oscillation should produce both positive and negative velocities"
-    );
 
     // Shutdown.
     shutdown.store(true, Ordering::Relaxed);
     handle.join().unwrap();
 
     println!(
-        "PASS: WASM sin oscillation → {} command frames, {} Gazebo entities in feedback loop",
+        "PASS: tick contract → {} command frames, {} Gazebo entities in feedback loop",
         cmds.len(),
         current.entities.len()
     );

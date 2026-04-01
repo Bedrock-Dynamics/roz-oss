@@ -37,17 +37,64 @@ fn load_quadcopter_manifest() -> ChannelManifest {
     robot.channel_manifest().unwrap()
 }
 
+fn test_artifact() -> roz_core::controller::artifact::ControllerArtifact {
+    use roz_core::controller::artifact::*;
+    ControllerArtifact {
+        controller_id: "drone-vz".into(),
+        sha256: "test".into(),
+        source_kind: SourceKind::LlmGenerated,
+        controller_class: ControllerClass::LowRiskCommandGenerator,
+        generator_model: None,
+        generator_provider: None,
+        channel_manifest_version: 1,
+        host_abi_version: 2,
+        evidence_bundle_id: None,
+        created_at: chrono::Utc::now(),
+        promoted_at: None,
+        replaced_controller_id: None,
+        verification_key: VerificationKey {
+            controller_digest: "test".into(),
+            wit_world_version: "bedrock:controller@1.0.0".into(),
+            model_digest: "test".into(),
+            calibration_digest: "test".into(),
+            manifest_digest: "test".into(),
+            execution_mode: ExecutionMode::Verify,
+            compiler_version: "wasmtime".into(),
+            embodiment_family: None,
+        },
+        wit_world: "tick-controller".into(),
+        verifier_result: None,
+    }
+}
+
 const BRIDGE_URL: &str = "http://127.0.0.1:9090";
 
-/// WAT that sets command channel 2 (velocity_z) to 0.5 m/s on every tick.
-const DRONE_VZ_WAT: &str = r#"
-    (module
-        (import "command" "set" (func $cmd (param i32 f64) (result i32)))
-        (func (export "process") (param i64)
-            (drop (call $cmd (i32.const 2) (f64.const 0.5)))
-        )
+/// Build WAT that uses the tick contract to set channel 2 (velocity_z) to 0.5 m/s.
+fn drone_vz_wat(manifest: &ChannelManifest) -> String {
+    // Build TickOutput JSON with command_values array sized for the manifest.
+    let mut values = vec![0.0_f64; manifest.commands.len()];
+    if values.len() > 2 {
+        values[2] = 0.5;
+    }
+    let output_json = serde_json::json!({
+        "command_values": values,
+        "estop": false,
+        "metrics": [],
+    });
+    let output_bytes = serde_json::to_vec(&output_json).unwrap();
+    let len = output_bytes.len();
+    let data_hex: String = output_bytes.iter().map(|b| format!("\\{b:02x}")).collect();
+    format!(
+        r#"(module
+            (import "tick" "set_output" (func $sout (param i32 i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 256) "{data_hex}")
+            (func (export "process") (param i64)
+                (call $sout (i32.const 256) (i32.const {len}))
+            )
+        )"#
     )
-"#;
+}
 
 /// Send a flight command via gRPC. Returns true on success.
 async fn send_flight_cmd(channel: tonic::transport::Channel, cmd: FlightCommand, mode: &str) -> bool {
@@ -151,12 +198,15 @@ async fn drone_wasm_velocity_through_bridge() {
     println!("BEFORE (hovering) drone z: {before_z:?}");
 
     // 4. Start WASM velocity setpoints, then switch to OFFBOARD.
-    // Load WASM — starts producing velocity commands at 100Hz.
-    tx.send(ControllerCommand::LoadWasm(
-        DRONE_VZ_WAT.as_bytes().to_vec(),
-        load_quadcopter_manifest(),
+    // Load WASM via artifact — starts producing velocity commands at 100Hz.
+    let drone_manifest = load_quadcopter_manifest();
+    let drone_wat = drone_vz_wat(&drone_manifest);
+    tx.send(ControllerCommand::LoadArtifact(
+        Box::new(test_artifact()),
+        drone_wat.into_bytes(),
+        drone_manifest,
     ))
-    .expect("send LoadWasm");
+    .expect("send LoadArtifact");
 
     // Wait for setpoints to stream before switching to OFFBOARD.
     tokio::time::sleep(Duration::from_millis(500)).await;

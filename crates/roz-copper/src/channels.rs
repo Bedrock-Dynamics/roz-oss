@@ -16,6 +16,8 @@ use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+use roz_core::controller::artifact::ControllerArtifact;
+
 // ---------------------------------------------------------------------------
 // Agent → Copper
 // ---------------------------------------------------------------------------
@@ -23,8 +25,13 @@ use tokio::sync::mpsc;
 /// Commands from the agent to the Copper controller.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControllerCommand {
-    /// Load new WASM module bytes with its channel manifest.
-    LoadWasm(Vec<u8>, roz_core::channels::ChannelManifest),
+    /// Load a verified WASM controller artifact with its compiled bytecode.
+    ///
+    /// The artifact carries pre-computed digests, verification key, and
+    /// lifecycle metadata. The bytecode is the raw WASM/WAT source.
+    /// The channel manifest is derived from the artifact's
+    /// `channel_manifest_version` and the robot's `ControlInterfaceManifest`.
+    LoadArtifact(Box<ControllerArtifact>, Vec<u8>, roz_core::channels::ChannelManifest),
     /// Update controller parameters (JSON).
     UpdateParams(serde_json::Value),
     /// Halt the controller (stop ticking).

@@ -263,6 +263,40 @@ impl Drop for CopperHandle {
 mod tests {
     use super::*;
 
+    fn test_artifact() -> roz_core::controller::artifact::ControllerArtifact {
+        use roz_core::controller::artifact::*;
+        ControllerArtifact {
+            controller_id: "test-ctrl".into(),
+            sha256: "test".into(),
+            source_kind: SourceKind::LlmGenerated,
+            controller_class: ControllerClass::LowRiskCommandGenerator,
+            generator_model: None,
+            generator_provider: None,
+            channel_manifest_version: 1,
+            host_abi_version: 2,
+            evidence_bundle_id: None,
+            created_at: chrono::Utc::now(),
+            promoted_at: None,
+            replaced_controller_id: None,
+            verification_key: VerificationKey {
+                controller_digest: "test".into(),
+                wit_world_version: "bedrock:controller@1.0.0".into(),
+                model_digest: "test".into(),
+                calibration_digest: "test".into(),
+                manifest_digest: "test".into(),
+                execution_mode: ExecutionMode::Verify,
+                compiler_version: "wasmtime".into(),
+                embodiment_family: None,
+            },
+            wit_world: "tick-controller".into(),
+            verifier_result: None,
+        }
+    }
+
+    fn load_artifact_cmd(bytes: &[u8], manifest: roz_core::channels::ChannelManifest) -> ControllerCommand {
+        ControllerCommand::LoadArtifact(Box::new(test_artifact()), bytes.to_vec(), manifest)
+    }
+
     #[tokio::test]
     async fn handle_spawns_and_shuts_down() {
         let handle = CopperHandle::spawn(1.5);
@@ -288,15 +322,12 @@ mod tests {
             )
         "#;
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-        handle
-            .send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
-            .await
-            .unwrap();
+        handle.send(load_artifact_cmd(wat.as_bytes(), manifest)).await.unwrap();
 
         // Wait for it to load and tick.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let state = handle.state().load();
-        assert!(state.running, "should be running after LoadWasm");
+        assert!(state.running, "should be running after LoadArtifact");
 
         // Halt it.
         handle.send(ControllerCommand::Halt).await.unwrap();
@@ -329,7 +360,7 @@ mod tests {
         );
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
         handle
-            .send(ControllerCommand::LoadWasm(wat.into_bytes(), manifest))
+            .send(load_artifact_cmd(&wat.into_bytes(), manifest))
             .await
             .unwrap();
 
@@ -359,10 +390,7 @@ mod tests {
             // Minimal tick-contract WASM (no-op controller).
             let wat = r#"(module (func (export "process") (param i64) nop))"#;
             let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-            handle
-                .send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
-                .await
-                .unwrap();
+            handle.send(load_artifact_cmd(wat.as_bytes(), manifest)).await.unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;
             assert!(state.load().running, "should be running before drop");
             // handle dropped here

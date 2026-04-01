@@ -3,7 +3,8 @@
 //! Runs on a dedicated thread at the rate specified by the loaded
 //! [`ChannelManifest`](roz_core::channels::ChannelManifest) (defaults to
 //! 100 Hz when no manifest is loaded). Drains commands from a
-//! `std::sync::mpsc` channel (non-blocking), ticks the WASM controller
+//! `std::sync::mpsc` channel (non-blocking), loads controller artifacts
+//! via [`ControllerCommand::LoadArtifact`], ticks the WASM controller
 //! using the structured tick contract ([`TickInput`]/[`TickOutput`]),
 //! applies safety filtering, and publishes state via `ArcSwap`.
 
@@ -43,7 +44,7 @@ fn tick_period_from_hz(control_rate_hz: u32) -> Duration {
     Duration::from_millis(1000 / u64::from(control_rate_hz.max(1)))
 }
 
-/// Result of processing a [`ControllerCommand::LoadWasm`].
+/// Result of processing a [`ControllerCommand::LoadArtifact`].
 ///
 /// Contains both the new tick period and a clone of the loaded manifest
 /// so the caller can rebuild tick-contract infrastructure.
@@ -62,14 +63,15 @@ fn handle_command(
     running: &mut bool,
 ) -> Option<LoadResult> {
     match cmd {
-        ControllerCommand::LoadWasm(bytes, manifest) => {
+        ControllerCommand::LoadArtifact(artifact, bytes, manifest) => {
             let new_period = tick_period_from_hz(manifest.control_rate_hz);
             tracing::info!(
+                controller_id = %artifact.controller_id,
                 bytes = bytes.len(),
                 channels = manifest.command_count(),
                 control_rate_hz = manifest.control_rate_hz,
                 tick_period_ms = new_period.as_millis(),
-                "loading new WASM controller"
+                "loading controller artifact"
             );
             let manifest_clone = manifest.clone();
             let host_ctx = crate::wit_host::HostContext::with_manifest(manifest);
@@ -77,14 +79,14 @@ fn handle_command(
                 Ok(task) => {
                     *wasm_task = Some(task);
                     *running = true;
-                    tracing::info!("WASM controller loaded and running");
+                    tracing::info!(controller_id = %artifact.controller_id, "controller artifact loaded and running");
                     Some(LoadResult {
                         period: new_period,
                         manifest: manifest_clone,
                     })
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "failed to load WASM controller");
+                    tracing::error!(error = %e, controller_id = %artifact.controller_id, "failed to load controller artifact");
                     *wasm_task = None;
                     *running = false;
                     None
@@ -145,7 +147,7 @@ fn publish_state(
 /// Drain emergency and normal command channels, returning whether any
 /// command was received on `cmd_rx` (for watchdog bookkeeping).
 ///
-/// When a `LoadWasm` command is processed, also rebuilds the tick-contract
+/// When a `LoadArtifact` command is processed, also rebuilds the tick-contract
 /// infrastructure (`tick_builder` and `hot_path_filter`) from the new manifest.
 #[allow(clippy::too_many_arguments)]
 fn drain_commands(
@@ -747,6 +749,42 @@ pub fn run_controller_loop_with_gazebo(
 mod tests {
     use super::*;
 
+    /// Build a minimal test artifact for controller loop tests.
+    fn test_artifact() -> roz_core::controller::artifact::ControllerArtifact {
+        use roz_core::controller::artifact::*;
+        ControllerArtifact {
+            controller_id: "test-ctrl".into(),
+            sha256: "test".into(),
+            source_kind: SourceKind::LlmGenerated,
+            controller_class: ControllerClass::LowRiskCommandGenerator,
+            generator_model: None,
+            generator_provider: None,
+            channel_manifest_version: 1,
+            host_abi_version: 2,
+            evidence_bundle_id: None,
+            created_at: chrono::Utc::now(),
+            promoted_at: None,
+            replaced_controller_id: None,
+            verification_key: VerificationKey {
+                controller_digest: "test".into(),
+                wit_world_version: "bedrock:controller@1.0.0".into(),
+                model_digest: "test".into(),
+                calibration_digest: "test".into(),
+                manifest_digest: "test".into(),
+                execution_mode: ExecutionMode::Verify,
+                compiler_version: "wasmtime".into(),
+                embodiment_family: None,
+            },
+            wit_world: "tick-controller".into(),
+            verifier_result: None,
+        }
+    }
+
+    /// Build a LoadArtifact command from WAT source and manifest.
+    fn load_artifact_cmd(wat: &[u8], manifest: roz_core::channels::ChannelManifest) -> ControllerCommand {
+        ControllerCommand::LoadArtifact(Box::new(test_artifact()), wat.to_vec(), manifest)
+    }
+
     #[test]
     fn tick_period_from_manifest() {
         use roz_core::channels::ChannelManifest;
@@ -825,8 +863,7 @@ mod tests {
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
         let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
 
-        tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
-            .unwrap();
+        tx.send(load_artifact_cmd(wat.as_bytes(), manifest)).unwrap();
         std::thread::sleep(Duration::from_millis(500));
 
         let current = state.load();
@@ -846,8 +883,7 @@ mod tests {
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
         let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
 
-        tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
-            .unwrap();
+        tx.send(load_artifact_cmd(wat.as_bytes(), manifest)).unwrap();
         std::thread::sleep(Duration::from_millis(200));
 
         let current = state.load();
@@ -873,8 +909,7 @@ mod tests {
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
         let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
 
-        tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
-            .unwrap();
+        tx.send(load_artifact_cmd(wat.as_bytes(), manifest)).unwrap();
         std::thread::sleep(Duration::from_millis(200));
 
         let current = state.load();
@@ -898,8 +933,7 @@ mod tests {
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
         let (tx, state, shutdown, handle, mut estop_rx) = spawn_controller(1.5);
 
-        tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
-            .unwrap();
+        tx.send(load_artifact_cmd(wat.as_bytes(), manifest)).unwrap();
         std::thread::sleep(Duration::from_millis(200));
 
         assert!(!state.load().running, "should halt after trap");
@@ -927,8 +961,7 @@ mod tests {
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
         let (tx, _state, shutdown, handle, mut estop_rx) = spawn_controller(1.5);
 
-        tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
-            .unwrap();
+        tx.send(load_artifact_cmd(wat.as_bytes(), manifest)).unwrap();
         std::thread::sleep(Duration::from_millis(200));
 
         let msg = estop_rx
@@ -947,8 +980,7 @@ mod tests {
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
         let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
 
-        tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
-            .unwrap();
+        tx.send(load_artifact_cmd(wat.as_bytes(), manifest)).unwrap();
         std::thread::sleep(Duration::from_millis(200));
         assert!(state.load().running);
 
@@ -1009,8 +1041,7 @@ mod tests {
         });
 
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-        tx.send(ControllerCommand::LoadWasm(wat.into_bytes(), manifest))
-            .unwrap();
+        tx.send(load_artifact_cmd(&wat.into_bytes(), manifest)).unwrap();
         std::thread::sleep(Duration::from_millis(100));
 
         let cmds = sink.commands();
@@ -1058,8 +1089,7 @@ mod tests {
         });
 
         let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-        tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
-            .unwrap();
+        tx.send(load_artifact_cmd(wat.as_bytes(), manifest)).unwrap();
         std::thread::sleep(Duration::from_millis(80));
 
         assert!(state.load().running, "should still be running at 80ms");

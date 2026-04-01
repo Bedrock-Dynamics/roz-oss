@@ -1,8 +1,12 @@
 //! WASM sandbox for agent-generated Copper tasks.
 //!
-//! Loads a WASM module (binary or WAT text) and calls its `process` export
-//! on each tick. The host provides structured tick input/output through the
-//! tick contract: `tick::get_input` / `tick::set_output` host functions.
+//! Loads a WASM module (binary or WAT text) and calls its `process(u64)` export
+//! on each tick. Data exchange uses the tick contract exclusively:
+//! `tick::get_input` / `tick::set_output` host functions carry JSON over shared
+//! memory. The `process(u64) -> ()` signature IS the lowered WIT ABI (spec
+//! design rule 5: "Codegen lowers WIT to flat core-Wasm ABI").
+//!
+//! The sole entry point is [`CuWasmTask::tick_with_contract`].
 //!
 //! # Safety
 //!
@@ -175,28 +179,6 @@ impl CuWasmTask {
         Ok(self.store.data_mut().take_tick_output())
     }
 
-    /// Execute one tick of the WASM module (legacy interface).
-    ///
-    /// This is the backward-compatible entry point that does not use the
-    /// structured tick contract. It calls `process(tick)` and checks for
-    /// e-stop. Use [`tick_with_contract`](Self::tick_with_contract) for the
-    /// new tick contract path.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the `process` function traps.
-    pub fn tick(&mut self, tick: u64) -> anyhow::Result<()> {
-        self.store.data_mut().reset_commands();
-        self.store.set_epoch_deadline(8);
-        if let Some(ref process) = self.process_fn {
-            process.call(&mut self.store, tick)?;
-        }
-        if self.store.data().estop_requested {
-            anyhow::bail!("e-stop requested by WASM module");
-        }
-        Ok(())
-    }
-
     /// Read an `i64` global from the WASM module (for testing).
     ///
     /// # Errors
@@ -288,8 +270,8 @@ mod tests {
     #[test]
     fn wasm_load_and_tick_minimal_module() {
         let mut task = CuWasmTask::from_source(MINIMAL_WAT.as_bytes()).unwrap();
-        task.tick(0).unwrap();
-        task.tick(100).unwrap();
+        task.tick_with_contract(0, None).unwrap();
+        task.tick_with_contract(100, None).unwrap();
     }
 
     #[test]
@@ -305,18 +287,18 @@ mod tests {
         let wat = r#"(module (func (export "process") (param i64) (loop br 0)))"#;
         let mut task = CuWasmTask::from_source(wat.as_bytes()).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        let result = task.tick(0);
+        let result = task.tick_with_contract(0, None);
         assert!(result.is_err(), "infinite loop should be auto-interrupted");
     }
 
     /// A module exporting `process` with the wrong signature (i32, i32) -> i32
     /// instead of (i64) -> (). `get_typed_func::<u64, ()>` returns `Err`, so
-    /// `tick` silently skips execution and returns Ok.
+    /// `tick_with_contract` silently skips execution and returns Ok.
     #[test]
     fn wasm_wrong_signature_silently_skipped() {
         let wat = r#"(module (func (export "process") (param i32 i32) (result i32) (i32.const 0)))"#;
         let mut task = CuWasmTask::from_source(wat.as_bytes()).unwrap();
-        let result = task.tick(0);
+        let result = task.tick_with_contract(0, None);
         assert!(result.is_ok(), "wrong signature should not crash, got: {result:?}");
     }
 
@@ -333,9 +315,9 @@ mod tests {
             )
         "#;
         let mut task = CuWasmTask::from_source(wat.as_bytes()).unwrap();
-        task.tick(0).unwrap();
-        task.tick(1).unwrap();
-        task.tick(2).unwrap();
+        task.tick_with_contract(0, None).unwrap();
+        task.tick_with_contract(1, None).unwrap();
+        task.tick_with_contract(2, None).unwrap();
         let counter = task.get_global_i64("counter").unwrap();
         assert_eq!(counter, 3, "state must persist across ticks");
     }
@@ -352,7 +334,7 @@ mod tests {
         "#;
         let mut task = CuWasmTask::from_source_with_host(wat.as_bytes(), HostContext::default()).unwrap();
         assert!(!task.host_context().estop_requested);
-        let result = task.tick(0);
+        let result = task.tick_with_contract(0, None);
         assert!(result.is_err(), "tick should return error when e-stop is requested");
         assert!(task.host_context().estop_requested);
     }
@@ -420,7 +402,7 @@ mod tests {
         "#;
         let mut task = CuWasmTask::from_source(wat.as_bytes()).unwrap();
         let start = std::time::Instant::now();
-        let result = task.tick(0);
+        let result = task.tick_with_contract(0, None);
         let elapsed = start.elapsed();
 
         assert!(result.is_err(), "long computation should be interrupted");

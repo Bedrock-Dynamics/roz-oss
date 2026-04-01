@@ -15,9 +15,39 @@ use roz_copper::channels::{ControllerCommand, ControllerState};
 use roz_copper::io::ActuatorSink;
 use roz_copper::io_grpc::GrpcActuatorSink;
 
+fn test_artifact() -> roz_core::controller::artifact::ControllerArtifact {
+    use roz_core::controller::artifact::*;
+    ControllerArtifact {
+        controller_id: "e2e-actuator".into(),
+        sha256: "test".into(),
+        source_kind: SourceKind::LlmGenerated,
+        controller_class: ControllerClass::LowRiskCommandGenerator,
+        generator_model: None,
+        generator_provider: None,
+        channel_manifest_version: 1,
+        host_abi_version: 2,
+        evidence_bundle_id: None,
+        created_at: chrono::Utc::now(),
+        promoted_at: None,
+        replaced_controller_id: None,
+        verification_key: VerificationKey {
+            controller_digest: "test".into(),
+            wit_world_version: "bedrock:controller@1.0.0".into(),
+            model_digest: "test".into(),
+            calibration_digest: "test".into(),
+            manifest_digest: "test".into(),
+            execution_mode: ExecutionMode::Verify,
+            compiler_version: "wasmtime".into(),
+            embodiment_family: None,
+        },
+        wit_world: "tick-controller".into(),
+        verifier_result: None,
+    }
+}
+
 /// WASM controller sends velocity commands through GrpcActuatorSink → bridge → Gazebo.
 ///
-/// Proves the entire output pipeline: WASM → set_velocity → CommandFrame → safety filter
+/// Proves the entire output pipeline: WASM tick contract → TickOutput → safety filter
 /// → GrpcActuatorSink → SendJointCommand RPC → bridge → gz-transport publish.
 #[tokio::test]
 #[ignore]
@@ -41,15 +71,20 @@ async fn wasm_velocity_reaches_gazebo_via_grpc() {
         tokio::runtime::Handle::current(),
     );
 
-    // WASM that calls set_velocity(0.42) every tick.
-    let wat = r#"
-        (module
-            (import "motor" "set_velocity" (func $sv (param f64) (result i32)))
+    // WASM that uses the tick contract to output velocity 0.42.
+    let output_json = br#"{"command_values":[0.42],"estop":false,"metrics":[]}"#;
+    let len = output_json.len();
+    let data_hex: String = output_json.iter().map(|b| format!("\\{b:02x}")).collect();
+    let wat = format!(
+        r#"(module
+            (import "tick" "set_output" (func $sout (param i32 i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 256) "{data_hex}")
             (func (export "process") (param i64)
-                (drop (call $sv (f64.const 0.42)))
+                (call $sout (i32.const 256) (i32.const {len}))
             )
-        )
-    "#;
+        )"#
+    );
 
     let (tx, rx) = std::sync::mpsc::sync_channel(64);
     let (_emergency_tx, emergency_rx) = std::sync::mpsc::sync_channel(1);
@@ -74,10 +109,14 @@ async fn wasm_velocity_reaches_gazebo_via_grpc() {
         );
     });
 
-    // Load WASM controller.
+    // Load WASM controller via artifact.
     let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-    tx.send(ControllerCommand::LoadWasm(wat.as_bytes().to_vec(), manifest))
-        .unwrap();
+    tx.send(ControllerCommand::LoadArtifact(
+        Box::new(test_artifact()),
+        wat.into_bytes(),
+        manifest,
+    ))
+    .unwrap();
 
     // Let it tick for 500ms — sends ~50 velocity commands to the bridge.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -101,7 +140,7 @@ async fn wasm_velocity_reaches_gazebo_via_grpc() {
     handle.join().unwrap();
 
     println!(
-        "PASS: WASM velocity 0.42 → {} ticks through GrpcActuatorSink → SendJointCommand → Gazebo",
+        "PASS: tick contract velocity 0.42 → {} ticks through GrpcActuatorSink → SendJointCommand → Gazebo",
         current.last_tick
     );
 }

@@ -148,7 +148,7 @@ impl TypedToolExecutor for ExecuteCodeTool {
 
         if input.verify_first {
             for tick in 0..VERIFY_TICK_COUNT {
-                if let Err(e) = task.tick(tick) {
+                if let Err(e) = task.tick_with_contract(tick, None) {
                     let output = ExecuteCodeOutput {
                         status: "error".to_string(),
                         message: format!("Verification failed on tick {tick}: {e}"),

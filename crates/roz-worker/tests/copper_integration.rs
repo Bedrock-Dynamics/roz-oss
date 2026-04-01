@@ -6,6 +6,36 @@ use std::time::Duration;
 use roz_agent::spatial_provider::SpatialContextProvider;
 use roz_copper::channels::ControllerCommand;
 
+fn test_artifact() -> roz_core::controller::artifact::ControllerArtifact {
+    use roz_core::controller::artifact::*;
+    ControllerArtifact {
+        controller_id: "integration-test".into(),
+        sha256: "test".into(),
+        source_kind: SourceKind::LlmGenerated,
+        controller_class: ControllerClass::LowRiskCommandGenerator,
+        generator_model: None,
+        generator_provider: None,
+        channel_manifest_version: 1,
+        host_abi_version: 2,
+        evidence_bundle_id: None,
+        created_at: chrono::Utc::now(),
+        promoted_at: None,
+        replaced_controller_id: None,
+        verification_key: VerificationKey {
+            controller_digest: "test".into(),
+            wit_world_version: "bedrock:controller@1.0.0".into(),
+            model_digest: "test".into(),
+            calibration_digest: "test".into(),
+            manifest_digest: "test".into(),
+            execution_mode: ExecutionMode::Verify,
+            compiler_version: "wasmtime".into(),
+            embodiment_family: None,
+        },
+        wit_world: "tick-controller".into(),
+        verifier_result: None,
+    }
+}
+
 #[tokio::test]
 async fn agent_deploys_wasm_to_copper_and_reads_state() {
     // Spawn Copper controller.
@@ -15,7 +45,7 @@ async fn agent_deploys_wasm_to_copper_and_reads_state() {
     let state = handle.state().load();
     assert!(!state.running, "should start idle");
 
-    // Agent deploys a WASM controller.
+    // Agent deploys a WASM controller via artifact.
     let wat = r#"
         (module
             (global $tick_count (mut i64) (i64.const 0))
@@ -27,7 +57,8 @@ async fn agent_deploys_wasm_to_copper_and_reads_state() {
         )
     "#;
     handle
-        .send(ControllerCommand::LoadWasm(
+        .send(ControllerCommand::LoadArtifact(
+            Box::new(test_artifact()),
             wat.as_bytes().to_vec(),
             roz_core::channels::ChannelManifest::generic_velocity(1, 1.5),
         ))
