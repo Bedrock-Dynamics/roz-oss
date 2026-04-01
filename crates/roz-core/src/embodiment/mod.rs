@@ -9,6 +9,7 @@ pub mod limits;
 pub mod model;
 pub mod perception;
 pub mod prediction;
+pub mod retargeting;
 pub mod safety_overlay;
 pub mod workspace;
 
@@ -29,6 +30,8 @@ pub use model::*;
 pub use perception::*;
 #[allow(unused_imports)]
 pub use prediction::*;
+#[allow(unused_imports)]
+pub use retargeting::*;
 #[allow(unused_imports)]
 pub use safety_overlay::*;
 pub use workspace::*;

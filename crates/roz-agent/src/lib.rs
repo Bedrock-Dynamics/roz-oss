@@ -21,3 +21,4 @@ pub mod spatial_provider;
 pub mod tools;
 pub mod trust_evaluator;
 pub mod verifier;
+pub mod world_model_verifier;
