@@ -104,7 +104,7 @@ pub struct UnboundChannel {
 /// Joint-like bindings (`JointPosition`, `JointVelocity`, `Command`) are validated
 /// against joint names. Sensor-like bindings (`ForceTorque`, `Imu*`, `Gripper*`)
 /// are validated against sensor IDs. Frame IDs are validated against the
-/// frame tree.
+/// frame tree. `channel_index` values are validated against `channel_count`.
 ///
 /// Returns all unbound channels with reasons.
 #[must_use]
@@ -113,6 +113,7 @@ pub fn validate_bindings(
     model_joint_names: &[&str],
     model_sensor_ids: &[&str],
     frame_ids: &[&str],
+    channel_count: u32,
 ) -> Vec<UnboundChannel> {
     let mut errors = Vec::new();
 
@@ -150,6 +151,19 @@ pub fn validate_bindings(
                 physical_name: b.physical_name.clone(),
                 binding_type: b.binding_type.clone(),
                 reason: format!("frame '{}' not found in frame tree", b.frame_id),
+            });
+        }
+
+        // Check channel_index is within range
+        if b.channel_index >= channel_count {
+            errors.push(UnboundChannel {
+                physical_name: b.physical_name.clone(),
+                binding_type: b.binding_type.clone(),
+                reason: format!(
+                    "channel_index {} out of range (max {})",
+                    b.channel_index,
+                    channel_count.saturating_sub(1)
+                ),
             });
         }
     }
@@ -199,7 +213,7 @@ mod tests {
         let joints = vec!["shoulder", "elbow"];
         let sensors = vec!["wrist_ft"];
         let frames = vec!["base", "world"];
-        let errors = validate_bindings(&bindings, &joints, &sensors, &frames);
+        let errors = validate_bindings(&bindings, &joints, &sensors, &frames, 2);
         assert!(errors.is_empty());
     }
 
@@ -216,7 +230,7 @@ mod tests {
         let joints = vec!["shoulder"];
         let sensors = vec![];
         let frames = vec!["base"];
-        let errors = validate_bindings(&bindings, &joints, &sensors, &frames);
+        let errors = validate_bindings(&bindings, &joints, &sensors, &frames, 1);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].physical_name, "nonexistent_joint");
     }
@@ -234,7 +248,7 @@ mod tests {
         let joints = vec!["shoulder"];
         let sensors = vec!["wrist_ft"];
         let frames = vec!["wrist"];
-        let errors = validate_bindings(&bindings, &joints, &sensors, &frames);
+        let errors = validate_bindings(&bindings, &joints, &sensors, &frames, 1);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].reason.contains("not found"));
     }
@@ -252,7 +266,7 @@ mod tests {
         let joints = vec!["shoulder"];
         let sensors = vec![];
         let frames = vec!["base"];
-        let errors = validate_bindings(&bindings, &joints, &sensors, &frames);
+        let errors = validate_bindings(&bindings, &joints, &sensors, &frames, 1);
         assert_eq!(errors.len(), 1);
         assert!(errors[0].reason.contains("frame"));
     }
@@ -270,7 +284,7 @@ mod tests {
         let joints = vec!["shoulder"]; // wrist_ft is NOT a joint
         let sensors = vec!["wrist_ft"]; // but it IS a sensor
         let frames = vec!["wrist"];
-        let errors = validate_bindings(&bindings, &joints, &sensors, &frames);
+        let errors = validate_bindings(&bindings, &joints, &sensors, &frames, 1);
         assert!(errors.is_empty());
     }
 
@@ -375,5 +389,42 @@ mod tests {
             let back: BindingType = serde_json::from_str(&json).unwrap();
             assert_eq!(bt, back);
         }
+    }
+
+    #[test]
+    fn validate_bindings_catches_out_of_range_channel_index() {
+        let bindings = vec![ChannelBinding {
+            physical_name: "shoulder".into(),
+            channel_index: 5, // out of range for channel_count=2
+            binding_type: BindingType::JointPosition,
+            frame_id: "base".into(),
+            units: "rad".into(),
+            semantic_role: None,
+        }];
+        let joints = vec!["shoulder"];
+        let sensors = vec![];
+        let frames = vec!["base"];
+        let errors = validate_bindings(&bindings, &joints, &sensors, &frames, 2);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].reason.contains("channel_index"));
+        assert!(errors[0].reason.contains("out of range"));
+    }
+
+    #[test]
+    fn validate_bindings_channel_index_at_boundary_valid() {
+        // channel_index == channel_count - 1 is valid
+        let bindings = vec![ChannelBinding {
+            physical_name: "shoulder".into(),
+            channel_index: 1, // valid for channel_count=2 (indices 0..=1)
+            binding_type: BindingType::JointPosition,
+            frame_id: "base".into(),
+            units: "rad".into(),
+            semantic_role: None,
+        }];
+        let joints = vec!["shoulder"];
+        let sensors = vec![];
+        let frames = vec!["base"];
+        let errors = validate_bindings(&bindings, &joints, &sensors, &frames, 2);
+        assert!(errors.is_empty());
     }
 }

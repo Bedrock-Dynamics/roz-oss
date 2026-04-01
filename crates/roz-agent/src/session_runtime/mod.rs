@@ -10,6 +10,9 @@ pub mod state;
 pub use events::*;
 pub use state::*;
 
+use std::future::Future;
+use std::pin::Pin;
+
 use roz_core::recovery::{RecoveryAction, RecoveryConfig, recovery_action_for};
 use roz_core::session::activity::{ResumeRequirements, RuntimeActivity, RuntimeFailureKind, SafePauseState};
 use roz_core::session::event::{EventEnvelope, SessionEvent};
@@ -17,7 +20,7 @@ use roz_core::session::snapshot::SessionSnapshot;
 use tokio::sync::broadcast;
 
 use crate::constitution::build_constitution;
-use crate::prompt_assembler::PromptAssembler;
+use crate::prompt_assembler::{PromptAssembler, SystemBlock};
 
 /// Input for a single turn.
 #[derive(Debug, Clone)]
@@ -45,6 +48,47 @@ pub enum SessionRuntimeError {
     SessionFailed(RuntimeFailureKind),
 }
 
+/// Boxed future returned by [`TurnExecutor::execute_turn`].
+pub type TurnFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<TurnOutput, Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>>;
+
+/// Trait that surface shells implement to execute a single turn.
+///
+/// `SessionRuntime` manages lifecycle (state checks, event emission, snapshot
+/// updates); the executor does the actual model invocation and tool dispatch.
+pub trait TurnExecutor: Send {
+    /// Execute a single turn within the `SessionRuntime` lifecycle.
+    ///
+    /// Called by [`SessionRuntime::run_turn`] after lifecycle checks pass.
+    /// The `turn_index` and `system_blocks` are provided by the runtime;
+    /// the executor is free to ignore the blocks if it builds its own prompt.
+    fn execute_turn(&mut self, turn_index: u32, user_message: &str, system_blocks: Vec<SystemBlock>) -> TurnFuture<'_>;
+}
+
+/// A no-op executor used in tests where no real model is needed.
+///
+/// Returns an empty `TurnOutput` — the same skeleton behaviour the old
+/// `run_turn` had before the `TurnExecutor` trait was introduced.
+pub struct NoopExecutor;
+
+impl TurnExecutor for NoopExecutor {
+    fn execute_turn(
+        &mut self,
+        _turn_index: u32,
+        _user_message: &str,
+        _system_blocks: Vec<SystemBlock>,
+    ) -> TurnFuture<'_> {
+        Box::pin(async {
+            Ok(TurnOutput {
+                assistant_message: String::new(),
+                tool_calls_made: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+            })
+        })
+    }
+}
+
 /// The single source of truth for session state.
 ///
 /// Wraps `AgentLoop` for single-turn execution. The runtime owns:
@@ -58,8 +102,6 @@ pub struct SessionRuntime {
     pub(crate) state: SessionState,
     pub(crate) emitter: EventEmitter,
     /// Assembles system prompt blocks each turn cycle.
-    /// Full prompt assembly wired when surfaces migrate to `SessionRuntime`.
-    #[allow(dead_code)]
     pub(crate) prompt_assembler: PromptAssembler,
     /// Determines recovery actions on failure (spec Section 29).
     pub(crate) recovery_config: RecoveryConfig,
@@ -141,17 +183,22 @@ impl SessionRuntime {
         Ok(())
     }
 
-    /// Run a single turn — emits `TurnStarted`, delegates to `AgentLoop`, updates snapshot.
+    /// Run a single turn — emits `TurnStarted`, delegates to the executor, updates snapshot.
     ///
-    /// This is the structural skeleton. Actual `AgentLoop` execution gets wired when
-    /// surfaces migrate — for now it emits lifecycle events and manages state.
+    /// The `SessionRuntime` manages lifecycle: it checks pause/failure state,
+    /// increments the turn index, emits events, and updates the snapshot.
+    /// The actual model invocation and tool dispatch happen inside the
+    /// [`TurnExecutor`] provided by the surface shell.
     ///
     /// # Errors
     ///
     /// Returns `SessionRuntimeError::SessionPaused` if the runtime is in safe pause.
     /// Returns `SessionRuntimeError::SessionFailed` if the session has failed.
-    #[allow(clippy::unused_async)] // will await AgentLoop when surfaces migrate
-    pub async fn run_turn(&mut self, _input: TurnInput) -> Result<TurnOutput, SessionRuntimeError> {
+    pub async fn run_turn(
+        &mut self,
+        input: TurnInput,
+        executor: &mut dyn TurnExecutor,
+    ) -> Result<TurnOutput, SessionRuntimeError> {
         // 1. Check terminal states
         if let Some(failure) = self.state.failure {
             return Err(SessionRuntimeError::SessionFailed(failure));
@@ -168,25 +215,38 @@ impl SessionRuntime {
             turn_index: self.state.turn_index,
         });
 
-        // 3. Build prompt via PromptAssembler
-        // (For now, just the constitution — full assembly comes when tools are wired)
+        // 3. Build system blocks via PromptAssembler
+        let system_blocks = self
+            .prompt_assembler
+            .assemble(&crate::prompt_assembler::AssemblyContext {
+                mode: crate::agent_loop::AgentLoopMode::React,
+                snapshot: Some(&self.state.snapshot),
+                spatial_context: None,
+                tool_schemas: &[],
+                trust_posture: &self.state.trust,
+                edge_state: &self.state.edge_state,
+                custom_blocks: vec![],
+            });
 
-        // 4. Execute turn
-        // NOTE: We don't actually call AgentLoop here yet — that requires the model
-        // provider and tool dispatcher which are set up by the surface shells.
-        // The actual AgentLoop call will be wired when surfaces migrate.
+        // 4. Execute turn via the surface-provided executor
+        let output = executor
+            .execute_turn(self.state.turn_index, &input.user_message, system_blocks)
+            .await
+            .map_err(|e| {
+                // On executor failure, transition to degraded and emit failure event
+                let failure = RuntimeFailureKind::ModelError;
+                self.state.failure = Some(failure);
+                self.state.activity = RuntimeActivity::Degraded;
+                tracing::error!("TurnExecutor failed: {e}");
+                SessionRuntimeError::SessionFailed(failure)
+            })?;
 
-        // 5. Update snapshot
+        // 5. Update snapshot from output
         self.state.snapshot.turn_index = self.state.turn_index;
         self.state.snapshot.updated_at = chrono::Utc::now();
         self.state.activity = RuntimeActivity::Idle;
 
-        Ok(TurnOutput {
-            assistant_message: String::new(), // filled by actual AgentLoop execution
-            tool_calls_made: 0,
-            input_tokens: 0,
-            output_tokens: 0,
-        })
+        Ok(output)
     }
 
     /// Complete the session normally — emits `SessionCompleted`.
@@ -202,8 +262,10 @@ impl SessionRuntime {
 
         self.emitter.emit(SessionEvent::SessionCompleted {
             summary: summary.into(),
-            input_tokens: 0,
-            output_tokens: 0,
+            total_usage: roz_core::session::event::SessionUsage {
+                input_tokens: 0,
+                output_tokens: 0,
+            },
         });
         Ok(())
     }
@@ -327,17 +389,21 @@ mod tests {
     async fn run_turn_increments_index() {
         let mut rt = make_runtime();
         let mut rx = rt.subscribe_events();
+        let mut executor = NoopExecutor;
 
         let output = rt
-            .run_turn(TurnInput {
-                user_message: "hello".into(),
-            })
+            .run_turn(
+                TurnInput {
+                    user_message: "hello".into(),
+                },
+                &mut executor,
+            )
             .await
             .expect("turn should succeed");
 
         assert_eq!(rt.state.turn_index, 1);
         assert_eq!(rt.snapshot().turn_index, 1);
-        assert_eq!(output.tool_calls_made, 0); // skeleton returns zero
+        assert_eq!(output.tool_calls_made, 0); // noop returns zero
 
         let env = rx.recv().await.expect("should receive TurnStarted");
         assert!(matches!(env.event, SessionEvent::TurnStarted { turn_index: 1 }));
@@ -349,6 +415,7 @@ mod tests {
     #[tokio::test]
     async fn run_turn_when_paused_returns_error() {
         let mut rt = make_runtime();
+        let mut executor = NoopExecutor;
 
         // Force into paused state
         rt.state.safe_pause = SafePauseState::Paused {
@@ -363,9 +430,12 @@ mod tests {
         };
 
         let err = rt
-            .run_turn(TurnInput {
-                user_message: "hello".into(),
-            })
+            .run_turn(
+                TurnInput {
+                    user_message: "hello".into(),
+                },
+                &mut executor,
+            )
             .await
             .unwrap_err();
 
@@ -375,12 +445,16 @@ mod tests {
     #[tokio::test]
     async fn run_turn_when_failed_returns_error() {
         let mut rt = make_runtime();
+        let mut executor = NoopExecutor;
         rt.state.failure = Some(RuntimeFailureKind::TrustViolation);
 
         let err = rt
-            .run_turn(TurnInput {
-                user_message: "hello".into(),
-            })
+            .run_turn(
+                TurnInput {
+                    user_message: "hello".into(),
+                },
+                &mut executor,
+            )
             .await
             .unwrap_err();
 
@@ -486,6 +560,7 @@ mod tests {
     async fn full_session_lifecycle() {
         let mut rt = make_runtime();
         let mut rx = rt.subscribe_events();
+        let mut executor = NoopExecutor;
 
         // Start
         rt.start_session().await.unwrap();
@@ -493,18 +568,24 @@ mod tests {
         assert!(matches!(env.event, SessionEvent::SessionStarted { .. }));
 
         // Turn 1
-        rt.run_turn(TurnInput {
-            user_message: "pick up the cube".into(),
-        })
+        rt.run_turn(
+            TurnInput {
+                user_message: "pick up the cube".into(),
+            },
+            &mut executor,
+        )
         .await
         .unwrap();
         let env = rx.recv().await.unwrap();
         assert!(matches!(env.event, SessionEvent::TurnStarted { turn_index: 1 }));
 
         // Turn 2
-        rt.run_turn(TurnInput {
-            user_message: "place it on the shelf".into(),
-        })
+        rt.run_turn(
+            TurnInput {
+                user_message: "place it on the shelf".into(),
+            },
+            &mut executor,
+        )
         .await
         .unwrap();
         let env = rx.recv().await.unwrap();

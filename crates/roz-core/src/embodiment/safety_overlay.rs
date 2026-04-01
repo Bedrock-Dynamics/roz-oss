@@ -20,6 +20,15 @@ pub struct SafetyOverlay {
     #[serde(default)]
     pub human_presence_zones: Vec<WorkspaceZone>,
     pub force_limits: Option<ForceSafetyLimits>,
+    /// Contact force envelopes per link.
+    #[serde(default)]
+    pub contact_force_envelopes: Vec<crate::embodiment::contact::ContactForceEnvelope>,
+    /// Zones where contact is permitted.
+    #[serde(default)]
+    pub contact_allowed_zones: Vec<WorkspaceZone>,
+    /// Per-sensor force rate limits (N/s).
+    #[serde(default)]
+    pub force_rate_limits: BTreeMap<String, f64>,
 }
 
 #[cfg(test)]
@@ -59,12 +68,22 @@ mod tests {
                 max_contact_torque_nm: 5.0,
                 force_rate_limit: 100.0,
             }),
+            contact_force_envelopes: vec![crate::embodiment::contact::ContactForceEnvelope {
+                link_name: "gripper_finger_left".into(),
+                max_normal_force_n: 20.0,
+                max_shear_force_n: 5.0,
+                max_force_rate_n_per_s: 100.0,
+            }],
+            contact_allowed_zones: vec![],
+            force_rate_limits: BTreeMap::from([("wrist_ft".into(), 200.0)]),
         };
         let json = serde_json::to_string(&overlay).unwrap();
         let back: SafetyOverlay = serde_json::from_str(&json).unwrap();
         assert_eq!(overlay.overlay_digest, back.overlay_digest);
         assert_eq!(overlay.workspace_restrictions.len(), 1);
         assert_eq!(overlay.joint_limit_overrides.len(), 1);
+        assert_eq!(back.contact_force_envelopes.len(), 1);
+        assert_eq!(back.force_rate_limits.len(), 1);
     }
 
     #[test]
@@ -76,6 +95,9 @@ mod tests {
             max_payload_kg: None,
             human_presence_zones: vec![],
             force_limits: None,
+            contact_force_envelopes: vec![],
+            contact_allowed_zones: vec![],
+            force_rate_limits: BTreeMap::new(),
         };
         let json = serde_json::to_string(&overlay).unwrap();
         let back: SafetyOverlay = serde_json::from_str(&json).unwrap();

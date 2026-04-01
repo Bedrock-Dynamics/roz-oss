@@ -7,9 +7,15 @@ use uuid::Uuid;
 use super::activity::{RuntimeActivity, RuntimeFailureKind, SafePauseState};
 use super::control::SessionMode;
 use super::feedback::ApprovalOutcome;
-use crate::controller::intervention::SafetyIntervention;
 use crate::edge_health::EdgeTransportHealth;
 use crate::trust::TrustPosture;
+
+/// Aggregated token usage for a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
 
 /// Unique event identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -79,8 +85,7 @@ pub enum SessionEvent {
     },
     SessionCompleted {
         summary: String,
-        input_tokens: u64,
-        output_tokens: u64,
+        total_usage: SessionUsage,
     },
     SessionFailed {
         failure: RuntimeFailureKind,
@@ -175,8 +180,12 @@ pub enum SessionEvent {
         restored_id: String,
         reason: String,
     },
-    SafetyInterventionEvent {
-        intervention: SafetyIntervention,
+    SafetyIntervention {
+        channel: String,
+        raw_value: f64,
+        clamped_value: f64,
+        kind: crate::controller::intervention::InterventionKind,
+        reason: String,
     },
 
     // -- Edge transport --

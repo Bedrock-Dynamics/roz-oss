@@ -18,7 +18,7 @@
 //! | 3.6: Planning | Mental planning model (no phantom tools) | By AGENTS.md |
 //! | 3.7: Camera | Camera/vision guidance (conditional) | By AGENTS.md |
 //! | 3.8: Simulation | Simulation environment guidance (conditional) | By AGENTS.md |
-//! | 3.9: WASM | WASM controller deployment guidance (conditional) | By AGENTS.md |
+//! | 3.9: WASM | WASM tick contract, promotion lifecycle, safety filter | By AGENTS.md |
 //! | 3.10: Multi-agent | Team coordination guidance (conditional) | By AGENTS.md |
 //! | 3.11: Skills | Behavior tree skill guidance (conditional) | By AGENTS.md |
 //! | 4: Quality | Conciseness, formatting, error reporting | By client config |
@@ -265,14 +265,44 @@ consume resources.";
 const TIER3_9_WASM: &str = "\
 WASM CONTROLLER DEPLOYMENT — Available when WASM tools are registered.
 
-1. Use execute_code to compile and verify WebAssembly BEFORE deploying. \
-Verification runs 100 ticks under production safety limits.
-2. Use deploy_controller ONLY after successful verification. This loads \
-the WASM into the live 100 Hz motor control loop.
-3. deploy_controller is a PHYSICAL tool — it moves real hardware. The \
-safety stack evaluates it before execution.
-4. If verification fails, fix the code and re-verify. Do not deploy \
-unverified code.";
+Tick contract (the ONLY ABI):
+1. The controller exports one function: process(tick-input) -> tick-output. \
+There are no per-call host queries. The host delivers all state in tick-input \
+before calling process(); the controller returns all commands in tick-output. \
+No mid-tick reads or writes. The legacy per-call host ABI is not supported.
+2. tick-input carries: tick counter, monotonic time, joint states, poses, \
+wrench, contact, pre-computed safety features, and a digest set. \
+tick-output carries: command_values (one per channel, by index), estop flag, \
+and optional metrics.
+
+Promotion lifecycle (verified → shadow → canary → active) — a controller \
+must pass each gate before actuation:
+3. verified: execute_code compiles and runs the controller under production \
+safety limits. No traps, no oscillation, latency within budget. Until \
+verified, the controller cannot be promoted.
+4. shadow: controller runs alongside the active controller; its tick-output \
+is compared but NOT sent to hardware.
+5. canary: controller actuates hardware; auto-rollback triggers on any \
+verifier failure or watchdog timeout.
+6. active: fully promoted, the current controller.
+
+Safety and verification:
+7. The safety filter runs AFTER process() and BEFORE hardware. The controller \
+cannot bypass it — outputs that exceed limits are clamped or rejected.
+8. The VerificationKey binds controller digest, manifest digest, model digest, \
+calibration digest, WIT world version, and compiler version. If ANY digest \
+changes, verification is stale and must be re-run before promotion.
+9. Do not promote a controller that has not been verified with matching digests. \
+A successful compilation is NOT sufficient — evidence (no traps, no oscillation, \
+latency within budget) is required.
+10. If verification fails, fix the code and re-verify. Do not deploy \
+unverified code.
+
+Interface manifest:
+11. The ControlInterfaceManifest describes the I/O contract — use this, not \
+the older per-call manifest format. It carries a version, a manifest_digest, \
+an ordered channel list, and bindings from physical joint names to channel \
+indices. Channel index is the position in tick-output.command_values.";
 
 const TIER3_10_MULTI_AGENT: &str = "\
 MULTI-AGENT COORDINATION — Available when team tools are registered.
@@ -778,6 +808,55 @@ mod tests {
         assert!(
             with_deploy.contains("WASM CONTROLLER DEPLOYMENT"),
             "deploy_controller should trigger WASM tier"
+        );
+    }
+
+    #[test]
+    fn wasm_tier_teaches_tick_contract_not_legacy_abi() {
+        let constitution = build_constitution(AgentLoopMode::React, &["execute_code"]);
+
+        // New tick contract must be present.
+        assert!(
+            constitution.contains("process(tick-input) -> tick-output"),
+            "WASM tier must describe the tick contract entrypoint"
+        );
+        assert!(
+            constitution.contains("no per-call host queries"),
+            "WASM tier must forbid per-call host queries"
+        );
+        assert!(
+            constitution.contains("ControlInterfaceManifest"),
+            "WASM tier must reference ControlInterfaceManifest, not ChannelManifest"
+        );
+        assert!(
+            constitution.contains("VerificationKey"),
+            "WASM tier must mention VerificationKey and digest binding"
+        );
+        assert!(
+            constitution.contains("verified → shadow → canary → active"),
+            "WASM tier must describe the promotion lifecycle"
+        );
+        assert!(
+            constitution.contains("safety filter runs AFTER process()"),
+            "WASM tier must state that safety filter runs after process()"
+        );
+        assert!(
+            constitution.contains("evidence"),
+            "WASM tier must require evidence for promotion"
+        );
+
+        // Old per-call ABI must NOT appear.
+        assert!(
+            !constitution.contains("command::set"),
+            "WASM tier must not teach legacy command::set host function"
+        );
+        assert!(
+            !constitution.contains("state::get"),
+            "WASM tier must not teach legacy state::get host function"
+        );
+        assert!(
+            !constitution.contains("ChannelManifest"),
+            "WASM tier must not reference legacy ChannelManifest"
         );
     }
 

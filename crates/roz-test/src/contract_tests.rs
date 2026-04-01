@@ -93,7 +93,7 @@ const fn event_type_name(event: &SessionEvent) -> &'static str {
         SessionEvent::ControllerShadowStarted { .. } => "controller_shadow",
         SessionEvent::ControllerPromoted { .. } => "controller_promoted",
         SessionEvent::ControllerRolledBack { .. } => "controller_rolled_back",
-        SessionEvent::SafetyInterventionEvent { .. } => "safety_intervention",
+        SessionEvent::SafetyIntervention { .. } => "safety_intervention",
         SessionEvent::EdgeTransportDegraded { .. } => "edge_degraded",
         SessionEvent::ReasoningTrace { .. } => "reasoning_trace",
         SessionEvent::ContextCompacted { .. } => "context_compacted",
@@ -139,8 +139,10 @@ mod tests {
     fn completed_envelope() -> EventEnvelope {
         make_envelope(SessionEvent::SessionCompleted {
             summary: "done".into(),
-            input_tokens: 100,
-            output_tokens: 50,
+            total_usage: roz_core::session::event::SessionUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+            },
         })
     }
 

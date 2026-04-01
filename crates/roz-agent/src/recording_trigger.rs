@@ -24,7 +24,7 @@ impl RecordingTrigger {
                 self.recording = true;
                 RecordingAction::StartRecording
             }
-            SessionEvent::SafetyInterventionEvent { .. } if self.config.record_on_safety && !self.recording => {
+            SessionEvent::SafetyIntervention { .. } if self.config.record_on_safety && !self.recording => {
                 self.recording = true;
                 RecordingAction::StartRecording
             }
@@ -51,19 +51,17 @@ pub enum RecordingAction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use roz_core::controller::intervention::{InterventionKind, SafetyIntervention};
+    use roz_core::controller::intervention::InterventionKind;
     use roz_core::session::activity::RuntimeFailureKind;
     use roz_core::session::control::SessionMode;
 
     fn safety_intervention_event() -> SessionEvent {
-        SessionEvent::SafetyInterventionEvent {
-            intervention: SafetyIntervention {
-                channel: "joint_vel".into(),
-                raw_value: 2.0,
-                clamped_value: 1.0,
-                kind: InterventionKind::VelocityClamp,
-                reason: "exceeded limit".into(),
-            },
+        SessionEvent::SafetyIntervention {
+            channel: "joint_vel".into(),
+            raw_value: 2.0,
+            clamped_value: 1.0,
+            kind: InterventionKind::VelocityClamp,
+            reason: "exceeded limit".into(),
         }
     }
 
@@ -78,8 +76,10 @@ mod tests {
     fn session_completed_event() -> SessionEvent {
         SessionEvent::SessionCompleted {
             summary: "done".into(),
-            input_tokens: 100,
-            output_tokens: 50,
+            total_usage: roz_core::session::event::SessionUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+            },
         }
     }
 

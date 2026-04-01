@@ -55,7 +55,7 @@ pub const fn event_type_name(event: &SessionEvent) -> &'static str {
         SessionEvent::ControllerShadowStarted { .. } => "controller_shadow",
         SessionEvent::ControllerPromoted { .. } => "controller_promoted",
         SessionEvent::ControllerRolledBack { .. } => "controller_rolled_back",
-        SessionEvent::SafetyInterventionEvent { .. } => "safety_intervention",
+        SessionEvent::SafetyIntervention { .. } => "safety_intervention",
         SessionEvent::EdgeTransportDegraded { .. } => "edge_degraded",
         SessionEvent::ReasoningTrace { .. } => "reasoning_trace",
         SessionEvent::ContextCompacted { .. } => "context_compacted",
@@ -109,8 +109,10 @@ mod tests {
         assert_eq!(
             event_type_name(&SessionEvent::SessionCompleted {
                 summary: "ok".into(),
-                input_tokens: 0,
-                output_tokens: 0,
+                total_usage: roz_core::session::event::SessionUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                },
             }),
             "session_completed"
         );

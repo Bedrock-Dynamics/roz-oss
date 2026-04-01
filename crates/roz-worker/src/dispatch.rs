@@ -40,50 +40,67 @@ pub fn build_agent_input(inv: &TaskInvocation) -> AgentInput {
     };
 
     // Inject robot controller interface context.
-    // TODO(reachy-mini): Read manifest from EnvironmentConfig in task invocation.
+    // TODO(reachy-mini): Read ControlInterfaceManifest from EnvironmentConfig in task invocation.
     // Empty manifest means no channel documentation in system prompt.
     let manifest = roz_core::channels::ChannelManifest::default();
-    let robot_context = format!(
-        "## Robot Controller Interface\n\
-         Robot: {} ({})\n\
-         Control rate: {}Hz\n\n\
-         ### Command Channels (write via command::set(index, value)):\n{}\n\n\
-         ### State Channels (read via state::get(index)):\n{}\n\n\
-         ### WASM Host Functions:\n\
-         - `command::set(index: i32, value: f64) -> i32` (0=ok, -1=OOB, -2=clamped)\n\
-         - `command::count() -> i32`\n\
-         - `state::get(index: i32) -> f64`\n\
-         - `state::count() -> i32`\n\
-         - `math::sin(f64) -> f64`, `math::cos(f64) -> f64`\n\
-         - `timing::sim_time_ns() -> i64`, `timing::now_ns() -> i64`\n\
-         - `safety::request_estop()`\n\n\
-         ### Example WAT (oscillate joint 0):\n\
-         ```wat\n\
-         (module\n\
-           (import \"math\" \"sin\" (func $sin (param f64) (result f64)))\n\
-           (import \"command\" \"set\" (func $cmd (param i32 f64) (result i32)))\n\
-           (func (export \"process\") (param i64)\n\
-             (drop (call $cmd (i32.const 0)\n\
-               (f64.mul (call $sin (f64.mul (f64.convert_i64_u (local.get 0)) (f64.const 0.05)))\n\
-                 (f64.const 0.3))))))\n\
-         ```",
-        manifest.robot_id,
-        manifest.robot_class,
-        manifest.control_rate_hz,
+    let command_channels = if manifest.commands.is_empty() {
+        "  (none — no channels configured)".to_owned()
+    } else {
         manifest
             .commands
             .iter()
             .enumerate()
             .map(|(i, c)| format!("  {i}: {} ({}, [{:.2}, {:.2}])", c.name, c.unit, c.limits.0, c.limits.1))
             .collect::<Vec<_>>()
-            .join("\n"),
+            .join("\n")
+    };
+    let state_channels = if manifest.states.is_empty() {
+        "  (none — no state channels configured)".to_owned()
+    } else {
         manifest
             .states
             .iter()
             .enumerate()
             .map(|(i, s)| format!("  {i}: {} ({})", s.name, s.unit))
             .collect::<Vec<_>>()
-            .join("\n"),
+            .join("\n")
+    };
+    let robot_context = format!(
+        "## Robot Controller Interface\n\
+         Robot: {} ({})\n\
+         Control rate: {}Hz\n\n\
+         ### Tick Contract\n\
+         Controllers export a single function: `process(tick-input) -> tick-output`.\n\
+         No per-call host queries. The host delivers all sensor state in tick-input\n\
+         before calling process(); the controller returns all commands in tick-output.\n\
+         There is no command::set / state::get. No mid-tick reads or writes.\n\n\
+         tick-input fields: tick (u64), monotonic_time_ns, digests (digest set),\n\
+         joints (name/position/velocity/effort per joint), watched_poses, wrench,\n\
+         contact, features (pre-computed safety margins + alerts), config_json.\n\n\
+         tick-output fields: command_values (Vec<f64>, one per command channel by index),\n\
+         estop (bool), estop_reason (optional string), metrics (optional named scalars).\n\n\
+         ### Command Channels (index → tick-output.command_values[index]):\n{}\n\n\
+         ### State Channels (available in tick-input.joints by name):\n{}\n\n\
+         ### Safety Filter\n\
+         The safety filter runs AFTER process() and BEFORE hardware. The controller\n\
+         cannot bypass it — outputs that exceed limits are clamped or rejected.\n\
+         Setting estop=true in tick-output triggers an immediate e-stop.\n\n\
+         ### Promotion Lifecycle\n\
+         verified → shadow → canary → active\n\
+         Promotion requires evidence: no traps, no oscillation, latency within budget.\n\
+         The VerificationKey binds controller digest + manifest digest + model digest\n\
+         + calibration digest + WIT world version + compiler version.\n\
+         Any digest change invalidates verification — re-run before promotion.\n\n\
+         ### Example WAT (hold all joints at 0.0):\n\
+         ```wat\n\
+         (module\n\
+           (func (export \"process\") (param i64) (result i64)\n\
+             ;; Return empty tick-output: command_values=[], estop=false.\n\
+             ;; Real controllers decode tick-input via WIT, compute commands,\n\
+             ;; and encode tick-output. Use execute_code to compile + verify.\n\
+             (i64.const 0)))\n\
+         ```",
+        manifest.robot_id, manifest.robot_class, manifest.control_rate_hz, command_channels, state_channels,
     );
     agent_input.system_prompt.push(robot_context);
 
@@ -337,5 +354,40 @@ mod tests {
         let legacy_json = r#"{"task_id":"00000000-0000-0000-0000-000000000000","tenant_id":"t","prompt":"test","environment_id":"00000000-0000-0000-0000-000000000000","safety_policy_id":null,"host_id":"00000000-0000-0000-0000-000000000000","timeout_secs":60,"mode":"react","parent_task_id":null,"restate_url":"http://localhost:8080"}"#;
         let inv: TaskInvocation = serde_json::from_str(legacy_json).unwrap();
         assert!(inv.phases.is_empty());
+    }
+
+    #[test]
+    fn robot_context_teaches_tick_contract_not_legacy_abi() {
+        let inv = sample_invocation(ExecutionMode::React);
+        let input = build_agent_input(&inv);
+        let ctx = &input.system_prompt[1];
+
+        // New tick contract must be present.
+        assert!(
+            ctx.contains("process(tick-input) -> tick-output"),
+            "robot context must describe the tick contract entrypoint"
+        );
+        assert!(
+            ctx.contains("Tick Contract"),
+            "robot context must have a Tick Contract section"
+        );
+        assert!(
+            ctx.contains("Promotion Lifecycle"),
+            "robot context must describe the promotion lifecycle"
+        );
+        assert!(
+            ctx.contains("Safety Filter"),
+            "robot context must describe the safety filter"
+        );
+        assert!(
+            ctx.contains("There is no command::set / state::get"),
+            "robot context must explicitly negate the legacy host functions"
+        );
+
+        // Old per-call ABI must NOT appear.
+        assert!(
+            !ctx.contains("WASM Host Functions"),
+            "robot context must not list legacy WASM host functions"
+        );
     }
 }

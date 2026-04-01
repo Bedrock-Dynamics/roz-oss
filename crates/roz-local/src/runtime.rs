@@ -10,8 +10,9 @@ use roz_agent::dispatch::remote::PendingApprovals;
 use roz_agent::error::AgentError;
 use roz_agent::model::create_model;
 use roz_agent::model::types::{Message, Model, StreamChunk};
+use roz_agent::prompt_assembler::SystemBlock;
 use roz_agent::safety::stack::SafetyStack;
-use roz_agent::session_runtime::{SessionConfig, SessionRuntime};
+use roz_agent::session_runtime::{SessionConfig, SessionRuntime, TurnExecutor, TurnInput, TurnOutput};
 use roz_agent::spatial_provider::{NullSpatialContextProvider, SpatialContextProvider};
 use roz_copper::handle::CopperHandle;
 use roz_core::session::control::SessionMode;
@@ -208,10 +209,99 @@ pub struct LocalRuntime {
     /// Running Copper controller handle — spawned lazily when simulation is active.
     /// Must not be dropped while the controller is in use (drop sends Halt).
     copper_handle: Option<CopperHandle>,
-    /// Session lifecycle runtime — tracks events and state alongside the existing `AgentLoop` path.
-    /// Does not replace `AgentLoop` yet; runs in parallel for lifecycle tracking.
-    #[allow(dead_code, reason = "wired for event emission; full execution migration pending")]
+    /// Session lifecycle runtime — the single source of truth for session state.
+    /// All turns go through `SessionRuntime::run_turn` which delegates to a `TurnExecutor`.
     session_runtime: SessionRuntime,
+}
+
+/// Extracted executor state that implements [`TurnExecutor`].
+///
+/// Holds everything needed to create an `AgentLoop` and run a single turn,
+/// without borrowing `LocalRuntime` (which owns `SessionRuntime`).
+///
+/// Fields are wrapped in `Option` so they can be taken (moved) into the async
+/// block without requiring placeholder values.
+struct LocalTurnExecutor<'a> {
+    model: Option<Box<dyn Model>>,
+    dispatcher: Option<ToolDispatcher>,
+    extensions: Option<roz_agent::dispatch::Extensions>,
+    safety: Option<SafetyStack>,
+    spatial: Option<Box<dyn SpatialContextProvider>>,
+    system_prompt: Vec<String>,
+    mode: AgentLoopMode,
+    history: Vec<Message>,
+    history_out: &'a mut Vec<Message>,
+    session_store: &'a SessionStore,
+    session_id: &'a str,
+}
+
+impl TurnExecutor for LocalTurnExecutor<'_> {
+    fn execute_turn(
+        &mut self,
+        _turn_index: u32,
+        user_message: &str,
+        _system_blocks: Vec<SystemBlock>,
+    ) -> roz_agent::session_runtime::TurnFuture<'_> {
+        // NOTE: We use self.system_prompt built by prepare_turn() rather than the
+        // SessionRuntime-provided system_blocks, because prepare_turn() includes the
+        // tool catalog, robot.toml, AGENTS.md, etc. that the assembler doesn't know about yet.
+        // As prompt assembly migrates fully into SessionRuntime, this will converge.
+        let user_msg = user_message.to_string();
+        Box::pin(async move {
+            let model = self.model.take().expect("execute_turn called more than once");
+            let dispatcher = self.dispatcher.take().expect("execute_turn called more than once");
+            let safety = self.safety.take().expect("execute_turn called more than once");
+            let spatial = self.spatial.take().expect("execute_turn called more than once");
+            let extensions = self.extensions.take().expect("execute_turn called more than once");
+
+            let mut agent = AgentLoop::new(model, dispatcher, safety, spatial).with_extensions(extensions);
+
+            let input = AgentInput {
+                task_id: uuid::Uuid::new_v4().to_string(),
+                tenant_id: "local".to_string(),
+                model_name: String::new(),
+                system_prompt: self.system_prompt.clone(),
+                user_message: user_msg,
+                max_cycles: 10,
+                max_tokens: 4096,
+                max_context_tokens: 100_000,
+                mode: self.mode,
+                phases: vec![],
+                tool_choice: None,
+                response_schema: None,
+                streaming: false,
+                history: self.history.clone(),
+                cancellation_token: None,
+                control_mode: roz_core::safety::ControlMode::default(),
+            };
+
+            let output = agent
+                .run(input)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+
+            // Update history on the outer runtime
+            self.history_out.clone_from(&output.messages);
+            self.session_store
+                .save(self.session_id, self.history_out)
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+
+            // Extract assistant text for TurnOutput
+            let assistant_message: String = output
+                .messages
+                .iter()
+                .filter(|m| m.role == roz_agent::model::types::MessageRole::Assistant)
+                .filter_map(roz_agent::model::types::Message::text)
+                .collect();
+
+            Ok(TurnOutput {
+                assistant_message,
+                tool_calls_made: output.cycles,
+                input_tokens: u64::from(output.total_usage.input_tokens),
+                output_tokens: u64::from(output.total_usage.output_tokens),
+            })
+        })
+    }
 }
 
 impl LocalRuntime {
@@ -574,8 +664,9 @@ impl LocalRuntime {
 
     /// Run a single conversational turn.
     ///
-    /// Creates the model, registers tools, builds the system prompt,
-    /// runs the `AgentLoop`, and persists the resulting messages.
+    /// Delegates to [`SessionRuntime::run_turn`] which manages lifecycle (state
+    /// checks, event emission, snapshot updates). The actual model invocation
+    /// happens inside [`LocalTurnExecutor`].
     pub async fn run_turn(&mut self, user_message: &str) -> Result<AgentOutput, RuntimeError> {
         let model = (self.model_factory)().map_err(RuntimeError::Model)?;
         let mode = self.current_mode();
@@ -583,34 +674,48 @@ impl LocalRuntime {
         let safety = self.build_safety_stack();
         let spatial = self.build_spatial_provider();
 
-        let mut agent = AgentLoop::new(model, dispatcher, safety, spatial).with_extensions(extensions);
-
-        let input = AgentInput {
-            task_id: uuid::Uuid::new_v4().to_string(),
-            tenant_id: "local".to_string(),
-            model_name: String::new(),
+        let mut executor = LocalTurnExecutor {
+            model: Some(model),
+            dispatcher: Some(dispatcher),
+            extensions: Some(extensions),
+            safety: Some(safety),
+            spatial: Some(spatial),
             system_prompt,
-            user_message: user_message.to_string(),
-            max_cycles: 10,
-            max_tokens: 4096,
-            max_context_tokens: 100_000,
             mode,
-            phases: vec![],
-            tool_choice: None,
-            response_schema: None,
-            streaming: false,
             history: self.history.clone(),
-            cancellation_token: None,
-            control_mode: roz_core::safety::ControlMode::default(),
+            history_out: &mut self.history,
+            session_store: &self.session_store,
+            session_id: &self.session_id,
         };
 
-        let output = agent.run(input).await.map_err(RuntimeError::Model)?;
-        self.history.clone_from(&output.messages);
-        self.session_store
-            .save(&self.session_id, &self.history)
-            .map_err(RuntimeError::Io)?;
+        let turn_input = TurnInput {
+            user_message: user_message.to_string(),
+        };
 
-        Ok(output)
+        let turn_output = self
+            .session_runtime
+            .run_turn(turn_input, &mut executor)
+            .await
+            .map_err(|e| RuntimeError::Agent(e.to_string()))?;
+
+        // Reconstruct an AgentOutput from the TurnOutput + updated history.
+        // This preserves the existing public API for callers of run_turn.
+        Ok(AgentOutput {
+            cycles: turn_output.tool_calls_made,
+            final_response: if turn_output.assistant_message.is_empty() {
+                None
+            } else {
+                Some(turn_output.assistant_message)
+            },
+            total_usage: roz_agent::model::types::TokenUsage {
+                #[allow(clippy::cast_possible_truncation)]
+                input_tokens: turn_output.input_tokens as u32,
+                #[allow(clippy::cast_possible_truncation)]
+                output_tokens: turn_output.output_tokens as u32,
+                ..Default::default()
+            },
+            messages: self.history.clone(),
+        })
     }
 
     /// Run a single conversational turn with streaming output.

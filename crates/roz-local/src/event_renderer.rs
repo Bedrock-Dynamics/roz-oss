@@ -31,10 +31,13 @@ pub fn render_event(event: &SessionEvent) -> Option<String> {
         SessionEvent::SessionCompleted { summary, .. } => Some(format!("[session] Completed: {summary}")),
         SessionEvent::SessionFailed { failure } => Some(format!("[session] FAILED: {failure:?}")),
         SessionEvent::ControllerPromoted { artifact_id, .. } => Some(format!("[controller] Promoted: {artifact_id}")),
-        SessionEvent::SafetyInterventionEvent { intervention } => Some(format!(
-            "[safety] {}: {} -> {} ({:?})",
-            intervention.channel, intervention.raw_value, intervention.clamped_value, intervention.kind
-        )),
+        SessionEvent::SafetyIntervention {
+            channel,
+            raw_value,
+            clamped_value,
+            kind,
+            ..
+        } => Some(format!("[safety] {channel}: {raw_value} -> {clamped_value} ({kind:?})")),
         // Observability-only events are not rendered in the TUI
         _ => None,
     }
@@ -43,7 +46,7 @@ pub fn render_event(event: &SessionEvent) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use roz_core::controller::intervention::{InterventionKind, SafetyIntervention};
+    use roz_core::controller::intervention::InterventionKind;
     use roz_core::session::activity::{RuntimeActivity, RuntimeFailureKind, SafePauseState};
     use roz_core::session::control::SessionMode;
 
@@ -137,8 +140,10 @@ mod tests {
     fn session_completed_renders() {
         let event = SessionEvent::SessionCompleted {
             summary: "task done".into(),
-            input_tokens: 100,
-            output_tokens: 50,
+            total_usage: roz_core::session::event::SessionUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+            },
         };
         let line = render_event(&event).expect("should render");
         assert!(line.contains("task done"));
@@ -165,14 +170,12 @@ mod tests {
 
     #[test]
     fn safety_intervention_renders() {
-        let event = SessionEvent::SafetyInterventionEvent {
-            intervention: SafetyIntervention {
-                channel: "joint_1_velocity".into(),
-                raw_value: 2.5,
-                clamped_value: 1.0,
-                kind: InterventionKind::VelocityClamp,
-                reason: "exceeded velocity limit".into(),
-            },
+        let event = SessionEvent::SafetyIntervention {
+            channel: "joint_1_velocity".into(),
+            raw_value: 2.5,
+            clamped_value: 1.0,
+            kind: InterventionKind::VelocityClamp,
+            reason: "exceeded velocity limit".into(),
         };
         let line = render_event(&event).expect("should render");
         assert!(line.contains("joint_1_velocity"));
