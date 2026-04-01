@@ -15,3 +15,4 @@ pub mod session_runtime;
 pub mod skills;
 pub mod spatial_provider;
 pub mod tools;
+pub mod verifier;
