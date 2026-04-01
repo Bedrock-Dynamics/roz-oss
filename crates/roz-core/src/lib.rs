@@ -26,6 +26,7 @@ pub mod phases;
 pub mod primitives;
 pub mod provenance;
 pub mod recording;
+pub mod recovery;
 pub mod safety;
 pub mod session;
 pub mod sim2real;
