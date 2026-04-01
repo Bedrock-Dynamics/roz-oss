@@ -11,6 +11,7 @@ pub mod model;
 pub mod prompt_assembler;
 pub mod provenance;
 pub mod safety;
+pub mod session_runtime;
 pub mod skills;
 pub mod spatial_provider;
 pub mod tools;
