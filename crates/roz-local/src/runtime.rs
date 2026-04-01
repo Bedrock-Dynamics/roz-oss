@@ -240,13 +240,16 @@ impl TurnExecutor for LocalTurnExecutor<'_> {
         &mut self,
         _turn_index: u32,
         user_message: &str,
-        _system_blocks: Vec<SystemBlock>,
+        system_blocks: Vec<SystemBlock>,
     ) -> roz_agent::session_runtime::TurnFuture<'_> {
-        // NOTE: We use self.system_prompt built by prepare_turn() rather than the
-        // SessionRuntime-provided system_blocks, because prepare_turn() includes the
-        // tool catalog, robot.toml, AGENTS.md, etc. that the assembler doesn't know about yet.
-        // As prompt assembly migrates fully into SessionRuntime, this will converge.
         let user_msg = user_message.to_string();
+        // Use SessionRuntime-provided system blocks as the authoritative prompt.
+        let system_prompt: Vec<String> = if system_blocks.is_empty() {
+            // Fallback only if assembler returned nothing (shouldn't happen).
+            self.system_prompt.clone()
+        } else {
+            system_blocks.into_iter().map(|b| b.content).collect()
+        };
         Box::pin(async move {
             let model = self.model.take().expect("execute_turn called more than once");
             let dispatcher = self.dispatcher.take().expect("execute_turn called more than once");
@@ -260,7 +263,7 @@ impl TurnExecutor for LocalTurnExecutor<'_> {
                 task_id: uuid::Uuid::new_v4().to_string(),
                 tenant_id: "local".to_string(),
                 model_name: String::new(),
-                system_prompt: self.system_prompt.clone(),
+                system_prompt,
                 user_message: user_msg,
                 max_cycles: 10,
                 max_tokens: 4096,
@@ -674,6 +677,10 @@ impl LocalRuntime {
         let safety = self.build_safety_stack();
         let spatial = self.build_spatial_provider();
 
+        // Extract project context for PromptAssembler (AGENTS.md, robot.toml, etc.)
+        // These come from prepare_turn's system_prompt blocks (indices 1+).
+        let project_context: Vec<String> = system_prompt.get(1..).unwrap_or_default().to_vec();
+
         let mut executor = LocalTurnExecutor {
             model: Some(model),
             dispatcher: Some(dispatcher),
@@ -690,6 +697,8 @@ impl LocalRuntime {
 
         let turn_input = TurnInput {
             user_message: user_message.to_string(),
+            tool_schemas: vec![], // Tool schemas go via system_prompt block 0 (constitution + catalog)
+            project_context,
         };
 
         let turn_output = self
@@ -724,6 +733,28 @@ impl LocalRuntime {
     /// in real time. Call [`TurnHandle::finish`] after draining chunks to persist
     /// history and retrieve the final [`AgentOutput`].
     ///
+    /// Build system prompt via `PromptAssembler`, falling back to `prepare_turn` output.
+    fn assemble_prompt(&self, prepare_prompt: &[String], mode: AgentLoopMode) -> Vec<String> {
+        let project_context: Vec<String> = prepare_prompt.get(1..).unwrap_or_default().to_vec();
+        let assembled = self
+            .session_runtime
+            .prompt_assembler
+            .assemble(&roz_agent::prompt_assembler::AssemblyContext {
+                mode,
+                snapshot: Some(&self.session_runtime.state.snapshot),
+                spatial_context: None,
+                tool_schemas: &[],
+                trust_posture: &self.session_runtime.state.trust,
+                edge_state: &self.session_runtime.state.edge_state,
+                custom_blocks: project_context,
+            });
+        if assembled.is_empty() {
+            prepare_prompt.to_vec()
+        } else {
+            assembled.into_iter().map(|b| b.content).collect()
+        }
+    }
+
     /// The non-streaming `run_turn()` is unchanged — `exec` mode continues to use it.
     pub fn run_turn_streaming(&mut self, user_message: &str) -> Result<TurnHandle, RuntimeError> {
         // SessionRuntime lifecycle: emit TurnStarted, track state
@@ -746,9 +777,12 @@ impl LocalRuntime {
 
         let model = (self.model_factory)().map_err(RuntimeError::Model)?;
         let mode = self.current_mode();
-        let (dispatcher, extensions, system_prompt) = self.prepare_turn(mode);
+        let (dispatcher, extensions, prepare_prompt) = self.prepare_turn(mode);
         let safety = self.build_safety_stack();
         let spatial = self.build_spatial_provider();
+
+        // Use PromptAssembler as authoritative prompt source.
+        let system_prompt = self.assemble_prompt(&prepare_prompt, mode);
 
         let pending_approvals: PendingApprovals = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let mut agent = AgentLoop::new(model, dispatcher, safety, spatial)

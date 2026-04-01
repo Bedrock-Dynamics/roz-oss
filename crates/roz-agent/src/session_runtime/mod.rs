@@ -26,6 +26,10 @@ use crate::prompt_assembler::{PromptAssembler, SystemBlock};
 #[derive(Debug, Clone)]
 pub struct TurnInput {
     pub user_message: String,
+    /// Tool schemas available this turn (for prompt assembly block 1).
+    pub tool_schemas: Vec<crate::prompt_assembler::ToolSchema>,
+    /// Project context strings (AGENTS.md, robot.toml summary, etc.) for prompt block 2.
+    pub project_context: Vec<String>,
 }
 
 /// Output from a single turn.
@@ -223,17 +227,17 @@ impl SessionRuntime {
             unblock_event: None,
         });
 
-        // 3. Build system blocks via PromptAssembler
+        // 3. Build system blocks via PromptAssembler (authoritative prompt source)
         let system_blocks = self
             .prompt_assembler
             .assemble(&crate::prompt_assembler::AssemblyContext {
                 mode: crate::agent_loop::AgentLoopMode::React,
                 snapshot: Some(&self.state.snapshot),
                 spatial_context: None,
-                tool_schemas: &[],
+                tool_schemas: &input.tool_schemas,
                 trust_posture: &self.state.trust,
                 edge_state: &self.state.edge_state,
-                custom_blocks: vec![],
+                custom_blocks: input.project_context.clone(),
             });
 
         // 4. Execute turn via the surface-provided executor
@@ -409,6 +413,8 @@ mod tests {
             .run_turn(
                 TurnInput {
                     user_message: "hello".into(),
+                    tool_schemas: vec![],
+                    project_context: vec![],
                 },
                 &mut executor,
             )
@@ -447,6 +453,8 @@ mod tests {
             .run_turn(
                 TurnInput {
                     user_message: "hello".into(),
+                    tool_schemas: vec![],
+                    project_context: vec![],
                 },
                 &mut executor,
             )
@@ -466,6 +474,8 @@ mod tests {
             .run_turn(
                 TurnInput {
                     user_message: "hello".into(),
+                    tool_schemas: vec![],
+                    project_context: vec![],
                 },
                 &mut executor,
             )
@@ -585,6 +595,8 @@ mod tests {
         rt.run_turn(
             TurnInput {
                 user_message: "pick up the cube".into(),
+                tool_schemas: vec![],
+                project_context: vec![],
             },
             &mut executor,
         )
@@ -601,6 +613,8 @@ mod tests {
         rt.run_turn(
             TurnInput {
                 user_message: "place it on the shelf".into(),
+                tool_schemas: vec![],
+                project_context: vec![],
             },
             &mut executor,
         )

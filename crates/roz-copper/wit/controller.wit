@@ -88,6 +88,18 @@ interface control {
         metrics: list<metric>,
     }
 
+    /// Logical contract: process(input: tick-input) -> tick-output
+    ///
+    /// Lowered ABI (what the WASM module actually exports/imports):
+    ///   export: process(tick: u64) -> ()
+    ///   import: tick::input-len() -> i32
+    ///   import: tick::get-input(ptr: i32, len: i32) -> i32
+    ///   import: tick::set-output(ptr: i32, len: i32)
+    ///
+    /// The host serializes tick-input as JSON and provides it via get-input.
+    /// The controller deserializes, processes, serializes tick-output,
+    /// and provides it via set-output. This is the flat core-WASM ABI
+    /// lowering per spec design rule 5 — no component-model runtime needed.
     process: func(input: tick-input) -> tick-output;
 }
 

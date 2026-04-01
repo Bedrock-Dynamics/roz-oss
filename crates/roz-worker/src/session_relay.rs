@@ -188,6 +188,9 @@ async fn handle_edge_session(
     };
     let mut session_runtime = roz_agent::session_runtime::SessionRuntime::new(&session_config);
 
+    // Maintain history across turns so the agent has conversational context.
+    let mut session_history: Vec<roz_agent::model::types::Message> = Vec::new();
+
     tracing::info!(session_id, ?session_mode, "edge session mode resolved");
 
     // Process subsequent messages on this session's dedicated subscription.
@@ -236,7 +239,7 @@ async fn handle_edge_session(
                     tool_choice: None,
                     response_schema: None,
                     streaming: false,
-                    history: Vec::new(),
+                    history: session_history.clone(),
                     phases: Vec::new(),
                     cancellation_token: Some(agent_cancel.clone()),
                     control_mode: roz_core::safety::ControlMode::for_remote(),
@@ -291,6 +294,9 @@ async fn handle_edge_session(
 
                 match agent_result {
                     Ok(output) => {
+                        // Persist messages across turns.
+                        session_history.clone_from(&output.messages);
+
                         // Send text response (may be None if agent produced no text).
                         if let Some(ref text) = output.final_response {
                             let text_delta = serde_json::json!({
