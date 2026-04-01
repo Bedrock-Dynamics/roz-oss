@@ -5874,6 +5874,8 @@ dependencies = [
 name = "roz-test"
 version = "0.2.0"
 dependencies = [
+ "chrono",
+ "roz-core",
  "testcontainers",
  "testcontainers-modules",
  "tokio",

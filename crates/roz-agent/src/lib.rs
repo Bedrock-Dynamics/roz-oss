@@ -14,6 +14,7 @@ pub mod model;
 pub mod observability;
 pub mod prompt_assembler;
 pub mod provenance;
+pub mod recording_trigger;
 pub mod safety;
 pub mod session_runtime;
 pub mod skills;
