@@ -25,7 +25,12 @@ pub struct TickInputBuilder {
 
 impl TickInputBuilder {
     /// Create a new builder with the given digests, joint names, watched frames, and config JSON.
-    pub const fn new(digests: DigestSet, joint_names: Vec<String>, watched_frames: Vec<String>, config_json: String) -> Self {
+    pub const fn new(
+        digests: DigestSet,
+        joint_names: Vec<String>,
+        watched_frames: Vec<String>,
+        config_json: String,
+    ) -> Self {
         Self {
             digests,
             joint_names,
