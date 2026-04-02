@@ -4,6 +4,8 @@
 pub mod binding;
 pub mod calibration;
 pub mod contact;
+pub mod embodiment_runtime;
+pub mod frame_snapshot;
 pub mod frame_tree;
 pub mod limits;
 pub mod model;
@@ -21,6 +23,10 @@ pub use binding::*;
 pub use calibration::*;
 #[allow(unused_imports)]
 pub use contact::*;
+#[allow(unused_imports)]
+pub use embodiment_runtime::*;
+#[allow(unused_imports)]
+pub use frame_snapshot::*;
 #[allow(unused_imports)]
 pub use frame_tree::*;
 pub use limits::*;

@@ -144,6 +144,30 @@ fn publish_state(
     }));
 }
 
+/// Finalize and log the current evidence collector (if any) before replacing it.
+///
+/// Called when a new `LoadArtifact` arrives or the controller is halted, so the
+/// evidence bundle from the previous controller run is not silently discarded.
+fn finalize_evidence(collector: &mut Option<EvidenceCollector>) {
+    if let Some(old) = collector.take() {
+        let bundle = old.finalize(
+            "not_available",
+            "not_available",
+            "not_available",
+            "bedrock:controller@2.0.0",
+            roz_core::controller::artifact::ExecutionMode::Live,
+            "wasmtime",
+        );
+        tracing::info!(
+            controller_id = %bundle.controller_id,
+            ticks = bundle.ticks_run,
+            rejections = bundle.rejection_count,
+            traps = bundle.trap_count,
+            "controller evidence finalized"
+        );
+    }
+}
+
 /// Drain emergency and normal command channels, returning whether any
 /// command was received on `cmd_rx` (for watchdog bookkeeping).
 ///
@@ -170,6 +194,8 @@ fn drain_commands(
                 let channel_names: Vec<String> = load.manifest.commands.iter().map(|c| c.name.clone()).collect();
                 *tick_builder = Some(builder);
                 *hot_path_filter = Some(filter);
+                // Finalize previous evidence before replacing the collector.
+                finalize_evidence(evidence_collector);
                 *evidence_collector = Some(EvidenceCollector::new("controller", &channel_names));
                 *controller_promoted = true;
             }
@@ -186,6 +212,8 @@ fn drain_commands(
             let channel_names: Vec<String> = load.manifest.commands.iter().map(|c| c.name.clone()).collect();
             *tick_builder = Some(builder);
             *hot_path_filter = Some(filter);
+            // Finalize previous evidence before replacing the collector.
+            finalize_evidence(evidence_collector);
             *evidence_collector = Some(EvidenceCollector::new("controller", &channel_names));
             *controller_promoted = true;
         }

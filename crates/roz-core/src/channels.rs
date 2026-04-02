@@ -141,6 +141,57 @@ impl Default for ChannelManifest {
 }
 
 // ---------------------------------------------------------------------------
+// Conversion from spec-level ControlInterfaceManifest
+// ---------------------------------------------------------------------------
+
+impl From<&crate::embodiment::binding::ControlInterfaceManifest> for ChannelManifest {
+    /// Build a `ChannelManifest` from a spec-level `ControlInterfaceManifest`.
+    ///
+    /// Each `ControlChannelDef` becomes a command `ChannelDescriptor`. The
+    /// conversion uses conservative defaults for limits and rate-of-change
+    /// since `ControlInterfaceManifest` does not carry per-channel limits.
+    fn from(cim: &crate::embodiment::binding::ControlInterfaceManifest) -> Self {
+        use crate::embodiment::binding::CommandInterfaceType;
+
+        let commands = cim
+            .channels
+            .iter()
+            .map(|ch| {
+                let (itype, default_limit) = match ch.interface_type {
+                    CommandInterfaceType::JointVelocity => (InterfaceType::Velocity, std::f64::consts::PI),
+                    CommandInterfaceType::JointPosition => (InterfaceType::Position, std::f64::consts::PI),
+                    CommandInterfaceType::JointTorque | CommandInterfaceType::GripperForce => {
+                        (InterfaceType::Effort, 50.0)
+                    }
+                    CommandInterfaceType::GripperPosition => (InterfaceType::Position, 0.1),
+                    CommandInterfaceType::ForceTorqueSensor | CommandInterfaceType::ImuSensor => {
+                        (InterfaceType::Position, 1.0)
+                    }
+                };
+                ChannelDescriptor {
+                    name: ch.name.clone(),
+                    interface_type: itype,
+                    unit: ch.units.clone(),
+                    limits: (-default_limit, default_limit),
+                    default: 0.0,
+                    max_rate_of_change: None,
+                    position_state_index: None,
+                    max_delta_from: None,
+                }
+            })
+            .collect();
+
+        Self {
+            robot_id: String::new(),
+            robot_class: String::new(),
+            control_rate_hz: 100,
+            commands,
+            states: Vec::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -198,6 +249,38 @@ mod tests {
         assert_eq!(m.command_count(), 0);
         assert_eq!(m.state_count(), 0);
         assert_eq!(m.control_rate_hz, 100);
+    }
+
+    #[test]
+    fn from_control_interface_manifest() {
+        use crate::embodiment::binding::{CommandInterfaceType, ControlChannelDef, ControlInterfaceManifest};
+
+        let cim = ControlInterfaceManifest {
+            version: 1,
+            manifest_digest: String::new(),
+            channels: vec![
+                ControlChannelDef {
+                    name: "shoulder_vel".into(),
+                    interface_type: CommandInterfaceType::JointVelocity,
+                    units: "rad/s".into(),
+                    frame_id: "base_link".into(),
+                },
+                ControlChannelDef {
+                    name: "gripper_pos".into(),
+                    interface_type: CommandInterfaceType::GripperPosition,
+                    units: "m".into(),
+                    frame_id: "wrist_link".into(),
+                },
+            ],
+            bindings: vec![],
+        };
+        let manifest = ChannelManifest::from(&cim);
+        assert_eq!(manifest.command_count(), 2);
+        assert_eq!(manifest.commands[0].name, "shoulder_vel");
+        assert_eq!(manifest.commands[0].interface_type, InterfaceType::Velocity);
+        assert_eq!(manifest.commands[1].name, "gripper_pos");
+        assert_eq!(manifest.commands[1].interface_type, InterfaceType::Position);
+        assert_eq!(manifest.control_rate_hz, 100);
     }
 
     #[test]

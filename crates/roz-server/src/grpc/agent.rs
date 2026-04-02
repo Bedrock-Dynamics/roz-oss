@@ -453,6 +453,19 @@ async fn run_session_loop(
 
                     sess.messages = output.messages;
 
+                    // SessionRuntime lifecycle: update snapshot and transition to Idle.
+                    sess.runtime.state.snapshot.turn_index = sess.runtime.state.turn_index;
+                    sess.runtime.state.snapshot.updated_at = chrono::Utc::now();
+                    sess.runtime.state.activity = roz_core::session::activity::RuntimeActivity::Idle;
+                    sess.runtime
+                        .emitter
+                        .emit(roz_core::session::event::SessionEvent::ActivityChanged {
+                            state: roz_core::session::activity::RuntimeActivity::Idle,
+                            reason: format!("turn {} completed", sess.runtime.state.turn_index),
+                            robot_safe: true,
+                            unblock_event: None,
+                        });
+
                     // Between-turn compaction (Level 1 + 2 only; no model for Level 3).
                     // Budget matches typical model context windows (200k tokens for claude-sonnet-4).
                     let ctx_mgr = roz_agent::context::ContextManager::new(sess.max_context_tokens);
@@ -902,13 +915,25 @@ async fn run_session_loop(
                                     content,
                                 }))
                             }
-                            // ToolUseStart and ToolUseInputDelta are handled internally by
-                            // the agent loop; the client sees ToolRequest when RemoteToolExecutor
-                            // sends calls. Skip these intermediate chunks.
-                            StreamChunk::ToolUseStart { .. }
-                            | StreamChunk::ToolUseInputDelta(_)
-                            | StreamChunk::Usage(_)
-                            | StreamChunk::Done(_) => None,
+                            // ToolUseStart maps to an ActivityUpdate so the client
+                            // knows the agent is calling a tool.
+                            StreamChunk::ToolUseStart { id, name } => {
+                                Some(session_response::Response::ActivityUpdate(roz_v1::ActivityUpdate {
+                                    state: "calling_tool".into(),
+                                    detail: format!("{name} ({id})"),
+                                    progress: None,
+                                }))
+                            }
+                            // ToolUseInputDelta and Usage are internal bookkeeping.
+                            StreamChunk::ToolUseInputDelta(_) | StreamChunk::Usage(_) => None,
+                            // Done signals the model stream ended — emit idle activity.
+                            StreamChunk::Done(_) => {
+                                Some(session_response::Response::ActivityUpdate(roz_v1::ActivityUpdate {
+                                    state: "idle".into(),
+                                    detail: "model stream finished".into(),
+                                    progress: None,
+                                }))
+                            }
                         };
 
                         if let Some(resp) = response

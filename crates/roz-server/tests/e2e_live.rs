@@ -790,7 +790,7 @@ Do NOT explain. Do NOT ask questions. Just call execute_code immediately with th
                             // Tick 10 times to verify the module executes correctly.
                             let mut tick_error = None;
                             for tick in 0..10 {
-                                if let Err(e) = task.tick(tick) {
+                                if let Err(e) = task.tick_with_contract(tick, None) {
                                     tick_error = Some(format!("tick {tick} failed: {e}"));
                                     break;
                                 }

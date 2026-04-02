@@ -401,6 +401,8 @@ fn build_clean_evidence(
 ///
 /// Designed to run inside `spawn_blocking` because wasmtime is CPU-bound.
 fn verify_wasm(code: &[u8], manifest: &roz_core::channels::ChannelManifest) -> VerifyOutcome {
+    use roz_copper::tick_contract::{DerivedFeatures, DigestSet, JointState, TickInput};
+
     let host_ctx = roz_copper::wit_host::HostContext::with_manifest(manifest.clone());
 
     let mut task = match roz_copper::wasm::CuWasmTask::from_source_with_host(code, host_ctx) {
@@ -408,8 +410,37 @@ fn verify_wasm(code: &[u8], manifest: &roz_core::channels::ChannelManifest) -> V
         Err(e) => return VerifyOutcome::Err(format!("compilation failed: {e}")),
     };
 
+    // Build a realistic TickInput from the manifest's channel names so the
+    // WASM controller receives proper joint state data during verification.
+    let joints: Vec<JointState> = manifest
+        .commands
+        .iter()
+        .map(|ch| JointState {
+            name: ch.name.clone(),
+            position: 0.0,
+            velocity: 0.0,
+            effort: None,
+        })
+        .collect();
+
     for tick in 0..VERIFY_TICK_COUNT {
-        if let Err(e) = task.tick_with_contract(tick, None) {
+        let input = TickInput {
+            tick,
+            monotonic_time_ns: tick * 10_000_000, // 10ms per tick
+            digests: DigestSet {
+                model: String::new(),
+                calibration: String::new(),
+                manifest: String::new(),
+                interface_version: String::new(),
+            },
+            joints: joints.clone(),
+            watched_poses: vec![],
+            wrench: None,
+            contact: None,
+            features: DerivedFeatures::default(),
+            config_json: String::new(),
+        };
+        if let Err(e) = task.tick_with_contract(tick, Some(&input)) {
             return VerifyOutcome::Err(format!("verification failed on tick {tick}: {e}"));
         }
     }

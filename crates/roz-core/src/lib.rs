@@ -34,6 +34,7 @@ pub mod session;
 pub mod sim2real;
 pub mod skills;
 pub mod spatial;
+pub use spatial::WorldState;
 pub mod tasks;
 pub mod team;
 pub mod template;

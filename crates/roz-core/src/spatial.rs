@@ -42,6 +42,9 @@ pub struct SpatialContext {
     pub occluded_regions: Vec<crate::embodiment::perception::OccludedRegion>,
 }
 
+/// Spec-level alias: new code should use `WorldState`.
+pub type WorldState = SpatialContext;
+
 /// The state of a single entity in 3-D space.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EntityState {
