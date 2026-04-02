@@ -202,8 +202,12 @@ impl ControllerLifecycle {
         // Last-known-good is saved when load_artifact() replaces an Active controller.
         // No snapshot needed here — the LKG was already set at load time.
 
-        // Consume the evidence bundle (it is now bound to this promotion).
-        self.evidence = None;
+        // Evidence is consumed only when reaching Active — intermediate stages
+        // (shadow, canary) reuse the same evidence since it's from the same
+        // verification run of the same controller code.
+        if new_state == DeploymentState::Active {
+            self.evidence = None;
+        }
         self.current_state = Some(new_state);
 
         Ok(new_state)

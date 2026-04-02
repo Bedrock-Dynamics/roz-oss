@@ -25,7 +25,7 @@ use roz_copper::controller_lifecycle::ControllerLifecycle;
 use roz_copper::deployment_manager::DeploymentManager;
 use roz_core::controller::artifact::{ControllerArtifact, ControllerClass, ExecutionMode, SourceKind, VerificationKey};
 use roz_core::controller::deployment::DeploymentState;
-use roz_core::controller::evidence::{ControllerEvidenceBundle, StabilitySummary};
+use roz_core::controller::evidence::ControllerEvidenceBundle;
 use roz_core::session::event::SessionEvent;
 use roz_core::tools::ToolResult;
 
@@ -118,7 +118,10 @@ impl PromoteControllerTool {
 /// Outcome of WASM verification: either a status message with rejection count
 /// (success) or a user-visible error string (compilation / tick failure).
 enum VerifyOutcome {
-    Ok { message: String, rejections: u32 },
+    Ok {
+        message: String,
+        evidence: Box<ControllerEvidenceBundle>,
+    },
     Err(String),
 }
 
@@ -159,17 +162,17 @@ impl TypedToolExecutor for PromoteControllerTool {
                 Box::new(std::io::Error::other(format!("verification task panicked: {e}")))
             })?;
 
-        let (message, rejections) = match outcome {
+        let (message, evidence) = match outcome {
             VerifyOutcome::Err(msg) => return Ok(ToolResult::error(msg)),
-            VerifyOutcome::Ok { message, rejections } => (message, rejections),
+            VerifyOutcome::Ok { message, evidence } => (message, *evidence),
         };
 
-        // 2–4. Build artifact, track lifecycle, and promote through deployment stages.
+        // 2–4. Build artifact, track lifecycle using REAL evidence, promote.
         let LifecycleResult {
             controller_id,
             final_state,
             events,
-        } = run_lifecycle(&input.code, &manifest, rejections)?;
+        } = run_lifecycle(&input.code, &manifest, evidence)?;
 
         // 5. Get cmd_tx from extensions — infrastructure failure is a hard error.
         let cmd_tx = ctx.extensions.get::<mpsc::Sender<ControllerCommand>>().ok_or_else(|| {
@@ -229,7 +232,7 @@ struct LifecycleResult {
 fn run_lifecycle(
     code: &str,
     manifest: &roz_core::channels::ChannelManifest,
-    rejections: u32,
+    real_evidence: ControllerEvidenceBundle,
 ) -> Result<LifecycleResult, Box<dyn std::error::Error + Send + Sync>> {
     let code_sha256 = hex::encode(Sha256::digest(code.as_bytes()));
     let controller_id = Uuid::new_v4().to_string();
@@ -243,9 +246,9 @@ fn run_lifecycle(
         .load_artifact(artifact)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(std::io::Error::other(e.to_string())) })?;
 
-    let evidence = build_clean_evidence(&controller_id, VERIFY_TICK_COUNT, rejections, &manifest_digest);
+    // Submit the REAL evidence from verify_wasm — no fabrication.
     lifecycle
-        .submit_evidence(evidence)
+        .submit_evidence(real_evidence)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(std::io::Error::other(e.to_string())) })?;
 
     let mut events = vec![SessionEvent::ControllerLoaded {
@@ -253,29 +256,22 @@ fn run_lifecycle(
         source_kind: "llm_generated".into(),
     }];
 
+    let runtime_digests = roz_copper::controller_lifecycle::RuntimeDigests {
+        controller_digest: code_sha256,
+        wit_world_version: "bedrock:controller@1.0.0".into(),
+        model_digest: "not_available".into(),
+        calibration_digest: "not_available".into(),
+        manifest_digest,
+        execution_mode: roz_core::controller::artifact::ExecutionMode::Verify,
+        compiler_version: "wasmtime".into(),
+    };
+
+    // Promote through deployment stages using real evidence at each gate.
     // Default policy: skip shadow and canary (fast local deploy).
     let deploy_mgr = DeploymentManager::new(false, false, true);
     let mut current_state = DeploymentState::VerifiedOnly;
 
     while let Some(target) = deploy_mgr.next_target(current_state) {
-        if lifecycle.current_state() != Some(DeploymentState::VerifiedOnly) {
-            let stage_evidence = build_clean_evidence(&controller_id, 0, 0, &manifest_digest);
-            lifecycle
-                .submit_evidence(stage_evidence)
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                    Box::new(std::io::Error::other(e.to_string()))
-                })?;
-        }
-
-        let runtime_digests = roz_copper::controller_lifecycle::RuntimeDigests {
-            controller_digest: code_sha256.clone(),
-            wit_world_version: "bedrock:controller@1.0.0".into(),
-            model_digest: "not_available".into(),
-            calibration_digest: "not_available".into(),
-            manifest_digest: manifest_digest.clone(),
-            execution_mode: roz_core::controller::artifact::ExecutionMode::Verify,
-            compiler_version: "wasmtime".into(),
-        };
         let new_state =
             lifecycle
                 .promote(&runtime_digests)
@@ -360,55 +356,6 @@ fn summarize_events(events: &[SessionEvent]) -> Vec<String> {
         .collect()
 }
 
-/// Build a clean evidence bundle suitable for fast-path promotion.
-fn build_clean_evidence(
-    controller_id: &str,
-    ticks_run: u64,
-    rejections: u32,
-    manifest_digest: &str,
-) -> ControllerEvidenceBundle {
-    ControllerEvidenceBundle {
-        bundle_id: Uuid::new_v4().to_string(),
-        controller_id: controller_id.to_string(),
-        ticks_run,
-        rejection_count: rejections,
-        limit_clamp_count: 0,
-        rate_clamp_count: 0,
-        position_limit_stop_count: 0,
-        epoch_interrupt_count: 0,
-        trap_count: 0,
-        watchdog_near_miss_count: 0,
-        channels_touched: vec![],
-        channels_untouched: vec![],
-        config_reads: 0,
-        tick_latency_p50_us: 0,
-        tick_latency_p95_us: 0,
-        tick_latency_p99_us: 0,
-        stability: StabilitySummary {
-            command_oscillation_detected: false,
-            idle_output_stable: true,
-            runtime_jitter_us: 0.0,
-            missed_tick_count: 0,
-            steady_state_reached: ticks_run >= 50,
-        },
-        verifier_status: if rejections == 0 { "pass" } else { "pass_with_warnings" }.into(),
-        verifier_reason: if rejections > 0 {
-            Some(format!("{rejections} command(s) rejected during verification"))
-        } else {
-            None
-        },
-        model_digest: "not_available".into(),
-        calibration_digest: "not_available".into(),
-        frame_snapshot_id: 0,
-        manifest_digest: manifest_digest.to_string(),
-        wit_world_version: "bedrock:controller@2.0.0".into(),
-        execution_mode: ExecutionMode::Verify,
-        compiler_version: "wasmtime".into(),
-        created_at: Utc::now(),
-        state_freshness: roz_core::session::snapshot::FreshnessState::Unknown,
-    }
-}
-
 /// Compile `code` and run it for [`VERIFY_TICK_COUNT`] ticks under production
 /// safety limits using the tick contract.
 ///
@@ -436,15 +383,30 @@ fn verify_wasm(code: &[u8], manifest: &roz_core::channels::ChannelManifest) -> V
         })
         .collect();
 
+    let code_sha256 = hex::encode(Sha256::digest(code));
+    let manifest_digest = hex::encode(Sha256::digest(
+        serde_json::to_string(manifest).unwrap_or_default().as_bytes(),
+    ));
+    let channel_names: Vec<String> = manifest.commands.iter().map(|c| c.name.clone()).collect();
+
+    // Use EvidenceCollector for real evidence — no fabrication.
+    let mut collector = roz_copper::evidence_collector::EvidenceCollector::new("verify", &channel_names);
+    let mut safety_filter = roz_copper::safety_filter::HotPathSafetyFilter::new(
+        roz_copper::controller::joint_limits_from_manifest(manifest),
+        None,
+        1.0 / f64::from(manifest.control_rate_hz),
+    );
+
     for tick in 0..VERIFY_TICK_COUNT {
+        let tick_start = std::time::Instant::now();
         let input = TickInput {
             tick,
             monotonic_time_ns: tick * 10_000_000, // 10ms per tick
             digests: DigestSet {
                 model: String::new(),
                 calibration: String::new(),
-                manifest: String::new(),
-                interface_version: String::new(),
+                manifest: manifest_digest.clone(),
+                interface_version: "bedrock:controller@1.0.0".into(),
             },
             joints: joints.clone(),
             watched_poses: vec![],
@@ -453,21 +415,49 @@ fn verify_wasm(code: &[u8], manifest: &roz_core::channels::ChannelManifest) -> V
             features: DerivedFeatures::default(),
             config_json: String::new(),
         };
-        if let Err(e) = task.tick_with_contract(tick, Some(&input)) {
-            return VerifyOutcome::Err(format!("verification failed on tick {tick}: {e}"));
+        match task.tick_with_contract(tick, Some(&input)) {
+            Ok(tick_output) => {
+                let commands = &task.host_context().command_values;
+                let filter_result = safety_filter.filter(commands, None, None);
+                let output = tick_output.unwrap_or_default();
+                collector.record_tick(tick_start.elapsed(), &output, &filter_result.interventions);
+            }
+            Err(e) => {
+                collector.record_trap();
+                return VerifyOutcome::Err(format!("verification failed on tick {tick}: {e}"));
+            }
         }
     }
 
-    let rejections = task
-        .host_context()
-        .rejection_count
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let mut message = format!("verified {VERIFY_TICK_COUNT} ticks via tick contract");
+    let evidence = collector.finalize(
+        &code_sha256,
+        &manifest_digest,
+        &manifest_digest,
+        "bedrock:controller@1.0.0",
+        roz_core::controller::artifact::ExecutionMode::Verify,
+        "wasmtime",
+    );
+
+    let rejections = evidence.rejection_count;
+    let mut message = format!(
+        "verified {} ticks, p99={}us",
+        evidence.ticks_run, evidence.tick_latency_p99_us,
+    );
     if rejections > 0 {
-        let _ = write!(message, ", {rejections} command(s) rejected");
+        let _ = write!(message, ", {rejections} rejection(s)");
+    }
+    if evidence.has_safety_issues() {
+        let _ = write!(
+            message,
+            ", SAFETY: traps={} epoch_interrupts={}",
+            evidence.trap_count, evidence.epoch_interrupt_count,
+        );
     }
 
-    VerifyOutcome::Ok { message, rejections }
+    VerifyOutcome::Ok {
+        message,
+        evidence: Box::new(evidence),
+    }
 }
 
 // ---------------------------------------------------------------------------

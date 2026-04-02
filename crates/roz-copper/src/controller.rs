@@ -424,7 +424,7 @@ fn tick_wasm(
 /// Maps each command channel to a `JointSafetyLimits` using the channel's
 /// per-axis limits and rate-of-change caps. Missing rate-of-change values
 /// default to `f64::INFINITY` (no limit).
-fn joint_limits_from_manifest(manifest: &ChannelManifest) -> Vec<JointSafetyLimits> {
+pub fn joint_limits_from_manifest(manifest: &ChannelManifest) -> Vec<JointSafetyLimits> {
     manifest
         .commands
         .iter()
