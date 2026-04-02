@@ -267,11 +267,21 @@ fn run_lifecycle(
                 })?;
         }
 
-        let new_state = lifecycle
-            .promote("not_available", "not_available", &manifest_digest)
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(std::io::Error::other(format!("promotion to {target:?} failed: {e}")))
-            })?;
+        let runtime_digests = roz_copper::controller_lifecycle::RuntimeDigests {
+            controller_digest: code_sha256.clone(),
+            wit_world_version: "bedrock:controller@1.0.0".into(),
+            model_digest: "not_available".into(),
+            calibration_digest: "not_available".into(),
+            manifest_digest: manifest_digest.clone(),
+            execution_mode: roz_core::controller::artifact::ExecutionMode::Verify,
+            compiler_version: "wasmtime".into(),
+        };
+        let new_state =
+            lifecycle
+                .promote(&runtime_digests)
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    Box::new(std::io::Error::other(format!("promotion to {target:?} failed: {e}")))
+                })?;
 
         match new_state {
             DeploymentState::Shadow => {
@@ -315,7 +325,7 @@ fn build_artifact(controller_id: &str, code_sha256: &str, manifest_digest: &str)
         replaced_controller_id: None,
         verification_key: VerificationKey {
             controller_digest: code_sha256.to_string(),
-            wit_world_version: "bedrock:controller@2.0.0".into(),
+            wit_world_version: "bedrock:controller@1.0.0".into(),
             model_digest: "not_available".into(),
             calibration_digest: "not_available".into(),
             manifest_digest: manifest_digest.to_string(),

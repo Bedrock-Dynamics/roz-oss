@@ -42,7 +42,7 @@ pub struct CuWasmTask {
     engine: Engine,
     store: Store<HostContext>,
     instance: Instance,
-    process_fn: Option<TypedFunc<u64, ()>>,
+    process_fn: TypedFunc<u64, ()>,
     epoch_shutdown: Arc<AtomicBool>,
     epoch_thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -129,7 +129,11 @@ impl CuWasmTask {
         let mut linker = Linker::new(&engine);
         wit_host::register_host_functions(&mut linker)?;
         let instance = linker.instantiate(&mut store, module)?;
-        let process_fn = instance.get_typed_func::<u64, ()>(&mut store, "process").ok();
+        // The controller MUST export process(u64) -> (). Reject at load time
+        // if the export is missing or has the wrong signature.
+        let process_fn = instance
+            .get_typed_func::<u64, ()>(&mut store, "process")
+            .map_err(|e| anyhow::anyhow!("controller must export `process(u64) -> ()`: {e}"))?;
         Ok(Self {
             engine,
             store,
@@ -166,9 +170,7 @@ impl CuWasmTask {
         }
 
         self.store.set_epoch_deadline(8); // 8ms budget for 100Hz tick rate
-        if let Some(ref process) = self.process_fn {
-            process.call(&mut self.store, tick)?;
-        }
+        self.process_fn.call(&mut self.store, tick)?;
 
         // Check e-stop after execution.
         if self.store.data().estop_requested {
@@ -293,13 +295,23 @@ mod tests {
 
     /// A module exporting `process` with the wrong signature (i32, i32) -> i32
     /// instead of (i64) -> (). `get_typed_func::<u64, ()>` returns `Err`, so
-    /// `tick_with_contract` silently skips execution and returns Ok.
+    /// Wrong signature `(i32, i32) -> i32` instead of `(u64) -> ()` must be
+    /// rejected at load time — the controller contract is strict.
     #[test]
-    fn wasm_wrong_signature_silently_skipped() {
+    fn wasm_wrong_signature_rejected_at_load() {
         let wat = r#"(module (func (export "process") (param i32 i32) (result i32) (i32.const 0)))"#;
-        let mut task = CuWasmTask::from_source(wat.as_bytes()).unwrap();
-        let result = task.tick_with_contract(0, None);
-        assert!(result.is_ok(), "wrong signature should not crash, got: {result:?}");
+        let result = CuWasmTask::from_source(wat.as_bytes());
+        assert!(result.is_err(), "wrong process signature must be rejected at load time");
+        let err = result.as_ref().err().unwrap().to_string();
+        assert!(err.contains("process"), "error should mention process export: {err}");
+    }
+
+    /// Module without a `process` export must be rejected at load time.
+    #[test]
+    fn wasm_missing_process_rejected_at_load() {
+        let wat = r#"(module (func (export "not_process") (param i64)))"#;
+        let result = CuWasmTask::from_source(wat.as_bytes());
+        assert!(result.is_err(), "missing process export must be rejected at load time");
     }
 
     #[test]

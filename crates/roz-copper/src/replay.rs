@@ -89,10 +89,39 @@ impl ReplayEngine {
     /// `process_fn` receives each [`TickInput`] in order and should return the
     /// [`TickOutput`] produced by the controller.  Any `Err` from `process_fn`
     /// is recorded as a mismatch on the `"tick_error"` field and stops the run.
-    pub fn replay_with<F>(&self, trace: &ReplayTrace, mut process_fn: F) -> ReplayResult
+    pub fn replay_with<F>(
+        &self,
+        trace: &ReplayTrace,
+        runtime_digests: Option<&crate::controller_lifecycle::RuntimeDigests>,
+        mut process_fn: F,
+    ) -> ReplayResult
     where
         F: FnMut(&TickInput) -> Result<TickOutput, String>,
     {
+        // Enforce VerificationKey match before replaying.
+        if let Some(digests) = runtime_digests {
+            let vk = &trace.verification_key;
+            if vk.controller_digest != digests.controller_digest
+                || vk.model_digest != digests.model_digest
+                || vk.calibration_digest != digests.calibration_digest
+                || vk.manifest_digest != digests.manifest_digest
+                || vk.wit_world_version != digests.wit_world_version
+                || vk.compiler_version != digests.compiler_version
+                || vk.execution_mode != digests.execution_mode
+            {
+                return ReplayResult {
+                    ticks_run: 0,
+                    mismatches: vec![ReplayMismatch {
+                        tick: 0,
+                        field: "verification_key".to_string(),
+                        expected: format!("{vk:?}"),
+                        actual: format!("{digests:?}"),
+                    }],
+                    passed: false,
+                };
+            }
+        }
+
         let mut mismatches = Vec::new();
         let mut ticks_run: u64 = 0;
 
@@ -241,7 +270,7 @@ mod tests {
     fn verify_only_runs_all_ticks() {
         let trace = make_trace(10, false);
         let engine = ReplayEngine::new(ReplayMode::VerifyOnly);
-        let result = engine.replay_with(&trace, |input| {
+        let result = engine.replay_with(&trace, None, |input| {
             Ok(TickOutput {
                 command_values: vec![input.tick as f64 * 0.1],
                 estop: false,
@@ -259,7 +288,7 @@ mod tests {
         let trace = make_trace(3, true);
         let engine = ReplayEngine::new(ReplayMode::VerifyOnly);
         // Return completely different outputs — VerifyOnly should still pass.
-        let result = engine.replay_with(&trace, |_| {
+        let result = engine.replay_with(&trace, None, |_| {
             Ok(TickOutput {
                 command_values: vec![999.0],
                 estop: true,
@@ -276,7 +305,7 @@ mod tests {
         let trace = make_trace(5, true);
         let engine = ReplayEngine::new(ReplayMode::RegressionTest);
         // Controller returns wrong command values.
-        let result = engine.replay_with(&trace, |_| {
+        let result = engine.replay_with(&trace, None, |_| {
             Ok(TickOutput {
                 command_values: vec![999.0],
                 estop: false,
@@ -295,7 +324,7 @@ mod tests {
     fn empty_trace_returns_passed() {
         let trace = make_trace(0, false);
         let engine = ReplayEngine::new(ReplayMode::RegressionTest);
-        let result = engine.replay_with(&trace, |_| unreachable!("no ticks"));
+        let result = engine.replay_with(&trace, None, |_| unreachable!("no ticks"));
         assert_eq!(result.ticks_run, 0);
         assert!(result.passed);
         assert!(result.mismatches.is_empty());
@@ -306,7 +335,7 @@ mod tests {
         let trace = make_trace(10, false);
         let engine = ReplayEngine::new(ReplayMode::VerifyOnly);
         let mut call_count = 0u64;
-        let result = engine.replay_with(&trace, |_| {
+        let result = engine.replay_with(&trace, None, |_| {
             call_count += 1;
             if call_count == 3 {
                 Err("WASM trap at tick 2".into())
@@ -325,7 +354,7 @@ mod tests {
         let trace = make_trace(4, true);
         let engine = ReplayEngine::new(ReplayMode::CompareAgainstCurrent);
         // Always return correct output except tick 2.
-        let result = engine.replay_with(&trace, |input| {
+        let result = engine.replay_with(&trace, None, |input| {
             if input.tick == 2 {
                 Ok(TickOutput {
                     command_values: vec![-1.0],

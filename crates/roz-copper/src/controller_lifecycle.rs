@@ -4,9 +4,22 @@
 //! no safety issues, all digests must match, and the deployment state machine
 //! transition must be valid. Rollback restores the last known good artifact.
 
-use roz_core::controller::artifact::ControllerArtifact;
+use roz_core::controller::artifact::{ControllerArtifact, ExecutionMode};
 use roz_core::controller::deployment::{DeploymentState, TransitionError};
 use roz_core::controller::evidence::ControllerEvidenceBundle;
+
+/// All runtime digests needed for promotion gating.
+/// Every field must match the artifact's `VerificationKey` exactly.
+#[derive(Debug, Clone)]
+pub struct RuntimeDigests {
+    pub controller_digest: String,
+    pub wit_world_version: String,
+    pub model_digest: String,
+    pub calibration_digest: String,
+    pub manifest_digest: String,
+    pub execution_mode: ExecutionMode,
+    pub compiler_version: String,
+}
 
 /// Error from controller lifecycle operations.
 #[derive(Debug)]
@@ -122,12 +135,7 @@ impl ControllerLifecycle {
     /// On success the evidence bundle is consumed (cleared) and the new state
     /// is returned.  If the new state is `Active`, the current artifact is
     /// saved as the last-known-good before state is updated.
-    pub fn promote(
-        &mut self,
-        runtime_model_digest: &str,
-        runtime_calibration_digest: &str,
-        runtime_manifest_digest: &str,
-    ) -> Result<DeploymentState, LifecycleError> {
+    pub fn promote(&mut self, runtime_digests: &RuntimeDigests) -> Result<DeploymentState, LifecycleError> {
         // Gate 1: artifact must be loaded.
         let artifact = self.current_artifact.as_ref().ok_or(LifecycleError::NoArtifact)?;
 
@@ -143,27 +151,46 @@ impl ControllerLifecycle {
             return Err(LifecycleError::SafetyIssues(detail));
         }
 
-        // Gate 4: digest binding — all three runtime digests must match.
+        // Gate 4: ALL 7 digest fields must match. Any change invalidates verification.
         let vk = &artifact.verification_key;
-        if vk.model_digest != runtime_model_digest {
-            return Err(LifecycleError::DigestMismatch {
-                field: "model_digest".into(),
-                expected: vk.model_digest.clone(),
-                actual: runtime_model_digest.into(),
-            });
+        let checks: &[(&str, &str, &str)] = &[
+            (
+                "controller_digest",
+                &vk.controller_digest,
+                &runtime_digests.controller_digest,
+            ),
+            (
+                "wit_world_version",
+                &vk.wit_world_version,
+                &runtime_digests.wit_world_version,
+            ),
+            ("model_digest", &vk.model_digest, &runtime_digests.model_digest),
+            (
+                "calibration_digest",
+                &vk.calibration_digest,
+                &runtime_digests.calibration_digest,
+            ),
+            ("manifest_digest", &vk.manifest_digest, &runtime_digests.manifest_digest),
+            (
+                "compiler_version",
+                &vk.compiler_version,
+                &runtime_digests.compiler_version,
+            ),
+        ];
+        for &(field, expected, actual) in checks {
+            if expected != actual {
+                return Err(LifecycleError::DigestMismatch {
+                    field: field.into(),
+                    expected: expected.into(),
+                    actual: actual.into(),
+                });
+            }
         }
-        if vk.calibration_digest != runtime_calibration_digest {
+        if vk.execution_mode != runtime_digests.execution_mode {
             return Err(LifecycleError::DigestMismatch {
-                field: "calibration_digest".into(),
-                expected: vk.calibration_digest.clone(),
-                actual: runtime_calibration_digest.into(),
-            });
-        }
-        if vk.manifest_digest != runtime_manifest_digest {
-            return Err(LifecycleError::DigestMismatch {
-                field: "manifest_digest".into(),
-                expected: vk.manifest_digest.clone(),
-                actual: runtime_manifest_digest.into(),
+                field: "execution_mode".into(),
+                expected: format!("{:?}", vk.execution_mode),
+                actual: format!("{:?}", runtime_digests.execution_mode),
             });
         }
 
@@ -245,7 +272,7 @@ mod tests {
     use roz_core::controller::deployment::DeploymentState;
     use roz_core::controller::evidence::{ControllerEvidenceBundle, StabilitySummary};
 
-    use super::ControllerLifecycle;
+    use super::{ControllerLifecycle, RuntimeDigests};
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -323,8 +350,16 @@ mod tests {
         }
     }
 
-    fn good_digests() -> (&'static str, &'static str, &'static str) {
-        ("model_sha", "cal_sha", "man_sha")
+    fn good_digests() -> RuntimeDigests {
+        RuntimeDigests {
+            controller_digest: "ctrl_sha".into(),
+            wit_world_version: "bedrock:controller@1.0.0".into(),
+            model_digest: "model_sha".into(),
+            calibration_digest: "cal_sha".into(),
+            manifest_digest: "man_sha".into(),
+            execution_mode: ExecutionMode::Verify,
+            compiler_version: "wasmtime-22.0".into(),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -343,8 +378,8 @@ mod tests {
     fn promote_without_evidence_fails() {
         let mut lc = ControllerLifecycle::new();
         lc.load_artifact(make_artifact("ctrl-1")).unwrap();
-        let (m, c, mn) = good_digests();
-        let err = lc.promote(m, c, mn).unwrap_err();
+        let digests = good_digests();
+        let err = lc.promote(&digests).unwrap_err();
         assert!(matches!(err, super::LifecycleError::NoEvidence));
     }
 
@@ -355,8 +390,8 @@ mod tests {
         let mut ev = make_clean_evidence("ctrl-1");
         ev.trap_count = 3;
         lc.submit_evidence(ev).unwrap();
-        let (m, c, mn) = good_digests();
-        let err = lc.promote(m, c, mn).unwrap_err();
+        let digests = good_digests();
+        let err = lc.promote(&digests).unwrap_err();
         assert!(matches!(err, super::LifecycleError::SafetyIssues(_)));
     }
 
@@ -365,7 +400,9 @@ mod tests {
         let mut lc = ControllerLifecycle::new();
         lc.load_artifact(make_artifact("ctrl-1")).unwrap();
         lc.submit_evidence(make_clean_evidence("ctrl-1")).unwrap();
-        let err = lc.promote("wrong_model", "cal_sha", "man_sha").unwrap_err();
+        let mut bad_digests = good_digests();
+        bad_digests.model_digest = "wrong_model".into();
+        let err = lc.promote(&bad_digests).unwrap_err();
         assert!(matches!(
             err,
             super::LifecycleError::DigestMismatch { field, .. } if field == "model_digest"
@@ -376,37 +413,37 @@ mod tests {
     fn full_promotion_path() {
         let mut lc = ControllerLifecycle::new();
         lc.load_artifact(make_artifact("ctrl-1")).unwrap();
-        let (m, c, mn) = good_digests();
+        let digests = good_digests();
 
         // verified_only → shadow
         lc.submit_evidence(make_clean_evidence("ctrl-1")).unwrap();
-        let state = lc.promote(m, c, mn).unwrap();
+        let state = lc.promote(&digests).unwrap();
         assert_eq!(state, DeploymentState::Shadow);
 
         // shadow → canary
         lc.submit_evidence(make_clean_evidence("ctrl-1")).unwrap();
-        let state = lc.promote(m, c, mn).unwrap();
+        let state = lc.promote(&digests).unwrap();
         assert_eq!(state, DeploymentState::Canary);
 
         // canary → active
         lc.submit_evidence(make_clean_evidence("ctrl-1")).unwrap();
-        let state = lc.promote(m, c, mn).unwrap();
+        let state = lc.promote(&digests).unwrap();
         assert_eq!(state, DeploymentState::Active);
     }
 
     #[test]
     fn load_new_artifact_saves_active_as_lkg() {
         let mut lc = ControllerLifecycle::new();
-        let (m, c, mn) = good_digests();
+        let digests = good_digests();
 
         // Promote ctrl-1 to active.
         lc.load_artifact(make_artifact("ctrl-1")).unwrap();
         lc.submit_evidence(make_clean_evidence("ctrl-1")).unwrap();
-        lc.promote(m, c, mn).unwrap(); // → shadow
+        lc.promote(&digests).unwrap(); // → shadow
         lc.submit_evidence(make_clean_evidence("ctrl-1")).unwrap();
-        lc.promote(m, c, mn).unwrap(); // → canary
+        lc.promote(&digests).unwrap(); // → canary
         lc.submit_evidence(make_clean_evidence("ctrl-1")).unwrap();
-        lc.promote(m, c, mn).unwrap(); // → active
+        lc.promote(&digests).unwrap(); // → active
 
         assert!(lc.last_known_good().is_none(), "no LKG until a replacement is loaded");
 
@@ -427,15 +464,15 @@ mod tests {
     fn rollback_restores_last_known_good() {
         let mut lc = ControllerLifecycle::new();
         lc.load_artifact(make_artifact("ctrl-1")).unwrap();
-        let (m, c, mn) = good_digests();
+        let digests = good_digests();
 
         // Promote all the way to active so lkg is set.
         lc.submit_evidence(make_clean_evidence("ctrl-1")).unwrap();
-        lc.promote(m, c, mn).unwrap();
+        lc.promote(&digests).unwrap();
         lc.submit_evidence(make_clean_evidence("ctrl-1")).unwrap();
-        lc.promote(m, c, mn).unwrap();
+        lc.promote(&digests).unwrap();
         lc.submit_evidence(make_clean_evidence("ctrl-1")).unwrap();
-        lc.promote(m, c, mn).unwrap();
+        lc.promote(&digests).unwrap();
 
         // Load a bad new controller, rollback should restore ctrl-1.
         lc.load_artifact(make_artifact("ctrl-2")).unwrap();
@@ -458,8 +495,8 @@ mod tests {
         let mut lc = ControllerLifecycle::new();
         lc.load_artifact(make_artifact("ctrl-1")).unwrap();
         lc.submit_evidence(make_clean_evidence("ctrl-1")).unwrap();
-        let (m, c, mn) = good_digests();
-        lc.promote(m, c, mn).unwrap(); // → shadow
+        let digests = good_digests();
+        lc.promote(&digests).unwrap(); // → shadow
 
         // Load a new artifact; state should reset to VerifiedOnly, evidence cleared.
         lc.load_artifact(make_artifact("ctrl-2")).unwrap();
@@ -467,7 +504,7 @@ mod tests {
         assert_eq!(lc.current_artifact().unwrap().controller_id, "ctrl-2");
 
         // Evidence was cleared; promote should fail with NoEvidence.
-        let err = lc.promote(m, c, mn).unwrap_err();
+        let err = lc.promote(&digests).unwrap_err();
         assert!(matches!(err, super::LifecycleError::NoEvidence));
     }
 }
