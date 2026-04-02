@@ -117,6 +117,8 @@ fn handle_command(
             }
             None
         }
+        // Handled by drain_commands before calling handle_command.
+        ControllerCommand::PromoteActive => None,
     }
 }
 
@@ -185,20 +187,46 @@ fn drain_commands(
     evidence_collector: &mut Option<EvidenceCollector>,
     controller_promoted: &mut bool,
 ) -> bool {
+    // Process a single command, updating tick infrastructure if LoadArtifact.
+    let process = |cmd: ControllerCommand,
+                   wasm_task: &mut Option<CuWasmTask>,
+                   running: &mut bool,
+                   tick_period: &mut Duration,
+                   tick_builder: &mut Option<TickInputBuilder>,
+                   hot_path_filter: &mut Option<HotPathSafetyFilter>,
+                   evidence_collector: &mut Option<EvidenceCollector>,
+                   controller_promoted: &mut bool| {
+        if matches!(cmd, ControllerCommand::PromoteActive) {
+            *controller_promoted = true;
+            tracing::info!("controller promoted to Active — watchdog disabled");
+            return;
+        }
+        if let Some(load) = handle_command(cmd, wasm_task, running) {
+            *tick_period = load.period;
+            let (builder, filter) = build_tick_infrastructure(&load.manifest);
+            let channel_names: Vec<String> = load.manifest.commands.iter().map(|c| c.name.clone()).collect();
+            *tick_builder = Some(builder);
+            *hot_path_filter = Some(filter);
+            finalize_evidence(evidence_collector);
+            *evidence_collector = Some(EvidenceCollector::new("controller", &channel_names));
+            // New controller starts unpromoted — watchdog applies until PromoteActive.
+            *controller_promoted = false;
+        }
+    };
+
     // Emergency channel first (bypasses tokio bridge).
     if let Some(erx) = emergency_rx {
         while let Ok(cmd) = erx.try_recv() {
-            if let Some(load) = handle_command(cmd, wasm_task, running) {
-                *tick_period = load.period;
-                let (builder, filter) = build_tick_infrastructure(&load.manifest);
-                let channel_names: Vec<String> = load.manifest.commands.iter().map(|c| c.name.clone()).collect();
-                *tick_builder = Some(builder);
-                *hot_path_filter = Some(filter);
-                // Finalize previous evidence before replacing the collector.
-                finalize_evidence(evidence_collector);
-                *evidence_collector = Some(EvidenceCollector::new("controller", &channel_names));
-                *controller_promoted = true;
-            }
+            process(
+                cmd,
+                wasm_task,
+                running,
+                tick_period,
+                tick_builder,
+                hot_path_filter,
+                evidence_collector,
+                controller_promoted,
+            );
         }
     }
 
@@ -206,17 +234,16 @@ fn drain_commands(
     let mut received = false;
     while let Ok(cmd) = cmd_rx.try_recv() {
         received = true;
-        if let Some(load) = handle_command(cmd, wasm_task, running) {
-            *tick_period = load.period;
-            let (builder, filter) = build_tick_infrastructure(&load.manifest);
-            let channel_names: Vec<String> = load.manifest.commands.iter().map(|c| c.name.clone()).collect();
-            *tick_builder = Some(builder);
-            *hot_path_filter = Some(filter);
-            // Finalize previous evidence before replacing the collector.
-            finalize_evidence(evidence_collector);
-            *evidence_collector = Some(EvidenceCollector::new("controller", &channel_names));
-            *controller_promoted = true;
-        }
+        process(
+            cmd,
+            wasm_task,
+            running,
+            tick_period,
+            tick_builder,
+            hot_path_filter,
+            evidence_collector,
+            controller_promoted,
+        );
     }
     received
 }

@@ -32,6 +32,9 @@ pub enum ControllerCommand {
     /// The channel manifest is derived from the artifact's
     /// `channel_manifest_version` and the robot's `ControlInterfaceManifest`.
     LoadArtifact(Box<ControllerArtifact>, Vec<u8>, roz_core::channels::ChannelManifest),
+    /// Signal that the current controller has been promoted to Active.
+    /// Disables the agent watchdog — the controller runs autonomously.
+    PromoteActive,
     /// Update controller parameters (JSON).
     UpdateParams(serde_json::Value),
     /// Halt the controller (stop ticking).

@@ -200,7 +200,10 @@ impl TypedToolExecutor for PromoteControllerTool {
                 ))
             })?;
 
-        // 7. Emit collected events via the event sink (if present).
+        // 7. Signal promotion to the controller thread — disables watchdog.
+        let _ = cmd_tx.send(ControllerCommand::PromoteActive).await;
+
+        // 8. Emit collected events via the event sink (if present).
         emit_lifecycle_events(ctx, &events).await;
 
         let event_summary = summarize_events(&events);
