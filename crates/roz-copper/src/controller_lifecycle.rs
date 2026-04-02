@@ -40,6 +40,8 @@ pub enum LifecycleError {
     SafetyIssues(String),
     /// Rollback requested but no last-known-good artifact is available.
     NoLastKnownGood,
+    /// Evidence `controller_id` doesn't match the loaded artifact.
+    EvidenceMismatch { expected: String, actual: String },
 }
 
 impl std::fmt::Display for LifecycleError {
@@ -57,6 +59,12 @@ impl std::fmt::Display for LifecycleError {
             }
             Self::SafetyIssues(msg) => write!(f, "safety issues in evidence: {msg}"),
             Self::NoLastKnownGood => write!(f, "no last-known-good artifact available"),
+            Self::EvidenceMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "evidence controller_id mismatch: expected={expected} actual={actual}"
+                )
+            }
         }
     }
 }
@@ -118,6 +126,14 @@ impl ControllerLifecycle {
     ///
     /// Evidence is consumed by the next [`promote`](Self::promote) call.
     pub fn submit_evidence(&mut self, evidence: ControllerEvidenceBundle) -> Result<(), LifecycleError> {
+        // Evidence must be for the currently loaded artifact.
+        let artifact = self.current_artifact.as_ref().ok_or(LifecycleError::NoArtifact)?;
+        if evidence.controller_id != artifact.controller_id {
+            let expected = artifact.controller_id.clone();
+            // evidence is owned and will be dropped on this error path anyway.
+            let actual = evidence.controller_id;
+            return Err(LifecycleError::EvidenceMismatch { expected, actual });
+        }
         self.evidence = Some(evidence);
         Ok(())
     }

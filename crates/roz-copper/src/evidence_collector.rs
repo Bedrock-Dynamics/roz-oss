@@ -80,11 +80,18 @@ impl EvidenceCollector {
         self.tick_count += 1;
         self.tick_latencies.push(duration);
 
-        // Track which channels had non-zero commands
-        for (i, &cmd) in output.command_values.iter().enumerate() {
-            if cmd != 0.0 {
-                // Use channel index as name if we don't have a mapping
-                let channel_name = format!("channel_{i}");
+        // Track which channels the controller wrote to.
+        // ANY output (including zero) counts as "touched" — the controller
+        // explicitly produced command values.
+        if !output.command_values.is_empty() {
+            for (i, _) in output.command_values.iter().enumerate() {
+                // Use the actual channel name from all_channels if available.
+                let channel_name = self
+                    .all_channels
+                    .iter()
+                    .nth(i)
+                    .cloned()
+                    .unwrap_or_else(|| format!("channel_{i}"));
                 self.channels_touched.insert(channel_name);
             }
         }
@@ -360,7 +367,9 @@ mod tests {
         let all_channels: Vec<String> = vec!["channel_0".into(), "channel_1".into(), "channel_2".into()];
         let mut collector = EvidenceCollector::new("ctrl-004", &all_channels);
 
-        // Only channels 0 and 1 get non-zero commands
+        // Controller writes output with 3 command values (including zero).
+        // ALL channels with output count as "touched" — writing zero is an
+        // explicit command, not absence of a command.
         let output = make_output(vec![0.5, 0.3, 0.0]);
         collector.record_tick(Duration::from_micros(200), &output, &[]);
 
@@ -368,8 +377,22 @@ mod tests {
 
         assert!(bundle.channels_touched.contains(&"channel_0".to_string()));
         assert!(bundle.channels_touched.contains(&"channel_1".to_string()));
-        assert!(!bundle.channels_touched.contains(&"channel_2".to_string()));
-        assert_eq!(bundle.channels_untouched, vec!["channel_2".to_string()]);
+        assert!(bundle.channels_touched.contains(&"channel_2".to_string()));
+        assert!(bundle.channels_untouched.is_empty(), "all channels should be touched");
+    }
+
+    #[test]
+    fn evidence_collector_untouched_when_no_output() {
+        let all_channels: Vec<String> = vec!["ch_a".into(), "ch_b".into()];
+        let mut collector = EvidenceCollector::new("ctrl-005", &all_channels);
+
+        // Controller produces empty output — no channels touched.
+        let output = make_output(vec![]);
+        collector.record_tick(Duration::from_micros(100), &output, &[]);
+
+        let bundle = collector.finalize("m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+        assert!(bundle.channels_touched.is_empty());
+        assert_eq!(bundle.channels_untouched.len(), 2);
     }
 
     #[test]

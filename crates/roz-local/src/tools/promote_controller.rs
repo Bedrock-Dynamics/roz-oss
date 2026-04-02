@@ -232,10 +232,12 @@ struct LifecycleResult {
 fn run_lifecycle(
     code: &str,
     manifest: &roz_core::channels::ChannelManifest,
-    real_evidence: ControllerEvidenceBundle,
+    mut real_evidence: ControllerEvidenceBundle,
 ) -> Result<LifecycleResult, Box<dyn std::error::Error + Send + Sync>> {
     let code_sha256 = hex::encode(Sha256::digest(code.as_bytes()));
     let controller_id = Uuid::new_v4().to_string();
+    // Bind evidence to this artifact's controller_id.
+    real_evidence.controller_id.clone_from(&controller_id);
     let manifest_digest = hex::encode(Sha256::digest(
         serde_json::to_string(manifest).unwrap_or_default().as_bytes(),
     ));
@@ -245,6 +247,15 @@ fn run_lifecycle(
     lifecycle
         .load_artifact(artifact)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(std::io::Error::other(e.to_string())) })?;
+
+    // Run verifier rule checks on the evidence before allowing promotion.
+    let verifier = roz_agent::verifier::Verifier::with_default_checks();
+    let verdict = verifier.verify(&real_evidence);
+    if !verdict.allows_promotion() {
+        return Err(Box::new(std::io::Error::other(format!(
+            "verifier rejected controller: {verdict:?}"
+        ))));
+    }
 
     // Submit the REAL evidence from verify_wasm — no fabrication.
     lifecycle
@@ -490,12 +501,30 @@ mod tests {
         roz_core::channels::ChannelManifest::generic_velocity(6, std::f64::consts::PI)
     }
 
+    /// WAT that writes a valid TickOutput with 6 command values via tick::set_output.
+    fn valid_controller_wat() -> String {
+        let output_json = r#"{"command_values":[0.0,0.0,0.0,0.0,0.0,0.0],"estop":false,"metrics":[]}"#;
+        let bytes = output_json.as_bytes();
+        let len = bytes.len();
+        let data_hex: String = bytes.iter().map(|b| format!("\\{b:02x}")).collect();
+        format!(
+            r#"(module
+                (import "tick" "set_output" (func $sout (param i32 i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 256) "{data_hex}")
+                (func (export "process") (param i64)
+                    (call $sout (i32.const 256) (i32.const {len}))
+                )
+            )"#
+        )
+    }
+
     #[tokio::test]
     async fn promotes_valid_wasm() {
         let tool = PromoteControllerTool::new(&test_manifest());
         let (ctx, mut rx) = test_ctx_with_sender();
         let input = PromoteControllerInput {
-            code: r#"(module (func (export "process") (param i64) nop))"#.into(),
+            code: valid_controller_wat(),
         };
         let result = TypedToolExecutor::execute(&tool, input, &ctx).await.unwrap();
         assert!(result.is_success(), "should succeed: {:?}", result);
