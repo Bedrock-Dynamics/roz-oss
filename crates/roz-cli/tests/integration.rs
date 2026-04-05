@@ -154,11 +154,11 @@ fn session_compact_preserves_recent_entries() {
 }
 
 // ---------------------------------------------------------------------------
-// robot.toml -> system prompt
+// embodiment.toml -> system prompt
 // ---------------------------------------------------------------------------
 
 #[test]
-fn robot_toml_generates_system_prompt() {
+fn embodiment_manifest_generates_system_prompt() {
     let toml_str = r#"
 [robot]
 name = "test-arm"
@@ -179,7 +179,7 @@ rate_hz = 100
 e_stop_behavior = "hold_position"
 max_contact_force_n = 80.0
 "#;
-    let manifest: roz_core::manifest::RobotManifest = toml::from_str(toml_str).unwrap();
+    let manifest: roz_core::manifest::EmbodimentManifest = toml::from_str(toml_str).unwrap();
     let prompt = manifest.to_system_prompt();
 
     assert!(prompt.contains("test-arm"), "prompt should contain robot name");

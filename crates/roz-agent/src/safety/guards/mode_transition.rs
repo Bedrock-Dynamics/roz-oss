@@ -50,6 +50,43 @@ impl SafetyGuard for ModeTransitionGuard {
             };
         }
 
+        if !state.entities.iter().any(|entity| entity.timestamp_ns.is_some()) {
+            return SafetyVerdict::Block {
+                reason: "OODA mode requires timestamped runtime world-state observations; \
+                         refusing tool call until heartbeat-backed observations arrive"
+                    .to_string(),
+            };
+        }
+
+        if state.alerts.iter().any(|alert| {
+            let source = alert.source.to_ascii_lowercase();
+            let message = alert.message.to_ascii_lowercase();
+            source.contains("heartbeat") || message.contains("heartbeat")
+        }) {
+            return SafetyVerdict::Block {
+                reason:
+                    "OODA mode requires a healthy observation heartbeat; runtime alerts indicate heartbeat degradation"
+                        .to_string(),
+            };
+        }
+
+        if state.alerts.iter().any(|alert| {
+            let source = alert.source.to_ascii_lowercase();
+            let message = alert.message.to_ascii_lowercase();
+            source.contains("estop") || message.contains("e-stop") || message.contains("estop")
+        }) || state.entities.iter().any(|entity| {
+            entity
+                .properties
+                .get("estop_active")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        }) {
+            return SafetyVerdict::Block {
+                reason: "OODA mode requires e-stop clear; runtime world-state indicates an active safety stop"
+                    .to_string(),
+            };
+        }
+
         if state.screenshots.is_empty() {
             tracing::warn!(
                 guard = "mode_transition",
@@ -82,6 +119,7 @@ mod tests {
                 id: "robot_1".to_string(),
                 kind: "robot_arm".to_string(),
                 position: Some([0.0, 0.0, 0.0]),
+                timestamp_ns: Some(1_000_000_000),
                 ..Default::default()
             }],
             ..Default::default()
@@ -94,6 +132,7 @@ mod tests {
                 id: "robot_1".to_string(),
                 kind: "robot_arm".to_string(),
                 position: Some([0.0, 0.0, 0.0]),
+                timestamp_ns: Some(1_000_000_000),
                 ..Default::default()
             }],
             screenshots: vec![SimScreenshot {
@@ -142,6 +181,34 @@ mod tests {
         let state = context_with_screenshot();
         let result = guard.check(&make_action(), &state).await;
         assert_eq!(result, SafetyVerdict::Allow);
+    }
+
+    #[tokio::test]
+    async fn blocks_ooda_without_timestamped_runtime_observation() {
+        let guard = ModeTransitionGuard::new(AgentLoopMode::OodaReAct);
+        let mut state = context_with_entities();
+        state.entities[0].timestamp_ns = None;
+        let result = guard.check(&make_action(), &state).await;
+        match result {
+            SafetyVerdict::Block { reason } => {
+                assert!(reason.contains("timestamped") || reason.contains("heartbeat"));
+            }
+            other => panic!("expected Block for untimestamped OODA observation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn blocks_ooda_when_estop_signal_present() {
+        let guard = ModeTransitionGuard::new(AgentLoopMode::OodaReAct);
+        let mut state = context_with_entities();
+        state.entities[0]
+            .properties
+            .insert("estop_active".into(), serde_json::Value::Bool(true));
+        let result = guard.check(&make_action(), &state).await;
+        match result {
+            SafetyVerdict::Block { reason } => assert!(reason.contains("e-stop") || reason.contains("safety stop")),
+            other => panic!("expected Block for estop signal, got {other:?}"),
+        }
     }
 
     // --- React mode (no spatial requirement) ---

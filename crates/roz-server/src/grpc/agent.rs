@@ -39,7 +39,7 @@ use roz_core::session::event::SessionPermissionRule;
 use roz_core::session::event::{CanonicalSessionEventEnvelope, CorrelationId, EventEnvelope, SessionEvent};
 use roz_core::tools::ToolCategory;
 
-use roz_core::team::{TeamEvent as CoreTeamEvent, WorkerFailReason};
+use roz_core::team::{SequencedTeamEvent, TeamEvent as CoreTeamEvent, WorkerFailReason};
 use roz_nats::subjects::Subjects;
 use roz_nats::team::{TEAM_STREAM, team_subject_pattern};
 
@@ -371,12 +371,9 @@ impl AgentService for AgentServiceImpl {
                             tracing::warn!(error = %e, "WatchTeam: failed to ack message");
                         }
 
-                        let core_event: CoreTeamEvent = match serde_json::from_slice(&msg.payload) {
-                            Ok(ev) => ev,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "WatchTeam: failed to decode TeamEvent, skipping");
-                                continue;
-                            }
+                        let Some(core_event) = decode_team_event_payload(&msg.payload) else {
+                            tracing::warn!("WatchTeam: failed to decode TeamEvent payload, skipping");
+                            continue;
                         };
 
                         let proto_event = core_team_event_to_proto(core_event);
@@ -2247,6 +2244,14 @@ fn core_team_event_to_proto(event: CoreTeamEvent) -> roz_v1::TeamEvent {
     roz_v1::TeamEvent { event: Some(inner) }
 }
 
+fn decode_team_event_payload(payload: &[u8]) -> Option<CoreTeamEvent> {
+    if let Ok(sequenced) = serde_json::from_slice::<SequencedTeamEvent>(payload) {
+        return Some(sequenced.event);
+    }
+
+    serde_json::from_slice::<CoreTeamEvent>(payload).ok()
+}
+
 /// Substrings that indicate a tool is "pure" (read-only / observational).
 const PURE_VERBS: &[&str] = &["read", "get", "list", "search", "glob", "grep", "find"];
 
@@ -3220,6 +3225,48 @@ mod tests {
                 assert!(resolved.modifier.is_some());
             }
             other => panic!("expected WorkerApprovalResolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_team_event_payload_accepts_sequenced_wrapper() {
+        let worker_id = uuid::Uuid::new_v4();
+        let payload = serde_json::to_vec(&SequencedTeamEvent {
+            seq: 7,
+            timestamp_ns: 123_456,
+            event: CoreTeamEvent::WorkerToolCall {
+                worker_id,
+                tool: "move_arm".into(),
+            },
+        })
+        .unwrap();
+
+        let decoded = decode_team_event_payload(&payload).expect("sequenced payload should decode");
+        match decoded {
+            CoreTeamEvent::WorkerToolCall { worker_id: id, tool } => {
+                assert_eq!(id, worker_id);
+                assert_eq!(tool, "move_arm");
+            }
+            other => panic!("expected WorkerToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_team_event_payload_still_accepts_legacy_payload() {
+        let worker_id = uuid::Uuid::new_v4();
+        let payload = serde_json::to_vec(&CoreTeamEvent::WorkerStarted {
+            worker_id,
+            host_id: "host-1".into(),
+        })
+        .unwrap();
+
+        let decoded = decode_team_event_payload(&payload).expect("legacy payload should decode");
+        match decoded {
+            CoreTeamEvent::WorkerStarted { worker_id: id, host_id } => {
+                assert_eq!(id, worker_id);
+                assert_eq!(host_id, "host-1");
+            }
+            other => panic!("expected WorkerStarted, got {other:?}"),
         }
     }
 }

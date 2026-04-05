@@ -7,11 +7,12 @@
 use async_nats::jetstream::Context as JetStreamContext;
 use async_nats::jetstream::kv::Config as KvConfig;
 use bytes::Bytes;
-use roz_core::team::{TeamEvent, WorkerRecord};
+use roz_core::team::{SequencedTeamEvent, TeamEvent, WorkerRecord};
 use uuid::Uuid;
 
 pub const TEAM_STREAM: &str = "ROZ_TEAM_EVENTS";
 pub const TEAM_KV_BUCKET: &str = "roz_teams";
+pub const TEAM_SEQUENCE_KV_BUCKET: &str = "roz_team_sequences";
 
 /// Internal NATS request-reply subject used by `SpawnWorkerTool` to create child tasks
 /// without going through the public REST API.
@@ -29,6 +30,11 @@ pub fn team_subject_pattern(parent_task_id: Uuid) -> String {
     format!("roz.team.{parent_task_id}.worker.>")
 }
 
+#[must_use]
+fn team_sequence_key(parent_task_id: Uuid, child_task_id: Uuid) -> String {
+    format!("team.{parent_task_id}.worker.{child_task_id}.seq")
+}
+
 /// Publish a `TeamEvent` to the worker's `JetStream` subject.
 ///
 /// # Errors
@@ -40,7 +46,16 @@ pub async fn publish_team_event(
     event: &TeamEvent,
 ) -> Result<(), async_nats::Error> {
     let subject = worker_subject(parent_task_id, child_task_id);
-    let payload = serde_json::to_vec(event).map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    let seq = next_team_event_sequence(js, parent_task_id, child_task_id).await?;
+    let payload = serde_json::to_vec(&SequencedTeamEvent {
+        seq,
+        timestamp_ns: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(0),
+        event: event.clone(),
+    })
+    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
     js.publish(subject, payload.into()).await?.await?;
     Ok(())
 }
@@ -57,6 +72,54 @@ async fn get_or_create_kv(js: &JetStreamContext) -> Result<async_nats::jetstream
             })
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+    }
+}
+
+async fn get_or_create_sequence_kv(
+    js: &JetStreamContext,
+) -> Result<async_nats::jetstream::kv::Store, async_nats::Error> {
+    match js.get_key_value(TEAM_SEQUENCE_KV_BUCKET).await {
+        Ok(store) => Ok(store),
+        Err(_) => js
+            .create_key_value(KvConfig {
+                bucket: TEAM_SEQUENCE_KV_BUCKET.into(),
+                max_age: std::time::Duration::from_secs(86400),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+    }
+}
+
+async fn next_team_event_sequence(
+    js: &JetStreamContext,
+    parent_task_id: Uuid,
+    child_task_id: Uuid,
+) -> Result<u64, async_nats::Error> {
+    let bucket = get_or_create_sequence_kv(js).await?;
+    let key = team_sequence_key(parent_task_id, child_task_id);
+
+    loop {
+        let entry = bucket
+            .entry(&key)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        let revision = entry.as_ref().map_or(0, |value| value.revision);
+        let current = entry
+            .as_ref()
+            .and_then(|value| std::str::from_utf8(&value.value).ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let next = current.saturating_add(1);
+
+        match bucket.update(&key, Bytes::from(next.to_string()), revision).await {
+            Ok(_) => return Ok(next),
+            Err(error) if error.kind() == async_nats::jetstream::kv::UpdateErrorKind::WrongLastRevision => {
+                tracing::debug!(%parent_task_id, %child_task_id, "team event sequence CAS conflict, retrying");
+            }
+            Err(error) => return Err(Box::new(error) as Box<dyn std::error::Error + Send + Sync>),
+        }
     }
 }
 
@@ -157,6 +220,18 @@ mod tests {
         let p = team_subject_pattern(parent);
         assert!(p.ends_with(".worker.>"));
         assert!(p.contains(&parent.to_string()));
+    }
+
+    #[test]
+    fn team_sequence_key_uses_jetstream_safe_namespace() {
+        let parent = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let key = team_sequence_key(parent, child);
+        assert!(key.starts_with("team."));
+        assert!(key.ends_with(".seq"));
+        assert!(!key.contains(':'));
+        assert!(!key.contains('*'));
+        assert!(!key.contains('>'));
     }
 
     #[test]

@@ -971,7 +971,8 @@ async fn provider_loop(
         let (text_tx, text_rx) = async_channel::unbounded::<String>();
         let event_tx_cloud = event_tx.clone();
 
-        // Build unified tool set (CLI built-ins + daemon tools from robot.toml).
+        // Build unified tool set (CLI built-ins + daemon tools from embodiment.toml,
+        // with legacy robot.toml accepted as fallback).
         let local_tool_opts = providers::cloud::build_local_tool_opts(std::path::Path::new("."));
 
         // Bridge: filter UserAction into plain text for the gRPC stream.
@@ -1034,7 +1035,7 @@ async fn provider_loop(
         .with_extensions(all_tools.extensions);
 
     // Build the system prompt once at session start (stable across turns for cache hits).
-    // Unified builder: constitution + robot.toml + AGENTS.md / ROBOT.md.
+    // Unified builder: constitution + embodiment.toml + AGENTS.md / ROBOT.md.
     let system_prompt = tools::build_system_prompt(std::path::Path::new("."), &[]);
 
     let _ = event_tx

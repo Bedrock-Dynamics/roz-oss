@@ -1,7 +1,10 @@
-//! Parser for `robot.toml` -- the hardware manifest describing a robot's
-//! capabilities for the LLM system prompt.
+//! Parser for the physical embodiment manifest.
+//!
+//! `embodiment.toml` is the canonical filename. Legacy `robot.toml` remains
+//! supported as a compatibility fallback while the public surface converges.
 
 use std::fmt::Write;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -9,10 +12,13 @@ use serde::{Deserialize, Serialize};
 /// `robot.toml`. These runtimes are transitional helpers, not authoritative
 /// embodiment authority for live controller promotion.
 pub const SYNTHETIC_EMBODIMENT_RUNTIME_ISSUE: &str = "embodiment runtime synthesized from robot.toml channel metadata";
+pub const EMBODIMENT_MANIFEST_FILE: &str = "embodiment.toml";
+pub const LEGACY_ROBOT_MANIFEST_FILE: &str = "robot.toml";
 
-/// Top-level manifest parsed from `robot.toml`.
+/// Top-level physical embodiment manifest parsed from `embodiment.toml`
+/// or the legacy `robot.toml` fallback.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RobotManifest {
+pub struct EmbodimentManifest {
     /// Basic robot identity.
     pub robot: RobotInfo,
     /// Hardware capabilities (e.g. joint groups, grippers).
@@ -31,6 +37,10 @@ pub struct RobotManifest {
     /// Daemon REST/WebSocket configuration for agent tools.
     pub daemon: Option<DaemonConfig>,
 }
+
+/// Legacy compatibility alias retained while downstream code converges on the
+/// canonical embodiment vocabulary.
+pub type RobotManifest = EmbodimentManifest;
 
 /// Robot identity metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,8 +274,8 @@ fn parse_interface_type(
     }
 }
 
-impl RobotManifest {
-    /// Load a `RobotManifest` from a `robot.toml` file.
+impl EmbodimentManifest {
+    /// Load an [`EmbodimentManifest`] from a supported manifest path.
     ///
     /// # Errors
     ///
@@ -274,6 +284,55 @@ impl RobotManifest {
         let contents = std::fs::read_to_string(path)?;
         let manifest: Self = toml::from_str(&contents)?;
         Ok(manifest)
+    }
+
+    /// Resolve the manifest file for a project directory.
+    ///
+    /// Prefers canonical `embodiment.toml` and falls back to legacy
+    /// `robot.toml` only for compatibility.
+    #[must_use]
+    pub fn project_manifest_path(project_dir: &Path) -> Option<PathBuf> {
+        let canonical = project_dir.join(EMBODIMENT_MANIFEST_FILE);
+        if canonical.exists() {
+            return Some(canonical);
+        }
+
+        let legacy = project_dir.join(LEGACY_ROBOT_MANIFEST_FILE);
+        if legacy.exists() {
+            return Some(legacy);
+        }
+
+        None
+    }
+
+    /// Load the project manifest from its canonical compatibility path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if neither supported manifest filename exists or if
+    /// the selected manifest cannot be parsed.
+    pub fn load_from_project_dir(project_dir: &Path) -> anyhow::Result<Self> {
+        let (manifest, _) = Self::load_from_project_dir_with_path(project_dir)?;
+        Ok(manifest)
+    }
+
+    /// Like [`Self::load_from_project_dir`] but also returns the winning path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if neither supported manifest filename exists or if
+    /// the selected manifest cannot be parsed.
+    pub fn load_from_project_dir_with_path(project_dir: &Path) -> anyhow::Result<(Self, PathBuf)> {
+        let path = Self::project_manifest_path(project_dir).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no {} or {} found in {}",
+                EMBODIMENT_MANIFEST_FILE,
+                LEGACY_ROBOT_MANIFEST_FILE,
+                project_dir.display()
+            )
+        })?;
+        let manifest = Self::load(&path)?;
+        Ok((manifest, path))
     }
 
     /// Build a legacy runtime manifest from the `[channels]` section.
@@ -896,5 +955,38 @@ set_target_body = '{"type": "set_full_target", "head": [1,0,0,0]}'
         // Edge cases
         assert!(!is_valid_channel_name("")); // empty
         assert!(!is_valid_channel_name("0starts_with_number"));
+    }
+
+    #[test]
+    fn project_manifest_prefers_embodiment_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(LEGACY_ROBOT_MANIFEST_FILE),
+            "[robot]\nname = \"legacy\"\ndescription = \"legacy manifest\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(EMBODIMENT_MANIFEST_FILE),
+            "[robot]\nname = \"canonical\"\ndescription = \"canonical manifest\"\n",
+        )
+        .unwrap();
+
+        let (manifest, path) = RobotManifest::load_from_project_dir_with_path(dir.path()).unwrap();
+        assert_eq!(manifest.robot.name, "canonical");
+        assert_eq!(path, dir.path().join(EMBODIMENT_MANIFEST_FILE));
+    }
+
+    #[test]
+    fn project_manifest_falls_back_to_robot_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(LEGACY_ROBOT_MANIFEST_FILE),
+            "[robot]\nname = \"legacy\"\ndescription = \"legacy manifest\"\n",
+        )
+        .unwrap();
+
+        let (manifest, path) = RobotManifest::load_from_project_dir_with_path(dir.path()).unwrap();
+        assert_eq!(manifest.robot.name, "legacy");
+        assert_eq!(path, dir.path().join(LEGACY_ROBOT_MANIFEST_FILE));
     }
 }

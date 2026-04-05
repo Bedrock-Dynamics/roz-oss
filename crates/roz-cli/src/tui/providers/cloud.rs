@@ -60,8 +60,9 @@ fn core_schema_to_proto(
 /// Build `LocalToolOpts` from the unified tool set, optionally spawning Copper.
 ///
 /// Always returns a valid `LocalToolOpts` -- CLI built-ins are always present,
-/// daemon tools from `robot.toml` are added when available, and the Copper WASM
-/// pipeline is spawned when `[daemon.websocket]` + `[channels]` are present.
+/// daemon tools from the embodiment manifest are added when available, and the
+/// Copper WASM pipeline is spawned when `[daemon.websocket]` + `[channels]`
+/// are present.
 pub fn build_local_tool_opts(project_dir: &std::path::Path) -> LocalToolOpts {
     let all = tools::build_all_tools_with_copper(project_dir);
     let proto_schemas = all
@@ -79,14 +80,13 @@ pub fn build_local_tool_opts(project_dir: &std::path::Path) -> LocalToolOpts {
 
 /// Load project context for the cloud agent session.
 ///
-/// Returns the robot.toml system prompt and AGENTS.md / ROBOT.md content
+/// Returns the embodiment-manifest system prompt and AGENTS.md / ROBOT.md content
 /// as separate string blocks for the `StartSession.project_context` field.
 fn load_cloud_project_context() -> Vec<String> {
     let project_dir = std::path::Path::new(".");
     let mut ctx = vec![];
-    // Robot system prompt from robot.toml
-    let robot_toml = project_dir.join("robot.toml");
-    if let Ok(manifest) = roz_core::manifest::RobotManifest::load(&robot_toml) {
+    // Embodiment system prompt from embodiment.toml (legacy robot.toml fallback accepted)
+    if let Ok(manifest) = roz_core::manifest::EmbodimentManifest::load_from_project_dir(project_dir) {
         let prompt = manifest.to_system_prompt();
         if !prompt.is_empty() {
             ctx.push(prompt);
@@ -208,7 +208,7 @@ pub async fn stream_session(
     // Extract tool schemas for StartSession
     let tool_schemas = local_tools.proto_schemas.clone();
 
-    // Load project context for the cloud agent (robot.toml + AGENTS.md / ROBOT.md)
+    // Load project context for the cloud agent (embodiment manifest + AGENTS.md / ROBOT.md)
     let project_context = load_cloud_project_context();
 
     // Send StartSession with registered tool schemas and project context
@@ -527,7 +527,7 @@ mod tests {
     fn build_local_tool_opts_preserves_categories() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::write(
-            dir.path().join("robot.toml"),
+            dir.path().join("embodiment.toml"),
             r#"
 [robot]
 name = "test"

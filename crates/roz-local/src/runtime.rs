@@ -179,12 +179,30 @@ fn resolve_base_url(manifest_url: &str) -> String {
 }
 
 /// Resolve the permission mode from `ROZ_PERMISSION_MODE` env var.
-fn resolve_permission_mode() -> PermissionMode {
-    match std::env::var("ROZ_PERMISSION_MODE").ok().as_deref() {
+fn default_permission_mode(is_interactive: bool) -> PermissionMode {
+    if is_interactive {
+        PermissionMode::Ask
+    } else {
+        PermissionMode::Auto
+    }
+}
+
+fn resolve_permission_mode_from_env(env_override: Option<&str>, is_interactive: bool) -> PermissionMode {
+    match env_override {
         Some("ask") => PermissionMode::Ask,
         Some("safe") => PermissionMode::Safe,
-        _ => PermissionMode::Auto,
+        _ => default_permission_mode(is_interactive),
     }
+}
+
+/// Resolve the permission mode from `ROZ_PERMISSION_MODE` env var.
+fn resolve_permission_mode() -> PermissionMode {
+    use std::io::IsTerminal as _;
+
+    resolve_permission_mode_from_env(
+        std::env::var("ROZ_PERMISSION_MODE").ok().as_deref(),
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+    )
 }
 
 /// Build the prefixed model name from provider + name, used for routing to the correct backend.
@@ -273,18 +291,19 @@ impl ModeTransitionAssessment {
 
 fn assess_embodied_mode_readiness(
     has_connections: bool,
-    has_robot_manifest: bool,
+    has_embodiment_manifest: bool,
     has_physical_tools: bool,
     has_world_state_tools: bool,
+    controller_estop_reason: Option<&str>,
     trust_posture: &TrustPosture,
     telemetry_freshness: FreshnessState,
 ) -> ModeTransitionAssessment {
     if !has_connections {
         return ModeTransitionAssessment::react("no connected embodied environment");
     }
-    if !has_robot_manifest {
+    if !has_embodiment_manifest {
         return ModeTransitionAssessment::react(
-            "connected MCP environment is not embodiment-backed; add robot.toml to enable OodaReAct",
+            "connected MCP environment is not embodiment-backed; add embodiment.toml (legacy robot.toml also accepted) to enable OodaReAct",
         );
     }
     if !has_physical_tools {
@@ -295,9 +314,14 @@ fn assess_embodied_mode_readiness(
             "connected MCP environment does not expose bounded world-state observation tools",
         );
     }
+    if let Some(reason) = controller_estop_reason {
+        return ModeTransitionAssessment::react(format!(
+            "controller safety interlock active: {reason}; clear e-stop before entering OodaReAct"
+        ));
+    }
     if telemetry_freshness != FreshnessState::Fresh {
         return ModeTransitionAssessment::react(format!(
-            "telemetry freshness is {:?}; OodaReAct requires fresh runtime telemetry",
+            "telemetry freshness is {:?}; OodaReAct requires fresh runtime telemetry and heartbeat",
             telemetry_freshness
         ));
     }
@@ -747,16 +771,23 @@ impl LocalRuntime {
         &self.manifest
     }
 
-    fn load_robot_manifest(&self) -> Option<roz_core::manifest::RobotManifest> {
-        let robot_toml_path = self.project_dir.join("robot.toml");
-        match roz_core::manifest::RobotManifest::load(&robot_toml_path) {
+    fn load_embodiment_manifest(&self) -> Option<roz_core::manifest::EmbodimentManifest> {
+        match roz_core::manifest::EmbodimentManifest::load_from_project_dir(&self.project_dir) {
             Ok(manifest) => Some(manifest),
-            Err(error) if robot_toml_path.exists() => {
-                tracing::warn!("failed to parse robot.toml: {error}");
+            Err(error)
+                if roz_core::manifest::EmbodimentManifest::project_manifest_path(&self.project_dir).is_some() =>
+            {
+                tracing::warn!("failed to parse embodiment manifest: {error}");
                 None
             }
             Err(_) => None,
         }
+    }
+
+    fn controller_estop_reason(&self) -> Option<String> {
+        self.copper_handle
+            .as_ref()
+            .and_then(|handle| handle.state().load().estop_reason.clone())
     }
 
     fn assess_mode_transition(&self) -> ModeTransitionAssessment {
@@ -764,9 +795,10 @@ impl LocalRuntime {
         let state = self.mode_state.lock().expect("mode state mutex poisoned");
         assess_embodied_mode_readiness(
             self.mcp.has_connections(),
-            self.load_robot_manifest().is_some(),
+            self.load_embodiment_manifest().is_some(),
             tools.iter().any(|tool| matches!(tool.category, ToolCategory::Physical)),
             DockerSpatialProvider::supports_runtime_world_state(&tools),
+            self.controller_estop_reason().as_deref(),
             &state.trust_posture,
             state.telemetry_freshness.clone(),
         )
@@ -927,8 +959,9 @@ impl LocalRuntime {
             dispatcher.register_with_category(Box::new(DelegationTool::new(spatial_model)), ToolCategory::Pure);
         }
 
-        // Load robot.toml (unconditional — daemon tools don't need Copper)
-        let robot_manifest = self.load_robot_manifest();
+        // Load embodiment.toml (legacy robot.toml fallback accepted; daemon
+        // tools do not require Copper)
+        let robot_manifest = self.load_embodiment_manifest();
         let authoritative_embodiment_runtime = robot_manifest
             .as_ref()
             .and_then(|manifest| manifest.authoritative_embodiment_runtime());
@@ -1054,7 +1087,8 @@ impl LocalRuntime {
         };
         let constitution = system_prompt.first().cloned().unwrap_or_default();
 
-        // Extract project context for PromptAssembler (AGENTS.md, robot.toml, etc.)
+        // Extract project context for PromptAssembler (AGENTS.md,
+        // embodiment.toml-derived prompt blocks, etc.)
         // These come from prepare_turn's system_prompt blocks (indices 1+).
         let project_context: Vec<String> = system_prompt.get(1..).unwrap_or_default().to_vec();
 
@@ -1442,6 +1476,25 @@ name = "llama3.1"
     }
 
     #[test]
+    fn default_permission_mode_prefers_ask_for_interactive_sessions() {
+        assert_eq!(default_permission_mode(true), PermissionMode::Ask);
+        assert_eq!(default_permission_mode(false), PermissionMode::Auto);
+    }
+
+    #[test]
+    fn resolve_permission_mode_respects_explicit_env_override() {
+        assert_eq!(
+            resolve_permission_mode_from_env(Some("safe"), true),
+            PermissionMode::Safe
+        );
+        assert_eq!(
+            resolve_permission_mode_from_env(Some("ask"), false),
+            PermissionMode::Ask
+        );
+        assert_eq!(resolve_permission_mode_from_env(None, false), PermissionMode::Auto);
+    }
+
+    #[test]
     fn session_id_is_set() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1507,13 +1560,14 @@ name = "llama3.1"
 
     #[test]
     fn mode_assessment_requires_embodiment_backing() {
-        let assessment = assess_embodied_mode_readiness(true, false, true, true, &high_trust(), FreshnessState::Fresh);
+        let assessment =
+            assess_embodied_mode_readiness(true, false, true, true, None, &high_trust(), FreshnessState::Fresh);
         assert_eq!(assessment.mode, AgentLoopMode::React);
         assert!(
             assessment
                 .blocker
                 .as_deref()
-                .is_some_and(|reason| reason.contains("robot.toml")),
+                .is_some_and(|reason| reason.contains("embodiment.toml")),
             "expected embodiment-backing blocker, got: {:?}",
             assessment.blocker
         );
@@ -1526,12 +1580,35 @@ name = "llama3.1"
             true,
             true,
             true,
+            None,
             &TrustPosture::default(),
             FreshnessState::Unknown,
         );
         assert_eq!(blocked.mode, AgentLoopMode::React);
 
-        let ready = assess_embodied_mode_readiness(true, true, true, true, &high_trust(), FreshnessState::Fresh);
+        let ready = assess_embodied_mode_readiness(true, true, true, true, None, &high_trust(), FreshnessState::Fresh);
         assert_eq!(ready.mode, AgentLoopMode::OodaReAct);
+    }
+
+    #[test]
+    fn mode_assessment_requires_estop_clear() {
+        let blocked = assess_embodied_mode_readiness(
+            true,
+            true,
+            true,
+            true,
+            Some("watchdog tripped"),
+            &high_trust(),
+            FreshnessState::Fresh,
+        );
+        assert_eq!(blocked.mode, AgentLoopMode::React);
+        assert!(
+            blocked
+                .blocker
+                .as_deref()
+                .is_some_and(|reason| reason.contains("e-stop") || reason.contains("safety interlock")),
+            "expected estop blocker, got: {:?}",
+            blocked.blocker
+        );
     }
 }

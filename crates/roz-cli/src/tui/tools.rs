@@ -8,7 +8,7 @@ use roz_agent::dispatch::{Extensions, ToolContext, ToolDispatcher, ToolExecutor}
 use roz_agent::tools::execute_code::ExecuteCodeTool;
 use roz_copper::evidence_archive::EvidenceArchive;
 use roz_core::embodiment::binding::CommandInterfaceType;
-use roz_core::manifest::RobotManifest;
+use roz_core::manifest::EmbodimentManifest;
 use roz_core::tools::{ToolCategory, ToolResult, ToolSchema};
 use serde_json::{Value, json};
 
@@ -24,7 +24,7 @@ fn is_actuator_channel(interface_type: &CommandInterfaceType) -> bool {
 }
 
 /// Build a `ToolDispatcher` with **all** tools for CLI sessions:
-/// 6 built-in tools + daemon tools from `robot.toml` (if present).
+/// 6 built-in tools + daemon tools from the embodiment manifest (if present).
 ///
 /// Returns the dispatcher and the combined schema vec paired with categories
 /// (used for cloud `RegisterTools` with correct `ToolCategoryHint` and for
@@ -42,9 +42,8 @@ pub fn build_all_tools(project_dir: &Path) -> (ToolDispatcher, Vec<(ToolSchema, 
     dispatcher.register_with_category(Box::new(ListFilesTool), ToolCategory::Pure);
     dispatcher.register_with_category(Box::new(SearchTool), ToolCategory::Pure);
 
-    // Daemon tools from robot.toml (if present)
-    let robot_toml = project_dir.join("robot.toml");
-    if let Ok(manifest) = RobotManifest::load(&robot_toml)
+    // Daemon tools from embodiment.toml (legacy robot.toml fallback accepted)
+    if let Ok(manifest) = EmbodimentManifest::load_from_project_dir(project_dir)
         && let Some(daemon) = manifest.daemon.as_ref()
     {
         let control_manifest = manifest.control_interface_manifest();
@@ -76,7 +75,7 @@ pub struct AllTools {
 
 /// Build tools and optionally spawn the Copper WASM pipeline with a WS bridge.
 ///
-/// When `robot.toml` has both `[daemon.websocket]` and `[channels]`, this:
+/// When the embodiment manifest has both `[daemon.websocket]` and `[channels]`, this:
 /// 1. Creates a WebSocket bridge (`WsActuatorSink` + `WsSensorSource`)
 /// 2. Spawns `CopperHandle::spawn_with_io()` with the bridge
 /// 3. Registers `replay_controller`, `stop_controller`, and
@@ -90,8 +89,7 @@ pub fn build_all_tools_with_copper(project_dir: &Path) -> AllTools {
     let mut copper_handle = None;
     let evidence_archive = EvidenceArchive::new(project_dir);
 
-    let robot_toml = project_dir.join("robot.toml");
-    if let Ok(manifest) = RobotManifest::load(&robot_toml) {
+    if let Ok(manifest) = EmbodimentManifest::load_from_project_dir(project_dir) {
         if let Some(control_manifest) = manifest.control_interface_manifest() {
             let replay_tool = roz_local::tools::replay_controller::ReplayControllerTool::new(&control_manifest);
             dispatcher.register_with_category(Box::new(replay_tool), ToolCategory::Pure);
@@ -113,10 +111,9 @@ pub fn build_all_tools_with_copper(project_dir: &Path) -> AllTools {
                         .replace("https://", "wss://"),
                     ws_config.path,
                 );
-                let body_template = ws_config
-                    .set_target_body
-                    .clone()
-                    .expect("robot.toml [daemon.websocket] must have set_target_body when [channels] is present");
+                let body_template = ws_config.set_target_body.clone().expect(
+                    "embodiment manifest [daemon.websocket] must have set_target_body when [channels] is present",
+                );
 
                 let bridge_config = roz_copper::io_ws::WsBridgeConfig {
                     url: ws_url,
@@ -176,17 +173,16 @@ pub fn build_all_tools_with_copper(project_dir: &Path) -> AllTools {
     }
 }
 
-/// Build system prompt blocks: constitution + robot.toml + project context.
+/// Build system prompt blocks: constitution + embodiment manifest + project context.
 ///
 /// Reuses `context::load_project_context_from()` for AGENTS.md/ROBOT.md,
-/// prepends the constitution, and adds robot.toml system prompt if present.
+/// prepends the constitution, and adds the embodiment manifest system prompt if present.
 pub fn build_system_prompt(project_dir: &Path, tool_names: &[&str]) -> Vec<String> {
     let mode = roz_agent::agent_loop::AgentLoopMode::React;
     let mut blocks = vec![roz_agent::constitution::build_constitution(mode, tool_names)];
 
-    // Robot system prompt from robot.toml
-    let robot_toml = project_dir.join("robot.toml");
-    if let Ok(manifest) = RobotManifest::load(&robot_toml) {
+    // Embodiment system prompt from embodiment.toml (legacy robot.toml fallback accepted)
+    if let Ok(manifest) = EmbodimentManifest::load_from_project_dir(project_dir) {
         let prompt = manifest.to_system_prompt();
         if !prompt.is_empty() {
             blocks.push(prompt);
@@ -463,7 +459,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    const MINIMAL_ROBOT_TOML: &str = r#"
+    const MINIMAL_EMBODIMENT_TOML: &str = r#"
 [robot]
 name = "test-bot"
 description = "A test robot"
@@ -485,7 +481,11 @@ path_prefix = "/api/move/play"
 available_moves = ["wake_up", "goto_sleep"]
 "#;
 
-    const ROBOT_TOML_WITH_CHANNELS: &str = r#"
+    fn write_embodiment_manifest(dir: &TempDir, contents: &str) {
+        fs::write(dir.path().join("embodiment.toml"), contents).unwrap();
+    }
+
+    const EMBODIMENT_TOML_WITH_CHANNELS: &str = r#"
 [robot]
 name = "test-bot"
 description = "A test robot"
@@ -530,7 +530,7 @@ available_moves = ["wake_up", "goto_sleep"]
 "#;
 
     #[test]
-    fn build_all_tools_includes_builtins_without_robot_toml() {
+    fn build_all_tools_includes_builtins_without_embodiment_manifest() {
         let dir = TempDir::new().unwrap();
         let (dispatcher, schemas) = build_all_tools(dir.path());
         // 6 CLI built-ins: bash, read_file, write_file, list_files, search, execute_code
@@ -546,9 +546,9 @@ available_moves = ["wake_up", "goto_sleep"]
     }
 
     #[test]
-    fn build_all_tools_includes_daemon_tools_when_robot_toml_present() {
+    fn build_all_tools_includes_daemon_tools_when_embodiment_manifest_present() {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("robot.toml"), MINIMAL_ROBOT_TOML).unwrap();
+        write_embodiment_manifest(&dir, MINIMAL_EMBODIMENT_TOML);
         let (_dispatcher, schemas) = build_all_tools(dir.path());
         // 6 CLI built-ins + 3 daemon tools (get_robot_state, set_motors, play_animation)
         assert_eq!(schemas.len(), 9);
@@ -562,7 +562,7 @@ available_moves = ["wake_up", "goto_sleep"]
     #[test]
     fn build_all_tools_includes_move_to_with_channels() {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("robot.toml"), ROBOT_TOML_WITH_CHANNELS).unwrap();
+        write_embodiment_manifest(&dir, EMBODIMENT_TOML_WITH_CHANNELS);
         let (_dispatcher, schemas) = build_all_tools(dir.path());
         // 6 built-ins + 4 daemon tools (get_robot_state, set_motors, move_to, play_animation)
         assert_eq!(schemas.len(), 10);
@@ -578,11 +578,7 @@ available_moves = ["wake_up", "goto_sleep"]
     #[test]
     fn build_all_tools_no_daemon_when_no_daemon_section() {
         let dir = TempDir::new().unwrap();
-        fs::write(
-            dir.path().join("robot.toml"),
-            "[robot]\nname = \"test\"\ndescription = \"test\"\n",
-        )
-        .unwrap();
+        write_embodiment_manifest(&dir, "[robot]\nname = \"test\"\ndescription = \"test\"\n");
         let (_dispatcher, schemas) = build_all_tools(dir.path());
         // Only CLI built-ins
         assert_eq!(schemas.len(), 6);
@@ -607,7 +603,7 @@ available_moves = ["wake_up", "goto_sleep"]
     #[test]
     fn copper_tools_not_registered_without_websocket() {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("robot.toml"), MINIMAL_ROBOT_TOML).unwrap();
+        write_embodiment_manifest(&dir, MINIMAL_EMBODIMENT_TOML);
         let all = build_all_tools_with_copper(dir.path());
         // No websocket section -> no copper handle, no controller tools.
         assert!(all.copper_handle.is_none());
@@ -632,7 +628,7 @@ base_url = "http://localhost:8000"
 [daemon.websocket]
 path = "/ws/sdk"
 "#;
-        fs::write(dir.path().join("robot.toml"), toml).unwrap();
+        write_embodiment_manifest(&dir, toml);
         let all = build_all_tools_with_copper(dir.path());
         assert!(all.copper_handle.is_none());
         let names: Vec<&str> = all.schemas.iter().map(|(s, _)| s.name.as_str()).collect();
@@ -640,7 +636,7 @@ path = "/ws/sdk"
     }
 
     #[test]
-    fn copper_tools_not_registered_without_robot_toml() {
+    fn copper_tools_not_registered_without_embodiment_manifest() {
         let dir = TempDir::new().unwrap();
         let all = build_all_tools_with_copper(dir.path());
         assert!(all.copper_handle.is_none());
@@ -686,7 +682,7 @@ path = "/ws/sdk"
 set_target_type = "set_target"
 set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
 "#;
-        fs::write(dir.path().join("robot.toml"), toml).unwrap();
+        write_embodiment_manifest(&dir, toml);
         let all = build_all_tools_with_copper(dir.path());
 
         // Copper handle should be present.
@@ -755,15 +751,11 @@ set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
     }
 
     #[test]
-    fn build_system_prompt_includes_robot_toml() {
+    fn build_system_prompt_includes_embodiment_manifest() {
         let dir = TempDir::new().unwrap();
-        fs::write(
-            dir.path().join("robot.toml"),
-            "[robot]\nname = \"test-bot\"\ndescription = \"A test robot\"\n",
-        )
-        .unwrap();
+        write_embodiment_manifest(&dir, "[robot]\nname = \"test-bot\"\ndescription = \"A test robot\"\n");
         let prompt = build_system_prompt(dir.path(), &[]);
-        assert!(prompt.len() >= 2, "should have constitution + robot prompt");
+        assert!(prompt.len() >= 2, "should have constitution + embodiment prompt");
         assert!(prompt[1].contains("test-bot"));
     }
 
@@ -779,14 +771,10 @@ set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
     #[test]
     fn build_system_prompt_all_blocks() {
         let dir = TempDir::new().unwrap();
-        fs::write(
-            dir.path().join("robot.toml"),
-            "[robot]\nname = \"all-bot\"\ndescription = \"Full test\"\n",
-        )
-        .unwrap();
+        write_embodiment_manifest(&dir, "[robot]\nname = \"all-bot\"\ndescription = \"Full test\"\n");
         fs::write(dir.path().join("AGENTS.md"), "Agent instructions.").unwrap();
         let prompt = build_system_prompt(dir.path(), &["bash"]);
-        // constitution + robot.toml + AGENTS.md = 3 blocks
+        // constitution + embodiment.toml + AGENTS.md = 3 blocks
         assert_eq!(prompt.len(), 3);
         assert!(prompt[0].contains("SAFETY-CRITICAL"));
         assert!(prompt[1].contains("all-bot"));

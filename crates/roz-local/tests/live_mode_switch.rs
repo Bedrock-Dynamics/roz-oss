@@ -4,7 +4,10 @@
 //! when a connected MCP environment is embodiment-backed and runtime
 //! readiness has been established, without recreating the runtime.
 //!
-//! Requires: `ANTHROPIC_API_KEY` + ros2-manipulator container on port 8094.
+//! Requires: `ANTHROPIC_API_KEY`, Docker daemon, and the local
+//! `bedrockdynamics/substrate-sim:ros2-manipulator` image.
+
+mod common;
 
 use std::time::Duration;
 
@@ -31,8 +34,12 @@ name = "claude-sonnet-4-6"
     .unwrap();
 }
 
-fn write_robot_manifest(dir: &std::path::Path) {
-    std::fs::write(dir.join("robot.toml"), include_str!("../../../examples/ur5/robot.toml")).unwrap();
+fn write_embodiment_manifest(dir: &std::path::Path) {
+    std::fs::write(
+        dir.join("embodiment.toml"),
+        include_str!("../../../examples/ur5/robot.toml"),
+    )
+    .unwrap();
 }
 
 async fn seed_runtime_execution_readiness(runtime: &LocalRuntime) {
@@ -58,13 +65,18 @@ fn used_tool(messages: &[Message], tool_name: &str) -> bool {
 }
 
 #[tokio::test]
-#[ignore = "requires ANTHROPIC_API_KEY + running Docker sim"]
+#[ignore = "requires ANTHROPIC_API_KEY + Docker daemon + local manipulator image"]
 async fn mode_switches_when_sim_connects() {
     let api_key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY required");
+    let _guard = common::live_test_mutex().lock().await;
+    if let Err(error) = common::recreate_docker_sim(&common::MANIPULATOR_SIM).await {
+        eprintln!("SKIP: failed to launch isolated ros2-manipulator test container: {error}");
+        return;
+    }
 
     let dir = tempfile::tempdir().unwrap();
     write_manifest(dir.path());
-    write_robot_manifest(dir.path());
+    write_embodiment_manifest(dir.path());
 
     // Build a model factory that always creates a fresh real Claude model.
     let key = api_key.clone();
@@ -117,7 +129,7 @@ async fn mode_switches_when_sim_connects() {
     match runtime.connect_mcp("arm", 8094, Duration::from_secs(15)).await {
         Ok(()) => {}
         Err(e) => {
-            eprintln!("SKIP: MCP connect failed (is ros2-manipulator running on port 8094?): {e}");
+            eprintln!("SKIP: MCP connect failed against isolated ros2-manipulator test container on port 8094: {e}");
             return;
         }
     }

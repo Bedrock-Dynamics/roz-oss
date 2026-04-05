@@ -34,7 +34,8 @@ async fn execute_cloud(config: &ProviderConfig, task: &str) -> anyhow::Result<()
     text_tx.send(task.to_string()).await?;
     text_tx.close();
 
-    // Build unified tool set (CLI built-ins + daemon tools from robot.toml)
+    // Build unified tool set (CLI built-ins + daemon tools from embodiment.toml,
+    // with legacy robot.toml accepted as fallback)
     let local_tool_opts = crate::tui::providers::cloud::build_local_tool_opts(std::path::Path::new("."));
 
     // Spawn gRPC session in background

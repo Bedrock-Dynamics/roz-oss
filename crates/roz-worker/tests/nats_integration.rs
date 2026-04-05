@@ -242,7 +242,7 @@ async fn approval_team_events_flow_through_nats_with_approval_id() {
 }
 
 /// Verifies the worker's real JetStream publish helper uses the canonical team
-/// subject and preserves `approval_id` in the emitted payload.
+/// subject, wraps events in `SequencedTeamEvent`, and preserves `approval_id`.
 #[tokio::test]
 async fn publish_team_event_uses_worker_subject_with_approval_id() {
     let guard = roz_test::nats_container().await;
@@ -278,9 +278,18 @@ async fn publish_team_event_uses_worker_subject_with_approval_id() {
         .await
         .expect("publish team event");
 
+    publish_team_event(&js, parent_task_id, child_task_id, &event)
+        .await
+        .expect("publish second team event");
+
     let msg = tokio::time::timeout(Duration::from_secs(5), sub.next())
         .await
         .expect("timed out waiting for published team event")
+        .expect("subscription closed unexpectedly");
+
+    let msg2 = tokio::time::timeout(Duration::from_secs(5), sub.next())
+        .await
+        .expect("timed out waiting for second published team event")
         .expect("subscription closed unexpectedly");
 
     assert_eq!(
@@ -288,8 +297,13 @@ async fn publish_team_event_uses_worker_subject_with_approval_id() {
         subject,
         "team event should use the worker subject"
     );
-    let received: TeamEvent = serde_json::from_slice(&msg.payload).expect("deserialize team event");
-    match received {
+    let received: SequencedTeamEvent = serde_json::from_slice(&msg.payload).expect("deserialize sequenced team event");
+    let received2: SequencedTeamEvent =
+        serde_json::from_slice(&msg2.payload).expect("deserialize second sequenced team event");
+    assert_eq!(received.seq, 1);
+    assert_eq!(received2.seq, 2);
+    assert!(received2.timestamp_ns >= received.timestamp_ns);
+    match received.event {
         TeamEvent::WorkerApprovalRequested {
             worker_id,
             task_id,
@@ -304,6 +318,13 @@ async fn publish_team_event_uses_worker_subject_with_approval_id() {
             assert_eq!(tool_name, "move_to");
             assert_eq!(reason, "workspace exit risk");
             assert_eq!(timeout_secs, 30);
+        }
+        other => panic!("expected WorkerApprovalRequested, got {other:?}"),
+    }
+
+    match received2.event {
+        TeamEvent::WorkerApprovalRequested { approval_id, .. } => {
+            assert_eq!(approval_id, "apr_publish_helper");
         }
         other => panic!("expected WorkerApprovalRequested, got {other:?}"),
     }
