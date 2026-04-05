@@ -105,6 +105,7 @@ fn grpc_router(state: &AppState) -> Router {
         state.http_client.clone(),
         state.restate_ingress_url.clone(),
         state.nats_client.clone(),
+        Arc::new(AppGrpcAuth) as Arc<dyn roz_server::grpc::agent::GrpcAuth>,
     );
     let agent_svc = roz_server::grpc::agent::AgentServiceImpl::new(
         state.pool.clone(),
@@ -1196,27 +1197,18 @@ mod tests {
             .expect("create key");
         let task_auth = format!("Bearer {}", key.full_key);
 
-        // POST /v1/tasks -> 201
-        let create_body = serde_json::json!({
-            "prompt": "Navigate to waypoint A",
-            "environment_id": env.id.to_string(),
-            "timeout_secs": 120
-        });
-        let req = Request::builder()
-            .uri("/v1/tasks")
-            .method("POST")
-            .header("authorization", &task_auth)
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&create_body).unwrap()))
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let task_id = json["data"]["id"].as_str().unwrap().to_string();
-        assert_eq!(json["data"]["prompt"], "Navigate to waypoint A");
-        assert_eq!(json["data"]["status"], "pending");
+        let task = roz_db::tasks::create(
+            &pool,
+            tenant.id,
+            "Navigate to waypoint A",
+            env.id,
+            Some(120),
+            serde_json::json!([]),
+            None,
+        )
+        .await
+        .expect("create task row");
+        let task_id = task.id.to_string();
 
         // GET /v1/tasks/:id -> 200
         let req = Request::builder()
@@ -1237,12 +1229,25 @@ mod tests {
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // GET after cancel -> 200 and cancelled
+        let req = Request::builder()
+            .uri(format!("/v1/tasks/{task_id}"))
+            .method("GET")
+            .header("authorization", &task_auth)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["status"], "cancelled");
     }
 
     // -- Task create & approve handler tests --------------------------------------
 
-    /// Helper: set up authed app + environment, return (pool, app, auth, `env_id`).
-    async fn setup_task_test() -> (sqlx::PgPool, Router, String, uuid::Uuid) {
+    /// Helper: set up authed app + environment + host, return (pool, app, auth, env_id, host_id).
+    async fn setup_task_test() -> (sqlx::PgPool, Router, String, uuid::Uuid, String) {
         let (pool, app, auth) = setup_authed_app().await;
 
         // Create an environment via the REST API (reuses the tenant from setup_authed_app)
@@ -1265,12 +1270,30 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let env_id: uuid::Uuid = json["data"]["id"].as_str().unwrap().parse().unwrap();
 
-        (pool, app, auth, env_id)
+        let host_body = serde_json::json!({
+            "name": format!("task-test-host-{}", uuid::Uuid::new_v4()),
+            "host_type": "edge"
+        });
+        let req = Request::builder()
+            .uri("/v1/hosts")
+            .method("POST")
+            .header("authorization", &auth)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&host_body).unwrap()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let host_id = json["data"]["id"].as_str().unwrap().to_string();
+
+        (pool, app, auth, env_id, host_id)
     }
 
     #[tokio::test]
-    async fn create_task_succeeds_without_restate() {
-        let (_pool, app, auth, env_id) = setup_task_test().await;
+    async fn create_task_requires_host_id() {
+        let (_pool, app, auth, env_id, _host_id) = setup_task_test().await;
 
         let create_body = serde_json::json!({
             "prompt": "Pick up the red cube",
@@ -1285,37 +1308,67 @@ mod tests {
             .body(Body::from(serde_json::to_vec(&create_body).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json["data"]["id"].as_str().is_some(), "response must contain data.id");
-        assert_eq!(json["data"]["prompt"], "Pick up the red cube");
-        assert_eq!(json["data"]["status"], "pending");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("host_id is required"),
+            "expected host_id validation error, got {json:?}"
+        );
     }
 
     #[tokio::test]
-    async fn approve_rejects_wrong_tenant() {
-        let (pool, app, auth_a, env_id) = setup_task_test().await;
+    async fn create_task_without_dispatch_backend_fails_closed() {
+        let (pool, app, auth, env_id, host_id) = setup_task_test().await;
 
-        // Create task as tenant A
         let create_body = serde_json::json!({
-            "prompt": "Scan area",
+            "prompt": "Pick up the red cube",
             "environment_id": env_id.to_string(),
+            "host_id": host_id,
+            "timeout_secs": 60
         });
         let req = Request::builder()
             .uri("/v1/tasks")
             .method("POST")
-            .header("authorization", &auth_a)
+            .header("authorization", &auth)
             .header("content-type", "application/json")
             .body(Body::from(serde_json::to_vec(&create_body).unwrap()))
             .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let api_key = roz_db::api_keys::verify_api_key(&pool, auth.trim_start_matches("Bearer "))
+            .await
+            .expect("verify api key")
+            .expect("api key should exist");
+        let tasks = roz_db::tasks::list(&pool, api_key.tenant_id, 10, 0)
+            .await
+            .expect("list tasks");
+        assert!(tasks.is_empty(), "failed create should not leave orphaned task rows");
+    }
 
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let task_id = json["data"]["id"].as_str().unwrap();
+    #[tokio::test]
+    async fn approve_rejects_wrong_tenant() {
+        let (pool, app, auth_a, env_id, _host_id) = setup_task_test().await;
+        let api_key = roz_db::api_keys::verify_api_key(&pool, auth_a.trim_start_matches("Bearer "))
+            .await
+            .expect("verify api key")
+            .expect("api key should exist");
+        let task = roz_db::tasks::create(
+            &pool,
+            api_key.tenant_id,
+            "Scan area",
+            env_id,
+            Some(60),
+            serde_json::json!([]),
+            None,
+        )
+        .await
+        .expect("create task row");
+        let task_id = task.id;
 
         // Create tenant B with its own API key
         let slug_b = format!("tenant-b-{}", uuid::Uuid::new_v4());
@@ -1345,7 +1398,7 @@ mod tests {
 
     #[tokio::test]
     async fn approve_rejects_nonexistent_task() {
-        let (_pool, app, auth, _env_id) = setup_task_test().await;
+        let (_pool, app, auth, _env_id, _host_id) = setup_task_test().await;
 
         let fake_id = uuid::Uuid::new_v4();
         let approve_body = serde_json::json!({
@@ -1365,26 +1418,23 @@ mod tests {
 
     #[tokio::test]
     async fn approve_without_restate_returns_error() {
-        let (_pool, app, auth, env_id) = setup_task_test().await;
-
-        // Create a task (fire-and-forget Restate call silently fails)
-        let create_body = serde_json::json!({
-            "prompt": "Move to dock",
-            "environment_id": env_id.to_string(),
-        });
-        let req = Request::builder()
-            .uri("/v1/tasks")
-            .method("POST")
-            .header("authorization", &auth)
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&create_body).unwrap()))
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let task_id = json["data"]["id"].as_str().unwrap();
+        let (pool, app, auth, env_id, _host_id) = setup_task_test().await;
+        let api_key = roz_db::api_keys::verify_api_key(&pool, auth.trim_start_matches("Bearer "))
+            .await
+            .expect("verify api key")
+            .expect("api key should exist");
+        let task = roz_db::tasks::create(
+            &pool,
+            api_key.tenant_id,
+            "Move to dock",
+            env_id,
+            Some(60),
+            serde_json::json!([]),
+            None,
+        )
+        .await
+        .expect("create task row");
+        let task_id = task.id;
 
         // Approve with correct tenant but no Restate -> 500
         let approve_body = serde_json::json!({
@@ -1902,6 +1952,7 @@ mod tests {
             state.http_client.clone(),
             state.restate_ingress_url.clone(),
             state.nats_client.clone(),
+            Arc::new(AppGrpcAuth),
         );
         let agent_svc = grpc::agent::AgentServiceImpl::new(
             state.pool.clone(),

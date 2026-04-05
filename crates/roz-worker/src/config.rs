@@ -49,6 +49,9 @@ pub struct WorkerConfig {
     /// Defaults to 1.5 rad/s if not specified. Set via `ROZ_MAX_VELOCITY`.
     #[serde(default)]
     pub max_velocity: Option<f64>,
+    /// Maximum number of concurrently executing tasks before new work is rejected.
+    #[serde(default = "default_max_concurrent_tasks")]
+    pub max_concurrent_tasks: usize,
     /// Camera subsystem configuration.
     #[serde(default)]
     pub camera: CameraConfig,
@@ -127,6 +130,10 @@ const fn default_model_timeout_secs() -> u64 {
     120
 }
 
+const fn default_max_concurrent_tasks() -> usize {
+    4
+}
+
 fn default_anthropic_provider() -> String {
     "anthropic".to_string()
 }
@@ -185,6 +192,7 @@ mod tests {
         assert_eq!(config.gateway_api_key, "paig_test_key");
         assert_eq!(config.model_name, "claude-haiku-4-5");
         assert_eq!(config.model_timeout_secs, 60);
+        assert_eq!(config.max_concurrent_tasks, 4);
     }
 
     #[test]
@@ -208,6 +216,7 @@ mod tests {
         assert_eq!(config.model_name, "claude-sonnet-4-6");
         assert_eq!(config.model_timeout_secs, 120);
         assert_eq!(config.gateway_api_key, "paig_test_key");
+        assert_eq!(config.max_concurrent_tasks, 4);
     }
 
     #[test]
@@ -308,5 +317,14 @@ mod tests {
             err_string.contains("gateway_api_key"),
             "error should mention missing field 'gateway_api_key', got: {err_string}"
         );
+    }
+
+    #[test]
+    fn config_supports_max_concurrent_tasks_override() {
+        let figment = Figment::new()
+            .merge(Serialized::defaults(base_config()))
+            .merge(("max_concurrent_tasks", 9));
+        let config = WorkerConfig::from_figment(&figment).unwrap();
+        assert_eq!(config.max_concurrent_tasks, 9);
     }
 }

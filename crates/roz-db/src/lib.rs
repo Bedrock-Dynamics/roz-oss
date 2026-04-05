@@ -18,8 +18,22 @@ pub mod triggers;
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
+fn parse_database_max_connections(value: Option<&str>) -> u32 {
+    value
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(10)
+}
+
+fn database_max_connections() -> u32 {
+    parse_database_max_connections(std::env::var("ROZ_DB_MAX_CONNECTIONS").ok().as_deref())
+}
+
 pub async fn create_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
-    PgPoolOptions::new().max_connections(10).connect(database_url).await
+    PgPoolOptions::new()
+        .max_connections(database_max_connections())
+        .connect(database_url)
+        .await
 }
 
 pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
@@ -75,6 +89,22 @@ pub(crate) async fn shared_test_pool() -> PgPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn database_max_connections_defaults_to_ten() {
+        assert_eq!(parse_database_max_connections(None), 10);
+    }
+
+    #[test]
+    fn database_max_connections_uses_env_override() {
+        assert_eq!(parse_database_max_connections(Some("24")), 24);
+    }
+
+    #[test]
+    fn database_max_connections_rejects_zero_and_invalid_values() {
+        assert_eq!(parse_database_max_connections(Some("0")), 10);
+        assert_eq!(parse_database_max_connections(Some("not-a-number")), 10);
+    }
 
     #[tokio::test]
     async fn pool_creation_and_migration() {

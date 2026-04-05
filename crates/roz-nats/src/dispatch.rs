@@ -9,11 +9,30 @@ use uuid::Uuid;
 
 /// Internal NATS subject prefix used to route approval responses back to a task worker.
 pub const INTERNAL_APPROVAL_SUBJECT_PREFIX: &str = "roz.internal.tasks.approval";
+/// Internal NATS subject prefix used to report task lifecycle transitions back to the server.
+pub const INTERNAL_TASK_STATUS_SUBJECT_PREFIX: &str = "roz.internal.tasks.status";
 
 /// Subject carrying approval responses for a specific task.
 #[must_use]
 pub fn approval_subject(task_id: Uuid) -> String {
     format!("{INTERNAL_APPROVAL_SUBJECT_PREFIX}.{task_id}")
+}
+
+/// Subject carrying task lifecycle events for a specific task.
+#[must_use]
+pub fn task_status_subject(task_id: Uuid) -> String {
+    format!("{INTERNAL_TASK_STATUS_SUBJECT_PREFIX}.{task_id}")
+}
+
+/// Wire event published by workers as task execution progresses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskStatusEvent {
+    pub task_id: Uuid,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<Uuid>,
 }
 
 /// Extract a W3C traceparent string from the current tracing span's `OTel` context.
@@ -226,6 +245,26 @@ mod tests {
         let bytes = serde_json::to_vec(&result).expect("serialize to bytes");
         let deserialized: TaskResult = serde_json::from_slice(&bytes).expect("deserialize");
         assert_eq!(result, deserialized);
+    }
+
+    #[test]
+    fn task_status_event_roundtrip() {
+        let task_id = Uuid::new_v4();
+        let host_id = Uuid::new_v4();
+        let event = TaskStatusEvent {
+            task_id,
+            status: "running".into(),
+            detail: Some("worker accepted invocation".into()),
+            host_id: Some(host_id),
+        };
+
+        let bytes = serde_json::to_vec(&event).expect("serialize");
+        let deserialized: TaskStatusEvent = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(deserialized, event);
+        assert_eq!(
+            task_status_subject(task_id),
+            format!("{INTERNAL_TASK_STATUS_SUBJECT_PREFIX}.{task_id}")
+        );
     }
 
     #[test]

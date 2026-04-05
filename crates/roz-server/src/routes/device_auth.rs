@@ -17,6 +17,33 @@ const POLL_INTERVAL_SECS: u64 = 5;
 /// Characters used to generate human-readable user codes.
 const USER_CODE_CHARS: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
+fn client_rate_limit_key(headers: &HeaderMap, scope: &str) -> String {
+    let client = headers
+        .get("fly-client-ip")
+        .or_else(|| headers.get("cf-connecting-ip"))
+        .or_else(|| headers.get("x-forwarded-for"))
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(',').next().unwrap_or(value).trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown");
+    format!("device-auth:{scope}:{client}")
+}
+
+fn rate_limit_error(retry_after_ms: u64) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({
+            "error": "rate_limited",
+            "retry_after_ms": retry_after_ms,
+        })),
+    )
+}
+
+fn enforce_rate_limit(state: &AppState, headers: &HeaderMap, scope: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    crate::middleware::rate_limit::check_rate_limit(&state.rate_limiter, &client_rate_limit_key(headers, scope))
+        .map_err(rate_limit_error)
+}
+
 /// Generate a cryptographically random device code (32 bytes, URL-safe base64).
 fn generate_device_code() -> String {
     let mut bytes = [0u8; 32];
@@ -58,7 +85,13 @@ pub struct CompleteRequest {
 ///
 /// Initiates a device authorization flow (RFC 8628). Returns a device code
 /// for CLI polling and a user code for browser entry.
-pub async fn request_code(State(state): State<AppState>) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+pub async fn request_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let _ = roz_db::device_codes::purge_stale_device_codes(&state.pool).await;
+    enforce_rate_limit(&state, &headers, "request_code")?;
+
     let device_code = generate_device_code();
     let user_code = generate_user_code();
     let expires_at = chrono::Utc::now() + chrono::Duration::seconds(DEVICE_CODE_TTL_SECS);
@@ -91,8 +124,12 @@ pub async fn request_code(State(state): State<AppState>) -> Result<Json<Value>, 
 /// Returns the appropriate RFC 8628 error codes while pending.
 pub async fn poll_token(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<PollTokenRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let _ = roz_db::device_codes::purge_stale_device_codes(&state.pool).await;
+    enforce_rate_limit(&state, &headers, "poll_token")?;
+
     let row = roz_db::device_codes::get_by_device_code(&state.pool, &body.device_code)
         .await
         .map_err(|e| {
@@ -157,6 +194,9 @@ pub async fn complete_auth(
     headers: HeaderMap,
     Form(body): Form<CompleteRequest>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let _ = roz_db::device_codes::purge_stale_device_codes(&state.pool).await;
+    enforce_rate_limit(&state, &headers, "complete_auth")?;
+
     let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
     let auth = crate::auth::extract_auth(&state.auth, &state.pool, auth_header)
         .await
@@ -237,5 +277,12 @@ mod tests {
         // Generate a batch and verify no collisions (probabilistic but very unlikely)
         let codes: std::collections::HashSet<String> = (0..100).map(|_| generate_user_code()).collect();
         assert_eq!(codes.len(), 100);
+    }
+
+    #[test]
+    fn client_rate_limit_key_prefers_forwarded_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.10, 198.51.100.3".parse().unwrap());
+        assert_eq!(client_rate_limit_key(&headers, "poll"), "device-auth:poll:203.0.113.10");
     }
 }

@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::Result;
 use async_nats::jetstream::Context as JetStreamContext;
 use futures::StreamExt;
-use roz_agent::agent_loop::{AgentInputSeed, AgentLoop, PresenceSignal};
+use roz_agent::agent_loop::{AgentInputSeed, AgentLoop, AgentOutput, PresenceSignal};
 use roz_agent::error::AgentError;
 use roz_agent::model::types::StreamChunk;
 use roz_agent::session_runtime::{
@@ -15,8 +15,9 @@ use roz_agent::spatial_provider::{NullWorldStateProvider, PrimedWorldStateProvid
 use roz_core::session::activity::RuntimeFailureKind;
 use roz_core::session::event::{EventEnvelope, SessionEvent};
 use roz_core::session::feedback::ApprovalOutcome;
-use roz_nats::dispatch::TaskInvocation;
-use tokio::sync::{broadcast, mpsc};
+use roz_core::team::{SequencedTeamEvent, TeamEvent};
+use roz_nats::dispatch::{TaskInvocation, TaskStatusEvent};
+use tokio::sync::{Semaphore, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use uuid::Uuid;
@@ -28,6 +29,49 @@ fn validate_control_interface_manifest(invocation: &TaskInvocation) -> Result<()
         return Err(anyhow::anyhow!("OODA task missing control_interface_manifest"));
     }
     Ok(())
+}
+
+fn decode_team_event_payload(payload: &[u8]) -> Option<TeamEvent> {
+    if let Ok(sequenced) = serde_json::from_slice::<SequencedTeamEvent>(payload) {
+        return Some(sequenced.event);
+    }
+
+    serde_json::from_slice::<TeamEvent>(payload).ok()
+}
+
+async fn publish_task_status(nats: &async_nats::Client, event: &TaskStatusEvent) {
+    let subject = roz_nats::dispatch::task_status_subject(event.task_id);
+    match serde_json::to_vec(event) {
+        Ok(payload) => {
+            if let Err(error) = nats.publish(subject, payload.into()).await {
+                tracing::warn!(%error, task_id = %event.task_id, status = %event.status, "failed to publish task status");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, task_id = %event.task_id, status = %event.status, "failed to serialize task status");
+        }
+    }
+}
+
+fn classify_terminal_status(
+    output: &Result<AgentOutput, AgentError>,
+    timed_out: bool,
+) -> (&'static str, Option<String>) {
+    if timed_out {
+        let detail = output
+            .as_ref()
+            .err()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "task timed out".to_string());
+        return ("timed_out", Some(detail));
+    }
+
+    match output {
+        Ok(_) => ("succeeded", None),
+        Err(AgentError::Cancelled { .. }) => ("cancelled", Some("task cancelled".into())),
+        Err(AgentError::Safety(message)) => ("safety_stop", Some(message.clone())),
+        Err(error) => ("failed", Some(error.to_string())),
+    }
 }
 
 struct WorkerTaskStreamingExecutor {
@@ -248,14 +292,14 @@ async fn consume_team_approval_events(
                 if let Err(error) = msg.ack().await {
                     tracing::warn!(%error, %approval_owner_task_id, task_id = %worker_task_id, "failed to ack team approval event");
                 }
-                let event = match serde_json::from_slice::<roz_core::team::TeamEvent>(&msg.payload) {
-                    Ok(event) => event,
-                    Err(error) => {
-                        tracing::warn!(%error, %approval_owner_task_id, task_id = %worker_task_id, "failed to decode team approval event");
+                let event = match decode_team_event_payload(&msg.payload) {
+                    Some(event) => event,
+                    None => {
+                        tracing::warn!(%approval_owner_task_id, task_id = %worker_task_id, "failed to decode team approval event");
                         continue;
                     }
                 };
-                if let roz_core::team::TeamEvent::WorkerApprovalResolved {
+                if let TeamEvent::WorkerApprovalResolved {
                     worker_id,
                     approval_id,
                     approved,
@@ -312,6 +356,16 @@ async fn execute_task(
 
     if invocation.parent_task_id.is_some() && invocation.delegation_scope.is_none() {
         tracing::error!(task_id = %task_id, "child worker invocation missing delegation scope");
+        publish_task_status(
+            &task_nats,
+            &TaskStatusEvent {
+                task_id,
+                status: "failed".into(),
+                detail: Some("child worker invocation missing delegation scope".into()),
+                host_id: Some(invocation.host_id),
+            },
+        )
+        .await;
         let result = roz_worker::dispatch::build_task_result(
             task_id,
             Err(roz_agent::error::AgentError::Safety(
@@ -328,6 +382,16 @@ async fn execute_task(
 
     if let Err(error) = validate_control_interface_manifest(&invocation) {
         tracing::error!(task_id = %task_id, %error, "invalid control interface manifest for task");
+        publish_task_status(
+            &task_nats,
+            &TaskStatusEvent {
+                task_id,
+                status: "failed".into(),
+                detail: Some(error.to_string()),
+                host_id: Some(invocation.host_id),
+            },
+        )
+        .await;
         let result = roz_worker::dispatch::build_task_result(
             task_id,
             Err(roz_agent::error::AgentError::Safety(error.to_string())),
@@ -345,6 +409,16 @@ async fn execute_task(
         Ok(m) => m,
         Err(e) => {
             tracing::error!(error = %e, "failed to build model for task, aborting");
+            publish_task_status(
+                &task_nats,
+                &TaskStatusEvent {
+                    task_id,
+                    status: "failed".into(),
+                    detail: Some(format!("failed to build model: {e}")),
+                    host_id: Some(invocation.host_id),
+                },
+            )
+            .await;
             let agent_err = roz_agent::error::AgentError::Model(e.into());
             let result = roz_worker::dispatch::build_task_result(task_id, Err(agent_err));
             if let Err(sig_err) =
@@ -540,23 +614,44 @@ async fn execute_task(
     };
     let _ = session_runtime.start_session().await;
     session_runtime.sync_world_state(primed_spatial_context);
-    let output = match session_runtime
-        .run_turn_streaming(turn_input, None, &mut executor)
-        .await
+    publish_task_status(
+        &task_nats,
+        &TaskStatusEvent {
+            task_id,
+            status: "running".into(),
+            detail: Some("worker accepted invocation".into()),
+            host_id: Some(invocation.host_id),
+        },
+    )
+    .await;
+    let timeout_secs = u64::from(invocation.timeout_secs.max(1));
+    let mut timed_out = false;
+    let output = match tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        session_runtime.run_turn_streaming(turn_input, None, &mut executor),
+    )
+    .await
     {
-        Ok(StreamingTurnResult::Completed(turn_output)) => {
+        Ok(Ok(StreamingTurnResult::Completed(turn_output))) => {
             Ok(roz_worker::dispatch::build_agent_output_from_turn_output(turn_output))
         }
-        Ok(StreamingTurnResult::Cancelled) => Err(AgentError::Cancelled {
+        Ok(Ok(StreamingTurnResult::Cancelled)) => Err(AgentError::Cancelled {
             partial_input_tokens: 0,
             partial_output_tokens: 0,
         }),
-        Err(error) => {
+        Ok(Err(error)) => {
             if *estop_rx.borrow() {
                 tracing::error!(task_id = %task_id, "E-STOP during task execution");
                 drop(copper_handle.take());
             }
             Err(session_runtime_error_to_agent_error(error, *estop_rx.borrow()))
+        }
+        Err(_) => {
+            timed_out = true;
+            task_agent_cancel.cancel();
+            Err(AgentError::Internal(anyhow::anyhow!(
+                "task timed out after {timeout_secs}s"
+            )))
         }
     };
 
@@ -580,7 +675,18 @@ async fn execute_task(
         }
     }
 
+    let (terminal_status, terminal_detail) = classify_terminal_status(&output, timed_out);
     let result = roz_worker::dispatch::build_task_result(task_id, output);
+    publish_task_status(
+        &task_nats,
+        &TaskStatusEvent {
+            task_id,
+            status: terminal_status.into(),
+            detail: terminal_detail.or_else(|| result.error.clone()),
+            host_id: Some(invocation.host_id),
+        },
+    )
+    .await;
 
     if let Err(e) = roz_worker::dispatch::signal_result(&task_http, &restate_url, &task_id.to_string(), &result).await {
         tracing::error!(error = %e, "failed to signal result to Restate");
@@ -609,6 +715,11 @@ async fn main() -> Result<()> {
     let config = roz_worker::config::WorkerConfig::load().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     tracing::info!(worker_id = %config.worker_id, "starting roz-worker");
+    let task_slots = Arc::new(Semaphore::new(config.max_concurrent_tasks));
+    tracing::info!(
+        max_concurrent_tasks = config.max_concurrent_tasks,
+        "task admission slots configured"
+    );
 
     // Connect to NATS
     let nats = async_nats::connect(&config.nats_url).await?;
@@ -795,19 +906,52 @@ async fn main() -> Result<()> {
         let task_camera_mgr = camera_manager.clone();
 
         let task_estop_rx = estop_rx.clone();
+        let Ok(task_permit) = task_slots.clone().try_acquire_owned() else {
+            tracing::warn!(
+                task_id = %task_id,
+                max_concurrent_tasks = config.max_concurrent_tasks,
+                "worker saturated; rejecting task"
+            );
+            let error = format!(
+                "worker saturated: max_concurrent_tasks={} exhausted",
+                config.max_concurrent_tasks
+            );
+            publish_task_status(
+                &task_nats,
+                &TaskStatusEvent {
+                    task_id,
+                    status: "failed".into(),
+                    detail: Some(error.clone()),
+                    host_id: Some(invocation.host_id),
+                },
+            )
+            .await;
+            let result =
+                roz_worker::dispatch::build_task_result(task_id, Err(AgentError::Internal(anyhow::anyhow!(error))));
+            if let Err(sig_err) =
+                roz_worker::dispatch::signal_result(&task_http, &restate_url, &task_id.to_string(), &result).await
+            {
+                tracing::error!(error = %sig_err, task_id = %task_id, "failed to signal saturation result");
+            }
+            continue;
+        };
         let span = tracing::info_span!("worker.execute_task", task_id = %task_id);
         tokio::spawn(
-            execute_task(
-                invocation,
-                task_id,
-                task_config,
-                task_nats,
-                task_js,
-                task_http,
-                restate_url,
-                task_estop_rx,
-                task_camera_mgr,
-            )
+            async move {
+                let _task_permit = task_permit;
+                execute_task(
+                    invocation,
+                    task_id,
+                    task_config,
+                    task_nats,
+                    task_js,
+                    task_http,
+                    restate_url,
+                    task_estop_rx,
+                    task_camera_mgr,
+                )
+                .await;
+            }
             .instrument(span),
         );
     }
@@ -819,6 +963,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roz_core::team::TeamEvent as CoreTeamEvent;
 
     fn sample_invocation(mode: roz_nats::dispatch::ExecutionMode) -> TaskInvocation {
         TaskInvocation {
@@ -850,5 +995,54 @@ mod tests {
     fn react_tasks_do_not_require_control_interface_manifest() {
         let invocation = sample_invocation(roz_nats::dispatch::ExecutionMode::React);
         validate_control_interface_manifest(&invocation).expect("react task should be allowed");
+    }
+
+    #[test]
+    fn decode_team_event_payload_accepts_sequenced_wrapper() {
+        let worker_id = Uuid::new_v4();
+        let payload = serde_json::to_vec(&SequencedTeamEvent {
+            seq: 7,
+            timestamp_ns: 99,
+            event: CoreTeamEvent::WorkerApprovalResolved {
+                worker_id,
+                task_id: worker_id,
+                approval_id: "apr_worker".into(),
+                approved: true,
+                modifier: None,
+            },
+        })
+        .expect("serialize sequenced worker event");
+
+        match decode_team_event_payload(&payload).expect("decode worker event") {
+            CoreTeamEvent::WorkerApprovalResolved {
+                worker_id: id,
+                approval_id,
+                approved,
+                ..
+            } => {
+                assert_eq!(id, worker_id);
+                assert_eq!(approval_id, "apr_worker");
+                assert!(approved);
+            }
+            other => panic!("expected WorkerApprovalResolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_team_event_payload_still_accepts_legacy_payload() {
+        let worker_id = Uuid::new_v4();
+        let payload = serde_json::to_vec(&CoreTeamEvent::WorkerStarted {
+            worker_id,
+            host_id: "legacy-host".into(),
+        })
+        .expect("serialize legacy worker event");
+
+        match decode_team_event_payload(&payload).expect("decode legacy worker event") {
+            CoreTeamEvent::WorkerStarted { worker_id: id, host_id } => {
+                assert_eq!(id, worker_id);
+                assert_eq!(host_id, "legacy-host");
+            }
+            other => panic!("expected WorkerStarted, got {other:?}"),
+        }
     }
 }

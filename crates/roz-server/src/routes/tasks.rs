@@ -18,7 +18,7 @@ pub struct CreateTaskRequest {
     pub prompt: String,
     pub environment_id: Uuid,
     pub timeout_secs: Option<i32>,
-    /// Route the task to a specific worker host. If absent, the task awaits manual assignment.
+    /// Route the task to a specific worker host.
     pub host_id: Option<String>,
     /// Ordered phase specs for the agent loop. Empty = single default React phase.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -110,6 +110,19 @@ pub async fn create(
     tracing::Span::current().record("tenant_id", tracing::field::display(tenant_id));
 
     validate_child_task_delegation_scope(body.parent_task_id, body.delegation_scope.as_ref())?;
+    let host_id_str = body
+        .host_id
+        .as_deref()
+        .ok_or_else(|| AppError::bad_request("host_id is required until deferred assignment is implemented"))?;
+    let nats = state
+        .nats_client
+        .as_ref()
+        .ok_or_else(|| AppError::internal("task dispatch unavailable: NATS is not configured"))?;
+    let host_uuid = Uuid::parse_str(host_id_str).map_err(|_| AppError::bad_request("host_id is not a valid UUID"))?;
+    let host = roz_db::hosts::get_by_id(&state.pool, host_uuid)
+        .await
+        .map_err(|e| AppError::internal(format!("failed to look up host: {e}")))?
+        .ok_or_else(|| AppError::not_found(format!("host {host_id_str} not found")))?;
 
     // Serialise phases to JSONB. An empty array is a valid default (single React phase).
     let phases_json = serde_json::to_value(&body.phases)
@@ -125,6 +138,9 @@ pub async fn create(
         body.parent_task_id,
     )
     .await?;
+    let task = roz_db::tasks::assign_host(&state.pool, task.id, host_uuid)
+        .await?
+        .ok_or_else(|| AppError::internal("created task disappeared before host assignment"))?;
 
     // Start Restate workflow (fire-and-forget -- workflow manages its own lifecycle).
     // The workflow must be registered before NATS publish so the worker can signal back.
@@ -138,52 +154,47 @@ pub async fn create(
     };
 
     let restate_url = format!("{}/TaskWorkflow/{}/run/send", state.restate_ingress_url, task.id,);
-    // Fire-and-forget -- don't fail the request. Task is created in DB; workflow can be retried.
     match state.http_client.post(&restate_url).json(&workflow_input).send().await {
         Ok(resp) => {
             if let Err(e) = resp.error_for_status() {
-                tracing::error!(?e, task_id = %task.id, "Restate returned error starting workflow");
+                let _ = roz_db::tasks::update_status(&state.pool, task.id, "failed").await;
+                return Err(AppError::internal(format!("failed to start workflow: {e}")));
             }
         }
         Err(e) => {
-            tracing::error!(?e, task_id = %task.id, "failed to start Restate workflow");
+            let _ = roz_db::tasks::update_status(&state.pool, task.id, "failed").await;
+            return Err(AppError::internal(format!("failed to start Restate workflow: {e}")));
         }
     }
 
-    // Publish task invocation to NATS for worker dispatch (only if host_id is provided).
-    if let (Some(nats), Some(host_id_str)) = (&state.nats_client, &body.host_id) {
-        // Resolve UUID to hostname — workers subscribe to invoke.{hostname}.>
-        let host_uuid =
-            Uuid::parse_str(host_id_str).map_err(|_| AppError::bad_request("host_id is not a valid UUID"))?;
-        let host = roz_db::hosts::get_by_id(&state.pool, host_uuid)
-            .await
-            .map_err(|e| AppError::internal(format!("failed to look up host: {e}")))?
-            .ok_or_else(|| AppError::not_found(format!("host {host_id_str} not found")))?;
-
-        let invocation = roz_nats::dispatch::TaskInvocation {
-            task_id: task.id,
-            tenant_id: tenant_id.to_string(),
-            prompt: task.prompt.clone(),
-            environment_id: task.environment_id,
-            safety_policy_id: None,
-            host_id: host_uuid,
-            timeout_secs: body.timeout_secs.map_or(300, |t| u32::try_from(t).unwrap_or(300)),
-            mode: mode_from_phases(&body.phases),
-            parent_task_id: body.parent_task_id,
-            restate_url: state.restate_ingress_url.clone(),
-            traceparent: roz_nats::dispatch::current_traceparent(),
-            phases: body.phases.clone(),
-            control_interface_manifest: body.control_interface_manifest.clone(),
-            delegation_scope: body.delegation_scope.clone(),
-        };
-        let subject = roz_nats::subjects::Subjects::invoke(&host.name, &task.id.to_string())
-            .map_err(|e| AppError::bad_request(format!("invalid NATS subject: {e}")))?;
-        if let Ok(payload) = serde_json::to_vec(&invocation)
-            && let Err(e) = nats.publish(subject, payload.into()).await
-        {
-            tracing::error!(?e, task_id = %task.id, "NATS publish failed");
-        }
+    let invocation = roz_nats::dispatch::TaskInvocation {
+        task_id: task.id,
+        tenant_id: tenant_id.to_string(),
+        prompt: task.prompt.clone(),
+        environment_id: task.environment_id,
+        safety_policy_id: None,
+        host_id: host_uuid,
+        timeout_secs: body.timeout_secs.map_or(300, |t| u32::try_from(t).unwrap_or(300)),
+        mode: mode_from_phases(&body.phases),
+        parent_task_id: body.parent_task_id,
+        restate_url: state.restate_ingress_url.clone(),
+        traceparent: roz_nats::dispatch::current_traceparent(),
+        phases: body.phases.clone(),
+        control_interface_manifest: body.control_interface_manifest.clone(),
+        delegation_scope: body.delegation_scope.clone(),
+    };
+    let subject = roz_nats::subjects::Subjects::invoke(&host.name, &task.id.to_string())
+        .map_err(|e| AppError::bad_request(format!("invalid NATS subject: {e}")))?;
+    let payload = serde_json::to_vec(&invocation)
+        .map_err(|e| AppError::internal(format!("failed to serialize task invocation: {e}")))?;
+    if let Err(e) = nats.publish(subject, payload.into()).await {
+        let _ = roz_db::tasks::update_status(&state.pool, task.id, "failed").await;
+        return Err(AppError::internal(format!("failed to publish task invocation: {e}")));
     }
+
+    let task = roz_db::tasks::update_status(&state.pool, task.id, "queued")
+        .await?
+        .ok_or_else(|| AppError::internal("task disappeared after dispatch"))?;
 
     Ok((StatusCode::CREATED, Json(json!({"data": task}))))
 }
@@ -302,7 +313,10 @@ pub async fn delete(
     if task.tenant_id != tenant_id {
         return Err(AppError::not_found("task not found"));
     }
-    roz_db::tasks::delete(&state.pool, id).await?;
+    let updated = roz_db::tasks::update_status(&state.pool, id, "cancelled").await?;
+    if updated.is_none() {
+        return Err(AppError::not_found("task not found"));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

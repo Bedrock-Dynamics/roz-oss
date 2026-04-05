@@ -11,6 +11,7 @@ use futures::StreamExt as _;
 use roz_core::phases::PhaseMode;
 use roz_core::safety::SafetyLevel;
 use roz_core::tasks::{SpawnReply, SpawnRequest};
+use roz_nats::dispatch::{INTERNAL_TASK_STATUS_SUBJECT_PREFIX, TaskStatusEvent};
 use sqlx::PgPool;
 
 /// Subscribe to all internal NATS subjects and spawn handler loops.
@@ -18,7 +19,13 @@ use sqlx::PgPool;
 /// This is called once at startup. Each subject gets its own `tokio::spawn` task that
 /// loops until the NATS connection is dropped.
 pub fn spawn_all(nats: NatsClient, pool: PgPool, restate_ingress_url: String, http_client: reqwest::Client) {
-    tokio::spawn(spawn_task_handler(nats, pool, restate_ingress_url, http_client));
+    tokio::spawn(spawn_task_handler(
+        nats.clone(),
+        pool.clone(),
+        restate_ingress_url,
+        http_client,
+    ));
+    tokio::spawn(spawn_task_status_handler(nats, pool));
 }
 
 /// Send an error string as the NATS reply so the caller does not time out.
@@ -41,6 +48,41 @@ fn validate_child_task_delegation_scope(req: &SpawnRequest) -> Result<(), &'stat
         return Err("child tasks require delegation_scope");
     }
     Ok(())
+}
+
+fn is_terminal_task_status(status: &str) -> bool {
+    matches!(
+        status,
+        "succeeded" | "failed" | "timed_out" | "cancelled" | "safety_stop"
+    )
+}
+
+async fn apply_task_status_event(pool: &PgPool, event: &TaskStatusEvent) {
+    if let Some(host_id) = event.host_id {
+        if let Err(error) = roz_db::tasks::assign_host(pool, event.task_id, host_id).await {
+            tracing::warn!(%error, task_id = %event.task_id, "failed to assign host from task status event");
+        }
+    }
+
+    if event.status == "running" {
+        if let Err(error) = roz_db::tasks::ensure_active_run(pool, event.task_id, event.host_id).await {
+            tracing::warn!(%error, task_id = %event.task_id, "failed to ensure active task run");
+        }
+    } else if is_terminal_task_status(&event.status) {
+        if let Ok(None) = roz_db::tasks::active_run_for_task(pool, event.task_id).await {
+            let _ = roz_db::tasks::ensure_active_run(pool, event.task_id, event.host_id).await;
+        }
+        if let Err(error) =
+            roz_db::tasks::complete_active_run_for_task(pool, event.task_id, &event.status, event.detail.as_deref())
+                .await
+        {
+            tracing::warn!(%error, task_id = %event.task_id, "failed to complete active task run");
+        }
+    }
+
+    if let Err(error) = roz_db::tasks::update_status(pool, event.task_id, &event.status).await {
+        tracing::warn!(%error, task_id = %event.task_id, status = %event.status, "failed to update task status");
+    }
 }
 
 /// Handle `roz.internal.tasks.spawn` request-reply messages.
@@ -199,6 +241,26 @@ async fn spawn_task_handler(nats: NatsClient, pool: PgPool, restate_ingress_url:
     tracing::info!(%subject, "internal NATS handler exiting");
 }
 
+async fn spawn_task_status_handler(nats: NatsClient, pool: PgPool) {
+    let subject = format!("{INTERNAL_TASK_STATUS_SUBJECT_PREFIX}.*");
+    let mut sub = match nats.subscribe(subject.clone()).await {
+        Ok(sub) => sub,
+        Err(error) => {
+            tracing::error!(%error, %subject, "failed to subscribe to task status updates");
+            return;
+        }
+    };
+
+    tracing::info!(%subject, "task status handler ready");
+
+    while let Some(msg) = sub.next().await {
+        match serde_json::from_slice::<TaskStatusEvent>(&msg.payload) {
+            Ok(event) => apply_task_status_event(&pool, &event).await,
+            Err(error) => tracing::warn!(%error, "failed to decode task status event"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +294,15 @@ mod tests {
         let mut req = spawn_request();
         req.delegation_scope = Some(roz_core::tasks::DelegationScope::fail_closed());
         validate_child_task_delegation_scope(&req).expect("scope should satisfy validation");
+    }
+
+    #[test]
+    fn terminal_task_statuses_match_runtime_contract() {
+        assert!(is_terminal_task_status("succeeded"));
+        assert!(is_terminal_task_status("failed"));
+        assert!(is_terminal_task_status("timed_out"));
+        assert!(is_terminal_task_status("cancelled"));
+        assert!(is_terminal_task_status("safety_stop"));
+        assert!(!is_terminal_task_status("queued"));
     }
 }

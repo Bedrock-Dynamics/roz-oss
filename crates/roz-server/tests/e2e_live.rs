@@ -306,12 +306,28 @@ async fn task_create_and_poll() {
         .expect("response should contain environment id")
         .to_owned();
 
-    // 2. Create task
+    // 2. Create prerequisite host
+    let (status, body) = post(
+        "/v1/hosts",
+        &json!({
+            "name": "e2e-task-host",
+            "host_type": "edge"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create host should return 201");
+    let host_id = body["data"]["id"]
+        .as_str()
+        .expect("response should contain host id")
+        .to_owned();
+
+    // 3. Create task
     let (status, body) = post(
         "/v1/tasks",
         &json!({
             "prompt": "Navigate to waypoint alpha",
             "environment_id": env_id,
+            "host_id": host_id,
             "timeout_secs": 300
         }),
     )
@@ -322,13 +338,13 @@ async fn task_create_and_poll() {
         .expect("response should contain task id")
         .to_owned();
 
-    // 3. GET task -- verify prompt and status
+    // 4. GET task -- verify prompt and status
     let (status, body) = get(&format!("/v1/tasks/{task_id}")).await;
     assert_eq!(status, StatusCode::OK, "get task should return 200");
     assert_eq!(body["data"]["prompt"].as_str(), Some("Navigate to waypoint alpha"));
-    assert_eq!(body["data"]["status"].as_str(), Some("pending"));
+    assert_ne!(body["data"]["status"].as_str(), Some("pending"));
 
-    // 4. List tasks -- verify task appears
+    // 5. List tasks -- verify task appears
     let (status, body) = get("/v1/tasks").await;
     assert_eq!(status, StatusCode::OK, "list tasks should return 200");
     let found = body["data"]
@@ -338,11 +354,17 @@ async fn task_create_and_poll() {
         .any(|t| t["id"].as_str() == Some(&task_id));
     assert!(found, "created task should appear in list");
 
-    // 5. Cancel task
+    // 6. Cancel task
     let status = delete(&format!("/v1/tasks/{task_id}")).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "cancel task should return 204");
 
-    // 6. Cleanup -- delete prerequisite environment
+    let (status, body) = get(&format!("/v1/tasks/{task_id}")).await;
+    assert_eq!(status, StatusCode::OK, "cancelled task should still be retrievable");
+    assert_eq!(body["data"]["status"].as_str(), Some("cancelled"));
+
+    // 7. Cleanup -- delete prerequisites
+    let status = delete(&format!("/v1/hosts/{host_id}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "cleanup host should return 204");
     let status = delete(&format!("/v1/environments/{env_id}")).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "cleanup environment should return 204");
 }
@@ -404,7 +426,7 @@ async fn safety_policy_crud_lifecycle() {
 async fn task_chain_starts_workflow() {
     // Tests the server-side of the task execution chain:
     // POST /v1/tasks with host_id → Restate workflow started + NATS publish attempted.
-    // No worker is deployed on Fly.io, so the task will stay pending/running —
+    // No worker is guaranteed to be deployed on Fly.io, so the task may stay queued or advance to running —
     // but the server-side wiring (DB insert, Restate workflow, NATS dispatch) is exercised.
 
     // 1. Create prerequisite environment
@@ -454,8 +476,7 @@ async fn task_chain_starts_workflow() {
         body["data"]["prompt"].as_str(),
         Some("e2e chain test — pick up the red block")
     );
-    // Status is "pending" in DB (Restate manages the workflow state separately)
-    assert_eq!(body["data"]["status"].as_str(), Some("pending"));
+    assert_ne!(body["data"]["status"].as_str(), Some("pending"));
 
     // 5. Cleanup
     let _ = delete(&format!("/v1/tasks/{task_id}")).await;
@@ -545,12 +566,28 @@ async fn task_create_with_phases() {
         .expect("response should contain environment id")
         .to_owned();
 
-    // 2. Create task with phases array
+    // 2. Create prerequisite host
+    let (status, body) = post(
+        "/v1/hosts",
+        &json!({
+            "name": "e2e-phases-host",
+            "host_type": "edge"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create host should return 201");
+    let host_id = body["data"]["id"]
+        .as_str()
+        .expect("response should contain host id")
+        .to_owned();
+
+    // 3. Create task with phases array
     let (status, body) = post(
         "/v1/tasks",
         &json!({
             "prompt": "Navigate to waypoint alpha with phases",
             "environment_id": env_id,
+            "host_id": host_id,
             "timeout_secs": 300,
             "phases": [
                 {"mode": "react", "tools": "all", "trigger": "on_tool_signal"},
@@ -565,8 +602,9 @@ async fn task_create_with_phases() {
         .expect("response should contain task id")
         .to_owned();
 
-    // 3. Cleanup
+    // 4. Cleanup
     let _ = delete(&format!("/v1/tasks/{task_id}")).await;
+    let _ = delete(&format!("/v1/hosts/{host_id}")).await;
     let status = delete(&format!("/v1/environments/{env_id}")).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "cleanup environment should return 204");
 }
