@@ -6,5 +6,6 @@ pub mod env_stop;
 pub mod file_read;
 pub mod file_write;
 pub mod promote_controller;
+pub mod replay_controller;
 pub mod stop_controller;
 pub mod template;

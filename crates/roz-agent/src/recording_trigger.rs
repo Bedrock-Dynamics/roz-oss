@@ -68,8 +68,10 @@ mod tests {
     fn session_started_event() -> SessionEvent {
         SessionEvent::SessionStarted {
             session_id: "sess-1".into(),
-            mode: SessionMode::LocalCanonical,
+            mode: SessionMode::Local,
             blueprint_version: "1.0".into(),
+            model_name: None,
+            permissions: vec![],
         }
     }
 

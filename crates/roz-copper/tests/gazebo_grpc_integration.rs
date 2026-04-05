@@ -63,27 +63,33 @@ fn to_entity_state(ep: &proto::EntityPose) -> roz_core::spatial::EntityState {
         velocity: None,
         properties: std::collections::HashMap::new(),
         timestamp_ns: None,
-        frame_id: Some("world".to_string()),
+        frame_id: "world".to_string(),
+        last_observed_ns: None,
+        observation_confidence: 1.0,
     }
 }
 
-/// Get the first PoseBatch from a stream.
-async fn first_batch(client: &mut SceneServiceClient<tonic::transport::Channel>) -> proto::PoseBatch {
+/// Get the first PoseBatch from a stream, or skip when the bridge is unavailable.
+async fn first_batch(client: &mut SceneServiceClient<tonic::transport::Channel>) -> Option<proto::PoseBatch> {
     let request = proto::StreamPosesRequest {
         world_name: String::new(),
         entity_filter: vec![],
     };
-    let mut stream = client
-        .stream_poses(request)
-        .await
-        .expect("StreamPoses failed")
-        .into_inner();
+    let mut stream = match client.stream_poses(request).await {
+        Ok(response) => response.into_inner(),
+        Err(error) => {
+            eprintln!("SKIP: StreamPoses unavailable: {error}");
+            return None;
+        }
+    };
 
-    tokio::time::timeout(Duration::from_secs(10), stream.next())
-        .await
-        .expect("timed out waiting for poses")
-        .expect("stream ended")
-        .expect("decode error")
+    Some(
+        tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("timed out waiting for poses")
+            .expect("stream ended")
+            .expect("decode error"),
+    )
 }
 
 /// Find an entity by path prefix in a PoseBatch.
@@ -109,7 +115,9 @@ async fn drone_teleport_changes_pose() {
     let mut control = ControlServiceClient::new(channel);
 
     // Read initial drone position.
-    let before = first_batch(&mut scene).await;
+    let Some(before) = first_batch(&mut scene).await else {
+        return;
+    };
     let drone_before = find_entity(&before, "x500").expect("x500 drone not found in scene");
     let t_before = drone_before.transform.as_ref().unwrap();
     println!(
@@ -170,7 +178,9 @@ async fn drone_teleport_changes_pose() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Read new pose.
-    let after = first_batch(&mut scene).await;
+    let Some(after) = first_batch(&mut scene).await else {
+        return;
+    };
     let drone_after = find_entity(&after, "x500").expect("x500 not found after teleport");
     let t_after = drone_after.transform.as_ref().unwrap();
     println!("AFTER:  x500 @ ({:.3}, {:.3}, {:.3})", t_after.x, t_after.y, t_after.z);
@@ -185,7 +195,7 @@ async fn drone_teleport_changes_pose() {
 
     // Convert to EntityState and verify.
     let entity = to_entity_state(drone_after);
-    assert_eq!(entity.frame_id.as_deref(), Some("world"));
+    assert_eq!(entity.frame_id, "world");
     assert!(entity.position.is_some());
 
     println!("PASS: drone teleport → pose changed → EntityState correct");
@@ -232,7 +242,9 @@ async fn drone_pose_stream_advances() {
     }
 
     // Convert all entities from last batch.
-    let last = first_batch(&mut scene).await;
+    let Some(last) = first_batch(&mut scene).await else {
+        return;
+    };
     let entities: Vec<_> = last.poses.iter().map(to_entity_state).collect();
     println!("Drone scene: {} entities", entities.len());
     for e in &entities {
@@ -265,7 +277,9 @@ async fn arm_teleport_changes_pose() {
     let mut control = ControlServiceClient::new(channel);
 
     // Read initial scene to find any model.
-    let before = first_batch(&mut scene).await;
+    let Some(before) = first_batch(&mut scene).await else {
+        return;
+    };
     println!(
         "Arm scene: {} entities, sim_time={:.3}s",
         before.poses.len(),
@@ -330,7 +344,9 @@ async fn arm_teleport_changes_pose() {
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let after = first_batch(&mut scene).await;
+    let Some(after) = first_batch(&mut scene).await else {
+        return;
+    };
     let moved = after.poses.iter().find(|p| p.path == entity_name);
 
     if let Some(ep) = moved {
@@ -343,7 +359,7 @@ async fn arm_teleport_changes_pose() {
         assert!(dx < 2.0, "entity should have moved: dx={dx:.3}");
 
         let entity = to_entity_state(ep);
-        assert_eq!(entity.frame_id.as_deref(), Some("world"));
+        assert_eq!(entity.frame_id, "world");
         println!("PASS: arm entity teleported → pose changed → EntityState correct");
     } else {
         println!("SKIP: entity not found in scene after teleport");
@@ -359,7 +375,9 @@ async fn arm_pose_stream_to_entity_state() {
     };
 
     let mut scene = SceneServiceClient::new(channel);
-    let batch = first_batch(&mut scene).await;
+    let Some(batch) = first_batch(&mut scene).await else {
+        return;
+    };
 
     let entities: Vec<_> = batch.poses.iter().map(to_entity_state).collect();
     println!(
@@ -377,7 +395,7 @@ async fn arm_pose_stream_to_entity_state() {
 
     assert!(!entities.is_empty(), "arm scene should have entities");
     assert!(
-        entities.iter().all(|e| e.frame_id.as_deref() == Some("world")),
+        entities.iter().all(|e| e.frame_id == "world"),
         "all entities should have frame_id=world"
     );
 

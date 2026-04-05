@@ -7,7 +7,8 @@ import "google/protobuf/struct.proto";
 
 service AgentService {
   // Bidirectional streaming RPC for interactive agent sessions.
-  // Client sends prompts and tool results. Server sends deltas and tool requests.
+  // Client sends prompts and tool results. Server sends canonical SessionEvent
+  // envelopes plus non-session side-channel messages (keepalive, WebRTC, cameras).
   rpc StreamSession(stream SessionRequest) returns (stream SessionResponse);
 
   // WatchTeam streams TeamEvent messages for all workers under a parent task.
@@ -100,8 +101,8 @@ message UserMessage {
   string content = 1;
   repeated ContentBlock context = 2;
   optional string ai_mode = 3;
-  // Client-generated message ID echoed back in all response chunks
-  // (TextDelta, ThinkingDelta, TurnComplete). If omitted, server generates one.
+  // Client-generated message ID echoed back in canonical turn events
+  // (`text_delta`, `thinking_delta`, `turn_finished`). If omitted, server generates one.
   optional string message_id = 4;
   // D3b: Complete tool snapshot for this turn. When present, Roz uses these
   // instead of session-accumulated tools (RegisterTools / StartSession.tools).
@@ -157,10 +158,11 @@ message MessageFeedback {
 // D2: IDE response to a Roz-authoritative tool approval request.
 // Sent when the user clicks Deny/Allow in the IDE popover.
 message PermissionDecision {
-  // The tool_call_id from the ActivityUpdate("waiting_approval") that triggered
+  // The approval_id from the canonical approval/session event that triggered
   // the popover. Roz uses this to unblock the waiting agent turn.
-  string tool_call_id = 1;
+  string approval_id = 1;
   bool approved = 2;
+  optional google.protobuf.Struct modifier = 3;
 }
 
 // D3: Dynamically register or unregister a named set of tools mid-session.
@@ -187,23 +189,298 @@ message RegisterTools {
 
 message SessionResponse {
   oneof response {
-    SessionStarted session_started = 1;
-    TextDelta text_delta = 2;
-    ThinkingDelta thinking_delta = 3;
-    ToolRequest tool_request = 4;
-    TurnComplete turn_complete = 5;
-    SessionError error = 6;
     Keepalive keepalive = 7;
     Pong pong = 8;
-    ContextCompacted context_compacted = 9;
-    PresenceHint presence_hint = 10;
-    ActivityUpdate activity_update = 11;
     TelemetryUpdate telemetry = 14;
     TaskProgress task_progress = 15;
     WebRtcOffer webrtc_offer = 16;
     IceCandidate ice_candidate = 17;
     CameraUpdate camera_update = 18;
+    SessionEventEnvelope session_event = 19;
   }
+}
+
+message SessionEventEnvelope {
+  string event_id = 1;
+  string correlation_id = 2;
+  optional string parent_event_id = 3;
+  google.protobuf.Timestamp timestamp = 4;
+  string event_type = 5;
+  reserved 6;
+  oneof typed_event {
+    SessionStartedPayload session_started = 7;
+    SessionRejectedPayload session_rejected = 8;
+    SessionFailedPayload session_failed = 9;
+    TextDeltaPayload text_delta = 10;
+    ThinkingDeltaPayload thinking_delta = 11;
+    TurnFinishedPayload turn_finished = 12;
+    ToolCallStartedPayload tool_call_started = 13;
+    ToolCallRequestedPayload tool_call_requested = 14;
+    ToolCallFinishedPayload tool_call_finished = 15;
+    SafePauseEnteredPayload safe_pause_entered = 16;
+    ActivityChangedPayload activity_changed = 17;
+    PresenceHintedPayload presence_hinted = 18;
+    TurnStartedPayload turn_started = 19;
+    SessionCompletedPayload session_completed = 20;
+    ContextCompactedPayload context_compacted = 21;
+    ToolUnavailablePayload tool_unavailable = 22;
+    ApprovalRequestedPayload approval_requested = 23;
+    ApprovalResolvedPayload approval_resolved = 24;
+    SafePauseClearedPayload safe_pause_cleared = 25;
+    ControllerLoadedPayload controller_loaded = 26;
+    ControllerShadowStartedPayload controller_shadow_started = 27;
+    ControllerPromotedPayload controller_promoted = 28;
+    ControllerRolledBackPayload controller_rolled_back = 29;
+    SafetyInterventionPayload safety_intervention = 30;
+    EdgeTransportDegradedPayload edge_transport_degraded = 31;
+    VerificationStartedPayload verification_started = 32;
+    VerificationFinishedPayload verification_finished = 33;
+    ResumeSummaryPayload resume_summary = 34;
+    TelemetryStatusChangedPayload telemetry_status_changed = 35;
+    TrustPostureChangedPayload trust_posture_changed = 36;
+    ReasoningTracePayload reasoning_trace = 37;
+    ModelCallCompletedPayload model_call_completed = 38;
+    MemoryReadPayload memory_read = 39;
+    MemoryWritePayload memory_write = 40;
+    SensorRepositionedPayload sensor_repositioned = 41;
+    ContactStateChangedPayload contact_state_changed = 42;
+    FeedbackReceivedPayload feedback_received = 43;
+  }
+}
+
+message SessionPermissionRulePayload {
+  string tool_pattern = 1;
+  string policy = 2;
+  optional string category = 3;
+  optional string reason = 4;
+}
+
+message SessionStartedPayload {
+  string session_id = 1;
+  string mode = 2;
+  string blueprint_version = 3;
+  optional string model_name = 4;
+  repeated SessionPermissionRulePayload permissions = 5;
+}
+
+message SessionRejectedPayload {
+  string code = 1;
+  string message = 2;
+  bool retryable = 3;
+}
+
+message SessionFailedPayload {
+  string failure = 1;
+}
+
+message TurnStartedPayload {
+  uint32 turn_index = 1;
+}
+
+message SessionCompletedPayload {
+  string summary = 1;
+  uint64 input_tokens = 2;
+  uint64 output_tokens = 3;
+}
+
+message TextDeltaPayload {
+  string content = 1;
+  optional string message_id = 2;
+}
+
+message ThinkingDeltaPayload {
+  string content = 1;
+  optional string message_id = 2;
+}
+
+message TurnFinishedPayload {
+  uint32 input_tokens = 1;
+  uint32 output_tokens = 2;
+  uint32 cache_creation_tokens = 3;
+  uint32 cache_read_tokens = 4;
+  string stop_reason = 5;
+  optional string message_id = 6;
+}
+
+message ToolCallStartedPayload {
+  string call_id = 1;
+  string tool_name = 2;
+  string category = 3;
+}
+
+message ToolCallRequestedPayload {
+  string call_id = 1;
+  string tool_name = 2;
+  google.protobuf.Struct parameters = 3;
+  uint32 timeout_ms = 4;
+}
+
+message ToolCallFinishedPayload {
+  string call_id = 1;
+  string tool_name = 2;
+  string result_summary = 3;
+}
+
+message ToolUnavailablePayload {
+  string tool_name = 1;
+  string reason = 2;
+}
+
+message ApprovalRequestedPayload {
+  string approval_id = 1;
+  string action = 2;
+  string reason = 3;
+  uint64 timeout_secs = 4;
+}
+
+message ApprovalResolvedPayload {
+  string approval_id = 1;
+  google.protobuf.Struct outcome = 2;
+}
+
+message SafePauseEnteredPayload {
+  string reason = 1;
+  string robot_state = 2;
+}
+
+message SafePauseClearedPayload {
+  string reason = 1;
+}
+
+message ActivityChangedPayload {
+  string state = 1;
+  string reason = 2;
+  bool robot_safe = 3;
+  optional string unblock_event = 4;
+}
+
+message PresenceHintedPayload {
+  string level = 1;
+  string reason = 2;
+}
+
+message ContextCompactedPayload {
+  string level = 1;
+  uint32 messages_affected = 2;
+  uint32 tokens_before = 3;
+  uint32 tokens_after = 4;
+}
+
+message ControllerLoadedPayload {
+  string artifact_id = 1;
+  string source_kind = 2;
+}
+
+message ControllerShadowStartedPayload {
+  string artifact_id = 1;
+}
+
+message ControllerPromotedPayload {
+  string artifact_id = 1;
+  optional string replaced_id = 2;
+}
+
+message ControllerRolledBackPayload {
+  string artifact_id = 1;
+  string restored_id = 2;
+  string reason = 3;
+}
+
+message SafetyInterventionPayload {
+  string channel = 1;
+  double raw_value = 2;
+  double clamped_value = 3;
+  string kind = 4;
+  string reason = 5;
+}
+
+message EdgeTransportDegradedPayload {
+  string transport = 1;
+  google.protobuf.Struct health = 2;
+  repeated string affected_capabilities = 3;
+}
+
+message VerificationStartedPayload {
+  string target = 1;
+  string verifier_kind = 2;
+}
+
+message VerificationFinishedPayload {
+  string target = 1;
+  google.protobuf.Struct verdict = 2;
+  optional google.protobuf.Struct evidence = 3;
+  string verdict_kind = 4;
+  optional string verifier_status = 5;
+  optional string verifier_reason = 6;
+  optional string evidence_bundle_id = 7;
+  optional uint64 frame_snapshot_id = 8;
+  optional string execution_mode = 9;
+}
+
+message ResumeSummaryPayload {
+  google.protobuf.Struct summary = 1;
+}
+
+message TelemetryStatusChangedPayload {
+  string freshness = 1;
+  repeated string degraded_sources = 2;
+}
+
+message TrustPostureChangedPayload {
+  google.protobuf.Struct old = 1;
+  google.protobuf.Struct new = 2;
+  string reason = 3;
+}
+
+message ReasoningTracePayload {
+  uint32 turn_index = 1;
+  uint32 cycle_index = 2;
+  optional string thinking_summary = 3;
+  string selected_action = 4;
+  repeated string alternatives_considered = 5;
+  repeated string observation_ids = 6;
+}
+
+message ModelCallCompletedPayload {
+  string model_id = 1;
+  string provider = 2;
+  uint32 input_tokens = 3;
+  uint32 output_tokens = 4;
+  uint64 latency_ms = 5;
+  uint32 cache_hit_tokens = 6;
+  string stop_reason = 7;
+}
+
+message MemoryReadPayload {
+  uint32 entries_returned = 1;
+  string scope_key = 2;
+  uint32 total_tokens = 3;
+}
+
+message MemoryWritePayload {
+  string memory_id = 1;
+  string class = 2;
+  string scope_key = 3;
+  string source_kind = 4;
+}
+
+message SensorRepositionedPayload {
+  string sensor_id = 1;
+  google.protobuf.Struct old_pose = 2;
+  google.protobuf.Struct new_pose = 3;
+  google.protobuf.Struct goal = 4;
+}
+
+message ContactStateChangedPayload {
+  string link = 1;
+  google.protobuf.Struct contact = 2;
+}
+
+message FeedbackReceivedPayload {
+  string feedback_id = 1;
+  optional string related_event_id = 2;
+  google.protobuf.Struct outcome = 3;
+  optional string operator_comment = 4;
 }
 
 message ContextCompacted {
@@ -215,72 +492,12 @@ message ContextCompacted {
   optional string summary = 6;
 }
 
-message SessionStarted {
-  string session_id = 1;
-  string model = 2;
-  repeated PermissionRule permissions = 3;
-}
-
-message PermissionRule {
-  string tool_pattern = 1;
-  string policy = 2;
-  optional string category = 3;
-  optional string reason = 4;
-}
-
-message TextDelta {
-  string message_id = 1;
-  string content = 2;
-}
-
-message ThinkingDelta {
-  string message_id = 1;
-  string content = 2;
-}
-
-message ToolRequest {
-  string tool_call_id = 1;
-  string tool_name = 2;
-  google.protobuf.Struct parameters = 3;
-  uint32 timeout_ms = 4;
-}
-
-message TurnComplete {
-  string message_id = 1;
-  TokenUsage usage = 2;
-  string stop_reason = 3;
-}
-
-message SessionError {
-  string code = 1;
-  string message = 2;
-  bool retryable = 3;
-}
-
 message Keepalive {
   optional uint32 tokens_used = 1;
   optional uint32 tokens_max = 2;
 }
 
 message Pong {}
-
-message PresenceHint {
-  string level = 1;       // "full", "mini", "hidden"
-  string reason = 2;
-}
-
-message ActivityUpdate {
-  string state = 1;       // "thinking", "calling_tool", "idle", "waiting_approval"
-  string detail = 2;
-  optional float progress = 3;
-}
-
-message TokenUsage {
-  uint32 input_tokens = 1;
-  uint32 output_tokens = 2;
-  uint32 cache_read_tokens = 3;
-  uint32 cache_creation_tokens = 4;
-}
 
 // Categorises a tool for UI presence decisions.
 enum ToolCategoryHint {
@@ -391,6 +608,8 @@ message TeamEvent {
     WorkerCompleted worker_completed = 4;
     WorkerFailed worker_failed = 5;
     WorkerExited worker_exited = 6;
+    WorkerApprovalRequested worker_approval_requested = 7;
+    WorkerApprovalResolved worker_approval_resolved = 8;
   }
 }
 
@@ -402,12 +621,29 @@ message WorkerStarted {
 message WorkerPhase {
   string worker_id = 1;
   uint32 phase = 2;
-  string mode = 3; // "react" or "ooda_re_act"
+  string mode = 3; // "react" or "ooda_react"
 }
 
 message WorkerToolCall {
   string worker_id = 1;
   string tool = 2;
+}
+
+message WorkerApprovalRequested {
+  string worker_id = 1;
+  string task_id = 2;
+  string approval_id = 3;
+  string tool_name = 4;
+  string reason = 5;
+  uint64 timeout_secs = 6;
+}
+
+message WorkerApprovalResolved {
+  string worker_id = 1;
+  string task_id = 2;
+  string approval_id = 3;
+  bool approved = 4;
+  optional google.protobuf.Struct modifier = 5;
 }
 
 message WorkerCompleted {

@@ -42,6 +42,12 @@ service ControlService {
   rpc SendFlightCommand(FlightCommandRequest) returns (FlightCommandResponse);
   // Set entity pose (teleport model in world)
   rpc SetEntityPose(SetEntityPoseRequest) returns (SetEntityPoseResponse);
+  // Acquire low-level controller ownership for deterministic runtime execution.
+  rpc AcquireLowLevelControl(AcquireLowLevelControlRequest) returns (AcquireLowLevelControlResponse);
+  // Release low-level controller ownership back to the high-level lane.
+  rpc ReleaseLowLevelControl(ReleaseLowLevelControlRequest) returns (ReleaseLowLevelControlResponse);
+  // Get current control-lane capability and ownership status.
+  rpc GetControlStatus(GetControlStatusRequest) returns (GetControlStatusResponse);
   // Send direct joint position/velocity command (for WASM 100Hz controllers)
   rpc SendJointCommand(JointCommandRequest) returns (JointCommandResponse);
 }
@@ -538,12 +544,75 @@ enum JointCommandMode {
   JOINT_VELOCITY = 2;             // Target velocities (rad/s)
 }
 
+enum ControlLane {
+  CONTROL_LANE_UNSPECIFIED = 0;
+  CONTROL_LANE_HIGH_LEVEL = 1;
+  CONTROL_LANE_LOW_LEVEL = 2;
+}
+
+enum ControlOwner {
+  CONTROL_OWNER_UNSPECIFIED = 0;
+  CONTROL_OWNER_NONE = 1;
+  CONTROL_OWNER_HIGH_LEVEL = 2;
+  CONTROL_OWNER_LOW_LEVEL = 3;
+}
+
+message BridgeControlStatus {
+  string robot_class = 1;
+  string backend_name = 2;
+  bool ready = 3;
+  bool supports_high_level = 4;
+  bool supports_low_level = 5;
+  repeated int32 supported_modes = 6;
+  ControlLane active_lane = 7;
+  ControlOwner owner = 8;
+  string active_controller = 9;
+  string owner_id = 10;
+  int64 last_command_age_ms = 11;
+  string last_error = 12;
+}
+
+message AcquireLowLevelControlRequest {
+  string robot_class = 1;
+  string owner_id = 2;
+  int32 requested_mode = 3;
+}
+
+message AcquireLowLevelControlResponse {
+  bool success = 1;
+  string error = 2;
+  BridgeControlStatus status = 3;
+}
+
+message ReleaseLowLevelControlRequest {
+  string robot_class = 1;
+  string owner_id = 2;
+}
+
+message ReleaseLowLevelControlResponse {
+  bool success = 1;
+  string error = 2;
+  BridgeControlStatus status = 3;
+}
+
+message GetControlStatusRequest {
+  string robot_class = 1;
+}
+
+message GetControlStatusResponse {
+  bool success = 1;
+  string error = 2;
+  BridgeControlStatus status = 3;
+}
+
 message JointCommandRequest {
   JointCommandMode mode = 1;
   repeated string joint_names = 2;  // Channel names from manifest
   repeated double values = 3;       // Channel values in manifest order
   string world_name = 4;           // Target world (empty = default)
   string robot_class = 5;          // "manipulator", "drone", "mobile" — determines routing
+  string owner_id = 6;             // Optional low-level owner identity for explicit leases
+  bool acquire_low_level_if_needed = 7;  // Backward-compatible implicit acquire hint
 }
 
 message JointCommandResponse {

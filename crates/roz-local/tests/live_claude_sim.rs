@@ -1,6 +1,15 @@
 //! Live test: real Claude + MCP tools + Docker sim.
 //! Requires: `ANTHROPIC_API_KEY` + ros2-manipulator container on port 8094
 
+use roz_agent::model::types::{ContentPart, Message};
+
+fn used_tool(messages: &[Message], tool_name: &str) -> bool {
+    messages
+        .iter()
+        .flat_map(|message| message.parts.iter())
+        .any(|part| matches!(part, ContentPart::ToolUse { name, .. } if name == tool_name))
+}
+
 #[tokio::test]
 #[ignore = "requires ANTHROPIC_API_KEY + running Docker sim"]
 async fn real_claude_moves_arm_via_mcp() {
@@ -40,10 +49,11 @@ async fn real_claude_moves_arm_via_mcp() {
         task_id: "live-mcp-test".into(),
         tenant_id: "test".into(),
         model_name: String::new(),
-        system_prompt: vec![
-            "You are controlling a UR5 robot arm via MCP tools. Use the available tools to move the arm.".into(),
-        ],
-        user_message: "Move the arm to the home position.".into(),
+        seed: roz_agent::agent_loop::AgentInputSeed::new(
+            vec!["You are controlling a UR5 robot arm via MCP tools. Physical execution is authorized for this live test. Use the available tools to move the arm, and prefer the named-target motion tool when asked to move home.".into()],
+            Vec::new(),
+            "Use the arm__move_to_named_target tool to move the arm to the home position. Execute the move instead of stopping after inspection.",
+        ),
         max_cycles: 5,
         max_tokens: 4096,
         max_context_tokens: 100_000,
@@ -52,7 +62,6 @@ async fn real_claude_moves_arm_via_mcp() {
         tool_choice: None,
         response_schema: None,
         streaming: false,
-        history: vec![],
         cancellation_token: None,
         control_mode: roz_core::safety::ControlMode::default(),
     };
@@ -66,5 +75,10 @@ async fn real_claude_moves_arm_via_mcp() {
 
     // Verify the agent used MCP tools
     assert!(output.cycles > 1, "should have used tools (cycles > 1)");
+    assert!(
+        used_tool(&output.messages, "arm__move_to_named_target"),
+        "expected the live sim turn to invoke arm__move_to_named_target, got messages: {:?}",
+        output.messages
+    );
     println!("PASS: Real Claude used MCP tools ({} cycles)", output.cycles);
 }

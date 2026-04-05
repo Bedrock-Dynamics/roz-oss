@@ -10,7 +10,7 @@
 //!
 //! Run: cargo test -p roz-agent --test e2e_code_execution
 
-use roz_agent::agent_loop::{AgentInput, AgentLoop, AgentLoopMode};
+use roz_agent::agent_loop::{AgentInput, AgentInputSeed, AgentLoop, AgentLoopMode};
 use roz_agent::dispatch::{Extensions, ToolDispatcher};
 use roz_agent::model::types::*;
 use roz_agent::safety::SafetyStack;
@@ -19,13 +19,28 @@ use roz_agent::tools::execute_code::{EXECUTE_CODE_TOOL_NAME, ExecuteCodeTool};
 use serde_json::json;
 use std::time::Duration;
 
-/// Build extensions with a generic 6-joint velocity manifest for execute_code tests.
+fn test_control_manifest() -> roz_core::embodiment::binding::ControlInterfaceManifest {
+    let mut manifest = roz_core::embodiment::binding::ControlInterfaceManifest {
+        version: 1,
+        manifest_digest: String::new(),
+        channels: (0..6)
+            .map(|index| roz_core::embodiment::binding::ControlChannelDef {
+                name: format!("joint{index}/velocity"),
+                interface_type: roz_core::embodiment::binding::CommandInterfaceType::JointVelocity,
+                units: "rad/s".into(),
+                frame_id: "base".into(),
+            })
+            .collect(),
+        bindings: Vec::new(),
+    };
+    manifest.stamp_digest();
+    manifest
+}
+
+/// Build extensions with a generic 6-joint canonical control manifest for execute_code tests.
 fn test_extensions() -> Extensions {
     let mut ext = Extensions::new();
-    ext.insert(roz_core::channels::ChannelManifest::generic_velocity(
-        6,
-        std::f64::consts::PI,
-    ));
+    ext.insert(test_control_manifest());
     ext
 }
 
@@ -41,8 +56,7 @@ fn build_input_with_prompt(system_prompt: Vec<String>, user_message: &str) -> Ag
         task_id: "e2e-test".to_string(),
         tenant_id: "test".to_string(),
         model_name: String::new(),
-        system_prompt,
-        user_message: user_message.to_string(),
+        seed: AgentInputSeed::new(system_prompt, Vec::new(), user_message.to_string()),
         max_cycles: 5,
         max_tokens: 4096,
         max_context_tokens: 200_000,
@@ -51,7 +65,6 @@ fn build_input_with_prompt(system_prompt: Vec<String>, user_message: &str) -> Ag
         tool_choice: None,
         response_schema: None,
         streaming: false,
-        history: vec![],
         cancellation_token: None,
         control_mode: roz_core::safety::ControlMode::default(),
     }
@@ -201,16 +214,19 @@ async fn live_model_generates_and_executes_wasm() {
         task_id: "live-test".to_string(),
         tenant_id: "test".to_string(),
         model_name: String::new(),
-        system_prompt: vec![
-            "You are a robot controller. You have access to the execute_code tool. \
-             When asked to control a robot, write a WAT (WebAssembly Text) module \
-             that exports a `process` function taking an i64 parameter (the tick count). \
-             Use the execute_code tool to compile and verify the code. \
-             Keep the WAT simple — a no-op function is fine for testing."
+        seed: AgentInputSeed::new(
+            vec![
+                "You are a robot controller. You have access to the execute_code tool. \
+                 When asked to control a robot, write a WAT (WebAssembly Text) module \
+                 that exports a `process` function taking an i64 parameter (the tick count). \
+                 Use the execute_code tool to compile and verify the code. \
+                 Keep the WAT simple — a no-op function is fine for testing."
+                    .to_string(),
+            ],
+            Vec::new(),
+            "Write a simple controller that does nothing on each tick. Use execute_code to verify it works."
                 .to_string(),
-        ],
-        user_message: "Write a simple controller that does nothing on each tick. Use execute_code to verify it works."
-            .to_string(),
+        ),
         max_cycles: 5,
         max_tokens: 4096,
         max_context_tokens: 200_000,
@@ -219,7 +235,6 @@ async fn live_model_generates_and_executes_wasm() {
         tool_choice: None,
         response_schema: None,
         streaming: false,
-        history: vec![],
         cancellation_token: None,
         control_mode: roz_core::safety::ControlMode::default(),
     };
@@ -348,10 +363,13 @@ Respond with ONLY the WAT code. No explanation, no markdown fences, just raw WAT
         task_id: "live-channel-test".to_string(),
         tenant_id: "test".to_string(),
         model_name: String::new(),
-        system_prompt: vec![system_prompt],
-        user_message: "Write a WAT module that oscillates command channel 0 using sin. \
+        seed: AgentInputSeed::new(
+            vec![system_prompt],
+            Vec::new(),
+            "Write a WAT module that oscillates command channel 0 using sin. \
             Use the tick parameter to compute sin(tick * 0.05) * 0.5 and write it to channel 0."
-            .to_string(),
+                .to_string(),
+        ),
         max_cycles: 1,
         max_tokens: 4096,
         max_context_tokens: 200_000,
@@ -360,7 +378,6 @@ Respond with ONLY the WAT code. No explanation, no markdown fences, just raw WAT
         tool_choice: None,
         response_schema: None,
         streaming: false,
-        history: vec![],
         cancellation_token: None,
         control_mode: roz_core::safety::ControlMode::default(),
     };
@@ -376,9 +393,9 @@ Respond with ONLY the WAT code. No explanation, no markdown fences, just raw WAT
     eprintln!("Extracted WAT:\n{wat}");
     assert!(wat.contains("(module"), "response must contain a WAT module");
 
-    // Compile with a 6-joint velocity manifest.
-    let manifest = roz_core::channels::ChannelManifest::generic_velocity(6, std::f64::consts::PI);
-    let host = roz_copper::wit_host::HostContext::with_manifest(manifest);
+    // Compile with a 6-joint canonical control manifest.
+    let control_manifest = test_control_manifest();
+    let host = roz_copper::wit_host::HostContext::with_control_manifest(&control_manifest);
     let mut task = roz_copper::wasm::CuWasmTask::from_source_with_host(wat.as_bytes(), host)
         .expect("Claude-generated WAT should compile");
 

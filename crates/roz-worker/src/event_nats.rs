@@ -7,7 +7,7 @@
 //! subject formatting and type-name extraction so the worker can route events
 //! without coupling NATS client details to the event model.
 
-use roz_core::session::event::SessionEvent;
+use roz_core::session::event::{SessionEvent, canonical_event_type_name};
 
 /// Format a NATS subject for a session event.
 ///
@@ -33,39 +33,7 @@ pub fn event_subject(prefix: &str, session_id: &str, event: &SessionEvent) -> St
 /// a new `SessionEvent` variant will cause a compile error here.
 #[must_use]
 pub const fn event_type_name(event: &SessionEvent) -> &'static str {
-    match event {
-        SessionEvent::SessionStarted { .. } => "session_started",
-        SessionEvent::TurnStarted { .. } => "turn_started",
-        SessionEvent::SessionCompleted { .. } => "session_completed",
-        SessionEvent::SessionFailed { .. } => "session_failed",
-        SessionEvent::ActivityChanged { .. } => "activity_changed",
-        SessionEvent::ToolCallStarted { .. } => "tool_call_started",
-        SessionEvent::ToolCallFinished { .. } => "tool_call_finished",
-        SessionEvent::ToolUnavailable { .. } => "tool_unavailable",
-        SessionEvent::ApprovalRequested { .. } => "approval_requested",
-        SessionEvent::ApprovalResolved { .. } => "approval_resolved",
-        SessionEvent::VerificationStarted { .. } => "verification_started",
-        SessionEvent::VerificationFinished { .. } => "verification_finished",
-        SessionEvent::ResumeSummaryReady { .. } => "resume_summary",
-        SessionEvent::TelemetryStatusChanged { .. } => "telemetry_status",
-        SessionEvent::TrustPostureChanged { .. } => "trust_posture",
-        SessionEvent::SafePauseEntered { .. } => "safe_pause_entered",
-        SessionEvent::SafePauseCleared { .. } => "safe_pause_cleared",
-        SessionEvent::ControllerLoaded { .. } => "controller_loaded",
-        SessionEvent::ControllerShadowStarted { .. } => "controller_shadow",
-        SessionEvent::ControllerPromoted { .. } => "controller_promoted",
-        SessionEvent::ControllerRolledBack { .. } => "controller_rolled_back",
-        SessionEvent::SafetyIntervention { .. } => "safety_intervention",
-        SessionEvent::EdgeTransportDegraded { .. } => "edge_degraded",
-        SessionEvent::ReasoningTrace { .. } => "reasoning_trace",
-        SessionEvent::ContextCompacted { .. } => "context_compacted",
-        SessionEvent::ModelCallCompleted { .. } => "model_call",
-        SessionEvent::MemoryRead { .. } => "memory_read",
-        SessionEvent::MemoryWrite { .. } => "memory_write",
-        SessionEvent::SensorRepositioned { .. } => "sensor_repositioned",
-        SessionEvent::ContactStateChanged { .. } => "contact_state_changed",
-        SessionEvent::FeedbackReceived { .. } => "feedback_received",
-    }
+    canonical_event_type_name(event)
 }
 
 #[cfg(test)]
@@ -85,8 +53,10 @@ mod tests {
     fn event_subject_with_different_prefix() {
         let event = SessionEvent::SessionStarted {
             session_id: "s".into(),
-            mode: SessionMode::LocalCanonical,
+            mode: SessionMode::Local,
             blueprint_version: "1.0".into(),
+            model_name: None,
+            permissions: vec![],
         };
         let subject = event_subject("prod.roz", "sess-abc", &event);
         assert_eq!(subject, "prod.roz.session.sess-abc.events.session_started");
@@ -97,8 +67,10 @@ mod tests {
         assert_eq!(
             event_type_name(&SessionEvent::SessionStarted {
                 session_id: "s".into(),
-                mode: SessionMode::LocalCanonical,
+                mode: SessionMode::Local,
                 blueprint_version: "1.0".into(),
+                model_name: None,
+                permissions: vec![],
             }),
             "session_started"
         );

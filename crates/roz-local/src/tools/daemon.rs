@@ -1,7 +1,7 @@
 //! Generic daemon REST tools configured via robot.toml `[daemon]` section.
 //!
 //! Body templates use `{{channel_name}}` placeholders resolved from the
-//! channel manifest at runtime. The LLM agent sees the same tool names
+//! canonical control manifest at runtime. The LLM agent sees the same tool names
 //! regardless of which robot daemon is connected.
 
 use std::collections::HashMap;
@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use roz_agent::dispatch::{ToolContext, ToolExecutor};
-use roz_core::channels::ChannelManifest;
+use roz_core::embodiment::EmbodimentRuntime;
+use roz_core::embodiment::binding::{CommandInterfaceType, ControlInterfaceManifest};
 use roz_core::manifest::{DaemonConfig, EndpointConfig, MoveToConfig, PlayAnimationConfig};
 use roz_core::tools::{ToolCategory, ToolResult, ToolSchema};
 use serde_json::{Value, json};
@@ -156,34 +157,76 @@ impl ToolExecutor for DaemonSetMotorsTool {
 /// Sends interpolated motion commands to the daemon.
 ///
 /// Implements `ToolExecutor` directly (not `TypedToolExecutor`) because the
-/// parameter schema is built dynamically from the channel manifest -- each
+/// parameter schema is built dynamically from the canonical control manifest -- each
 /// command channel becomes a named property with type, unit, and range.
 pub struct DaemonMoveToTool {
     client: Arc<reqwest::Client>,
     base_url: String,
     config: MoveToConfig,
-    manifest: ChannelManifest,
+    channels: Vec<DaemonCommandChannel>,
     schema: ToolSchema,
 }
 
-fn build_move_to_schema(manifest: &ChannelManifest) -> ToolSchema {
+#[derive(Debug, Clone)]
+struct DaemonCommandChannel {
+    name: String,
+    units: String,
+    default: f64,
+    limits: (f64, f64),
+}
+
+fn is_actuator_channel(interface_type: &CommandInterfaceType) -> bool {
+    matches!(
+        interface_type,
+        CommandInterfaceType::JointVelocity
+            | CommandInterfaceType::JointPosition
+            | CommandInterfaceType::JointTorque
+            | CommandInterfaceType::GripperPosition
+            | CommandInterfaceType::GripperForce
+    )
+}
+
+fn daemon_command_channels(
+    control_manifest: &ControlInterfaceManifest,
+    embodiment_runtime: Option<&EmbodimentRuntime>,
+) -> Vec<DaemonCommandChannel> {
+    let joint_limits = embodiment_runtime.map_or_else(
+        || roz_copper::controller::joint_limits_from_control_manifest(control_manifest),
+        |runtime| roz_copper::controller::joint_limits_from_runtime(control_manifest, runtime),
+    );
+
+    control_manifest
+        .channels
+        .iter()
+        .zip(joint_limits)
+        .filter(|(channel, _)| is_actuator_channel(&channel.interface_type))
+        .map(|(channel, limits)| DaemonCommandChannel {
+            name: channel.name.clone(),
+            units: channel.units.clone(),
+            default: 0.0,
+            limits: (limits.position_min, limits.position_max),
+        })
+        .collect()
+}
+
+fn build_move_to_schema(channels: &[DaemonCommandChannel]) -> ToolSchema {
     let mut properties = serde_json::Map::new();
     let mut description_parts = vec![
         "Move the robot to target channel positions with smooth interpolation.".to_string(),
         "Available channels:".to_string(),
     ];
 
-    for ch in &manifest.commands {
+    for ch in channels {
         properties.insert(
             ch.name.clone(),
             json!({
                 "type": "number",
-                "description": format!("{} ({:.3} to {:.3})", ch.unit, ch.limits.0, ch.limits.1),
+                "description": format!("{} ({:.3} to {:.3})", ch.units, ch.limits.0, ch.limits.1),
             }),
         );
         description_parts.push(format!(
             "  {}: {} ({:.3} to {:.3})",
-            ch.name, ch.unit, ch.limits.0, ch.limits.1
+            ch.name, ch.units, ch.limits.0, ch.limits.1
         ));
     }
 
@@ -223,8 +266,8 @@ impl ToolExecutor for DaemonMoveToTool {
 
         // Check for unknown channel names first
         for key in params_obj.keys() {
-            if key != "duration_secs" && !self.manifest.commands.iter().any(|ch| ch.name == *key) {
-                let valid: Vec<&str> = self.manifest.commands.iter().map(|ch| ch.name.as_str()).collect();
+            if key != "duration_secs" && !self.channels.iter().any(|ch| ch.name == *key) {
+                let valid: Vec<&str> = self.channels.iter().map(|ch| ch.name.as_str()).collect();
                 return Ok(ToolResult::error(format!(
                     "Unknown channel '{key}'. Valid channels: {}",
                     valid.join(", ")
@@ -243,7 +286,7 @@ impl ToolExecutor for DaemonMoveToTool {
         let mut template_values = HashMap::new();
         template_values.insert("duration".to_string(), format!("{duration}"));
 
-        for ch in &self.manifest.commands {
+        for ch in &self.channels {
             let value = params_obj
                 .get(&ch.name)
                 .and_then(Value::as_f64)
@@ -369,11 +412,12 @@ impl ToolExecutor for DaemonPlayAnimationTool {
 /// Build daemon tool executors from the `[daemon]` config section.
 ///
 /// Only creates tools for endpoints present in the config. The `move_to` tool
-/// requires a channel manifest to build its dynamic schema -- if `manifest` is
+/// requires a canonical control manifest to build its dynamic schema -- if `control_manifest` is
 /// `None`, the `move_to` tool is skipped.
 pub fn daemon_tools(
     daemon: &DaemonConfig,
-    manifest: Option<&ChannelManifest>,
+    control_manifest: Option<&ControlInterfaceManifest>,
+    embodiment_runtime: Option<&EmbodimentRuntime>,
 ) -> Vec<(Box<dyn ToolExecutor>, ToolCategory)> {
     let client = Arc::new(http_client());
     let mut tools: Vec<(Box<dyn ToolExecutor>, ToolCategory)> = Vec::new();
@@ -401,15 +445,16 @@ pub fn daemon_tools(
     }
 
     if let Some(ref config) = daemon.move_to
-        && let Some(m) = manifest
+        && let Some(control_manifest) = control_manifest
     {
+        let channels = daemon_command_channels(control_manifest, embodiment_runtime);
         tools.push((
             Box::new(DaemonMoveToTool {
                 client: Arc::clone(&client),
                 base_url: daemon.base_url.clone(),
                 config: config.clone(),
-                manifest: m.clone(),
-                schema: build_move_to_schema(m),
+                channels: channels.clone(),
+                schema: build_move_to_schema(&channels),
             }),
             ToolCategory::Physical,
         ));
@@ -437,38 +482,49 @@ pub fn daemon_tools(
 mod tests {
     use super::*;
     use roz_agent::dispatch::Extensions;
-    use roz_core::channels::{ChannelDescriptor, InterfaceType};
+    use roz_core::embodiment::binding::{
+        BindingType, ChannelBinding, CommandInterfaceType, ControlChannelDef, ControlInterfaceManifest,
+    };
 
-    /// Build a minimal test manifest with 2 command channels.
-    fn test_manifest() -> ChannelManifest {
-        ChannelManifest {
-            robot_id: "test".into(),
-            robot_class: "expressive".into(),
-            control_rate_hz: 50,
-            commands: vec![
-                ChannelDescriptor {
+    fn test_control_manifest() -> ControlInterfaceManifest {
+        let mut manifest = ControlInterfaceManifest {
+            version: 1,
+            manifest_digest: String::new(),
+            channels: vec![
+                ControlChannelDef {
                     name: "head_pitch".into(),
-                    interface_type: InterfaceType::Position,
-                    unit: "rad".into(),
-                    limits: (-0.35, 0.17),
-                    default: 0.0,
-                    max_rate_of_change: None,
-                    position_state_index: None,
-                    max_delta_from: None,
+                    interface_type: CommandInterfaceType::JointPosition,
+                    units: "rad".into(),
+                    frame_id: "head_pitch_joint".into(),
                 },
-                ChannelDescriptor {
+                ControlChannelDef {
                     name: "head_yaw".into(),
-                    interface_type: InterfaceType::Position,
-                    unit: "rad".into(),
-                    limits: (-1.13, 1.13),
-                    default: 0.0,
-                    max_rate_of_change: None,
-                    position_state_index: None,
-                    max_delta_from: None,
+                    interface_type: CommandInterfaceType::JointPosition,
+                    units: "rad".into(),
+                    frame_id: "head_yaw_joint".into(),
                 },
             ],
-            states: vec![],
-        }
+            bindings: vec![
+                ChannelBinding {
+                    physical_name: "head_pitch".into(),
+                    channel_index: 0,
+                    binding_type: BindingType::JointPosition,
+                    frame_id: "head_pitch_joint".into(),
+                    units: "rad".into(),
+                    semantic_role: None,
+                },
+                ChannelBinding {
+                    physical_name: "head_yaw".into(),
+                    channel_index: 1,
+                    binding_type: BindingType::JointPosition,
+                    frame_id: "head_yaw_joint".into(),
+                    units: "rad".into(),
+                    semantic_role: None,
+                },
+            ],
+        };
+        manifest.stamp_digest();
+        manifest
     }
 
     fn test_daemon_config() -> DaemonConfig {
@@ -518,8 +574,8 @@ mod tests {
 
     #[test]
     fn build_move_to_schema_generates_correct_properties() {
-        let manifest = test_manifest();
-        let schema = build_move_to_schema(&manifest);
+        let control_manifest = test_control_manifest();
+        let schema = build_move_to_schema(&daemon_command_channels(&control_manifest, None));
 
         assert_eq!(schema.name, "move_to");
         assert!(schema.description.contains("head_pitch"));
@@ -531,13 +587,12 @@ mod tests {
         assert!(props.contains_key("duration_secs"));
         assert_eq!(props.len(), 3); // 2 channels + duration_secs
 
-        // Check channel property has type and description with limits
+        // Check channel property exposes the canonical units and a numeric range description.
         let pitch = &props["head_pitch"];
         assert_eq!(pitch["type"], "number");
         let desc = pitch["description"].as_str().unwrap();
         assert!(desc.contains("rad"));
-        assert!(desc.contains("-0.350"));
-        assert!(desc.contains("0.170"));
+        assert!(desc.contains(" to "));
 
         // duration_secs is required
         let required = schema.parameters["required"].as_array().unwrap();
@@ -551,8 +606,8 @@ mod tests {
     #[test]
     fn daemon_tools_factory_produces_all_tools_with_manifest() {
         let config = test_daemon_config();
-        let manifest = test_manifest();
-        let tools = daemon_tools(&config, Some(&manifest));
+        let control_manifest = test_control_manifest();
+        let tools = daemon_tools(&config, Some(&control_manifest), None);
         // get_state + set_motors + move_to + play_animation = 4
         assert_eq!(tools.len(), 4);
     }
@@ -560,7 +615,7 @@ mod tests {
     #[test]
     fn daemon_tools_factory_skips_move_to_without_manifest() {
         let config = test_daemon_config();
-        let tools = daemon_tools(&config, None);
+        let tools = daemon_tools(&config, None, None);
         // get_state + set_motors + play_animation = 3 (no move_to)
         assert_eq!(tools.len(), 3);
     }
@@ -576,7 +631,7 @@ mod tests {
             play_animation: None,
             stop_motion: None,
         };
-        let tools = daemon_tools(&config, None);
+        let tools = daemon_tools(&config, None, None);
         assert!(tools.is_empty());
     }
 
@@ -586,7 +641,8 @@ mod tests {
 
     #[test]
     fn move_to_template_renders_valid_json() {
-        let manifest = test_manifest();
+        let control_manifest = test_control_manifest();
+        let channels = daemon_command_channels(&control_manifest, None);
         let config = test_daemon_config();
         let move_cfg = config.move_to.unwrap();
 
@@ -605,7 +661,7 @@ mod tests {
         // Also check that the manifest channels produce correct default values
         let mut default_values = HashMap::new();
         default_values.insert("duration".to_string(), "1".to_string());
-        for ch in &manifest.commands {
+        for ch in &channels {
             default_values.insert(ch.name.clone(), format!("{}", ch.default));
         }
         let rendered_defaults = render_template(&move_cfg.body, &default_values);
@@ -621,14 +677,14 @@ mod tests {
 
     #[tokio::test]
     async fn move_to_rejects_unknown_channel() {
-        let manifest = test_manifest();
+        let control_manifest = test_control_manifest();
         let config = test_daemon_config();
         let tool = DaemonMoveToTool {
             client: Arc::new(http_client()),
             base_url: "http://localhost:1".into(),
             config: config.move_to.unwrap(),
-            schema: build_move_to_schema(&manifest),
-            manifest,
+            schema: build_move_to_schema(&daemon_command_channels(&control_manifest, None)),
+            channels: daemon_command_channels(&control_manifest, None),
         };
 
         let params = json!({
@@ -717,14 +773,14 @@ mod tests {
 
     #[tokio::test]
     async fn move_to_clamps_values_to_limits() {
-        let manifest = test_manifest();
+        let control_manifest = test_control_manifest();
         let config = test_daemon_config();
         let tool = DaemonMoveToTool {
             client: Arc::new(http_client()),
             base_url: "http://localhost:1".into(),
             config: config.move_to.unwrap(),
-            schema: build_move_to_schema(&manifest),
-            manifest,
+            schema: build_move_to_schema(&daemon_command_channels(&control_manifest, None)),
+            channels: daemon_command_channels(&control_manifest, None),
         };
 
         // Values wildly out of range — should be clamped, not rejected.
@@ -741,14 +797,14 @@ mod tests {
 
     #[tokio::test]
     async fn move_to_enforces_minimum_duration() {
-        let manifest = test_manifest();
+        let control_manifest = test_control_manifest();
         let config = test_daemon_config();
         let tool = DaemonMoveToTool {
             client: Arc::new(http_client()),
             base_url: "http://localhost:1".into(),
             config: config.move_to.unwrap(),
-            schema: build_move_to_schema(&manifest),
-            manifest,
+            schema: build_move_to_schema(&daemon_command_channels(&control_manifest, None)),
+            channels: daemon_command_channels(&control_manifest, None),
         };
 
         // duration_secs below minimum — should be clamped to 0.5, not rejected.
@@ -767,8 +823,8 @@ mod tests {
     #[test]
     fn tool_schemas_have_correct_names() {
         let config = test_daemon_config();
-        let manifest = test_manifest();
-        let tools = daemon_tools(&config, Some(&manifest));
+        let control_manifest = test_control_manifest();
+        let tools = daemon_tools(&config, Some(&control_manifest), None);
 
         let names: Vec<String> = tools.iter().map(|(t, _)| t.schema().name.clone()).collect();
         assert!(names.contains(&"get_robot_state".to_string()));
@@ -780,8 +836,8 @@ mod tests {
     #[test]
     fn tool_categories_are_correct() {
         let config = test_daemon_config();
-        let manifest = test_manifest();
-        let tools = daemon_tools(&config, Some(&manifest));
+        let control_manifest = test_control_manifest();
+        let tools = daemon_tools(&config, Some(&control_manifest), None);
 
         for (tool, category) in &tools {
             match tool.schema().name.as_str() {

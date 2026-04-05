@@ -15,13 +15,21 @@ use crate::tui::proto::roz_v1::{
 use crate::tui::provider::{AgentEvent, ProviderConfig};
 use crate::tui::tools;
 
+struct CanonicalToolRequest {
+    tool_call_id: String,
+    tool_name: String,
+    parameters: serde_json::Value,
+    #[cfg_attr(not(test), allow(dead_code))]
+    timeout_ms: u32,
+}
+
 /// Options for local tool execution in cloud mode.
 pub struct LocalToolOpts {
     /// Tool schemas to register with the cloud session (proto format).
     pub proto_schemas: Vec<roz_v1::ToolSchema>,
     /// Local dispatcher for executing tools client-side.
     pub dispatcher: ToolDispatcher,
-    /// Shared extensions for tool context (e.g. `cmd_tx`, `ChannelManifest`).
+    /// Shared extensions for tool context (e.g. `cmd_tx`, `ControlInterfaceManifest`).
     pub extensions: Extensions,
     /// Kept alive to prevent the Copper controller thread from halting on drop.
     pub _copper_handle: Option<roz_copper::handle::CopperHandle>,
@@ -95,7 +103,7 @@ fn load_cloud_project_context() -> Vec<String> {
 ///
 /// Spawned as a tokio task for each incoming `ToolRequest`.
 async fn execute_tool_locally(
-    tool_request: roz_v1::ToolRequest,
+    tool_request: CanonicalToolRequest,
     dispatcher: Arc<Mutex<ToolDispatcher>>,
     extensions: Extensions,
     req_tx: tokio::sync::mpsc::Sender<SessionRequest>,
@@ -115,9 +123,7 @@ async fn execute_tool_locally(
         }
     }
 
-    let params_json = tool_request
-        .parameters
-        .map_or_else(|| serde_json::Value::Object(serde_json::Map::new()), struct_to_value);
+    let params_json = tool_request.parameters;
 
     let ctx = tools::default_context_with(extensions);
     let call = ToolCall {
@@ -260,85 +266,210 @@ pub async fn stream_session(
         let Some(response) = resp.response else {
             continue;
         };
-        let event = match response {
-            session_response::Response::SessionStarted(s) => AgentEvent::Connected { model: s.model },
-            session_response::Response::TextDelta(d) => AgentEvent::TextDelta(d.content),
-            session_response::Response::ThinkingDelta(d) => AgentEvent::ThinkingDelta(d.content),
-            session_response::Response::ToolRequest(t) => {
-                let params_display = t.parameters.as_ref().map(format_struct).unwrap_or_default();
-
-                // Send the display event so the TUI shows the tool call
-                event_tx
-                    .send(AgentEvent::ToolRequest {
-                        id: t.tool_call_id.clone(),
-                        name: t.tool_name.clone(),
-                        params: params_display,
-                    })
-                    .await?;
-
-                // Execute locally (clone the sender if still available)
-                if let Some(ref tx) = req_tx {
-                    tokio::spawn(execute_tool_locally(
-                        t,
-                        dispatcher.clone(),
-                        extensions.clone(),
-                        tx.clone(),
-                        event_tx.clone(),
-                    ));
-                }
-
-                // ToolRequest was already sent above; don't emit a second event.
-                continue;
-            }
-            session_response::Response::TurnComplete(c) => {
-                // If no more user messages are coming (non-interactive mode),
-                // drop the last sender so the server sees the client stream
-                // end and closes its side -- preventing a deadlock.
-                // Interactive mode: msg_rx stays open, sender stays alive.
-                if msg_closed.is_closed() {
-                    req_tx.take();
-                }
-
-                let usage = c.usage.unwrap_or_default();
-                AgentEvent::TurnComplete {
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                    stop_reason: c.stop_reason,
-                }
-            }
-            session_response::Response::Error(e) => AgentEvent::Error(e.message),
-            session_response::Response::ActivityUpdate(a) => {
-                // Could map to UI state changes
-                if a.state == "waiting_approval" {
-                    // Future: trigger safety approval UI
-                }
-                continue;
-            }
-            _ => continue,
+        let session_response::Response::SessionEvent(event) = &response else {
+            continue;
         };
+        let event = event.clone();
+
+        if let Some(tool_request) = session_event_to_tool_request(&event) {
+            let params_display = format_json_value(&tool_request.parameters);
+
+            event_tx
+                .send(AgentEvent::ToolRequest {
+                    id: tool_request.tool_call_id.clone(),
+                    name: tool_request.tool_name.clone(),
+                    params: params_display,
+                })
+                .await?;
+
+            if let Some(ref tx) = req_tx {
+                tokio::spawn(execute_tool_locally(
+                    tool_request,
+                    dispatcher.clone(),
+                    extensions.clone(),
+                    tx.clone(),
+                    event_tx.clone(),
+                ));
+            }
+
+            continue;
+        }
+
+        let Some(event) = session_event_to_agent_event(&event) else {
+            continue;
+        };
+
+        if matches!(event, AgentEvent::TurnComplete { .. }) && msg_closed.is_closed() {
+            req_tx.take();
+        }
         event_tx.send(event).await?;
     }
 
     Ok(())
 }
 
-/// Format a prost Struct as a compact JSON-like string for display.
-fn format_struct(s: &prost_types::Struct) -> String {
-    s.fields
-        .iter()
-        .map(|(k, v)| format!("{k}: {}", format_value(v)))
-        .collect::<Vec<_>>()
-        .join(", ")
+fn session_event_to_agent_event(event: &roz_v1::SessionEventEnvelope) -> Option<AgentEvent> {
+    let typed = event.typed_event.as_ref()?;
+    match typed {
+        roz_v1::session_event_envelope::TypedEvent::SessionStarted(payload) => Some(AgentEvent::Connected {
+            model: payload.model_name.clone().unwrap_or_default(),
+        }),
+        roz_v1::session_event_envelope::TypedEvent::SessionRejected(payload) => {
+            Some(AgentEvent::Error(payload.message.clone()))
+        }
+        roz_v1::session_event_envelope::TypedEvent::SessionFailed(payload) => {
+            Some(AgentEvent::Error(if payload.failure.is_empty() {
+                "session failed".to_string()
+            } else {
+                format!("session failed: {}", payload.failure)
+            }))
+        }
+        roz_v1::session_event_envelope::TypedEvent::TextDelta(payload) => {
+            Some(AgentEvent::TextDelta(payload.content.clone()))
+        }
+        roz_v1::session_event_envelope::TypedEvent::ThinkingDelta(payload) => {
+            Some(AgentEvent::ThinkingDelta(payload.content.clone()))
+        }
+        roz_v1::session_event_envelope::TypedEvent::TurnFinished(payload) => Some(AgentEvent::TurnComplete {
+            input_tokens: payload.input_tokens,
+            output_tokens: payload.output_tokens,
+            stop_reason: payload.stop_reason.clone(),
+        }),
+        roz_v1::session_event_envelope::TypedEvent::ToolCallStarted(payload) => Some(AgentEvent::ToolRequest {
+            id: payload.call_id.clone(),
+            name: payload.tool_name.clone(),
+            params: String::new(),
+        }),
+        roz_v1::session_event_envelope::TypedEvent::ToolCallFinished(payload) => Some(AgentEvent::ToolResultDisplay {
+            name: payload.tool_name.clone(),
+            content: payload.result_summary.clone(),
+            is_error: false,
+        }),
+        roz_v1::session_event_envelope::TypedEvent::ToolUnavailable(payload) => {
+            Some(AgentEvent::Error(if payload.reason.is_empty() {
+                format!("tool unavailable: {}", payload.tool_name)
+            } else {
+                format!("tool unavailable: {} ({})", payload.tool_name, payload.reason)
+            }))
+        }
+        roz_v1::session_event_envelope::TypedEvent::ApprovalRequested(payload) => {
+            let mut content = if payload.action.is_empty() {
+                "approval requested".to_string()
+            } else if payload.reason.is_empty() {
+                format!("approval requested: {}", payload.action)
+            } else {
+                format!("approval requested: {} ({})", payload.action, payload.reason)
+            };
+            if payload.timeout_secs > 0 {
+                content.push_str(&format!(" [timeout={}s]", payload.timeout_secs));
+            }
+            Some(AgentEvent::ToolResultDisplay {
+                name: "approval_requested".into(),
+                content,
+                is_error: false,
+            })
+        }
+        roz_v1::session_event_envelope::TypedEvent::ApprovalResolved(payload) => {
+            let outcome = payload
+                .outcome
+                .as_ref()
+                .cloned()
+                .map(struct_to_value)
+                .unwrap_or(serde_json::Value::Null);
+            let (content, is_error) = format_approval_outcome(&payload.approval_id, &outcome);
+            Some(AgentEvent::ToolResultDisplay {
+                name: "approval_resolved".into(),
+                content,
+                is_error,
+            })
+        }
+        roz_v1::session_event_envelope::TypedEvent::ControllerRolledBack(payload) => {
+            Some(AgentEvent::Error(if payload.reason.is_empty() {
+                format!("controller rolled back: {}", payload.artifact_id)
+            } else {
+                format!("controller rolled back: {}", payload.reason)
+            }))
+        }
+        roz_v1::session_event_envelope::TypedEvent::SafetyIntervention(payload) => Some(AgentEvent::Error(format!(
+            "safety intervention: {} ({})",
+            payload.channel, payload.kind
+        ))),
+        roz_v1::session_event_envelope::TypedEvent::EdgeTransportDegraded(payload) => {
+            Some(AgentEvent::Error(format!("edge degraded: {}", payload.transport)))
+        }
+        roz_v1::session_event_envelope::TypedEvent::SafePauseEntered(payload) => {
+            let reason = if payload.reason.is_empty() {
+                "safe pause entered".to_string()
+            } else {
+                format!("safe pause: {}", payload.reason)
+            };
+            Some(AgentEvent::Error(reason))
+        }
+        _ => None,
+    }
 }
 
-fn format_value(v: &prost_types::Value) -> String {
-    use prost_types::value::Kind;
-    match &v.kind {
-        Some(Kind::StringValue(s)) => format!("\"{s}\""),
-        Some(Kind::NumberValue(n)) => format!("{n}"),
-        Some(Kind::BoolValue(b)) => format!("{b}"),
-        Some(Kind::NullValue(_)) => "null".to_string(),
-        _ => "...".to_string(),
+fn session_event_to_tool_request(event: &roz_v1::SessionEventEnvelope) -> Option<CanonicalToolRequest> {
+    let roz_v1::session_event_envelope::TypedEvent::ToolCallRequested(payload) = event.typed_event.as_ref()? else {
+        return None;
+    };
+
+    Some(CanonicalToolRequest {
+        tool_call_id: payload.call_id.clone(),
+        tool_name: payload.tool_name.clone(),
+        parameters: payload
+            .parameters
+            .clone()
+            .map(struct_to_value)
+            .unwrap_or_else(|| serde_json::json!({})),
+        timeout_ms: payload.timeout_ms,
+    })
+}
+
+fn format_json_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        serde_json::Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn format_approval_outcome(approval_id: &str, outcome: &serde_json::Value) -> (String, bool) {
+    let approval_type = outcome.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+    match approval_type {
+        "approved" => (format!("approval resolved: {approval_id} approved"), false),
+        "denied" => {
+            let reason = outcome
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("no reason provided");
+            (format!("approval denied: {approval_id} ({reason})"), true)
+        }
+        "modified" => {
+            let fields = outcome
+                .get("modifications")
+                .and_then(serde_json::Value::as_array)
+                .map(|mods| {
+                    mods.iter()
+                        .filter_map(|modification| modification.get("field").and_then(serde_json::Value::as_str))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if fields.is_empty() {
+                (format!("approval modified: {approval_id}"), false)
+            } else {
+                (
+                    format!("approval modified: {approval_id} [{}]", fields.join(", ")),
+                    false,
+                )
+            }
+        }
+        "partial_approval" => (format!("approval partially granted: {approval_id}"), false),
+        _ => (format!("approval resolved: {approval_id}"), false),
     }
 }
 
@@ -347,6 +478,22 @@ mod tests {
     use super::*;
     use roz_core::tools::{ToolCategory, ToolSchema};
     use serde_json::json;
+
+    fn typed_envelope(
+        event_id: &str,
+        correlation_id: &str,
+        event_type: &str,
+        typed_event: roz_v1::session_event_envelope::TypedEvent,
+    ) -> roz_v1::SessionEventEnvelope {
+        roz_v1::SessionEventEnvelope {
+            event_id: event_id.into(),
+            correlation_id: correlation_id.into(),
+            parent_event_id: None,
+            timestamp: None,
+            event_type: event_type.into(),
+            typed_event: Some(typed_event),
+        }
+    }
 
     fn test_schema(name: &str) -> ToolSchema {
         ToolSchema {
@@ -440,5 +587,345 @@ body = '{"pitch": {{head_pitch}}, "duration": {{duration}}}'
             i32::from(roz_v1::ToolCategoryHint::ToolCategoryPure),
             "read_file should be Pure"
         );
+    }
+
+    #[test]
+    fn session_event_to_agent_event_maps_session_failed() {
+        let event = typed_envelope(
+            "evt-1",
+            "corr-1",
+            "session_failed",
+            roz_v1::session_event_envelope::TypedEvent::SessionFailed(roz_v1::SessionFailedPayload {
+                failure: "controller_trap".into(),
+            }),
+        );
+
+        let mapped = session_event_to_agent_event(&event);
+        assert!(matches!(
+            mapped,
+            Some(AgentEvent::Error(message)) if message == "session failed: controller_trap"
+        ));
+    }
+
+    #[test]
+    fn session_event_to_agent_event_maps_session_started() {
+        let event = typed_envelope(
+            "evt-start",
+            "corr-start",
+            "session_started",
+            roz_v1::session_event_envelope::TypedEvent::SessionStarted(roz_v1::SessionStartedPayload {
+                session_id: "sess-1".into(),
+                mode: "server_canonical".into(),
+                blueprint_version: "1.0".into(),
+                model_name: Some("claude-sonnet-4-6".into()),
+                permissions: vec![],
+            }),
+        );
+
+        let mapped = session_event_to_agent_event(&event);
+        assert!(matches!(
+            mapped,
+            Some(AgentEvent::Connected { model }) if model == "claude-sonnet-4-6"
+        ));
+    }
+
+    #[test]
+    fn session_event_to_agent_event_ignores_non_terminal_events() {
+        let event = typed_envelope(
+            "evt-2",
+            "corr-2",
+            "turn_started",
+            roz_v1::session_event_envelope::TypedEvent::TurnStarted(roz_v1::TurnStartedPayload { turn_index: 2 }),
+        );
+
+        assert!(session_event_to_agent_event(&event).is_none());
+    }
+
+    #[test]
+    fn session_event_to_agent_event_maps_tool_call_finished() {
+        let event = typed_envelope(
+            "evt-3",
+            "corr-3",
+            "tool_call_finished",
+            roz_v1::session_event_envelope::TypedEvent::ToolCallFinished(roz_v1::ToolCallFinishedPayload {
+                call_id: "toolu_123".into(),
+                tool_name: "read_file".into(),
+                result_summary: "read 18 lines".into(),
+            }),
+        );
+
+        let mapped = session_event_to_agent_event(&event);
+        assert!(matches!(
+            mapped,
+            Some(AgentEvent::ToolResultDisplay { name, content, is_error: false })
+                if name == "read_file" && content == "read 18 lines"
+        ));
+    }
+
+    #[test]
+    fn session_event_to_agent_event_maps_tool_unavailable() {
+        let event = typed_envelope(
+            "evt-unavailable",
+            "corr-unavailable",
+            "tool_unavailable",
+            roz_v1::session_event_envelope::TypedEvent::ToolUnavailable(roz_v1::ToolUnavailablePayload {
+                tool_name: "promote_controller".into(),
+                reason: "not_registered".into(),
+            }),
+        );
+
+        let mapped = session_event_to_agent_event(&event);
+        assert!(matches!(
+            mapped,
+            Some(AgentEvent::Error(message))
+                if message == "tool unavailable: promote_controller (not_registered)"
+        ));
+    }
+
+    #[test]
+    fn session_event_to_agent_event_maps_approval_requested() {
+        let event = typed_envelope(
+            "evt-approval-request",
+            "corr-approval-request",
+            "approval_requested",
+            roz_v1::session_event_envelope::TypedEvent::ApprovalRequested(roz_v1::ApprovalRequestedPayload {
+                approval_id: "apr-1".into(),
+                action: "move_arm".into(),
+                reason: "needs human approval".into(),
+                timeout_secs: 30,
+            }),
+        );
+
+        let mapped = session_event_to_agent_event(&event);
+        assert!(matches!(
+            mapped,
+            Some(AgentEvent::ToolResultDisplay { name, content, is_error: false })
+                if name == "approval_requested"
+                    && content == "approval requested: move_arm (needs human approval) [timeout=30s]"
+        ));
+    }
+
+    #[test]
+    fn session_event_to_agent_event_maps_approval_resolved_modified() {
+        let outcome = json!({
+            "type": "modified",
+            "modifications": [
+                {"field": "speed", "old_value": "1.0", "new_value": "0.25"}
+            ]
+        });
+        let event = typed_envelope(
+            "evt-approval-resolved",
+            "corr-approval-resolved",
+            "approval_resolved",
+            roz_v1::session_event_envelope::TypedEvent::ApprovalResolved(roz_v1::ApprovalResolvedPayload {
+                approval_id: "apr-1".into(),
+                outcome: Some(crate::tui::convert::value_to_struct(outcome)),
+            }),
+        );
+
+        let mapped = session_event_to_agent_event(&event);
+        assert!(matches!(
+            mapped,
+            Some(AgentEvent::ToolResultDisplay { name, content, is_error: false })
+                if name == "approval_resolved"
+                    && content == "approval modified: apr-1 [speed]"
+        ));
+    }
+
+    #[test]
+    fn session_event_to_agent_event_maps_approval_resolved_denied() {
+        let outcome = json!({
+            "type": "denied",
+            "reason": "too close to operator"
+        });
+        let event = typed_envelope(
+            "evt-approval-denied",
+            "corr-approval-denied",
+            "approval_resolved",
+            roz_v1::session_event_envelope::TypedEvent::ApprovalResolved(roz_v1::ApprovalResolvedPayload {
+                approval_id: "apr-2".into(),
+                outcome: Some(crate::tui::convert::value_to_struct(outcome)),
+            }),
+        );
+
+        let mapped = session_event_to_agent_event(&event);
+        assert!(matches!(
+            mapped,
+            Some(AgentEvent::ToolResultDisplay { name, content, is_error: true })
+                if name == "approval_resolved"
+                    && content == "approval denied: apr-2 (too close to operator)"
+        ));
+    }
+
+    #[test]
+    fn session_event_to_agent_event_maps_text_delta() {
+        let event = typed_envelope(
+            "evt-text",
+            "corr-text",
+            "text_delta",
+            roz_v1::session_event_envelope::TypedEvent::TextDelta(roz_v1::TextDeltaPayload {
+                content: "hello".into(),
+                message_id: Some("msg-1".into()),
+            }),
+        );
+
+        let mapped = session_event_to_agent_event(&event);
+        assert!(matches!(mapped, Some(AgentEvent::TextDelta(content)) if content == "hello"));
+    }
+
+    #[test]
+    fn session_event_to_agent_event_prefers_typed_text_delta() {
+        let event = roz_v1::SessionEventEnvelope {
+            event_id: "evt-text-typed".into(),
+            correlation_id: "corr-text-typed".into(),
+            parent_event_id: None,
+            timestamp: None,
+            event_type: "text_delta".into(),
+            typed_event: Some(roz_v1::session_event_envelope::TypedEvent::TextDelta(
+                roz_v1::TextDeltaPayload {
+                    content: "typed".into(),
+                    message_id: None,
+                },
+            )),
+        };
+
+        let mapped = session_event_to_agent_event(&event);
+        assert!(matches!(mapped, Some(AgentEvent::TextDelta(content)) if content == "typed"));
+    }
+
+    #[test]
+    fn session_event_to_agent_event_prefers_typed_tool_unavailable() {
+        let event = roz_v1::SessionEventEnvelope {
+            event_id: "evt-unavailable-typed".into(),
+            correlation_id: "corr-unavailable-typed".into(),
+            parent_event_id: None,
+            timestamp: None,
+            event_type: "tool_unavailable".into(),
+            typed_event: Some(roz_v1::session_event_envelope::TypedEvent::ToolUnavailable(
+                roz_v1::ToolUnavailablePayload {
+                    tool_name: "promote_controller".into(),
+                    reason: "not_registered".into(),
+                },
+            )),
+        };
+
+        let mapped = session_event_to_agent_event(&event);
+        assert!(matches!(
+            mapped,
+            Some(AgentEvent::Error(message))
+                if message == "tool unavailable: promote_controller (not_registered)"
+        ));
+    }
+
+    #[test]
+    fn session_event_to_agent_event_maps_typed_safety_intervention() {
+        let event = roz_v1::SessionEventEnvelope {
+            event_id: "evt-safety".into(),
+            correlation_id: "corr-safety".into(),
+            parent_event_id: None,
+            timestamp: None,
+            event_type: "safety_intervention".into(),
+            typed_event: Some(roz_v1::session_event_envelope::TypedEvent::SafetyIntervention(
+                roz_v1::SafetyInterventionPayload {
+                    channel: "joint_1".into(),
+                    raw_value: 4.2,
+                    clamped_value: 1.1,
+                    kind: "velocity_clamp".into(),
+                    reason: "limit exceeded".into(),
+                },
+            )),
+        };
+
+        let mapped = session_event_to_agent_event(&event);
+        assert!(matches!(
+            mapped,
+            Some(AgentEvent::Error(message))
+                if message == "safety intervention: joint_1 (velocity_clamp)"
+        ));
+    }
+
+    #[test]
+    fn session_event_to_agent_event_maps_typed_controller_rollback() {
+        let event = roz_v1::SessionEventEnvelope {
+            event_id: "evt-rollback".into(),
+            correlation_id: "corr-rollback".into(),
+            parent_event_id: None,
+            timestamp: None,
+            event_type: "controller_rolled_back".into(),
+            typed_event: Some(roz_v1::session_event_envelope::TypedEvent::ControllerRolledBack(
+                roz_v1::ControllerRolledBackPayload {
+                    artifact_id: "ctrl-2".into(),
+                    restored_id: "ctrl-1".into(),
+                    reason: "candidate divergence exceeded limit".into(),
+                },
+            )),
+        };
+
+        let mapped = session_event_to_agent_event(&event);
+        assert!(matches!(
+            mapped,
+            Some(AgentEvent::Error(message))
+                if message == "controller rolled back: candidate divergence exceeded limit"
+        ));
+    }
+
+    #[test]
+    fn session_event_to_agent_event_maps_session_rejected() {
+        let event = typed_envelope(
+            "evt-reject",
+            "corr-reject",
+            "session_rejected",
+            roz_v1::session_event_envelope::TypedEvent::SessionRejected(roz_v1::SessionRejectedPayload {
+                code: "turn_rejected".into(),
+                message: "turn already in progress".into(),
+                retryable: false,
+            }),
+        );
+
+        let mapped = session_event_to_agent_event(&event);
+        assert!(matches!(
+            mapped,
+            Some(AgentEvent::Error(message)) if message == "turn already in progress"
+        ));
+    }
+
+    #[test]
+    fn session_event_to_tool_request_maps_requested_tool() {
+        let event = typed_envelope(
+            "evt-tool",
+            "corr-tool",
+            "tool_call_requested",
+            roz_v1::session_event_envelope::TypedEvent::ToolCallRequested(roz_v1::ToolCallRequestedPayload {
+                call_id: "toolu_123".into(),
+                tool_name: "read_file".into(),
+                parameters: Some(crate::tui::convert::value_to_struct(json!({"path": "README.md"}))),
+                timeout_ms: 1500,
+            }),
+        );
+
+        let request = session_event_to_tool_request(&event).expect("tool request should parse");
+        assert_eq!(request.tool_call_id, "toolu_123");
+        assert_eq!(request.tool_name, "read_file");
+        assert_eq!(request.timeout_ms, 1500);
+        assert_eq!(request.parameters["path"], "README.md");
+    }
+
+    #[test]
+    fn session_event_to_agent_event_maps_safe_pause() {
+        let event = typed_envelope(
+            "evt-4",
+            "corr-4",
+            "safe_pause_entered",
+            roz_v1::session_event_envelope::TypedEvent::SafePauseEntered(roz_v1::SafePauseEnteredPayload {
+                reason: "operator estop".into(),
+                robot_state: "running".into(),
+            }),
+        );
+
+        let mapped = session_event_to_agent_event(&event);
+        assert!(matches!(
+            mapped,
+            Some(AgentEvent::Error(message)) if message == "safe pause: operator estop"
+        ));
     }
 }

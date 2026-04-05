@@ -11,6 +11,8 @@ use chrono::Utc;
 use roz_core::controller::artifact::ExecutionMode;
 use roz_core::controller::evidence::{ControllerEvidenceBundle, StabilitySummary};
 use roz_core::controller::intervention::{InterventionKind, SafetyIntervention};
+use roz_core::controller::verification::VerifierStatus;
+use roz_core::session::snapshot::FreshnessState;
 use uuid::Uuid;
 
 use crate::tick_contract::TickOutput;
@@ -42,6 +44,22 @@ pub struct EvidenceCollector {
 
 /// Number of consecutive stable ticks required to declare steady state.
 const STEADY_STATE_THRESHOLD: u32 = 50;
+
+/// Extra replay/verification context that binds an evidence bundle to a concrete frame snapshot.
+#[derive(Debug, Clone)]
+pub struct EvidenceFinalizeContext {
+    pub frame_snapshot_id: u64,
+    pub state_freshness: FreshnessState,
+}
+
+impl Default for EvidenceFinalizeContext {
+    fn default() -> Self {
+        Self {
+            frame_snapshot_id: 0,
+            state_freshness: FreshnessState::Unknown,
+        }
+    }
+}
 
 impl EvidenceCollector {
     /// Create a new collector for the given controller.
@@ -180,12 +198,38 @@ impl EvidenceCollector {
     #[must_use]
     pub fn finalize(
         self,
+        controller_digest: &str,
         model_digest: &str,
         calibration_digest: &str,
         manifest_digest: &str,
         wit_world_version: &str,
         execution_mode: ExecutionMode,
         compiler_version: &str,
+    ) -> ControllerEvidenceBundle {
+        self.finalize_with_context(
+            controller_digest,
+            model_digest,
+            calibration_digest,
+            manifest_digest,
+            wit_world_version,
+            execution_mode,
+            compiler_version,
+            &EvidenceFinalizeContext::default(),
+        )
+    }
+
+    /// Finalize into a [`ControllerEvidenceBundle`] with explicit snapshot/freshness linkage.
+    #[must_use]
+    pub fn finalize_with_context(
+        self,
+        controller_digest: &str,
+        model_digest: &str,
+        calibration_digest: &str,
+        manifest_digest: &str,
+        wit_world_version: &str,
+        execution_mode: ExecutionMode,
+        compiler_version: &str,
+        context: &EvidenceFinalizeContext,
     ) -> ControllerEvidenceBundle {
         let (p50, p95, p99) = compute_percentiles(&self.tick_latencies);
         let jitter_us = compute_jitter_us(&self.tick_latencies);
@@ -195,7 +239,7 @@ impl EvidenceCollector {
 
         let steady_state_reached = self.steady_state_ticks >= STEADY_STATE_THRESHOLD;
 
-        ControllerEvidenceBundle {
+        let mut evidence = ControllerEvidenceBundle {
             bundle_id: Uuid::new_v4().to_string(),
             controller_id: self.controller_id,
             ticks_run: self.tick_count,
@@ -209,28 +253,31 @@ impl EvidenceCollector {
             channels_touched,
             channels_untouched,
             config_reads: self.config_reads,
-            tick_latency_p50_us: p50,
-            tick_latency_p95_us: p95,
-            tick_latency_p99_us: p99,
-            stability: StabilitySummary {
+            tick_latency_p50: p50.into(),
+            tick_latency_p95: p95.into(),
+            tick_latency_p99: p99.into(),
+            controller_stability_summary: StabilitySummary {
                 command_oscillation_detected: self.command_oscillation_detected,
                 idle_output_stable: !self.command_oscillation_detected,
                 runtime_jitter_us: jitter_us,
                 missed_tick_count: 0, // TODO: wire missed tick detection from pipeline
                 steady_state_reached,
             },
-            verifier_status: "pending".into(),
+            verifier_status: VerifierStatus::Pending,
             verifier_reason: None,
+            controller_digest: controller_digest.to_string(),
             model_digest: model_digest.to_string(),
             calibration_digest: calibration_digest.to_string(),
-            frame_snapshot_id: 0,
+            frame_snapshot_id: context.frame_snapshot_id,
             manifest_digest: manifest_digest.to_string(),
             wit_world_version: wit_world_version.to_string(),
             execution_mode,
             compiler_version: compiler_version.to_string(),
             created_at: Utc::now(),
-            state_freshness: roz_core::session::snapshot::FreshnessState::Unknown,
-        }
+            state_freshness: context.state_freshness.clone(),
+        };
+        evidence.set_verifier_status(VerifierStatus::Pending);
+        evidence
     }
 }
 
@@ -304,6 +351,7 @@ mod tests {
         }
 
         let bundle = collector.finalize(
+            "ctrl_sha",
             "model_sha",
             "cal_sha",
             "man_sha",
@@ -335,7 +383,7 @@ mod tests {
         let output = make_output(vec![0.1, 0.2, 0.3]);
         collector.record_tick(Duration::from_micros(500), &output, &interventions);
 
-        let bundle = collector.finalize("m", "c", "man", "1.0.0", ExecutionMode::Shadow, "wt");
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Shadow, "wt");
 
         assert_eq!(bundle.limit_clamp_count, 1); // VelocityClamp
         assert_eq!(bundle.rate_clamp_count, 1); // AccelerationLimit
@@ -355,11 +403,11 @@ mod tests {
             collector.record_tick(Duration::from_micros(100), &output, &[]);
         }
 
-        let bundle = collector.finalize("m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
 
-        assert!(bundle.stability.command_oscillation_detected);
+        assert!(bundle.controller_stability_summary.command_oscillation_detected);
         // Because oscillation keeps resetting steady_state_ticks
-        assert!(!bundle.stability.steady_state_reached);
+        assert!(!bundle.controller_stability_summary.steady_state_reached);
     }
 
     #[test]
@@ -373,7 +421,7 @@ mod tests {
         let output = make_output(vec![0.5, 0.3, 0.0]);
         collector.record_tick(Duration::from_micros(200), &output, &[]);
 
-        let bundle = collector.finalize("m", "c", "man", "1.0.0", ExecutionMode::Canary, "wt");
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Canary, "wt");
 
         assert!(bundle.channels_touched.contains(&"channel_0".to_string()));
         assert!(bundle.channels_touched.contains(&"channel_1".to_string()));
@@ -390,7 +438,7 @@ mod tests {
         let output = make_output(vec![]);
         collector.record_tick(Duration::from_micros(100), &output, &[]);
 
-        let bundle = collector.finalize("m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
         assert!(bundle.channels_touched.is_empty());
         assert_eq!(bundle.channels_untouched.len(), 2);
     }
@@ -405,14 +453,14 @@ mod tests {
             collector.record_tick(Duration::from_micros(i), &output, &[]);
         }
 
-        let bundle = collector.finalize("m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
 
         // p50 = index 50 of sorted 1..100 = 51
-        assert_eq!(bundle.tick_latency_p50_us, 51);
+        assert_eq!(bundle.tick_latency_p50.as_micros(), 51);
         // p95 = index 95 = 96
-        assert_eq!(bundle.tick_latency_p95_us, 96);
+        assert_eq!(bundle.tick_latency_p95.as_micros(), 96);
         // p99 = index 99 = 100
-        assert_eq!(bundle.tick_latency_p99_us, 100);
+        assert_eq!(bundle.tick_latency_p99.as_micros(), 100);
     }
 
     #[test]
@@ -423,7 +471,7 @@ mod tests {
         collector.record_trap();
         collector.record_trap();
 
-        let bundle = collector.finalize("m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
 
         assert_eq!(bundle.trap_count, 3);
         assert!(bundle.has_safety_issues());
@@ -437,6 +485,7 @@ mod tests {
         collector.record_tick(Duration::from_micros(100), &output, &[]);
 
         let bundle = collector.finalize(
+            "sha256:ctrl999",
             "sha256:model123",
             "sha256:cal456",
             "sha256:man789",
@@ -445,6 +494,7 @@ mod tests {
             "wasmtime-43.0.0",
         );
 
+        assert_eq!(bundle.controller_digest, "sha256:ctrl999");
         assert_eq!(bundle.model_digest, "sha256:model123");
         assert_eq!(bundle.calibration_digest, "sha256:cal456");
         assert_eq!(bundle.manifest_digest, "sha256:man789");
@@ -456,13 +506,36 @@ mod tests {
     #[test]
     fn evidence_collector_empty_finalize() {
         let collector = EvidenceCollector::new("ctrl-empty", &[]);
-        let bundle = collector.finalize("m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
 
         assert_eq!(bundle.ticks_run, 0);
-        assert_eq!(bundle.tick_latency_p50_us, 0);
-        assert_eq!(bundle.tick_latency_p95_us, 0);
-        assert_eq!(bundle.tick_latency_p99_us, 0);
+        assert_eq!(bundle.tick_latency_p50.as_micros(), 0);
+        assert_eq!(bundle.tick_latency_p95.as_micros(), 0);
+        assert_eq!(bundle.tick_latency_p99.as_micros(), 0);
         assert!(!bundle.has_safety_issues());
+    }
+
+    #[test]
+    fn evidence_collector_finalize_with_context_binds_snapshot() {
+        let mut collector = EvidenceCollector::new("ctrl-ctx", &[]);
+        collector.record_tick(Duration::from_micros(42), &make_output(vec![0.1]), &[]);
+
+        let bundle = collector.finalize_with_context(
+            "ctrl",
+            "model",
+            "cal",
+            "manifest",
+            "1.0.0",
+            ExecutionMode::Replay,
+            "wt",
+            &EvidenceFinalizeContext {
+                frame_snapshot_id: 77,
+                state_freshness: FreshnessState::Fresh,
+            },
+        );
+
+        assert_eq!(bundle.frame_snapshot_id, 77);
+        assert_eq!(bundle.state_freshness, FreshnessState::Fresh);
     }
 
     #[test]
@@ -471,7 +544,7 @@ mod tests {
         collector.record_watchdog_near_miss();
         collector.record_watchdog_near_miss();
 
-        let bundle = collector.finalize("m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
         assert_eq!(bundle.watchdog_near_miss_count, 2);
     }
 
@@ -480,7 +553,7 @@ mod tests {
         let mut collector = EvidenceCollector::new("ctrl-009", &[]);
         collector.record_epoch_interrupt();
 
-        let bundle = collector.finalize("m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
         assert_eq!(bundle.epoch_interrupt_count, 1);
         assert!(bundle.has_safety_issues());
     }

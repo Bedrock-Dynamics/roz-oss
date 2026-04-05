@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use roz_agent::agent_loop::{AgentInput, AgentLoop, AgentLoopMode};
+use roz_agent::agent_loop::{AgentInput, AgentInputSeed, AgentLoop, AgentLoopMode};
 use roz_agent::bt::registry::ExecutorRegistry;
 use roz_agent::dispatch::ToolDispatcher;
 use roz_agent::model::types::*;
@@ -102,8 +102,11 @@ async fn bt_execution_through_agent_loop() {
         task_id: "bt-test-1".to_string(),
         tenant_id: "test-tenant".to_string(),
         model_name: String::new(),
-        system_prompt: vec!["You are a robot controller. Use execute_skill to run BT skills.".to_string()],
-        user_message: "Pick and place the object.".to_string(),
+        seed: AgentInputSeed::new(
+            vec!["You are a robot controller. Use execute_skill to run BT skills.".to_string()],
+            Vec::new(),
+            "Pick and place the object.".to_string(),
+        ),
         max_cycles: 5,
         max_tokens: 4096,
         max_context_tokens: 200_000,
@@ -112,7 +115,6 @@ async fn bt_execution_through_agent_loop() {
         tool_choice: None,
         response_schema: None,
         streaming: false,
-        history: vec![],
         cancellation_token: None,
         control_mode: roz_core::safety::ControlMode::default(),
     };

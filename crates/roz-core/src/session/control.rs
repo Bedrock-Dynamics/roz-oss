@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::phases::PhaseMode;
+
 /// The actuation mode of the runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -15,11 +17,13 @@ pub enum ControlMode {
 
 /// The session mode determining source of truth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum SessionMode {
-    LocalCanonical,
-    ServerCanonical,
-    EdgeCanonical,
+    #[serde(rename = "local", alias = "local_canonical")]
+    Local,
+    #[serde(rename = "server", alias = "server_canonical")]
+    Server,
+    #[serde(rename = "edge", alias = "edge_canonical")]
+    Edge,
 }
 
 /// A gripper command.
@@ -60,10 +64,39 @@ pub struct TeleopCommand {
 
 /// The cognition mode of the agent runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum CognitionMode {
+    #[serde(rename = "react")]
     React,
+    #[serde(rename = "ooda_react", alias = "ooda_re_act")]
     OodaReAct,
+}
+
+impl CognitionMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::React => "react",
+            Self::OodaReAct => "ooda_react",
+        }
+    }
+}
+
+impl From<PhaseMode> for CognitionMode {
+    fn from(value: PhaseMode) -> Self {
+        match value {
+            PhaseMode::React => Self::React,
+            PhaseMode::OodaReAct => Self::OodaReAct,
+        }
+    }
+}
+
+impl From<CognitionMode> for PhaseMode {
+    fn from(value: CognitionMode) -> Self {
+        match value {
+            CognitionMode::React => Self::React,
+            CognitionMode::OodaReAct => Self::OodaReAct,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -88,15 +121,12 @@ mod tests {
 
     #[test]
     fn session_mode_variants_serde() {
-        let modes = vec![
-            SessionMode::LocalCanonical,
-            SessionMode::ServerCanonical,
-            SessionMode::EdgeCanonical,
-        ];
-        for m in modes {
-            let json = serde_json::to_string(&m).unwrap();
+        let modes = vec![SessionMode::Local, SessionMode::Server, SessionMode::Edge];
+        for (mode, expected) in modes.into_iter().zip(["\"local\"", "\"server\"", "\"edge\""]) {
+            let json = serde_json::to_string(&mode).unwrap();
+            assert_eq!(json, expected);
             let back: SessionMode = serde_json::from_str(&json).unwrap();
-            assert_eq!(m, back);
+            assert_eq!(mode, back);
         }
     }
 
@@ -165,6 +195,34 @@ mod tests {
         let json = serde_json::to_string(&CognitionMode::React).unwrap();
         assert_eq!(json, "\"react\"");
         let json = serde_json::to_string(&CognitionMode::OodaReAct).unwrap();
-        assert_eq!(json, "\"ooda_re_act\"");
+        assert_eq!(json, "\"ooda_react\"");
+    }
+
+    #[test]
+    fn cognition_mode_round_trips_phase_mode() {
+        assert_eq!(CognitionMode::from(PhaseMode::React), CognitionMode::React);
+        assert_eq!(CognitionMode::from(PhaseMode::OodaReAct), CognitionMode::OodaReAct);
+        assert_eq!(PhaseMode::from(CognitionMode::React), PhaseMode::React);
+        assert_eq!(PhaseMode::from(CognitionMode::OodaReAct), PhaseMode::OodaReAct);
+    }
+
+    #[test]
+    fn session_mode_accepts_legacy_aliases() {
+        let local: SessionMode = serde_json::from_str("\"local_canonical\"").unwrap();
+        let server: SessionMode = serde_json::from_str("\"server_canonical\"").unwrap();
+        let edge: SessionMode = serde_json::from_str("\"edge_canonical\"").unwrap();
+
+        assert_eq!(local, SessionMode::Local);
+        assert_eq!(server, SessionMode::Server);
+        assert_eq!(edge, SessionMode::Edge);
+    }
+
+    #[test]
+    fn cognition_mode_accepts_legacy_alias() {
+        let mode: CognitionMode = serde_json::from_str("\"ooda_react\"").unwrap();
+        assert_eq!(mode, CognitionMode::OodaReAct);
+
+        let legacy: CognitionMode = serde_json::from_str("\"ooda_re_act\"").unwrap();
+        assert_eq!(legacy, CognitionMode::OodaReAct);
     }
 }

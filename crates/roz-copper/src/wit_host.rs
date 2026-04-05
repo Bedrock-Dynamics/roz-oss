@@ -8,6 +8,7 @@
 //! | `tick`      | `get_input`      | `(ptr: i32, len: i32)->i32`| host copies `TickInput`   |
 //! | `tick`      | `set_output`     | `(ptr: i32, len: i32)`     | host reads `TickOutput`   |
 //! | `safety`    | `request_estop`  | `() -> ()`                 | emergency stop            |
+//! | `runtime`   | `execution_mode` | `() -> i32`                | live/replay/verify stage  |
 //! | `timing`    | `now_ns`         | `() -> i64`                | wall-clock nanoseconds    |
 //! | `timing`    | `sim_time_ns`    | `() -> i64`                | simulation time           |
 //! | `math`      | `sin`            | `(f64) -> f64`             | trig (no WASM intrinsic)  |
@@ -21,10 +22,12 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use roz_core::channels::ChannelManifest;
+use roz_core::controller::artifact::ExecutionMode;
+use roz_core::embodiment::binding::ControlInterfaceManifest;
 use wasmtime::{Linker, StoreLimits, StoreLimitsBuilder};
 
 use crate::tick_contract::{TickInput, TickOutput};
+use crate::wit_bindings::live_controller;
 
 /// A single command recorded by a host function (retained for observability).
 #[derive(Debug, Clone, PartialEq)]
@@ -40,9 +43,63 @@ pub struct CommandEntry {
 /// Stored inside a wasmtime [`Store`](wasmtime::Store) so that every
 /// host function can access safety limits and tick I/O via
 /// [`Caller::data_mut`](wasmtime::Caller::data_mut).
+#[derive(Debug, Clone, Default)]
+pub struct HostManifest {
+    pub commands: Vec<HostCommandDescriptor>,
+    pub states: Vec<HostStateDescriptor>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HostCommandDescriptor {
+    pub name: String,
+    pub default: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HostStateDescriptor;
+
+impl HostManifest {
+    fn from_parts(
+        control_manifest: &ControlInterfaceManifest,
+        command_defaults: Option<&[f64]>,
+        state_count: usize,
+    ) -> Self {
+        Self {
+            commands: control_manifest
+                .channels
+                .iter()
+                .enumerate()
+                .map(|(index, channel)| HostCommandDescriptor {
+                    name: channel.name.clone(),
+                    default: command_defaults
+                        .and_then(|defaults| defaults.get(index))
+                        .copied()
+                        .unwrap_or(0.0),
+                })
+                .collect(),
+            states: vec![HostStateDescriptor; state_count],
+        }
+    }
+
+    #[must_use]
+    pub fn from_control_manifest(control_manifest: &ControlInterfaceManifest) -> Self {
+        Self::from_parts(control_manifest, None, 0)
+    }
+
+    #[must_use]
+    pub const fn command_count(&self) -> usize {
+        self.commands.len()
+    }
+
+    #[must_use]
+    pub const fn state_count(&self) -> usize {
+        self.states.len()
+    }
+}
+
 pub struct HostContext {
     /// Channel manifest describing command/state interface.
-    pub manifest: ChannelManifest,
+    pub manifest: HostManifest,
     /// Serialized `TickInput` JSON, written by the host before each tick.
     /// The controller reads this via `tick::get_input`.
     pub tick_input_json: Vec<u8>,
@@ -69,6 +126,8 @@ pub struct HostContext {
     pub store_limits: StoreLimits,
     /// Simulation time in nanoseconds (from sensor frame, respects pause/speed).
     pub sim_time_ns: i64,
+    /// Current runtime execution mode exposed to controllers.
+    pub execution_mode: ExecutionMode,
     /// Count of tick-contract rejections (invalid output, etc.).
     /// Incremented by host functions, checked by verification.
     pub rejection_count: AtomicU32,
@@ -83,7 +142,7 @@ impl Default for HostContext {
     /// Memory is capped at 16 MiB by default.
     fn default() -> Self {
         Self {
-            manifest: ChannelManifest::default(),
+            manifest: HostManifest::default(),
             tick_input_json: Vec::new(),
             tick_output_json: Vec::new(),
             command_values: Vec::new(),
@@ -93,9 +152,10 @@ impl Default for HostContext {
             estop_reason: None,
             store_limits: StoreLimitsBuilder::new()
                 .memory_size(16 * 1024 * 1024) // 16 MiB
-                .instances(1)
+                .instances(8)
                 .build(),
             sim_time_ns: 0,
+            execution_mode: ExecutionMode::Live,
             rejection_count: AtomicU32::new(0),
             config_json: Vec::new(),
         }
@@ -103,11 +163,7 @@ impl Default for HostContext {
 }
 
 impl HostContext {
-    /// Create a context with the given channel manifest.
-    ///
-    /// Command values are initialized to each channel's default.
-    /// State values are initialized to zero.
-    pub fn with_manifest(manifest: ChannelManifest) -> Self {
+    fn from_host_manifest(manifest: HostManifest) -> Self {
         let defaults: Vec<f64> = manifest.commands.iter().map(|c| c.default).collect();
         let state_count = manifest.state_count();
         Self {
@@ -116,6 +172,25 @@ impl HostContext {
             state_values: vec![0.0; state_count],
             ..Self::default()
         }
+    }
+
+    /// Create a context from the canonical control-interface manifest.
+    ///
+    /// This is the preferred constructor for new control-surface code. The
+    /// host keeps only the narrower per-command runtime metadata needed by the
+    /// tick contract.
+    pub fn with_control_manifest(control_manifest: &ControlInterfaceManifest) -> Self {
+        Self::from_host_manifest(HostManifest::from_control_manifest(control_manifest))
+    }
+
+    /// Create a context from the canonical control-interface manifest plus an
+    /// explicit controller state slot count.
+    ///
+    /// The control-interface manifest is the sole command-surface authority,
+    /// but some host paths still need a separate count of sensor/state slots
+    /// when preparing `TickInput` data.
+    pub fn with_control_manifest_state_count(control_manifest: &ControlInterfaceManifest, state_count: usize) -> Self {
+        Self::from_host_manifest(HostManifest::from_parts(control_manifest, None, state_count))
     }
 
     /// Reset command values to defaults. Call at tick start.
@@ -136,6 +211,43 @@ impl HostContext {
         self.tick_input_json = serde_json::to_vec(input).unwrap_or_default();
     }
 
+    /// Set the runtime execution mode for the current tick.
+    pub fn set_execution_mode(&mut self, execution_mode: ExecutionMode) {
+        self.execution_mode = execution_mode;
+    }
+
+    /// Apply a structured tick output to the host context.
+    ///
+    /// Updates command values, estop state, and the command log.
+    pub fn record_tick_output(&mut self, output: &TickOutput) {
+        for (i, v) in output.command_values.iter().enumerate() {
+            if let Some(slot) = self.command_values.get_mut(i) {
+                *slot = *v;
+            }
+        }
+        if output.estop {
+            self.estop_requested = true;
+            if let Some(ref reason) = output.estop_reason {
+                self.estop_reason = Some(reason.clone());
+            }
+        }
+        for (i, v) in output.command_values.iter().enumerate() {
+            let label = self
+                .manifest
+                .commands
+                .get(i)
+                .map_or_else(|| format!("cmd[{i}]"), |c| c.name.clone());
+            let entry = CommandEntry { label, value: *v };
+            match self.command_log.lock() {
+                Ok(mut log) => log.push(entry),
+                Err(e) => {
+                    tracing::error!("command_log mutex poisoned: {e}");
+                    e.into_inner().push(entry);
+                }
+            }
+        }
+    }
+
     /// Parse the `TickOutput` JSON written by the controller.
     ///
     /// Returns `None` if the controller did not call `tick::set_output` or
@@ -147,35 +259,7 @@ impl HostContext {
         }
         match serde_json::from_slice::<TickOutput>(&self.tick_output_json) {
             Ok(output) => {
-                // Update command_values from the structured output.
-                for (i, v) in output.command_values.iter().enumerate() {
-                    if let Some(slot) = self.command_values.get_mut(i) {
-                        *slot = *v;
-                    }
-                }
-                // Update estop state.
-                if output.estop {
-                    self.estop_requested = true;
-                    if let Some(ref reason) = output.estop_reason {
-                        self.estop_reason = Some(reason.clone());
-                    }
-                }
-                // Log commands for observability.
-                for (i, v) in output.command_values.iter().enumerate() {
-                    let label = self
-                        .manifest
-                        .commands
-                        .get(i)
-                        .map_or_else(|| format!("cmd[{i}]"), |c| c.name.clone());
-                    let entry = CommandEntry { label, value: *v };
-                    match self.command_log.lock() {
-                        Ok(mut log) => log.push(entry),
-                        Err(e) => {
-                            tracing::error!("command_log mutex poisoned: {e}");
-                            e.into_inner().push(entry);
-                        }
-                    }
-                }
+                self.record_tick_output(&output);
                 Some(output)
             }
             Err(e) => {
@@ -184,6 +268,22 @@ impl HostContext {
                 None
             }
         }
+    }
+}
+
+fn runtime_mode_to_wit(mode: ExecutionMode) -> live_controller::bedrock::controller::runtime::ExecutionMode {
+    match mode {
+        ExecutionMode::Live => live_controller::bedrock::controller::runtime::ExecutionMode::Live,
+        ExecutionMode::Replay => live_controller::bedrock::controller::runtime::ExecutionMode::Replay,
+        ExecutionMode::Verify => live_controller::bedrock::controller::runtime::ExecutionMode::Verify,
+        ExecutionMode::Shadow => live_controller::bedrock::controller::runtime::ExecutionMode::Shadow,
+        ExecutionMode::Canary => live_controller::bedrock::controller::runtime::ExecutionMode::Canary,
+    }
+}
+
+impl live_controller::bedrock::controller::runtime::Host for HostContext {
+    fn current_execution_mode(&mut self) -> live_controller::bedrock::controller::runtime::ExecutionMode {
+        runtime_mode_to_wit(self.execution_mode)
     }
 }
 
@@ -196,6 +296,7 @@ impl HostContext {
 /// | `tick`      | `get_input`      | `(ptr: i32, len: i32)->i32`|
 /// | `tick`      | `set_output`     | `(ptr: i32, len: i32)`     |
 /// | `safety`    | `request_estop`  | `() -> ()`                 |
+/// | `runtime`   | `execution_mode` | `() -> i32`                |
 /// | `timing`    | `now_ns`         | `() -> i64`                |
 /// | `timing`    | `sim_time_ns`    | `() -> i64`                |
 /// | `math`      | `sin`            | `(f64) -> f64`             |
@@ -285,6 +386,21 @@ fn register_system_functions(linker: &mut Linker<HostContext>) -> anyhow::Result
         },
     )?;
 
+    // -- runtime -------------------------------------------------------
+    linker.func_wrap(
+        "runtime",
+        "execution_mode",
+        |caller: wasmtime::Caller<'_, HostContext>| -> i32 {
+            match caller.data().execution_mode {
+                ExecutionMode::Live => 0,
+                ExecutionMode::Replay => 1,
+                ExecutionMode::Verify => 2,
+                ExecutionMode::Shadow => 3,
+                ExecutionMode::Canary => 4,
+            }
+        },
+    )?;
+
     // -- timing --------------------------------------------------------
     linker.func_wrap(
         "timing",
@@ -328,7 +444,7 @@ fn register_system_functions(linker: &mut Linker<HostContext>) -> anyhow::Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use roz_core::channels::InterfaceType;
+    use roz_core::embodiment::binding::{BindingType, ChannelBinding, CommandInterfaceType, ControlChannelDef};
     use wasmtime::{Config, Engine, Module, Store};
 
     /// Helper: build a `CuWasmTask`-like setup with host functions for a
@@ -350,59 +466,47 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Helper to build a simple 2-command manifest for tests
+    // Helper to build a simple 2-command control manifest for tests
     // -----------------------------------------------------------------------
-    fn two_cmd_manifest() -> ChannelManifest {
-        use roz_core::channels::ChannelDescriptor;
-        ChannelManifest {
-            robot_id: "test".into(),
-            robot_class: "test".into(),
-            control_rate_hz: 100,
-            commands: vec![
-                ChannelDescriptor {
-                    name: "joint0/velocity".into(),
-                    interface_type: InterfaceType::Velocity,
-                    unit: "rad/s".into(),
-                    limits: (-1.5, 1.5),
-                    default: 0.0,
-                    max_rate_of_change: None,
-                    position_state_index: None,
-                    max_delta_from: None,
+    fn two_cmd_control_manifest() -> ControlInterfaceManifest {
+        let mut manifest = ControlInterfaceManifest {
+            version: 1,
+            manifest_digest: String::new(),
+            channels: vec![
+                ControlChannelDef {
+                    name: "joint0_velocity".into(),
+                    interface_type: CommandInterfaceType::JointVelocity,
+                    units: "rad/s".into(),
+                    frame_id: "base".into(),
                 },
-                ChannelDescriptor {
-                    name: "joint1/velocity".into(),
-                    interface_type: InterfaceType::Velocity,
-                    unit: "rad/s".into(),
-                    limits: (-2.0, 2.0),
-                    default: 0.0,
-                    max_rate_of_change: None,
-                    position_state_index: None,
-                    max_delta_from: None,
+                ControlChannelDef {
+                    name: "joint1_velocity".into(),
+                    interface_type: CommandInterfaceType::JointVelocity,
+                    units: "rad/s".into(),
+                    frame_id: "base".into(),
                 },
             ],
-            states: vec![
-                ChannelDescriptor {
-                    name: "joint0/position".into(),
-                    interface_type: InterfaceType::Position,
-                    unit: "rad".into(),
-                    limits: (-6.28, 6.28),
-                    default: 0.0,
-                    max_rate_of_change: None,
-                    position_state_index: None,
-                    max_delta_from: None,
+            bindings: vec![
+                ChannelBinding {
+                    physical_name: "joint0".into(),
+                    channel_index: 0,
+                    binding_type: BindingType::Command,
+                    frame_id: "base".into(),
+                    units: "rad/s".into(),
+                    semantic_role: None,
                 },
-                ChannelDescriptor {
-                    name: "joint1/position".into(),
-                    interface_type: InterfaceType::Position,
-                    unit: "rad".into(),
-                    limits: (-6.28, 6.28),
-                    default: 0.0,
-                    max_rate_of_change: None,
-                    position_state_index: None,
-                    max_delta_from: None,
+                ChannelBinding {
+                    physical_name: "joint1".into(),
+                    channel_index: 1,
+                    binding_type: BindingType::Command,
+                    frame_id: "base".into(),
+                    units: "rad/s".into(),
+                    semantic_role: None,
                 },
             ],
-        }
+        };
+        manifest.stamp_digest();
+        manifest
     }
 
     // ===================================================================
@@ -411,8 +515,8 @@ mod tests {
 
     #[test]
     fn tick_input_round_trips_through_host() {
-        let manifest = two_cmd_manifest();
-        let mut host = HostContext::with_manifest(manifest);
+        let control_manifest = two_cmd_control_manifest();
+        let mut host = HostContext::with_control_manifest(&control_manifest);
 
         let input = TickInput {
             tick: 42,
@@ -438,8 +542,8 @@ mod tests {
 
     #[test]
     fn tick_output_updates_command_values() {
-        let manifest = two_cmd_manifest();
-        let mut host = HostContext::with_manifest(manifest);
+        let control_manifest = two_cmd_control_manifest();
+        let mut host = HostContext::with_control_manifest(&control_manifest);
 
         let output = TickOutput {
             command_values: vec![0.5, -1.0],
@@ -457,7 +561,8 @@ mod tests {
 
     #[test]
     fn tick_output_estop_sets_flag() {
-        let mut host = HostContext::with_manifest(two_cmd_manifest());
+        let control_manifest = two_cmd_control_manifest();
+        let mut host = HostContext::with_control_manifest(&control_manifest);
 
         let output = TickOutput {
             command_values: vec![],
@@ -475,7 +580,8 @@ mod tests {
 
     #[test]
     fn tick_output_invalid_json_rejected() {
-        let mut host = HostContext::with_manifest(two_cmd_manifest());
+        let control_manifest = two_cmd_control_manifest();
+        let mut host = HostContext::with_control_manifest(&control_manifest);
         host.tick_output_json = b"not json".to_vec();
 
         assert!(host.take_tick_output().is_none());
@@ -484,7 +590,8 @@ mod tests {
 
     #[test]
     fn reset_commands_clears_to_defaults() {
-        let mut ctx = HostContext::with_manifest(two_cmd_manifest());
+        let control_manifest = two_cmd_control_manifest();
+        let mut ctx = HostContext::with_control_manifest(&control_manifest);
         ctx.command_values[0] = 99.0;
         ctx.command_values[1] = -99.0;
         ctx.tick_output_json = b"leftover".to_vec();
@@ -519,7 +626,8 @@ mod tests {
                 )
             )
         "#;
-        let mut host = HostContext::with_manifest(two_cmd_manifest());
+        let control_manifest = two_cmd_control_manifest();
+        let mut host = HostContext::with_control_manifest(&control_manifest);
         let input = TickInput {
             tick: 7,
             monotonic_time_ns: 100,
@@ -573,7 +681,8 @@ mod tests {
             )"#
         );
 
-        let host = HostContext::with_manifest(two_cmd_manifest());
+        let control_manifest = two_cmd_control_manifest();
+        let host = HostContext::with_control_manifest(&control_manifest);
         let (_engine, mut store, instance) = instantiate_with_host(&wat, host).unwrap();
         let process = instance.get_typed_func::<u64, ()>(&mut store, "process").unwrap();
         process.call(&mut store, 0).unwrap();
@@ -654,6 +763,31 @@ mod tests {
     }
 
     #[test]
+    fn execution_mode_returns_injected_stage() {
+        let wat = r#"
+            (module
+                (import "runtime" "execution_mode" (func $mode (result i32)))
+                (global $mode_value (export "mode_value") (mut i32) (i32.const -1))
+                (func (export "process") (param i64) (global.set $mode_value (call $mode)))
+            )
+        "#;
+        let host = HostContext {
+            execution_mode: ExecutionMode::Shadow,
+            ..HostContext::default()
+        };
+        let (_engine, mut store, instance) = instantiate_with_host(wat, host).unwrap();
+
+        let process = instance.get_typed_func::<u64, ()>(&mut store, "process").unwrap();
+        process.call(&mut store, 0).unwrap();
+
+        let mode_value = match instance.get_global(&mut store, "mode_value").unwrap().get(&mut store) {
+            wasmtime::Val::I32(v) => v,
+            other => panic!("expected i32, got {other:?}"),
+        };
+        assert_eq!(mode_value, 3);
+    }
+
+    #[test]
     fn math_sin_returns_correct_value() {
         let wat = r#"
             (module
@@ -712,13 +846,22 @@ mod tests {
     }
 
     #[test]
-    fn with_manifest_initializes_defaults() {
-        let manifest = two_cmd_manifest();
-        let ctx = HostContext::with_manifest(manifest);
+    fn with_control_manifest_state_count_initializes_defaults() {
+        let manifest = two_cmd_control_manifest();
+        let ctx = HostContext::with_control_manifest_state_count(&manifest, 2);
         assert_eq!(ctx.command_values.len(), 2);
         assert_eq!(ctx.state_values.len(), 2);
         assert!(ctx.command_values.iter().all(|v| *v == 0.0));
         assert!(ctx.state_values.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn with_control_manifest_initializes_defaults() {
+        let manifest = two_cmd_control_manifest();
+        let ctx = HostContext::with_control_manifest(&manifest);
+        assert_eq!(ctx.command_values.len(), 2);
+        assert_eq!(ctx.state_values.len(), 0);
+        assert!(ctx.command_values.iter().all(|v| *v == 0.0));
     }
 
     #[test]

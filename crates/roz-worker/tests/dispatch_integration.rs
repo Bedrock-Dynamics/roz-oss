@@ -28,6 +28,8 @@ async fn worker_receives_task_invocation_via_nats() {
         restate_url: "http://localhost:9080".to_string(),
         traceparent: None,
         phases: vec![],
+        control_interface_manifest: None,
+        delegation_scope: None,
     };
 
     let subject = format!("invoke.test-robot.{task_id}");

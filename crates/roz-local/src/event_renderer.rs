@@ -2,6 +2,13 @@
 
 use roz_core::session::event::SessionEvent;
 
+fn format_runtime_failure(failure: roz_core::session::activity::RuntimeFailureKind) -> String {
+    serde_json::to_value(failure)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "model_error".to_string())
+}
+
 /// Render a `SessionEvent` as a human-readable terminal line.
 ///
 /// Returns `Some(line)` for events that should be displayed in the TUI,
@@ -29,7 +36,9 @@ pub fn render_event(event: &SessionEvent) -> Option<String> {
         SessionEvent::SafePauseEntered { reason, .. } => Some(format!("[PAUSE] Safe pause entered: {reason}")),
         SessionEvent::SafePauseCleared { reason } => Some(format!("[RESUME] Safe pause cleared: {reason}")),
         SessionEvent::SessionCompleted { summary, .. } => Some(format!("[session] Completed: {summary}")),
-        SessionEvent::SessionFailed { failure } => Some(format!("[session] FAILED: {failure:?}")),
+        SessionEvent::SessionFailed { failure } => {
+            Some(format!("[session] FAILED: {}", format_runtime_failure(*failure)))
+        }
         SessionEvent::ControllerPromoted { artifact_id, .. } => Some(format!("[controller] Promoted: {artifact_id}")),
         SessionEvent::SafetyIntervention {
             channel,
@@ -54,8 +63,10 @@ mod tests {
     fn session_started_renders() {
         let event = SessionEvent::SessionStarted {
             session_id: "sess-1".into(),
-            mode: SessionMode::LocalCanonical,
+            mode: SessionMode::Local,
             blueprint_version: "1.0".into(),
+            model_name: None,
+            permissions: vec![],
         };
         let line = render_event(&event).expect("should render");
         assert!(line.contains("sess-1"));

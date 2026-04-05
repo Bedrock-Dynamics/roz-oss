@@ -7,6 +7,15 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Internal NATS subject prefix used to route approval responses back to a task worker.
+pub const INTERNAL_APPROVAL_SUBJECT_PREFIX: &str = "roz.internal.tasks.approval";
+
+/// Subject carrying approval responses for a specific task.
+#[must_use]
+pub fn approval_subject(task_id: Uuid) -> String {
+    format!("{INTERNAL_APPROVAL_SUBJECT_PREFIX}.{task_id}")
+}
+
 /// Extract a W3C traceparent string from the current tracing span's `OTel` context.
 ///
 /// Returns `None` if no valid trace context is active (e.g., in tests or when `OTel` is not configured).
@@ -28,11 +37,12 @@ pub fn current_traceparent() -> Option<String> {
 
 /// How the agent loop should execute a task.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum ExecutionMode {
     /// Pure LLM reasoning + tools (no spatial context).
+    #[serde(rename = "react")]
     React,
     /// Spatial context injected into model messages + safety guards.
+    #[serde(rename = "ooda_react", alias = "ooda_re_act")]
     OodaReAct,
 }
 
@@ -56,6 +66,12 @@ pub struct TaskInvocation {
     /// Ordered phase specs for the agent loop. Empty = single React phase (default).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub phases: Vec<roz_core::phases::PhaseSpec>,
+    /// Optional control-interface contract propagated from the spawning session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_interface_manifest: Option<roz_core::embodiment::binding::ControlInterfaceManifest>,
+    /// Optional inherited worker delegation scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_scope: Option<roz_core::tasks::DelegationScope>,
 }
 
 /// Token counts for a completed task.
@@ -120,6 +136,8 @@ mod tests {
             restate_url: "http://localhost:8080".to_string(),
             traceparent: None,
             phases: vec![],
+            control_interface_manifest: None,
+            delegation_scope: None,
         };
 
         let bytes = serde_json::to_vec(&invocation).expect("serialize");
@@ -167,16 +185,20 @@ mod tests {
         let react_json = serde_json::to_value(ExecutionMode::React).expect("serialize react");
         assert_eq!(react_json, serde_json::json!("react"));
 
-        let ooda_json = serde_json::to_value(ExecutionMode::OodaReAct).expect("serialize ooda_re_act");
-        assert_eq!(ooda_json, serde_json::json!("ooda_re_act"));
+        let ooda_json = serde_json::to_value(ExecutionMode::OodaReAct).expect("serialize ooda_react");
+        assert_eq!(ooda_json, serde_json::json!("ooda_react"));
 
         // Roundtrip from string
         let react: ExecutionMode = serde_json::from_value(serde_json::json!("react")).expect("deserialize react");
         assert_eq!(react, ExecutionMode::React);
 
         let ooda: ExecutionMode =
-            serde_json::from_value(serde_json::json!("ooda_re_act")).expect("deserialize ooda_re_act");
+            serde_json::from_value(serde_json::json!("ooda_react")).expect("deserialize ooda_react");
         assert_eq!(ooda, ExecutionMode::OodaReAct);
+
+        let legacy: ExecutionMode =
+            serde_json::from_value(serde_json::json!("ooda_re_act")).expect("deserialize ooda_re_act");
+        assert_eq!(legacy, ExecutionMode::OodaReAct);
     }
 
     #[test]
@@ -273,6 +295,8 @@ mod tests {
                     trigger: PhaseTrigger::OnToolSignal,
                 },
             ],
+            control_interface_manifest: None,
+            delegation_scope: None,
         };
         let json = serde_json::to_string(&inv).unwrap();
         let back: TaskInvocation = serde_json::from_str(&json).unwrap();
@@ -302,6 +326,8 @@ mod tests {
             restate_url: "http://localhost:9070".to_string(),
             traceparent: None,
             phases: vec![],
+            control_interface_manifest: None,
+            delegation_scope: None,
         };
 
         // Verify optional fields serialize as null in the wire format.
@@ -314,5 +340,14 @@ mod tests {
         let bytes = serde_json::to_vec(&invocation).expect("serialize to bytes");
         let deserialized: TaskInvocation = serde_json::from_slice(&bytes).expect("deserialize");
         assert_eq!(invocation, deserialized);
+    }
+
+    #[test]
+    fn approval_subject_formats_with_task_id() {
+        let task_id = Uuid::nil();
+        assert_eq!(
+            approval_subject(task_id),
+            format!("{INTERNAL_APPROVAL_SUBJECT_PREFIX}.{task_id}")
+        );
     }
 }

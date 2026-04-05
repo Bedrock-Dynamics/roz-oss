@@ -18,6 +18,32 @@ pub fn format_team_event(event: &TeamEvent) -> String {
         TeamEvent::WorkerToolCall { worker_id, tool } => {
             format!("  \u{25b8} Worker {} called {tool}", short_id(worker_id))
         }
+        TeamEvent::WorkerApprovalRequested {
+            worker_id,
+            tool_name,
+            reason,
+            ..
+        } => {
+            format!(
+                "  \u{25b8} Worker {} requested approval for {tool_name}: {reason}",
+                short_id(worker_id)
+            )
+        }
+        TeamEvent::WorkerApprovalResolved {
+            worker_id,
+            approved,
+            modifier,
+            ..
+        } => {
+            let verdict = if modifier.is_some() {
+                "modified"
+            } else if *approved {
+                "approved"
+            } else {
+                "denied"
+            };
+            format!("  \u{25b8} Worker {} approval {verdict}", short_id(worker_id))
+        }
         TeamEvent::WorkerCompleted { worker_id, result } => {
             let preview = if result.len() > 80 { &result[..80] } else { result };
             format!("  \u{2713} Worker {} completed: {preview}", short_id(worker_id))
@@ -74,5 +100,33 @@ mod tests {
         };
         let formatted = format_team_event(&event);
         assert!(formatted.len() < 150);
+    }
+
+    #[test]
+    fn format_worker_approval_requested() {
+        let event = TeamEvent::WorkerApprovalRequested {
+            worker_id: uuid::Uuid::nil(),
+            task_id: uuid::Uuid::new_v4(),
+            approval_id: "apr-1".to_string(),
+            tool_name: "exec_command".to_string(),
+            reason: "requires human approval".to_string(),
+            timeout_secs: 30,
+        };
+        let formatted = format_team_event(&event);
+        assert!(formatted.contains("requested approval"));
+        assert!(formatted.contains("exec_command"));
+    }
+
+    #[test]
+    fn format_worker_approval_resolved() {
+        let event = TeamEvent::WorkerApprovalResolved {
+            worker_id: uuid::Uuid::nil(),
+            task_id: uuid::Uuid::new_v4(),
+            approval_id: "apr-1".to_string(),
+            approved: false,
+            modifier: None,
+        };
+        let formatted = format_team_event(&event);
+        assert!(formatted.contains("approval denied"));
     }
 }

@@ -6,9 +6,22 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use roz_agent::dispatch::{Extensions, ToolContext, ToolDispatcher, ToolExecutor};
 use roz_agent::tools::execute_code::ExecuteCodeTool;
+use roz_copper::evidence_archive::EvidenceArchive;
+use roz_core::embodiment::binding::CommandInterfaceType;
 use roz_core::manifest::RobotManifest;
 use roz_core::tools::{ToolCategory, ToolResult, ToolSchema};
 use serde_json::{Value, json};
+
+fn is_actuator_channel(interface_type: &CommandInterfaceType) -> bool {
+    matches!(
+        interface_type,
+        CommandInterfaceType::JointPosition
+            | CommandInterfaceType::JointVelocity
+            | CommandInterfaceType::JointTorque
+            | CommandInterfaceType::GripperPosition
+            | CommandInterfaceType::GripperForce
+    )
+}
 
 /// Build a `ToolDispatcher` with **all** tools for CLI sessions:
 /// 6 built-in tools + daemon tools from `robot.toml` (if present).
@@ -34,8 +47,11 @@ pub fn build_all_tools(project_dir: &Path) -> (ToolDispatcher, Vec<(ToolSchema, 
     if let Ok(manifest) = RobotManifest::load(&robot_toml)
         && let Some(daemon) = manifest.daemon.as_ref()
     {
-        let channels = manifest.channel_manifest();
-        for (tool, category) in roz_local::tools::daemon::daemon_tools(daemon, channels.as_ref()) {
+        let control_manifest = manifest.control_interface_manifest();
+        let embodiment_runtime = manifest.authoritative_embodiment_runtime();
+        for (tool, category) in
+            roz_local::tools::daemon::daemon_tools(daemon, control_manifest.as_ref(), embodiment_runtime.as_ref())
+        {
             dispatcher.register_with_category(tool, category);
         }
     }
@@ -53,7 +69,7 @@ pub struct AllTools {
     pub schemas: Vec<(ToolSchema, ToolCategory)>,
     /// Kept alive to prevent the controller thread from halting on drop.
     pub copper_handle: Option<roz_copper::handle::CopperHandle>,
-    /// Shared extensions containing `cmd_tx`, `ChannelManifest`, and
+    /// Shared extensions containing `cmd_tx`, canonical control metadata, and
     /// `Arc<ArcSwap<ControllerState>>` when Copper is active.
     pub extensions: Extensions,
 }
@@ -63,75 +79,92 @@ pub struct AllTools {
 /// When `robot.toml` has both `[daemon.websocket]` and `[channels]`, this:
 /// 1. Creates a WebSocket bridge (`WsActuatorSink` + `WsSensorSource`)
 /// 2. Spawns `CopperHandle::spawn_with_io()` with the bridge
-/// 3. Registers `promote_controller`, `stop_controller`, `get_controller_status`
-/// 4. Injects `cmd_tx`, `ChannelManifest`, and `ControllerState` into Extensions
+/// 3. Registers `replay_controller`, `stop_controller`, and
+///    `get_controller_status` when Copper is active
+/// 4. Injects `EvidenceArchive`, `ControlInterfaceManifest`, and any live Copper handles into Extensions
 ///
 /// Falls back to the plain `build_all_tools` tool set when conditions aren't met.
 pub fn build_all_tools_with_copper(project_dir: &Path) -> AllTools {
     let (mut dispatcher, _) = build_all_tools(project_dir);
     let mut extensions = Extensions::default();
     let mut copper_handle = None;
+    let evidence_archive = EvidenceArchive::new(project_dir);
 
     let robot_toml = project_dir.join("robot.toml");
-    if let Ok(manifest) = RobotManifest::load(&robot_toml)
-        && let Some(ref daemon) = manifest.daemon
-        && let Some(ref ws_config) = daemon.websocket
-        && let Some(channel_manifest) = manifest.channel_manifest()
-    {
-        // Build WS URL from daemon base_url + websocket path.
-        let ws_url = format!(
-            "{}{}",
-            daemon
-                .base_url
-                .replace("http://", "ws://")
-                .replace("https://", "wss://"),
-            ws_config.path,
-        );
-        let body_template = ws_config
-            .set_target_body
-            .clone()
-            .expect("robot.toml [daemon.websocket] must have set_target_body when [channels] is present");
+    if let Ok(manifest) = RobotManifest::load(&robot_toml) {
+        if let Some(control_manifest) = manifest.control_interface_manifest() {
+            let replay_tool = roz_local::tools::replay_controller::ReplayControllerTool::new(&control_manifest);
+            dispatcher.register_with_category(Box::new(replay_tool), ToolCategory::Pure);
+            extensions.insert(evidence_archive);
+            extensions.insert(control_manifest.clone());
+            if let Some(embodiment_runtime) = manifest.authoritative_embodiment_runtime() {
+                extensions.insert(embodiment_runtime);
+            }
 
-        let bridge_config = roz_copper::io_ws::WsBridgeConfig {
-            url: ws_url,
-            set_target_type: ws_config.set_target_type.clone().unwrap_or_default(),
-            body_template,
-            channel_names: channel_manifest.commands.iter().map(|c| c.name.clone()).collect(),
-            channel_defaults: channel_manifest.commands.iter().map(|c| c.default).collect(),
-        };
+            if let Some(ref daemon) = manifest.daemon
+                && let Some(ref ws_config) = daemon.websocket
+            {
+                // Build WS URL from daemon base_url + websocket path.
+                let ws_url = format!(
+                    "{}{}",
+                    daemon
+                        .base_url
+                        .replace("http://", "ws://")
+                        .replace("https://", "wss://"),
+                    ws_config.path,
+                );
+                let body_template = ws_config
+                    .set_target_body
+                    .clone()
+                    .expect("robot.toml [daemon.websocket] must have set_target_body when [channels] is present");
 
-        // Create WS bridge on the current tokio runtime.
-        let rt = tokio::runtime::Handle::current();
-        let (actuator, sensor, _supervisor) = roz_copper::io_ws::create_ws_bridge(bridge_config, &rt);
+                let bridge_config = roz_copper::io_ws::WsBridgeConfig {
+                    url: ws_url,
+                    set_target_type: ws_config.set_target_type.clone().unwrap_or_default(),
+                    body_template,
+                    channel_names: control_manifest
+                        .channels
+                        .iter()
+                        .filter(|channel| is_actuator_channel(&channel.interface_type))
+                        .map(|channel| channel.name.clone())
+                        .collect(),
+                    channel_defaults: control_manifest
+                        .channels
+                        .iter()
+                        .filter(|channel| is_actuator_channel(&channel.interface_type))
+                        .map(|_| 0.0)
+                        .collect(),
+                };
 
-        // Spawn Copper with IO backends.
-        let handle = roz_copper::handle::CopperHandle::spawn_with_io(
-            1.5,
-            Some(actuator as Arc<dyn roz_copper::io::ActuatorSink>),
-            Some(sensor as Box<dyn roz_copper::io::SensorSource>),
-        );
+                // Create WS bridge on the current tokio runtime.
+                let rt = tokio::runtime::Handle::current();
+                let (actuator, sensor, _supervisor) = roz_copper::io_ws::create_ws_bridge(bridge_config, &rt);
 
-        // Build promote_controller tool before moving manifest into Extensions.
-        let promote_tool = roz_local::tools::promote_controller::PromoteControllerTool::new(&channel_manifest);
+                // Spawn Copper with IO backends.
+                let handle = roz_copper::handle::CopperHandle::spawn_with_io(
+                    1.5,
+                    Some(actuator as Arc<dyn roz_copper::io::ActuatorSink>),
+                    Some(sensor as Box<dyn roz_copper::io::SensorSource>),
+                );
 
-        // Inject into Extensions for tool access.
-        extensions.insert(handle.cmd_tx());
-        extensions.insert(channel_manifest);
-        extensions.insert(Arc::clone(handle.state()) as Arc<ArcSwap<roz_copper::channels::ControllerState>>);
+                // Inject into Extensions for tool access.
+                extensions.insert(handle.cmd_tx());
+                extensions.insert(Arc::clone(handle.state()) as Arc<ArcSwap<roz_copper::channels::ControllerState>>);
 
-        // Register controller tools.
-        dispatcher.register_with_category(Box::new(promote_tool), ToolCategory::Physical);
-        dispatcher.register_with_category(
-            Box::new(roz_local::tools::stop_controller::StopControllerTool),
-            ToolCategory::Physical,
-        );
-        dispatcher.register_with_category(
-            Box::new(roz_local::tools::controller_status::GetControllerStatusTool),
-            ToolCategory::Pure,
-        );
+                // Register controller tools.
+                dispatcher.register_with_category(
+                    Box::new(roz_local::tools::stop_controller::StopControllerTool),
+                    ToolCategory::Physical,
+                );
+                dispatcher.register_with_category(
+                    Box::new(roz_local::tools::controller_status::GetControllerStatusTool),
+                    ToolCategory::Pure,
+                );
 
-        tracing::info!("copper WASM pipeline spawned with WS bridge");
-        copper_handle = Some(handle);
+                tracing::info!("copper WASM pipeline spawned with WS bridge");
+                copper_handle = Some(handle);
+            }
+        }
     }
 
     let schemas = dispatcher.schemas_with_categories();
@@ -181,7 +214,7 @@ pub fn default_context() -> ToolContext {
 /// `ToolContext` for local execution with pre-populated Extensions.
 ///
 /// Used by the cloud provider path to inject Copper handles (cmd\_tx,
-/// `ChannelManifest`, `ControllerState`) into tool execution context.
+/// canonical control metadata, `ControllerState`) into tool execution context.
 pub fn default_context_with(extensions: Extensions) -> ToolContext {
     ToolContext {
         task_id: "local".into(),
@@ -661,7 +694,10 @@ set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
 
         // Controller tools registered.
         let names: Vec<&str> = all.schemas.iter().map(|(s, _)| s.name.as_str()).collect();
-        assert!(names.contains(&"promote_controller"), "missing promote_controller");
+        assert!(
+            !names.contains(&"promote_controller"),
+            "promote_controller should remain external-authority only"
+        );
         assert!(names.contains(&"stop_controller"), "missing stop_controller");
         assert!(
             names.contains(&"get_controller_status"),
@@ -676,8 +712,10 @@ set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
             "extensions should contain cmd_tx"
         );
         assert!(
-            all.extensions.get::<roz_core::channels::ChannelManifest>().is_some(),
-            "extensions should contain ChannelManifest"
+            all.extensions
+                .get::<roz_core::embodiment::binding::ControlInterfaceManifest>()
+                .is_some(),
+            "extensions should contain ControlInterfaceManifest"
         );
         assert!(
             all.extensions
@@ -687,13 +725,6 @@ set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
         );
 
         // Verify categories.
-        let deploy_cat = all
-            .schemas
-            .iter()
-            .find(|(s, _)| s.name == "promote_controller")
-            .map(|(_, c)| c);
-        assert_eq!(deploy_cat, Some(&ToolCategory::Physical));
-
         let status_cat = all
             .schemas
             .iter()
@@ -702,8 +733,8 @@ set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
         assert_eq!(status_cat, Some(&ToolCategory::Pure));
 
         // Existing daemon tools should also be present (from [daemon] section).
-        // No get_state/set_motors/etc in this toml -> only CLI builtins + 3 controller tools.
-        // CLI builtins(6) + controller tools(3) = 9
+        // No get_state/set_motors/etc in this toml -> CLI builtins + replay + 2 controller tools.
+        // CLI builtins(6) + replay(1) + controller tools(2) = 9
         assert_eq!(all.schemas.len(), 9);
 
         // Clean shutdown.

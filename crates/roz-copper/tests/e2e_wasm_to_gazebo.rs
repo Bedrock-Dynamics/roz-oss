@@ -1,13 +1,18 @@
-//! E2E test: WASM controller → motor commands + Gazebo sensor feedback.
+//! E2E test: WASM controller output + live Gazebo sensor feedback.
 //!
-//! Proves the full closed loop through the IO traits against a live Gazebo sim.
-//! Uses LogActuatorSink (captures commands) + GrpcSensorSource (live poses).
+//! Proves the live feedback loop through the IO traits against a real Gazebo
+//! scene with dynamic pose updates. This test intentionally focuses on sensor
+//! ingestion plus controller output publication; the live actuator bridge path
+//! is covered separately by `e2e_wasm_actuator_bridge` and the drone/manipulator
+//! verticals.
 //!
 //! Run with:
 //! ```bash
 //! cargo test -p roz-copper --test e2e_wasm_to_gazebo -- --ignored --nocapture
 //! ```
-//! Requires: substrate-sim container with gRPC bridge on port 9090.
+//! Requires: PX4 Gazebo container with gRPC bridge on port 9090.
+
+mod live_controller_support;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,36 +24,6 @@ use roz_copper::channels::{ControllerCommand, ControllerState};
 use roz_copper::io::ActuatorSink;
 use roz_copper::io_log::LogActuatorSink;
 
-fn test_artifact() -> roz_core::controller::artifact::ControllerArtifact {
-    use roz_core::controller::artifact::*;
-    ControllerArtifact {
-        controller_id: "e2e-gazebo".into(),
-        sha256: "test".into(),
-        source_kind: SourceKind::LlmGenerated,
-        controller_class: ControllerClass::LowRiskCommandGenerator,
-        generator_model: None,
-        generator_provider: None,
-        channel_manifest_version: 1,
-        host_abi_version: 2,
-        evidence_bundle_id: None,
-        created_at: chrono::Utc::now(),
-        promoted_at: None,
-        replaced_controller_id: None,
-        verification_key: VerificationKey {
-            controller_digest: "test".into(),
-            wit_world_version: "bedrock:controller@1.0.0".into(),
-            model_digest: "test".into(),
-            calibration_digest: "test".into(),
-            manifest_digest: "test".into(),
-            execution_mode: ExecutionMode::Verify,
-            compiler_version: "wasmtime".into(),
-            embodiment_family: None,
-        },
-        wit_world: "tick-controller".into(),
-        verifier_result: None,
-    }
-}
-
 /// Full pipeline: WASM controller ticks → sensor reads Gazebo poses → motor commands captured.
 ///
 /// Proves: GrpcSensorSource delivers real EntityState from Gazebo,
@@ -57,7 +32,7 @@ fn test_artifact() -> roz_core::controller::artifact::ControllerArtifact {
 #[tokio::test]
 #[ignore]
 async fn wasm_controller_with_live_gazebo_sensor() {
-    // Connect to live bridge for sensor data.
+    // Connect to the live PX4/Gazebo bridge for sensor data.
     let sensor = roz_copper::io_grpc::GrpcSensorSource::connect("http://127.0.0.1:9090").await;
     let mut sensor = match sensor {
         Ok(s) => s,
@@ -70,21 +45,7 @@ async fn wasm_controller_with_live_gazebo_sensor() {
     // Use LogActuatorSink to capture command frames (don't send to bridge).
     let sink = Arc::new(LogActuatorSink::new());
 
-    // WASM that uses the tick contract to output velocity commands.
-    // Writes a hardcoded TickOutput JSON with command_values=[0.5].
-    let output_json = br#"{"command_values":[0.5],"estop":false,"metrics":[]}"#;
-    let len = output_json.len();
-    let data_hex: String = output_json.iter().map(|b| format!("\\{b:02x}")).collect();
-    let wat = format!(
-        r#"(module
-            (import "tick" "set_output" (func $sout (param i32 i32)))
-            (memory (export "memory") 1)
-            (data (i32.const 256) "{data_hex}")
-            (func (export "process") (param i64)
-                (call $sout (i32.const 256) (i32.const {len}))
-            )
-        )"#
-    );
+    let wat = live_controller_support::constant_output_controller_wat(&[0.5]);
 
     // Set up controller.
     let (tx, rx) = std::sync::mpsc::sync_channel(64);
@@ -98,7 +59,7 @@ async fn wasm_controller_with_live_gazebo_sensor() {
     let sink_clone = Arc::clone(&sink);
 
     let handle = std::thread::spawn(move || {
-        roz_copper::controller::run_controller_loop(
+        roz_copper::controller::run_controller_loop_with_compatibility_fallback(
             &rx,
             &s,
             1.5,
@@ -112,13 +73,45 @@ async fn wasm_controller_with_live_gazebo_sensor() {
     });
 
     // Load WASM controller via artifact.
-    let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-    tx.send(ControllerCommand::LoadArtifact(
-        Box::new(test_artifact()),
-        wat.into_bytes(),
-        manifest,
-    ))
+    let mut control_manifest = roz_core::embodiment::binding::ControlInterfaceManifest {
+        version: 1,
+        manifest_digest: String::new(),
+        channels: vec![roz_core::embodiment::binding::ControlChannelDef {
+            name: "joint0/velocity".into(),
+            interface_type: roz_core::embodiment::binding::CommandInterfaceType::JointVelocity,
+            units: "rad/s".into(),
+            frame_id: "joint0_link".into(),
+        }],
+        bindings: vec![roz_core::embodiment::binding::ChannelBinding {
+            physical_name: "joint0".into(),
+            channel_index: 0,
+            binding_type: roz_core::embodiment::binding::BindingType::JointVelocity,
+            frame_id: "joint0_link".into(),
+            units: "rad/s".into(),
+            semantic_role: None,
+        }],
+    };
+    control_manifest.stamp_digest();
+    let embodiment_runtime = live_controller_support::compile_test_embodiment_runtime(&control_manifest);
+    let (artifact, component_bytes) = live_controller_support::build_live_artifact(
+        "e2e-gazebo",
+        wat.as_bytes(),
+        &control_manifest,
+        &embodiment_runtime,
+    );
+    tx.send(
+        ControllerCommand::load_artifact_with_embodiment_runtime(
+            artifact,
+            component_bytes,
+            &control_manifest,
+            &embodiment_runtime,
+        )
+        .into_runtime()
+        .expect("prepare runtime command"),
+    )
     .unwrap();
+    tx.send(roz_copper::channels::CopperRuntimeCommand::PromoteActive)
+        .unwrap();
 
     // Let it tick for 500ms (~50 ticks at 100Hz).
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -150,17 +143,38 @@ async fn wasm_controller_with_live_gazebo_sensor() {
         "should have entities from Gazebo sensor stream"
     );
 
-    // Verify command frames were produced.
+    // Verify controller output was produced while consuming live sensor data.
+    println!("Last output: {:?}", current.last_output);
+    let output = current
+        .last_output
+        .as_ref()
+        .expect("should have published controller output");
+    let vel = output["values"][0]
+        .as_f64()
+        .expect("controller output should contain first command value");
+    assert!(
+        (vel - 0.5).abs() < f64::EPSILON,
+        "expected constant output 0.5, got {vel}"
+    );
+
+    // LogActuatorSink remains useful as a secondary sanity check, but the
+    // explicit actuator-bridge E2E covers transport and command delivery.
     let cmds = sink.commands();
     println!("Command frames captured: {}", cmds.len());
-    assert!(!cmds.is_empty(), "should have produced command frames");
+    if let Some(last) = cmds.last() {
+        assert!(
+            (last.values[0] - 0.5).abs() < f64::EPSILON,
+            "expected sink value 0.5, got {}",
+            last.values[0]
+        );
+    }
 
     // Shutdown.
     shutdown.store(true, Ordering::Relaxed);
     handle.join().unwrap();
 
     println!(
-        "PASS: tick contract → {} command frames, {} Gazebo entities in feedback loop",
+        "PASS: tick contract → output published, {} command frames captured, {} Gazebo entities in feedback loop",
         cmds.len(),
         current.entities.len()
     );

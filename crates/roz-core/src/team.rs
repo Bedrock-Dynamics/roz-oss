@@ -66,6 +66,22 @@ pub enum TeamEvent {
         worker_id: Uuid,
         tool: String,
     },
+    WorkerApprovalRequested {
+        worker_id: Uuid,
+        task_id: Uuid,
+        approval_id: String,
+        tool_name: String,
+        reason: String,
+        timeout_secs: u64,
+    },
+    WorkerApprovalResolved {
+        worker_id: Uuid,
+        task_id: Uuid,
+        approval_id: String,
+        approved: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        modifier: Option<serde_json::Value>,
+    },
     WorkerCompleted {
         worker_id: Uuid,
         result: String,
@@ -91,6 +107,8 @@ impl TeamEvent {
             Self::WorkerStarted { .. } => "worker_started".to_string(),
             Self::WorkerPhase { .. } => "worker_phase".to_string(),
             Self::WorkerToolCall { .. } => "worker_tool_call".to_string(),
+            Self::WorkerApprovalRequested { .. } => "worker_approval_requested".to_string(),
+            Self::WorkerApprovalResolved { .. } => "worker_approval_resolved".to_string(),
             Self::WorkerCompleted { .. } => "worker_completed".to_string(),
             Self::WorkerFailed { .. } => "worker_failed".to_string(),
             Self::WorkerExited { .. } => "worker_exited".to_string(),
@@ -104,6 +122,8 @@ impl TeamEvent {
             Self::WorkerStarted { worker_id, .. }
             | Self::WorkerPhase { worker_id, .. }
             | Self::WorkerToolCall { worker_id, .. }
+            | Self::WorkerApprovalRequested { worker_id, .. }
+            | Self::WorkerApprovalResolved { worker_id, .. }
             | Self::WorkerCompleted { worker_id, .. }
             | Self::WorkerFailed { worker_id, .. }
             | Self::WorkerExited { worker_id, .. } => Some(*worker_id),
@@ -197,6 +217,63 @@ mod tests {
             _ => panic!("expected WorkerCompleted"),
         }
 
+        // WorkerApprovalRequested
+        let approval_requested = TeamEvent::WorkerApprovalRequested {
+            worker_id,
+            task_id: Uuid::nil(),
+            approval_id: "apr_1".into(),
+            tool_name: "move_arm".into(),
+            reason: "workspace exit risk".into(),
+            timeout_secs: 30,
+        };
+        let json = serde_json::to_string(&approval_requested).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["type"], "worker_approval_requested");
+        let roundtripped: TeamEvent = serde_json::from_str(&json).unwrap();
+        match roundtripped {
+            TeamEvent::WorkerApprovalRequested {
+                worker_id: id,
+                approval_id,
+                tool_name,
+                timeout_secs,
+                ..
+            } => {
+                assert_eq!(id, worker_id);
+                assert_eq!(approval_id, "apr_1");
+                assert_eq!(tool_name, "move_arm");
+                assert_eq!(timeout_secs, 30);
+            }
+            _ => panic!("expected WorkerApprovalRequested"),
+        }
+
+        // WorkerApprovalResolved
+        let approval_resolved = TeamEvent::WorkerApprovalResolved {
+            worker_id,
+            task_id: Uuid::nil(),
+            approval_id: "apr_1".into(),
+            approved: true,
+            modifier: Some(serde_json::json!({"velocity": 0.2})),
+        };
+        let json = serde_json::to_string(&approval_resolved).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["type"], "worker_approval_resolved");
+        let roundtripped: TeamEvent = serde_json::from_str(&json).unwrap();
+        match roundtripped {
+            TeamEvent::WorkerApprovalResolved {
+                worker_id: id,
+                approval_id,
+                approved,
+                modifier,
+                ..
+            } => {
+                assert_eq!(id, worker_id);
+                assert_eq!(approval_id, "apr_1");
+                assert!(approved);
+                assert_eq!(modifier, Some(serde_json::json!({"velocity": 0.2})));
+            }
+            _ => panic!("expected WorkerApprovalResolved"),
+        }
+
         // WorkerPhase
         let phase_event = TeamEvent::WorkerPhase {
             worker_id: Uuid::nil(),
@@ -277,6 +354,18 @@ mod tests {
             }
             .type_name(),
             "worker_completed"
+        );
+        assert_eq!(
+            TeamEvent::WorkerApprovalRequested {
+                worker_id,
+                task_id: Uuid::nil(),
+                approval_id: "apr".into(),
+                tool_name: "move_arm".into(),
+                reason: "reason".into(),
+                timeout_secs: 30,
+            }
+            .type_name(),
+            "worker_approval_requested"
         );
         assert_eq!(
             TeamEvent::WorkerFailed {

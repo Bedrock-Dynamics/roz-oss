@@ -19,7 +19,7 @@ pub enum BindingType {
 /// the controller and hardware. Lives in roz-core (not roz-copper) so all
 /// crates can import it.
 ///
-/// Migrated from roz-copper's `RobotManifest` / `ChannelManifest`.
+/// Migrated from roz-copper's `RobotManifest` / legacy runtime manifest.
 /// The embodiment model describes physical structure; this describes control I/O.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlInterfaceManifest {
@@ -116,6 +116,7 @@ pub fn validate_bindings(
     channel_count: u32,
 ) -> Vec<UnboundChannel> {
     let mut errors = Vec::new();
+    let mut bound_channel_counts = vec![0_u32; usize::try_from(channel_count).unwrap_or(0)];
 
     for b in bindings {
         // Check physical name against appropriate model collection
@@ -164,6 +165,28 @@ pub fn validate_bindings(
                     b.channel_index,
                     channel_count.saturating_sub(1)
                 ),
+            });
+            continue;
+        }
+
+        if let Some(count) = bound_channel_counts.get_mut(usize::try_from(b.channel_index).unwrap_or(usize::MAX)) {
+            *count += 1;
+            if *count > 1 {
+                errors.push(UnboundChannel {
+                    physical_name: b.physical_name.clone(),
+                    binding_type: b.binding_type.clone(),
+                    reason: format!("channel_index {} is bound multiple times", b.channel_index),
+                });
+            }
+        }
+    }
+
+    for (index, count) in bound_channel_counts.into_iter().enumerate() {
+        if count == 0 {
+            errors.push(UnboundChannel {
+                physical_name: format!("channel[{index}]"),
+                binding_type: BindingType::Command,
+                reason: format!("channel_index {index} has no binding"),
             });
         }
     }
@@ -405,9 +428,8 @@ mod tests {
         let sensors = vec![];
         let frames = vec!["base"];
         let errors = validate_bindings(&bindings, &joints, &sensors, &frames, 2);
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].reason.contains("channel_index"));
-        assert!(errors[0].reason.contains("out of range"));
+        assert!(errors.iter().any(|error| error.reason.contains("channel_index")));
+        assert!(errors.iter().any(|error| error.reason.contains("out of range")));
     }
 
     #[test]
@@ -425,6 +447,56 @@ mod tests {
         let sensors = vec![];
         let frames = vec!["base"];
         let errors = validate_bindings(&bindings, &joints, &sensors, &frames, 2);
-        assert!(errors.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].physical_name, "channel[0]");
+        assert!(errors[0].reason.contains("has no binding"));
+    }
+
+    #[test]
+    fn validate_bindings_catches_duplicate_channel_index() {
+        let bindings = vec![
+            ChannelBinding {
+                physical_name: "shoulder".into(),
+                channel_index: 0,
+                binding_type: BindingType::JointPosition,
+                frame_id: "base".into(),
+                units: "rad".into(),
+                semantic_role: None,
+            },
+            ChannelBinding {
+                physical_name: "elbow".into(),
+                channel_index: 0,
+                binding_type: BindingType::JointPosition,
+                frame_id: "base".into(),
+                units: "rad".into(),
+                semantic_role: None,
+            },
+        ];
+        let joints = vec!["shoulder", "elbow"];
+        let sensors = vec![];
+        let frames = vec!["base"];
+        let errors = validate_bindings(&bindings, &joints, &sensors, &frames, 1);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].physical_name, "elbow");
+        assert!(errors[0].reason.contains("bound multiple times"));
+    }
+
+    #[test]
+    fn validate_bindings_catches_unbound_channel_index() {
+        let bindings = vec![ChannelBinding {
+            physical_name: "shoulder".into(),
+            channel_index: 1,
+            binding_type: BindingType::JointPosition,
+            frame_id: "base".into(),
+            units: "rad".into(),
+            semantic_role: None,
+        }];
+        let joints = vec!["shoulder"];
+        let sensors = vec![];
+        let frames = vec!["base"];
+        let errors = validate_bindings(&bindings, &joints, &sensors, &frames, 2);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].physical_name, "channel[0]");
+        assert!(errors[0].reason.contains("has no binding"));
     }
 }

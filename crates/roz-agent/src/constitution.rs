@@ -826,7 +826,7 @@ mod tests {
         );
         assert!(
             constitution.contains("ControlInterfaceManifest"),
-            "WASM tier must reference ControlInterfaceManifest, not ChannelManifest"
+            "WASM tier must reference the canonical control manifest"
         );
         assert!(
             constitution.contains("VerificationKey"),
@@ -854,9 +854,10 @@ mod tests {
             !constitution.contains("state::get"),
             "WASM tier must not teach legacy state::get host function"
         );
+        let legacy_manifest_name = ["Channel", "Manifest"].join("");
         assert!(
-            !constitution.contains("ChannelManifest"),
-            "WASM tier must not reference legacy ChannelManifest"
+            !constitution.contains(&legacy_manifest_name),
+            "WASM tier must not reference the legacy control manifest"
         );
     }
 

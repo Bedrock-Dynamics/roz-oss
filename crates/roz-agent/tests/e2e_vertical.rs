@@ -14,7 +14,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use roz_agent::agent_loop::{AgentInput, AgentLoop, AgentLoopMode};
+use roz_agent::agent_loop::{AgentInput, AgentInputSeed, AgentLoop, AgentLoopMode};
 use roz_agent::delegation::DelegationTool;
 use roz_agent::dispatch::{ToolContext, ToolDispatcher, ToolExecutor};
 use roz_agent::model::anthropic::{AnthropicConfig, AnthropicProvider};
@@ -26,7 +26,7 @@ use roz_agent::skills::executor::{SkillExecutionRequest, SkillExecutor};
 use roz_agent::spatial_provider::MockSpatialContextProvider;
 
 use roz_core::skills::SkillKind;
-use roz_core::spatial::{EntityState, SpatialContext};
+use roz_core::spatial::{EntityState, WorldState};
 use roz_core::tools::{ToolCategory, ToolResult, ToolSchema};
 
 // ---------------------------------------------------------------------------
@@ -160,8 +160,11 @@ async fn agent_loop_tool_roundtrip() {
         task_id: "e2e-tool-roundtrip".to_string(),
         tenant_id: "test-tenant".to_string(),
         model_name: String::new(),
-        system_prompt: vec!["You are a calculator assistant. Use the calculator tool to multiply numbers. Always use the tool, never calculate in your head.".to_string()],
-        user_message: "What is 7 times 8?".to_string(),
+        seed: AgentInputSeed::new(
+            vec!["You are a calculator assistant. Use the calculator tool to multiply numbers. Always use the tool, never calculate in your head.".to_string()],
+            Vec::new(),
+            "What is 7 times 8?".to_string(),
+        ),
         max_cycles: 5,
         max_tokens: 4096,
         max_context_tokens: 200_000,
@@ -170,7 +173,6 @@ async fn agent_loop_tool_roundtrip() {
         tool_choice: None,
         response_schema: None,
         streaming: false,
-        history: vec![],
         cancellation_token: None,
         control_mode: roz_core::safety::ControlMode::default(),
     };
@@ -202,7 +204,7 @@ async fn agent_loop_ooda_react_spatial() {
     let dispatcher = ToolDispatcher::new(Duration::from_secs(30));
     let safety = SafetyStack::new(vec![]);
 
-    let spatial_ctx = SpatialContext {
+    let spatial_ctx = WorldState {
         entities: vec![EntityState {
             id: "arm_1".to_string(),
             kind: "robot_arm".to_string(),
@@ -211,7 +213,7 @@ async fn agent_loop_ooda_react_spatial() {
             velocity: None,
             properties: HashMap::new(),
             timestamp_ns: None,
-            frame_id: None,
+            frame_id: "world".into(),
             ..Default::default()
         }],
         relations: vec![],
@@ -227,10 +229,14 @@ async fn agent_loop_ooda_react_spatial() {
         task_id: "e2e-spatial".to_string(),
         tenant_id: "test-tenant".to_string(),
         model_name: String::new(),
-        system_prompt: vec![
-            "You are a robot monitoring assistant. Describe the spatial state of all entities you observe.".to_string(),
-        ],
-        user_message: "What is the current position of the robot arm?".to_string(),
+        seed: AgentInputSeed::new(
+            vec![
+                "You are a robot monitoring assistant. Describe the spatial state of all entities you observe."
+                    .to_string(),
+            ],
+            Vec::new(),
+            "What is the current position of the robot arm?".to_string(),
+        ),
         max_cycles: 5,
         max_tokens: 4096,
         max_context_tokens: 200_000,
@@ -239,7 +245,6 @@ async fn agent_loop_ooda_react_spatial() {
         tool_choice: None,
         response_schema: None,
         streaming: false,
-        history: vec![],
         cancellation_token: None,
         control_mode: roz_core::safety::ControlMode::default(),
     };
@@ -279,7 +284,7 @@ async fn agent_loop_safety_clamps_velocity() {
     let safety = SafetyStack::new(vec![Box::new(VelocityLimiter::new(2.0))]);
 
     // Provide spatial context so OodaReAct mode has something to observe.
-    let spatial_ctx = SpatialContext {
+    let spatial_ctx = WorldState {
         entities: vec![EntityState {
             id: "arm_1".to_string(),
             kind: "robot_arm".to_string(),
@@ -288,7 +293,7 @@ async fn agent_loop_safety_clamps_velocity() {
             velocity: None,
             properties: HashMap::new(),
             timestamp_ns: None,
-            frame_id: None,
+            frame_id: "world".into(),
             ..Default::default()
         }],
         relations: vec![],
@@ -304,8 +309,11 @@ async fn agent_loop_safety_clamps_velocity() {
         task_id: "e2e-velocity-clamp".to_string(),
         tenant_id: "test-tenant".to_string(),
         model_name: String::new(),
-        system_prompt: vec!["You are a robot arm controller. When asked to move, use the move_arm tool with the requested velocity and target.".to_string()],
-        user_message: "Move the arm to [5, 5, 5] at velocity 10 m/s".to_string(),
+        seed: AgentInputSeed::new(
+            vec!["You are a robot arm controller. When asked to move, use the move_arm tool with the requested velocity and target.".to_string()],
+            Vec::new(),
+            "Move the arm to [5, 5, 5] at velocity 10 m/s".to_string(),
+        ),
         max_cycles: 5,
         max_tokens: 4096,
         max_context_tokens: 200_000,
@@ -314,7 +322,6 @@ async fn agent_loop_safety_clamps_velocity() {
         tool_choice: None,
         response_schema: None,
         streaming: false,
-        history: vec![],
         cancellation_token: None,
         control_mode: roz_core::safety::ControlMode::default(),
     };
@@ -453,17 +460,20 @@ async fn agent_loop_multi_tool_batches_results() {
         task_id: "e2e-multi-tool-batch".to_string(),
         tenant_id: "test-tenant".to_string(),
         model_name: String::new(),
-        system_prompt: vec![
-            "You have two tools: calculator and lookup. \
-             When asked to compute area, FIRST call lookup for \
-             both 'width' and 'height' in a SINGLE response \
-             (call both tools at once, do not wait between them), \
-             THEN multiply the results with calculator."
-                .to_string(),
-        ],
-        user_message: "Compute the area (width * height). \
+        seed: AgentInputSeed::new(
+            vec![
+                "You have two tools: calculator and lookup. \
+                 When asked to compute area, FIRST call lookup for \
+                 both 'width' and 'height' in a SINGLE response \
+                 (call both tools at once, do not wait between them), \
+                 THEN multiply the results with calculator."
+                    .to_string(),
+            ],
+            Vec::new(),
+            "Compute the area (width * height). \
             Look up both dimensions first."
-            .to_string(),
+                .to_string(),
+        ),
         max_cycles: 10,
         max_tokens: 4096,
         max_context_tokens: 200_000,
@@ -472,7 +482,6 @@ async fn agent_loop_multi_tool_batches_results() {
         tool_choice: None,
         response_schema: None,
         streaming: false,
-        history: vec![],
         cancellation_token: None,
         control_mode: roz_core::safety::ControlMode::default(),
     };
@@ -537,17 +546,20 @@ async fn gemini_multi_tool_batches_results() {
         task_id: "e2e-gemini-multi-tool".to_string(),
         tenant_id: "test-tenant".to_string(),
         model_name: String::new(),
-        system_prompt: vec![
-            "You have two tools: calculator and lookup. \
-             When asked to compute area, FIRST call lookup for \
-             both 'width' and 'height' in a SINGLE response \
-             (call both tools at once, do not wait between them), \
-             THEN multiply the results with calculator."
-                .to_string(),
-        ],
-        user_message: "Compute the area (width * height). \
+        seed: AgentInputSeed::new(
+            vec![
+                "You have two tools: calculator and lookup. \
+                 When asked to compute area, FIRST call lookup for \
+                 both 'width' and 'height' in a SINGLE response \
+                 (call both tools at once, do not wait between them), \
+                 THEN multiply the results with calculator."
+                    .to_string(),
+            ],
+            Vec::new(),
+            "Compute the area (width * height). \
             Look up both dimensions first."
-            .to_string(),
+                .to_string(),
+        ),
         max_cycles: 10,
         max_tokens: 4096,
         max_context_tokens: 200_000,
@@ -556,7 +568,6 @@ async fn gemini_multi_tool_batches_results() {
         tool_choice: None,
         response_schema: None,
         streaming: false,
-        history: vec![],
         cancellation_token: None,
         control_mode: roz_core::safety::ControlMode::default(),
     };
@@ -619,8 +630,11 @@ async fn agent_loop_streaming_tool_roundtrip() {
         task_id: "e2e-streaming-roundtrip".to_string(),
         tenant_id: "test-tenant".to_string(),
         model_name: String::new(),
-        system_prompt: vec!["You are a calculator assistant. Use the calculator tool to multiply numbers. Always use the tool, never calculate in your head.".to_string()],
-        user_message: "What is 7 times 8?".to_string(),
+        seed: AgentInputSeed::new(
+            vec!["You are a calculator assistant. Use the calculator tool to multiply numbers. Always use the tool, never calculate in your head.".to_string()],
+            Vec::new(),
+            "What is 7 times 8?".to_string(),
+        ),
         max_cycles: 5,
         max_tokens: 4096,
         max_context_tokens: 200_000,
@@ -629,7 +643,6 @@ async fn agent_loop_streaming_tool_roundtrip() {
         tool_choice: None,
         response_schema: None,
         streaming: true,
-        history: vec![],
         cancellation_token: None,
         control_mode: roz_core::safety::ControlMode::default(),
     };
@@ -673,15 +686,18 @@ async fn delegation_tool_roundtrip() {
         task_id: "e2e-delegation-roundtrip".to_string(),
         tenant_id: "test-tenant".to_string(),
         model_name: String::new(),
-        system_prompt: vec![
-            "You have a delegate_to_spatial tool. Use it to delegate spatial analysis \
-             tasks. When asked about spatial relationships or distances, delegate to the \
-             spatial model and incorporate its response."
-                .to_string(),
-        ],
-        user_message: "Describe the spatial layout of these objects: a cube at [0,0,0] \
+        seed: AgentInputSeed::new(
+            vec![
+                "You have a delegate_to_spatial tool. Use it to delegate spatial analysis \
+                 tasks. When asked about spatial relationships or distances, delegate to the \
+                 spatial model and incorporate its response."
+                    .to_string(),
+            ],
+            Vec::new(),
+            "Describe the spatial layout of these objects: a cube at [0,0,0] \
             and a sphere at [3,4,0]. What is the distance between them?"
-            .to_string(),
+                .to_string(),
+        ),
         max_cycles: 5,
         max_tokens: 4096,
         max_context_tokens: 200_000,
@@ -690,7 +706,6 @@ async fn delegation_tool_roundtrip() {
         tool_choice: None,
         response_schema: None,
         streaming: false,
-        history: vec![],
         cancellation_token: None,
         control_mode: roz_core::safety::ControlMode::default(),
     };
@@ -763,15 +778,18 @@ async fn delegation_tool_roundtrip_gemini_as_primary() {
         task_id: "e2e-delegation-gemini-primary".to_string(),
         tenant_id: "test-tenant".to_string(),
         model_name: String::new(),
-        system_prompt: vec![
-            "You have a delegate_to_spatial tool. Use it to delegate spatial analysis \
-             tasks. When asked about spatial relationships or distances, delegate to the \
-             spatial model and incorporate its response."
-                .to_string(),
-        ],
-        user_message: "Use the delegate_to_spatial tool to analyze: what is the Euclidean \
+        seed: AgentInputSeed::new(
+            vec![
+                "You have a delegate_to_spatial tool. Use it to delegate spatial analysis \
+                 tasks. When asked about spatial relationships or distances, delegate to the \
+                 spatial model and incorporate its response."
+                    .to_string(),
+            ],
+            Vec::new(),
+            "Use the delegate_to_spatial tool to analyze: what is the Euclidean \
             distance between point A at [1,0,0] and point B at [0,1,0]?"
-            .to_string(),
+                .to_string(),
+        ),
         max_cycles: 5,
         max_tokens: 4096,
         max_context_tokens: 200_000,
@@ -780,7 +798,6 @@ async fn delegation_tool_roundtrip_gemini_as_primary() {
         tool_choice: None,
         response_schema: None,
         streaming: false,
-        history: vec![],
         cancellation_token: None,
         control_mode: roz_core::safety::ControlMode::default(),
     };
@@ -859,16 +876,19 @@ async fn compaction_does_not_fire_on_normal_conversation() {
         task_id: "e2e-no-compaction".to_string(),
         tenant_id: "test-tenant".to_string(),
         model_name: String::new(),
-        system_prompt: vec![
-            "You are a key-value lookup assistant. \
-             Use the kv_lookup tool to check keys. \
-             Always use the tool, never guess values."
-                .to_string(),
-        ],
-        user_message: "Use the kv_lookup tool to check these keys \
+        seed: AgentInputSeed::new(
+            vec![
+                "You are a key-value lookup assistant. \
+                 Use the kv_lookup tool to check keys. \
+                 Always use the tool, never guess values."
+                    .to_string(),
+            ],
+            Vec::new(),
+            "Use the kv_lookup tool to check these keys \
              one at a time: alpha, beta, gamma, delta, \
              epsilon. Report back all the values."
-            .to_string(),
+                .to_string(),
+        ),
         max_cycles: 12,
         max_tokens: 4096,
         max_context_tokens: 200_000,
@@ -877,7 +897,6 @@ async fn compaction_does_not_fire_on_normal_conversation() {
         tool_choice: None,
         response_schema: None,
         streaming: false,
-        history: vec![],
         cancellation_token: None,
         control_mode: roz_core::safety::ControlMode::default(),
     };
@@ -962,10 +981,13 @@ async fn compaction_fires_correctly_with_small_context_budget() {
         task_id: "e2e-small-context".to_string(),
         tenant_id: "test-tenant".to_string(),
         model_name: String::new(),
-        system_prompt: vec![system_prompt],
-        user_message: "Use the kv_lookup tool to check keys: \
+        seed: AgentInputSeed::new(
+            vec![system_prompt],
+            Vec::new(),
+            "Use the kv_lookup tool to check keys: \
              foo, bar, baz. Report the values."
-            .to_string(),
+                .to_string(),
+        ),
         max_cycles: 12,
         max_tokens: 4096,
         // Intentionally small — forces compaction
@@ -975,7 +997,6 @@ async fn compaction_fires_correctly_with_small_context_budget() {
         tool_choice: None,
         response_schema: None,
         streaming: false,
-        history: vec![],
         cancellation_token: None,
         control_mode: roz_core::safety::ControlMode::default(),
     };

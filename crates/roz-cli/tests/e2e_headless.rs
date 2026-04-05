@@ -29,15 +29,29 @@ struct HeadlessResult {
 /// Uses a poll loop with `try_wait` since `Command::timeout()` is not
 /// stabilized in our pinned Rust 1.92.0.
 fn roz_headless(task: &str, timeout: Duration) -> HeadlessResult {
-    roz_headless_in(task, timeout, None)
+    roz_headless_in_with_env(task, timeout, None, &[])
 }
 
 /// Run `roz --non-interactive --task <task>` in a specific directory.
 fn roz_headless_in(task: &str, timeout: Duration, working_dir: Option<&std::path::Path>) -> HeadlessResult {
+    roz_headless_in_with_env(task, timeout, working_dir, &[])
+}
+
+/// Run `roz --non-interactive --task <task>` in a specific directory with
+/// explicit environment overrides.
+fn roz_headless_in_with_env(
+    task: &str,
+    timeout: Duration,
+    working_dir: Option<&std::path::Path>,
+    envs: &[(&str, &str)],
+) -> HeadlessResult {
     let mut cmd = Command::new(cargo_bin("roz"));
     cmd.args(["--non-interactive", "--task", task]);
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
+    }
+    for (key, value) in envs {
+        cmd.env(key, value);
     }
 
     let child = cmd
@@ -77,6 +91,23 @@ fn roz_headless_in(task: &str, timeout: Duration, working_dir: Option<&std::path
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Run `roz` against an explicitly provided cloud deployment using only env
+/// overrides, not any persisted local auth state.
+fn roz_headless_with_cloud_override(task: &str, timeout: Duration, api_url: &str, api_key: &str) -> HeadlessResult {
+    let home = tempfile::TempDir::new().expect("create temp HOME");
+    roz_headless_in_with_env(
+        task,
+        timeout,
+        None,
+        &[
+            ("HOME", home.path().to_str().expect("HOME path should be valid UTF-8")),
+            ("ROZ_API_URL", api_url),
+            ("ROZ_API_KEY", api_key),
+            ("ROZ_PROFILE", "dev-e2e-override"),
+        ],
+    )
 }
 
 /// Resolve the path to a cargo-built binary.
@@ -161,6 +192,116 @@ fn headless_basic_prompt() {
     let json = parse_output(&result);
     let response = json["response"].as_str().expect("response should be a string");
     assert!(!response.is_empty(), "response should contain text: {json}");
+}
+
+/// The headless CLI must honor `ROZ_API_URL` and `ROZ_API_KEY` environment
+/// overrides so it can be pointed at dev without relying on local auth state
+/// or the default production endpoint.
+#[test]
+#[ignore = "requires ROZ_API_URL + ROZ_API_KEY for a live cloud deployment"]
+fn headless_respects_api_url_override() {
+    let api_url = std::env::var("ROZ_API_URL").expect("ROZ_API_URL must be set for this test");
+    let api_key = std::env::var("ROZ_API_KEY").expect("ROZ_API_KEY must be set for this test");
+    let result = roz_headless_with_cloud_override(
+        "Say hello in exactly 3 words.",
+        Duration::from_secs(30),
+        &api_url,
+        &api_key,
+    );
+    assert!(
+        result.success,
+        "roz should exit successfully when pointed at an overridden cloud URL.\nstderr: {}",
+        result.stderr
+    );
+
+    let json = parse_output(&result);
+    assert_eq!(json["status"], "success", "status should be success: {json}");
+    assert!(
+        json["response"].as_str().is_some_and(|s| !s.is_empty()),
+        "response should contain text: {json}"
+    );
+}
+
+/// The dev cloud override should still permit client-side bash execution.
+#[test]
+#[ignore = "requires ROZ_API_URL + ROZ_API_KEY for a live cloud deployment"]
+fn headless_cloud_bash_tool_respects_api_url_override() {
+    let api_url = std::env::var("ROZ_API_URL").expect("ROZ_API_URL must be set for this test");
+    let api_key = std::env::var("ROZ_API_KEY").expect("ROZ_API_KEY must be set for this test");
+
+    let result = roz_headless_with_cloud_override(
+        "Use the bash tool to run 'echo roz_e2e_override_marker'. Report the exact output.",
+        Duration::from_secs(45),
+        &api_url,
+        &api_key,
+    );
+    assert!(result.success, "stderr: {}", result.stderr);
+
+    let json = parse_output(&result);
+    let response = json["response"].as_str().unwrap_or("").to_lowercase();
+    assert!(
+        response.contains("roz_e2e_override_marker"),
+        "agent should report the bash output containing our override marker.\nGot: {}",
+        json["response"]
+    );
+    let cycles = json["cycles"].as_u64().unwrap_or(0);
+    assert!(cycles >= 1, "expected at least one tool cycle, got {cycles}");
+}
+
+/// The dev cloud override should still permit client-side file reads with no
+/// dependence on persisted auth state.
+#[test]
+#[ignore = "requires ROZ_API_URL + ROZ_API_KEY for a live cloud deployment"]
+fn headless_cloud_read_file_respects_api_url_override() {
+    let api_url = std::env::var("ROZ_API_URL").expect("ROZ_API_URL must be set for this test");
+    let api_key = std::env::var("ROZ_API_KEY").expect("ROZ_API_KEY must be set for this test");
+
+    let dir = tempfile::TempDir::new().expect("create temp dir");
+    let test_file = dir.path().join("roz_override_test_file.txt");
+    std::fs::write(&test_file, "roz_override_file_content_67890").expect("write temp file");
+
+    let task = format!(
+        "Use the read_file tool to read the file at '{}' and tell me its exact contents.",
+        test_file.display()
+    );
+    let result = roz_headless_with_cloud_override(&task, Duration::from_secs(45), &api_url, &api_key);
+    assert!(result.success, "stderr: {}", result.stderr);
+
+    let json = parse_output(&result);
+    let response = json["response"].as_str().unwrap_or("");
+    assert!(
+        response.contains("roz_override_file_content_67890"),
+        "agent should report the file contents.\nGot: {}",
+        json["response"]
+    );
+}
+
+/// The dev cloud override should preserve multi-step cloud execution and return
+/// both requested outputs in a single headless session.
+#[test]
+#[ignore = "requires ROZ_API_URL + ROZ_API_KEY for a live cloud deployment"]
+fn headless_multi_step_bash_respects_api_url_override() {
+    let api_url = std::env::var("ROZ_API_URL").expect("ROZ_API_URL must be set for this test");
+    let api_key = std::env::var("ROZ_API_KEY").expect("ROZ_API_KEY must be set for this test");
+
+    let result = roz_headless_with_cloud_override(
+        "You must invoke the bash tool exactly twice. The first tool call may only run 'echo override_step1_done'. \
+         The second tool call may only run 'echo override_step2_done'. After the second tool call, report both outputs.",
+        Duration::from_secs(60),
+        &api_url,
+        &api_key,
+    );
+    assert!(result.success, "stderr: {}", result.stderr);
+
+    let json = parse_output(&result);
+    let response = json["response"].as_str().unwrap_or("").to_lowercase();
+    assert!(
+        response.contains("override_step1_done") && response.contains("override_step2_done"),
+        "agent should report both bash outputs.\nGot: {}",
+        json["response"]
+    );
+    let cycles = json["cycles"].as_u64().unwrap_or(0);
+    assert!(cycles >= 1, "expected at least one agent cycle, got {cycles}");
 }
 
 // ---------------------------------------------------------------------------

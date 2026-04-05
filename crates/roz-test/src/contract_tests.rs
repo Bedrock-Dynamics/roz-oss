@@ -73,12 +73,15 @@ impl Default for EventCollector {
 const fn event_type_name(event: &SessionEvent) -> &'static str {
     match event {
         SessionEvent::SessionStarted { .. } => "session_started",
+        SessionEvent::SessionRejected { .. } => "session_rejected",
         SessionEvent::TurnStarted { .. } => "turn_started",
         SessionEvent::SessionCompleted { .. } => "session_completed",
         SessionEvent::SessionFailed { .. } => "session_failed",
         SessionEvent::ActivityChanged { .. } => "activity_changed",
+        SessionEvent::PresenceHinted { .. } => "presence_hint",
         SessionEvent::ToolCallStarted { .. } => "tool_call_started",
         SessionEvent::ToolCallFinished { .. } => "tool_call_finished",
+        SessionEvent::ToolCallRequested { .. } => "tool_call_requested",
         SessionEvent::ToolUnavailable { .. } => "tool_unavailable",
         SessionEvent::ApprovalRequested { .. } => "approval_requested",
         SessionEvent::ApprovalResolved { .. } => "approval_resolved",
@@ -98,6 +101,9 @@ const fn event_type_name(event: &SessionEvent) -> &'static str {
         SessionEvent::ReasoningTrace { .. } => "reasoning_trace",
         SessionEvent::ContextCompacted { .. } => "context_compacted",
         SessionEvent::ModelCallCompleted { .. } => "model_call",
+        SessionEvent::TextDelta { .. } => "text_delta",
+        SessionEvent::ThinkingDelta { .. } => "thinking_delta",
+        SessionEvent::TurnFinished { .. } => "turn_finished",
         SessionEvent::MemoryRead { .. } => "memory_read",
         SessionEvent::MemoryWrite { .. } => "memory_write",
         SessionEvent::SensorRepositioned { .. } => "sensor_repositioned",
@@ -127,8 +133,10 @@ mod tests {
     fn started_envelope() -> EventEnvelope {
         make_envelope(SessionEvent::SessionStarted {
             session_id: "sess-1".into(),
-            mode: SessionMode::LocalCanonical,
+            mode: SessionMode::Local,
             blueprint_version: "1.0".into(),
+            model_name: None,
+            permissions: vec![],
         })
     }
 

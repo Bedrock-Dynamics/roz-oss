@@ -79,6 +79,8 @@ async fn send_velocity_to_ur5_shoulder() {
             values: vec![0.5],
             world_name: "empty".to_string(),
             robot_class: "manipulator".to_string(),
+            owner_id: String::new(),
+            acquire_low_level_if_needed: false,
         })
         .await;
 

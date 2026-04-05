@@ -80,6 +80,39 @@ cargo test --workspace
 cargo test --workspace -- --ignored --nocapture
 ```
 
+## Paper-Grade E2E Matrix
+
+The strongest live validation path now uses real LLM-authored raw WAT, real `promote_controller`, real Copper activation, and real observed motion in each supported sim container.
+
+For mobile, PX4, and ArduPilot, the script recreates fresh sim containers before running the tests so the results are not polluted by stale vehicle state.
+
+Run the full matrix:
+
+```bash
+export ANTHROPIC_API_KEY=...
+scripts/run_paper_e2e_matrix.sh
+```
+
+Useful subsets:
+
+```bash
+scripts/run_paper_e2e_matrix.sh --paper-only
+scripts/run_paper_e2e_matrix.sh --deterministic-only
+scripts/run_paper_e2e_matrix.sh --paper-only --with-manipulator
+```
+
+The paper-grade authored-WAT suite covers:
+
+- mobile, PX4, and ArduPilot via [live_claude_wasm_containers.rs](crates/roz-local/tests/live_claude_wasm_containers.rs)
+- manipulator via [live_claude_wasm_gazebo.rs](crates/roz-local/tests/live_claude_wasm_gazebo.rs)
+  This remains opt-in in the script and expects a known-good `ros2-manipulator` sim already running on `8094/9094`.
+
+The deterministic Copper/WASM bridge suite covers:
+
+- [mobile_wasm_cmd_vel.rs](crates/roz-copper/tests/mobile_wasm_cmd_vel.rs)
+- [drone_wasm_velocity.rs](crates/roz-copper/tests/drone_wasm_velocity.rs)
+- [ardupilot_wasm_velocity.rs](crates/roz-copper/tests/ardupilot_wasm_velocity.rs)
+
 ## Status
 
 This is a **research preview**. The following are proven end-to-end with real infrastructure:

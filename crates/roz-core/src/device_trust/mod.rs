@@ -6,13 +6,13 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
-// TrustPosture
+// DeviceTrustPosture
 // ---------------------------------------------------------------------------
 
 /// The assessed trust level of a device in the fleet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TrustPosture {
+pub enum DeviceTrustPosture {
     Trusted,
     Provisional,
     Untrusted,
@@ -54,7 +54,7 @@ pub struct FirmwareManifest {
 pub struct DeviceTrust {
     pub host_id: Uuid,
     pub tenant_id: String,
-    pub posture: TrustPosture,
+    pub posture: DeviceTrustPosture,
     pub firmware: Option<FirmwareManifest>,
     pub sbom_hash: Option<String>,
     pub last_attestation: Option<DateTime<Utc>>,
@@ -130,7 +130,7 @@ mod tests {
         DeviceTrust {
             host_id: Uuid::new_v4(),
             tenant_id: "tenant-acme-001".to_string(),
-            posture: TrustPosture::Trusted,
+            posture: DeviceTrustPosture::Trusted,
             firmware: Some(sample_firmware()),
             sbom_hash: Some("sha256:sbom_hash_value".to_string()),
             last_attestation: Some(now),
@@ -140,31 +140,34 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // TrustPosture serde
+    // DeviceTrustPosture serde
     // -----------------------------------------------------------------------
 
     #[test]
     fn trust_posture_serde_roundtrip() {
         for posture in [
-            TrustPosture::Trusted,
-            TrustPosture::Provisional,
-            TrustPosture::Untrusted,
+            DeviceTrustPosture::Trusted,
+            DeviceTrustPosture::Provisional,
+            DeviceTrustPosture::Untrusted,
         ] {
             let json = serde_json::to_string(&posture).unwrap();
-            let restored: TrustPosture = serde_json::from_str(&json).unwrap();
+            let restored: DeviceTrustPosture = serde_json::from_str(&json).unwrap();
             assert_eq!(posture, restored);
         }
     }
 
     #[test]
     fn trust_posture_variants_serialize_as_snake_case() {
-        assert_eq!(serde_json::to_string(&TrustPosture::Trusted).unwrap(), "\"trusted\"");
         assert_eq!(
-            serde_json::to_string(&TrustPosture::Provisional).unwrap(),
+            serde_json::to_string(&DeviceTrustPosture::Trusted).unwrap(),
+            "\"trusted\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DeviceTrustPosture::Provisional).unwrap(),
             "\"provisional\""
         );
         assert_eq!(
-            serde_json::to_string(&TrustPosture::Untrusted).unwrap(),
+            serde_json::to_string(&DeviceTrustPosture::Untrusted).unwrap(),
             "\"untrusted\""
         );
     }

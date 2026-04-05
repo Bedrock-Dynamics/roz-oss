@@ -415,7 +415,7 @@ mod tests {
     fn parse_phases_json() {
         let json = r#"[
             {"mode":"react","tools":"all","trigger":"immediate"},
-            {"mode":"ooda_re_act","tools":{"named":["goto"]},"trigger":{"after_cycles":5}}
+            {"mode":"ooda_react","tools":{"named":["goto"]},"trigger":{"after_cycles":5}}
         ]"#;
         let phases: Vec<PhaseSpec> = serde_json::from_str(json).unwrap();
         assert_eq!(phases.len(), 2);
@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn parse_phases_single_phase() {
-        let json = r#"[{"mode":"ooda_re_act","tools":"all","trigger":"immediate"}]"#;
+        let json = r#"[{"mode":"ooda_react","tools":"all","trigger":"immediate"}]"#;
         let phases: Vec<PhaseSpec> = serde_json::from_str(json).unwrap();
         assert_eq!(phases.len(), 1);
         assert!(matches!(phases[0].mode, PhaseMode::OodaReAct));

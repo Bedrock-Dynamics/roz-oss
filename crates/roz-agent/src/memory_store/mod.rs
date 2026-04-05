@@ -10,12 +10,14 @@ pub use retrieval::rank_and_budget;
 use std::collections::BTreeMap;
 
 use roz_core::memory::MemoryEntry;
+use serde::{Deserialize, Serialize};
 
 /// In-memory store for agent memory entries.
 ///
 /// Entries are keyed by `memory_id`. Stale entries remain in storage until
 /// explicitly removed; [`read`] filters them out automatically via
 /// [`rank_and_budget`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryStore {
     entries: BTreeMap<String, MemoryEntry>,
 }

@@ -205,6 +205,8 @@ async fn task_chain_end_to_end() {
         restate_url: restate.url().to_string(),
         traceparent: None,
         phases: vec![],
+        control_interface_manifest: None,
+        delegation_scope: None,
     };
 
     let subject = format!("invoke.{worker_id}.{}", task.id);

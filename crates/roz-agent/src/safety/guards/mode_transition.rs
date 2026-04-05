@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use roz_core::safety::SafetyVerdict;
-use roz_core::spatial::SpatialContext;
+use roz_core::spatial::WorldState;
 use roz_core::tools::ToolCall;
 
 use crate::agent_loop::AgentLoopMode;
@@ -37,7 +37,7 @@ impl SafetyGuard for ModeTransitionGuard {
         "mode_transition"
     }
 
-    async fn check(&self, _action: &ToolCall, state: &SpatialContext) -> SafetyVerdict {
+    async fn check(&self, _action: &ToolCall, state: &WorldState) -> SafetyVerdict {
         if self.mode != AgentLoopMode::OodaReAct {
             return SafetyVerdict::Allow;
         }
@@ -76,8 +76,8 @@ mod tests {
         }
     }
 
-    fn context_with_entities() -> SpatialContext {
-        SpatialContext {
+    fn context_with_entities() -> WorldState {
+        WorldState {
             entities: vec![EntityState {
                 id: "robot_1".to_string(),
                 kind: "robot_arm".to_string(),
@@ -88,8 +88,8 @@ mod tests {
         }
     }
 
-    fn context_with_screenshot() -> SpatialContext {
-        SpatialContext {
+    fn context_with_screenshot() -> WorldState {
+        WorldState {
             entities: vec![EntityState {
                 id: "robot_1".to_string(),
                 kind: "robot_arm".to_string(),
@@ -111,7 +111,7 @@ mod tests {
     #[tokio::test]
     async fn blocks_ooda_without_spatial_context() {
         let guard = ModeTransitionGuard::new(AgentLoopMode::OodaReAct);
-        let state = SpatialContext::default(); // empty — no entities
+        let state = WorldState::default(); // empty — no entities
         let result = guard.check(&make_action(), &state).await;
         match result {
             SafetyVerdict::Block { reason } => {
@@ -149,7 +149,7 @@ mod tests {
     #[tokio::test]
     async fn react_mode_allows_empty_spatial_context() {
         let guard = ModeTransitionGuard::new(AgentLoopMode::React);
-        let state = SpatialContext::default();
+        let state = WorldState::default();
         let result = guard.check(&make_action(), &state).await;
         assert_eq!(
             result,

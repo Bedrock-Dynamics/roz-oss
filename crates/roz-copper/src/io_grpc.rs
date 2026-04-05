@@ -11,8 +11,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio_stream::StreamExt;
 
-use roz_core::channels::InterfaceType;
 use roz_core::command::CommandFrame;
+use roz_core::embodiment::binding::{BindingType, CommandInterfaceType, ControlInterfaceManifest};
+use roz_core::embodiment::{FrameSnapshotInput, FrameSource, TimestampedTransform, Transform3D};
+use roz_core::session::snapshot::FreshnessState;
 use roz_core::spatial::EntityState;
 
 use crate::io::{ActuatorSink, SensorFrame, SensorSource};
@@ -146,54 +148,138 @@ pub struct GrpcActuatorSink {
     /// Proto-encoded [`proto::JointCommandMode`] derived from the manifest's
     /// [`InterfaceType`](roz_core::channels::InterfaceType).
     command_mode: i32,
+    /// Stable owner identity for this sink's low-level control lease.
+    owner_id: String,
+    /// Whether the sink has successfully acquired low-level control.
+    control_acquired: Arc<AtomicBool>,
     /// Tokio runtime handle for spawning fire-and-forget sends.
     runtime: tokio::runtime::Handle,
     /// Set by a background send task on failure; cleared on the next [`send`].
     last_error: Arc<AtomicBool>,
+    /// Most recent background send error, if any.
+    last_error_message: Arc<parking_lot::Mutex<Option<String>>>,
 }
 
 impl GrpcActuatorSink {
-    /// Create a new actuator sink from a channel manifest.
-    ///
-    /// `channel` should point to the substrate-sim-bridge gRPC endpoint.
-    /// Channel names and robot class are extracted from the manifest.
-    #[must_use]
-    pub fn from_manifest(
-        channel: tonic::transport::Channel,
-        manifest: &roz_core::channels::ChannelManifest,
-        runtime: tokio::runtime::Handle,
-    ) -> Self {
-        debug_assert!(
-            manifest
-                .commands
-                .windows(2)
-                .all(|w| w[0].interface_type == w[1].interface_type),
-            "GrpcActuatorSink assumes uniform InterfaceType across all command channels"
-        );
+    fn new_owner_id() -> String {
+        format!("copper-{}", uuid::Uuid::new_v4())
+    }
 
-        let command_mode = manifest
-            .commands
-            .first()
-            .map_or(proto::JointCommandMode::JointVelocity as i32, |c| {
-                match c.interface_type {
-                    InterfaceType::Position => proto::JointCommandMode::JointPosition.into(),
-                    InterfaceType::Velocity => proto::JointCommandMode::JointVelocity.into(),
-                    InterfaceType::Effort => {
+    fn is_actuator_channel(interface_type: &CommandInterfaceType) -> bool {
+        matches!(
+            interface_type,
+            CommandInterfaceType::JointPosition
+                | CommandInterfaceType::JointVelocity
+                | CommandInterfaceType::JointTorque
+                | CommandInterfaceType::GripperPosition
+                | CommandInterfaceType::GripperForce
+        )
+    }
+
+    fn command_mode_from_control_manifest(control_manifest: &ControlInterfaceManifest) -> i32 {
+        control_manifest
+            .channels
+            .iter()
+            .find(|channel| Self::is_actuator_channel(&channel.interface_type))
+            .map_or(proto::JointCommandMode::JointVelocity as i32, |channel| {
+                match channel.interface_type {
+                    CommandInterfaceType::JointPosition | CommandInterfaceType::GripperPosition => {
+                        proto::JointCommandMode::JointPosition.into()
+                    }
+                    CommandInterfaceType::JointVelocity => proto::JointCommandMode::JointVelocity.into(),
+                    CommandInterfaceType::JointTorque | CommandInterfaceType::GripperForce => {
                         tracing::warn!(
-                            "Effort InterfaceType not natively supported by bridge; falling back to JointVelocity mode"
+                            "Effort-oriented control interface not natively supported by bridge; falling back to JointVelocity mode"
+                        );
+                        proto::JointCommandMode::JointVelocity.into()
+                    }
+                    CommandInterfaceType::ForceTorqueSensor | CommandInterfaceType::ImuSensor => {
+                        tracing::warn!(
+                            "Sensor-oriented control interface is not an actuator command mode; falling back to JointVelocity mode"
                         );
                         proto::JointCommandMode::JointVelocity.into()
                     }
                 }
-            });
+            })
+    }
 
+    fn is_actuator_binding(binding_type: &BindingType) -> bool {
+        matches!(
+            binding_type,
+            BindingType::JointPosition
+                | BindingType::JointVelocity
+                | BindingType::Command
+                | BindingType::GripperPosition
+                | BindingType::GripperForce
+        )
+    }
+
+    fn normalize_bridge_joint_name(robot_class: &str, name: &str) -> String {
+        if robot_class != "manipulator" {
+            return name.to_string();
+        }
+
+        let Some((prefix, leaf)) = name.rsplit_once('/') else {
+            return if name.ends_with("_joint") {
+                name.to_string()
+            } else {
+                format!("{name}_joint")
+            };
+        };
+
+        if leaf.ends_with("_joint") {
+            name.to_string()
+        } else {
+            format!("{prefix}/{leaf}_joint")
+        }
+    }
+
+    fn actuator_names_from_control_manifest(
+        control_manifest: &ControlInterfaceManifest,
+        robot_class: &str,
+    ) -> Vec<String> {
+        control_manifest
+            .channels
+            .iter()
+            .enumerate()
+            .filter(|(_, channel)| Self::is_actuator_channel(&channel.interface_type))
+            .map(|(index, channel)| {
+                let bound_name = control_manifest
+                    .bindings
+                    .iter()
+                    .find(|binding| {
+                        usize::try_from(binding.channel_index).ok() == Some(index)
+                            && Self::is_actuator_binding(&binding.binding_type)
+                    })
+                    .map(|binding| binding.physical_name.as_str())
+                    .unwrap_or(channel.name.as_str());
+                Self::normalize_bridge_joint_name(robot_class, bound_name)
+            })
+            .collect()
+    }
+
+    /// Create a new actuator sink from the canonical control interface manifest.
+    ///
+    /// `robot_class` remains explicit because it is not encoded by
+    /// [`ControlInterfaceManifest`].
+    #[must_use]
+    pub fn from_control_manifest(
+        channel: tonic::transport::Channel,
+        control_manifest: &ControlInterfaceManifest,
+        robot_class: impl Into<String>,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        let robot_class = robot_class.into();
         Self {
             client: ControlServiceClient::new(channel),
-            channel_names: manifest.commands.iter().map(|c| c.name.clone()).collect(),
-            robot_class: manifest.robot_class.clone(),
-            command_mode,
+            channel_names: Self::actuator_names_from_control_manifest(control_manifest, &robot_class),
+            robot_class,
+            command_mode: Self::command_mode_from_control_manifest(control_manifest),
+            owner_id: Self::new_owner_id(),
+            control_acquired: Arc::new(AtomicBool::new(false)),
             runtime,
             last_error: Arc::new(AtomicBool::new(false)),
+            last_error_message: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 
@@ -207,8 +293,11 @@ impl GrpcActuatorSink {
             channel_names: joint_names,
             robot_class: "manipulator".into(),
             command_mode: proto::JointCommandMode::JointVelocity.into(),
+            owner_id: Self::new_owner_id(),
+            control_acquired: Arc::new(AtomicBool::new(false)),
             runtime,
             last_error: Arc::new(AtomicBool::new(false)),
+            last_error_message: Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 
@@ -216,6 +305,12 @@ impl GrpcActuatorSink {
     #[must_use]
     pub fn had_error(&self) -> bool {
         self.last_error.load(Ordering::Relaxed)
+    }
+
+    /// Returns the most recent background send error, if any.
+    #[must_use]
+    pub fn last_error_message(&self) -> Option<String> {
+        self.last_error_message.lock().clone()
     }
 }
 
@@ -231,15 +326,48 @@ impl ActuatorSink for GrpcActuatorSink {
         let values = frame.values.clone();
         let robot_class = self.robot_class.clone();
         let command_mode = self.command_mode;
+        let owner_id = self.owner_id.clone();
+        let control_acquired = Arc::clone(&self.control_acquired);
         let error_flag = Arc::clone(&self.last_error);
+        let error_message = Arc::clone(&self.last_error_message);
 
         self.runtime.spawn(async move {
+            if !control_acquired.load(Ordering::Relaxed) {
+                match client
+                    .acquire_low_level_control(proto::AcquireLowLevelControlRequest {
+                        robot_class: robot_class.clone(),
+                        owner_id: owner_id.clone(),
+                        requested_mode: command_mode,
+                    })
+                    .await
+                {
+                    Ok(response) => {
+                        let inner = response.into_inner();
+                        if !inner.success {
+                            tracing::warn!(error = inner.error, "AcquireLowLevelControl returned error");
+                            error_flag.store(true, Ordering::Relaxed);
+                            *error_message.lock() = Some(inner.error);
+                            return;
+                        }
+                        control_acquired.store(true, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "AcquireLowLevelControl RPC failed");
+                        error_flag.store(true, Ordering::Relaxed);
+                        *error_message.lock() = Some(e.to_string());
+                        return;
+                    }
+                }
+            }
+
             let request = proto::JointCommandRequest {
                 mode: command_mode,
                 joint_names: names,
                 values,
                 world_name: String::new(),
                 robot_class,
+                owner_id,
+                acquire_low_level_if_needed: true,
             };
 
             match client.send_joint_command(request).await {
@@ -247,17 +375,43 @@ impl ActuatorSink for GrpcActuatorSink {
                     let inner = response.into_inner();
                     if !inner.success {
                         tracing::warn!(error = inner.error, "SendJointCommand returned error");
+                        control_acquired.store(false, Ordering::Relaxed);
                         error_flag.store(true, Ordering::Relaxed);
+                        *error_message.lock() = Some(inner.error);
+                    } else {
+                        *error_message.lock() = None;
                     }
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "SendJointCommand RPC failed");
+                    control_acquired.store(false, Ordering::Relaxed);
                     error_flag.store(true, Ordering::Relaxed);
+                    *error_message.lock() = Some(e.to_string());
                 }
             }
         });
 
         Ok(())
+    }
+}
+
+impl Drop for GrpcActuatorSink {
+    fn drop(&mut self) {
+        if !self.control_acquired.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let mut client = self.client.clone();
+        let robot_class = self.robot_class.clone();
+        let owner_id = self.owner_id.clone();
+        self.runtime.spawn(async move {
+            if let Err(error) = client
+                .release_low_level_control(proto::ReleaseLowLevelControlRequest { robot_class, owner_id })
+                .await
+            {
+                tracing::warn!(error = %error, "ReleaseLowLevelControl RPC failed");
+            }
+        });
     }
 }
 
@@ -280,7 +434,46 @@ fn pose_batch_to_sensor_frame(batch: &proto::PoseBatch) -> SensorFrame {
         joint_positions: Vec::new(),
         joint_velocities: Vec::new(),
         sim_time_ns,
+        frame_snapshot_input: pose_batch_to_snapshot_input(batch, sim_time_ns),
     }
+}
+
+fn pose_batch_to_snapshot_input(batch: &proto::PoseBatch, sim_time_ns: i64) -> FrameSnapshotInput {
+    let timestamp_ns = u64::try_from(sim_time_ns).unwrap_or(0);
+    let dynamic_transforms = batch
+        .poses
+        .iter()
+        .filter_map(|pose| {
+            let transform = pose.transform.as_ref()?;
+            let frame_id = canonical_frame_id_from_pose_path(&pose.path);
+            if frame_id.is_empty() {
+                return None;
+            }
+            Some(TimestampedTransform {
+                frame_id,
+                parent_id: Some("world".into()),
+                transform: Transform3D {
+                    translation: [transform.x, transform.y, transform.z],
+                    rotation: [transform.qw, transform.qx, transform.qy, transform.qz],
+                    timestamp_ns,
+                },
+                freshness: FreshnessState::Fresh,
+                source: FrameSource::Dynamic,
+            })
+        })
+        .collect();
+
+    FrameSnapshotInput {
+        dynamic_transforms,
+        ..FrameSnapshotInput::default()
+    }
+}
+
+fn canonical_frame_id_from_pose_path(path: &str) -> String {
+    path.rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(path)
+        .to_string()
 }
 
 /// Convert a single gRPC [`EntityPose`] into an [`EntityState`].
@@ -300,7 +493,7 @@ fn entity_pose_to_state(ep: &proto::EntityPose) -> EntityState {
         velocity: None,
         properties: HashMap::new(),
         timestamp_ns: None,
-        frame_id: Some("world".to_owned()),
+        frame_id: "world".to_owned(),
         last_observed_ns: None,
         observation_confidence: 0.0,
     }
@@ -349,13 +542,19 @@ mod tests {
 
         assert_eq!(frame.entities.len(), 2);
         assert_eq!(frame.sim_time_ns, 1_500_000_000);
+        assert_eq!(frame.frame_snapshot_input.dynamic_transforms.len(), 1);
+        assert_eq!(frame.frame_snapshot_input.dynamic_transforms[0].frame_id, "base_link");
+        assert_eq!(
+            frame.frame_snapshot_input.dynamic_transforms[0].transform.translation,
+            [1.0, 2.0, 3.0]
+        );
 
         let robot = &frame.entities[0];
         assert_eq!(robot.id, "world/robot/base_link");
         assert_eq!(robot.kind, "gazebo_model");
         assert_eq!(robot.position, Some([1.0, 2.0, 3.0]));
         assert_eq!(robot.orientation, Some([1.0, 0.0, 0.0, 0.0])); // [w,x,y,z]
-        assert_eq!(robot.frame_id.as_deref(), Some("world"));
+        assert_eq!(robot.frame_id, "world");
 
         let camera = &frame.entities[1];
         assert_eq!(camera.id, "world/camera");
@@ -370,6 +569,111 @@ mod tests {
         let frame = CommandFrame::zero(1);
         assert!(sink.send(&frame).is_ok());
         assert!(!sink.had_error());
+    }
+
+    #[tokio::test]
+    async fn grpc_actuator_sink_from_control_manifest_preserves_canonical_metadata() {
+        let mut control_manifest = ControlInterfaceManifest {
+            version: 1,
+            manifest_digest: String::new(),
+            channels: vec![
+                roz_core::embodiment::binding::ControlChannelDef {
+                    name: "joint0/velocity".into(),
+                    interface_type: roz_core::embodiment::binding::CommandInterfaceType::JointVelocity,
+                    units: "rad/s".into(),
+                    frame_id: "joint0_link".into(),
+                },
+                roz_core::embodiment::binding::ControlChannelDef {
+                    name: "joint1/velocity".into(),
+                    interface_type: roz_core::embodiment::binding::CommandInterfaceType::JointVelocity,
+                    units: "rad/s".into(),
+                    frame_id: "joint1_link".into(),
+                },
+            ],
+            bindings: vec![
+                roz_core::embodiment::binding::ChannelBinding {
+                    physical_name: "joint0".into(),
+                    channel_index: 0,
+                    binding_type: roz_core::embodiment::binding::BindingType::JointVelocity,
+                    frame_id: "joint0_link".into(),
+                    units: "rad/s".into(),
+                    semantic_role: None,
+                },
+                roz_core::embodiment::binding::ChannelBinding {
+                    physical_name: "joint1".into(),
+                    channel_index: 1,
+                    binding_type: roz_core::embodiment::binding::BindingType::JointVelocity,
+                    frame_id: "joint1_link".into(),
+                    units: "rad/s".into(),
+                    semantic_role: None,
+                },
+            ],
+        };
+        control_manifest.stamp_digest();
+        let runtime = tokio::runtime::Handle::current();
+        let channel = tonic::transport::Channel::from_static("http://127.0.0.1:9999").connect_lazy();
+
+        let canonical = GrpcActuatorSink::from_control_manifest(channel, &control_manifest, "manipulator", runtime);
+
+        assert_eq!(
+            canonical.channel_names,
+            vec!["joint0_joint".to_string(), "joint1_joint".to_string()]
+        );
+        assert_eq!(canonical.robot_class, "manipulator");
+        assert_eq!(canonical.command_mode, proto::JointCommandMode::JointVelocity as i32);
+    }
+
+    #[tokio::test]
+    async fn grpc_actuator_sink_preserves_non_manipulator_physical_names() {
+        let mut control_manifest = ControlInterfaceManifest {
+            version: 1,
+            manifest_digest: String::new(),
+            channels: vec![roz_core::embodiment::binding::ControlChannelDef {
+                name: "body/vx".into(),
+                interface_type: roz_core::embodiment::binding::CommandInterfaceType::JointVelocity,
+                units: "m/s".into(),
+                frame_id: "base_link".into(),
+            }],
+            bindings: vec![roz_core::embodiment::binding::ChannelBinding {
+                physical_name: "body/vx".into(),
+                channel_index: 0,
+                binding_type: roz_core::embodiment::binding::BindingType::Command,
+                frame_id: "base_link".into(),
+                units: "m/s".into(),
+                semantic_role: None,
+            }],
+        };
+        control_manifest.stamp_digest();
+        let runtime = tokio::runtime::Handle::current();
+        let channel = tonic::transport::Channel::from_static("http://127.0.0.1:9999").connect_lazy();
+
+        let canonical = GrpcActuatorSink::from_control_manifest(channel, &control_manifest, "mobile", runtime);
+
+        assert_eq!(canonical.channel_names, vec!["body/vx".to_string()]);
+        assert_eq!(canonical.robot_class, "mobile");
+    }
+
+    #[tokio::test]
+    async fn grpc_actuator_sink_uses_ros_joint_names_for_ur5_manipulator_manifest() {
+        let robot: roz_core::manifest::RobotManifest =
+            toml::from_str(include_str!("../../../examples/ur5/robot.toml")).expect("ur5 manifest");
+        let control_manifest = robot.control_interface_manifest().expect("control manifest");
+        let runtime = tokio::runtime::Handle::current();
+        let channel = tonic::transport::Channel::from_static("http://127.0.0.1:9999").connect_lazy();
+
+        let canonical = GrpcActuatorSink::from_control_manifest(channel, &control_manifest, "manipulator", runtime);
+
+        assert_eq!(
+            canonical.channel_names,
+            vec![
+                "shoulder_pan_joint".to_string(),
+                "shoulder_lift_joint".to_string(),
+                "elbow_joint".to_string(),
+                "wrist_1_joint".to_string(),
+                "wrist_2_joint".to_string(),
+                "wrist_3_joint".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]

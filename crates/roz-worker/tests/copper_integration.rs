@@ -60,7 +60,29 @@ async fn agent_deploys_wasm_to_copper_and_reads_state() {
         .send(ControllerCommand::LoadArtifact(
             Box::new(test_artifact()),
             wat.as_bytes().to_vec(),
-            roz_core::channels::ChannelManifest::generic_velocity(1, 1.5),
+            {
+                let mut control_manifest = roz_core::embodiment::binding::ControlInterfaceManifest {
+                    version: 1,
+                    manifest_digest: String::new(),
+                    channels: vec![roz_core::embodiment::binding::ControlChannelDef {
+                        name: "joint0/velocity".into(),
+                        interface_type: roz_core::embodiment::binding::CommandInterfaceType::JointVelocity,
+                        units: "rad/s".into(),
+                        frame_id: "joint0_link".into(),
+                    }],
+                    bindings: vec![roz_core::embodiment::binding::ChannelBinding {
+                        physical_name: "joint0".into(),
+                        channel_index: 0,
+                        binding_type: roz_core::embodiment::binding::BindingType::JointVelocity,
+                        frame_id: "joint0_link".into(),
+                        units: "rad/s".into(),
+                        semantic_role: None,
+                    }],
+                };
+                control_manifest.stamp_digest();
+                control_manifest
+            },
+            None,
         ))
         .await
         .unwrap();

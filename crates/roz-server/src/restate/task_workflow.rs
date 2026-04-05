@@ -32,7 +32,7 @@ pub enum TaskOutcome {
 /// Tool approval request sent to humans
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolApproval {
-    pub tool_call_id: String,
+    pub approval_id: String,
     pub approved: bool,
     pub modifier: Option<serde_json::Value>,
 }
@@ -134,7 +134,7 @@ impl TaskWorkflow for TaskWorkflowImpl {
         approval: Json<ToolApproval>,
     ) -> Result<(), HandlerError> {
         let inner = &approval.0;
-        let promise_name = format!("approval.{}", inner.tool_call_id);
+        let promise_name = format!("approval.{}", inner.approval_id);
         ctx.resolve_promise::<Json<ToolApproval>>(&promise_name, approval);
         Ok(())
     }
@@ -294,13 +294,13 @@ mod tests {
     #[test]
     fn tool_approval_with_modifier() {
         let approval = ToolApproval {
-            tool_call_id: "tc-123".to_string(),
+            approval_id: "apr-123".to_string(),
             approved: true,
             modifier: Some(json!({"max_speed": 0.5})),
         };
         let json_str = serde_json::to_string(&approval).unwrap();
         let deser: ToolApproval = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(deser.tool_call_id, "tc-123");
+        assert_eq!(deser.approval_id, "apr-123");
         assert!(deser.approved);
         assert!(deser.modifier.is_some());
     }
@@ -308,13 +308,13 @@ mod tests {
     #[test]
     fn tool_approval_without_modifier() {
         let approval = ToolApproval {
-            tool_call_id: "tc-456".to_string(),
+            approval_id: "apr-456".to_string(),
             approved: false,
             modifier: None,
         };
         let json_str = serde_json::to_string(&approval).unwrap();
         let deser: ToolApproval = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(deser.tool_call_id, "tc-456");
+        assert_eq!(deser.approval_id, "apr-456");
         assert!(!deser.approved);
         assert!(deser.modifier.is_none());
     }

@@ -15,7 +15,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::agent_loop::{AgentInput, AgentLoop, AgentLoopMode};
+use crate::agent_loop::{AgentInput, AgentInputSeed, AgentLoop, AgentLoopMode};
 use crate::dispatch::{ToolContext, ToolDispatcher, ToolExecutor};
 use crate::model::types::{CompletionRequest, CompletionResponse, Message, Model, ModelCapability};
 use crate::safety::SafetyStack;
@@ -159,12 +159,15 @@ impl ToolExecutor for DelegationTool {
             task_id: ctx.task_id.clone(),
             tenant_id: ctx.tenant_id.clone(),
             model_name: String::new(),
-            system_prompt: vec![
-                "You are a spatial analysis assistant. Analyze the provided spatial data, \
-                 measurements, or visual information and return a clear, structured response."
-                    .to_string(),
-            ],
-            user_message,
+            seed: AgentInputSeed::new(
+                vec![
+                    "You are a spatial analysis assistant. Analyze the provided spatial data, \
+                     measurements, or visual information and return a clear, structured response."
+                        .to_string(),
+                ],
+                history,
+                user_message,
+            ),
             max_cycles: 1,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -173,7 +176,6 @@ impl ToolExecutor for DelegationTool {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history,
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -257,8 +259,11 @@ mod tests {
             task_id: "test-delegation".to_string(),
             tenant_id: "test-tenant".to_string(),
             model_name: String::new(),
-            system_prompt: vec!["You are a spatial analysis assistant.".to_string()],
-            user_message: "analyze scene\n\nContext:\nrobot at [1,2,3]".to_string(),
+            seed: AgentInputSeed::new(
+                vec!["You are a spatial analysis assistant.".to_string()],
+                Vec::new(),
+                "analyze scene\n\nContext:\nrobot at [1,2,3]".to_string(),
+            ),
             max_cycles: 1,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -267,7 +272,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -389,8 +393,11 @@ mod tests {
             task_id: "test-delegation".to_string(),
             tenant_id: "test-tenant".to_string(),
             model_name: String::new(),
-            system_prompt: vec!["You are a spatial analysis assistant.".to_string()],
-            user_message: task.to_string(),
+            seed: AgentInputSeed::new(
+                vec!["You are a spatial analysis assistant.".to_string()],
+                history,
+                task.to_string(),
+            ),
             max_cycles: 1,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -399,7 +406,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history,
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };

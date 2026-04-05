@@ -5706,7 +5706,11 @@ dependencies = [
  "tonic-build",
  "tracing",
  "uuid",
+ "wasmprinter",
  "wasmtime",
+ "wat",
+ "wit-component",
+ "wit-parser 0.244.0",
 ]
 
 [[package]]
@@ -9558,6 +9562,7 @@ dependencies = [
  "wasm-encoder 0.244.0",
  "wasm-metadata",
  "wasmparser 0.244.0",
+ "wat",
  "wit-parser 0.244.0",
 ]
 

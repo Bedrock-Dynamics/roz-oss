@@ -44,7 +44,7 @@ impl RecordingReader {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use roz_core::recording::{ChannelManifest, RecordingSource};
+    use roz_core::recording::{RecordingChannel, RecordingSource};
     use uuid::Uuid;
 
     fn sample_manifest() -> RecordingManifest {
@@ -54,7 +54,7 @@ mod tests {
             environment_id: Uuid::new_v4(),
             host_id: Uuid::new_v4(),
             source: RecordingSource::Simulation,
-            channels: vec![ChannelManifest {
+            channels: vec![RecordingChannel {
                 name: "velocity".to_string(),
                 topic: "/vel".to_string(),
                 schema_name: "Float64".to_string(),

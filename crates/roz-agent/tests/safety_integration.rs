@@ -1,6 +1,6 @@
 use roz_agent::safety::guards::{BatteryGuard, GeofenceGuard, GeofenceZone, VelocityLimiter};
 use roz_agent::safety::{SafetyResult, SafetyStack};
-use roz_core::spatial::{EntityState, SpatialContext};
+use roz_core::spatial::{EntityState, WorldState};
 use roz_core::tools::ToolCall;
 use serde_json::json;
 use std::collections::HashMap;
@@ -14,10 +14,10 @@ fn workspace_zone() -> GeofenceZone {
     }
 }
 
-fn context_with_battery(pct: f64) -> SpatialContext {
+fn context_with_battery(pct: f64) -> WorldState {
     let mut properties = HashMap::new();
     properties.insert("battery_pct".to_string(), json!(pct));
-    SpatialContext {
+    WorldState {
         entities: vec![EntityState {
             id: "drone_1".to_string(),
             kind: "drone".to_string(),
@@ -26,7 +26,7 @@ fn context_with_battery(pct: f64) -> SpatialContext {
             velocity: None,
             properties,
             timestamp_ns: None,
-            frame_id: None,
+            frame_id: "world".into(),
             ..Default::default()
         }],
         ..Default::default()

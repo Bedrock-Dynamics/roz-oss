@@ -673,13 +673,13 @@ fn dispatch(
         // Handle /phases inline — informational only.
         if text.trim() == "/phases" {
             stdout.println("Phase system:".bold().to_string());
-            stdout.println("  Available modes: react, ooda_re_act".to_string());
+            stdout.println("  Available modes: react, ooda_react".to_string());
             stdout.println(String::new());
             stdout.println("  Phases are configured via `roz task run --phases '[...]'`".to_string());
             stdout.println("  Example:".to_string());
             stdout.println(r#"    [{"mode":"react","tools":"all","trigger":"immediate"},"#.to_string());
             stdout.println(
-                r#"     {"mode":"ooda_re_act","tools":{"named":["goto","arm"]},"trigger":{"after_cycles":5}}]"#
+                r#"     {"mode":"ooda_react","tools":{"named":["goto","arm"]},"trigger":{"after_cycles":5}}]"#
                     .to_string(),
             );
             return;
@@ -1028,7 +1028,7 @@ async fn provider_loop(
     let all_tools = tools::build_all_tools_with_copper(std::path::Path::new("."));
     let _copper_handle = all_tools.copper_handle; // kept alive for session lifetime
     let safety = roz_agent::safety::SafetyStack::new(vec![]); // no-op for BYOK
-    let spatial = roz_agent::spatial_provider::NullSpatialContextProvider;
+    let spatial = roz_agent::spatial_provider::NullWorldStateProvider;
 
     let mut agent_loop = roz_agent::agent_loop::AgentLoop::new(model, all_tools.dispatcher, safety, Box::new(spatial))
         .with_extensions(all_tools.extensions);
@@ -1055,8 +1055,7 @@ async fn provider_loop(
                     task_id: uuid::Uuid::new_v4().to_string(),
                     tenant_id: "cli".to_string(),
                     model_name: String::new(),
-                    system_prompt: system_prompt.clone(),
-                    user_message: user_text,
+                    seed: roz_agent::agent_loop::AgentInputSeed::new(system_prompt.clone(), Vec::new(), user_text),
                     max_cycles: 20,
                     max_tokens: 8192,
                     max_context_tokens: 200_000,
@@ -1064,7 +1063,6 @@ async fn provider_loop(
                     tool_choice: None,
                     response_schema: None,
                     streaming: true,
-                    history: Vec::new(),
                     phases: Vec::new(),
                     cancellation_token: None,
                     control_mode: roz_core::safety::ControlMode::default(),

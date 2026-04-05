@@ -61,6 +61,121 @@ pub struct EventEnvelope {
     pub event: SessionEvent,
 }
 
+/// Canonical transport envelope for session events over non-proto transports.
+///
+/// Mirrors the public `SessionEventEnvelope` wire shape closely enough that
+/// relays can move between NATS JSON and gRPC proto without going back through
+/// ad hoc message families.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CanonicalSessionEventEnvelope {
+    pub event_id: String,
+    pub correlation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_event_id: Option<String>,
+    pub timestamp: DateTime<Utc>,
+    pub event_type: String,
+    pub event_payload: serde_json::Value,
+}
+
+impl CanonicalSessionEventEnvelope {
+    #[must_use]
+    pub fn from_event_envelope(envelope: &EventEnvelope) -> Self {
+        Self {
+            event_id: envelope.event_id.0.clone(),
+            correlation_id: envelope.correlation_id.0.clone(),
+            parent_event_id: envelope.parent_event_id.as_ref().map(|id| id.0.clone()),
+            timestamp: envelope.timestamp,
+            event_type: canonical_event_type_name(&envelope.event).to_string(),
+            event_payload: serde_json::to_value(&envelope.event)
+                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::default())),
+        }
+    }
+
+    pub fn into_event_envelope(self) -> Result<EventEnvelope, serde_json::Error> {
+        let event: SessionEvent = serde_json::from_value(self.event_payload)?;
+        let canonical_event_type = canonical_event_type_name(&event);
+        if self.event_type != canonical_event_type {
+            return Err(serde_json::Error::io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "event_type '{}' does not match payload type '{}'",
+                    self.event_type, canonical_event_type
+                ),
+            )));
+        }
+        Ok(EventEnvelope {
+            event_id: EventId(self.event_id),
+            correlation_id: CorrelationId(self.correlation_id),
+            parent_event_id: self.parent_event_id.map(EventId),
+            timestamp: self.timestamp,
+            event,
+        })
+    }
+}
+
+impl SessionEvent {
+    #[must_use]
+    pub fn resume_summary(summary: super::snapshot::SessionSnapshot) -> Self {
+        Self::ResumeSummaryReady { summary }
+    }
+
+    #[must_use]
+    pub const fn resume_summary_ref(&self) -> Option<&super::snapshot::SessionSnapshot> {
+        match self {
+            Self::ResumeSummaryReady { summary } => Some(summary),
+            _ => None,
+        }
+    }
+}
+
+/// Canonical transport name for a session event.
+///
+/// This intentionally follows the public/session-envelope naming rather than
+/// the serde-tagged enum variant name in a few cases, such as
+/// `PresenceHinted -> "presence_hint"`.
+#[must_use]
+pub const fn canonical_event_type_name(event: &SessionEvent) -> &'static str {
+    match event {
+        SessionEvent::SessionStarted { .. } => "session_started",
+        SessionEvent::SessionRejected { .. } => "session_rejected",
+        SessionEvent::TurnStarted { .. } => "turn_started",
+        SessionEvent::SessionCompleted { .. } => "session_completed",
+        SessionEvent::SessionFailed { .. } => "session_failed",
+        SessionEvent::ActivityChanged { .. } => "activity_changed",
+        SessionEvent::PresenceHinted { .. } => "presence_hint",
+        SessionEvent::ToolCallStarted { .. } => "tool_call_started",
+        SessionEvent::ToolCallFinished { .. } => "tool_call_finished",
+        SessionEvent::ToolCallRequested { .. } => "tool_call_requested",
+        SessionEvent::ToolUnavailable { .. } => "tool_unavailable",
+        SessionEvent::ApprovalRequested { .. } => "approval_requested",
+        SessionEvent::ApprovalResolved { .. } => "approval_resolved",
+        SessionEvent::VerificationStarted { .. } => "verification_started",
+        SessionEvent::VerificationFinished { .. } => "verification_finished",
+        SessionEvent::ResumeSummaryReady { .. } => "resume_summary",
+        SessionEvent::TelemetryStatusChanged { .. } => "telemetry_status",
+        SessionEvent::TrustPostureChanged { .. } => "trust_posture",
+        SessionEvent::SafePauseEntered { .. } => "safe_pause_entered",
+        SessionEvent::SafePauseCleared { .. } => "safe_pause_cleared",
+        SessionEvent::ControllerLoaded { .. } => "controller_loaded",
+        SessionEvent::ControllerShadowStarted { .. } => "controller_shadow",
+        SessionEvent::ControllerPromoted { .. } => "controller_promoted",
+        SessionEvent::ControllerRolledBack { .. } => "controller_rolled_back",
+        SessionEvent::SafetyIntervention { .. } => "safety_intervention",
+        SessionEvent::EdgeTransportDegraded { .. } => "edge_degraded",
+        SessionEvent::ReasoningTrace { .. } => "reasoning_trace",
+        SessionEvent::ContextCompacted { .. } => "context_compacted",
+        SessionEvent::ModelCallCompleted { .. } => "model_call",
+        SessionEvent::TextDelta { .. } => "text_delta",
+        SessionEvent::ThinkingDelta { .. } => "thinking_delta",
+        SessionEvent::TurnFinished { .. } => "turn_finished",
+        SessionEvent::MemoryRead { .. } => "memory_read",
+        SessionEvent::MemoryWrite { .. } => "memory_write",
+        SessionEvent::SensorRepositioned { .. } => "sensor_repositioned",
+        SessionEvent::ContactStateChanged { .. } => "contact_state_changed",
+        SessionEvent::FeedbackReceived { .. } => "feedback_received",
+    }
+}
+
 /// Compaction level for context window management.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -68,6 +183,17 @@ pub enum CompactionLevel {
     ToolClear,
     ThinkingStrip,
     LlmSummary,
+}
+
+/// Permission rule metadata surfaced to clients when a session starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPermissionRule {
+    pub tool_pattern: String,
+    pub policy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Transport-neutral typed events. Every surface consumes the same family.
@@ -79,6 +205,15 @@ pub enum SessionEvent {
         session_id: String,
         mode: SessionMode,
         blueprint_version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_name: Option<String>,
+        #[serde(default)]
+        permissions: Vec<SessionPermissionRule>,
+    },
+    SessionRejected {
+        code: String,
+        message: String,
+        retryable: bool,
     },
     TurnStarted {
         turn_index: u32,
@@ -98,6 +233,10 @@ pub enum SessionEvent {
         robot_safe: bool,
         unblock_event: Option<String>,
     },
+    PresenceHinted {
+        level: String,
+        reason: String,
+    },
 
     // -- Tool execution --
     ToolCallStarted {
@@ -109,6 +248,12 @@ pub enum SessionEvent {
         call_id: String,
         tool_name: String,
         result_summary: String,
+    },
+    ToolCallRequested {
+        call_id: String,
+        tool_name: String,
+        parameters: serde_json::Value,
+        timeout_ms: u32,
     },
     ToolUnavailable {
         tool_name: String,
@@ -139,8 +284,10 @@ pub enum SessionEvent {
     },
 
     // -- Resumability --
+    #[serde(rename = "resume_summary", alias = "resume_summary_ready")]
     ResumeSummaryReady {
-        snapshot: super::snapshot::SessionSnapshot,
+        #[serde(alias = "snapshot")]
+        summary: super::snapshot::SessionSnapshot,
     },
 
     // -- Trust & telemetry --
@@ -219,6 +366,22 @@ pub enum SessionEvent {
         cache_hit_tokens: u32,
         stop_reason: String,
     },
+    TextDelta {
+        message_id: String,
+        content: String,
+    },
+    ThinkingDelta {
+        message_id: String,
+        content: String,
+    },
+    TurnFinished {
+        message_id: String,
+        input_tokens: u32,
+        output_tokens: u32,
+        cache_read_tokens: u32,
+        cache_creation_tokens: u32,
+        stop_reason: String,
+    },
     MemoryRead {
         entries_returned: u32,
         scope_key: String,
@@ -272,12 +435,31 @@ mod tests {
     fn session_started_serde() {
         let env = make_envelope(SessionEvent::SessionStarted {
             session_id: "sess-1".into(),
-            mode: SessionMode::LocalCanonical,
+            mode: SessionMode::Local,
             blueprint_version: "1.0".into(),
+            model_name: Some("claude-sonnet-4-6".into()),
+            permissions: vec![SessionPermissionRule {
+                tool_pattern: "capture_frame".into(),
+                policy: "allow".into(),
+                category: Some("pure".into()),
+                reason: Some("observation only".into()),
+            }],
         });
         let json = serde_json::to_string(&env).unwrap();
         let back: EventEnvelope = serde_json::from_str(&json).unwrap();
         assert!(matches!(back.event, SessionEvent::SessionStarted { .. }));
+    }
+
+    #[test]
+    fn session_rejected_serde() {
+        let env = make_envelope(SessionEvent::SessionRejected {
+            code: "turn_rejected".into(),
+            message: "turn already in progress".into(),
+            retryable: false,
+        });
+        let json = serde_json::to_string(&env).unwrap();
+        let back: EventEnvelope = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back.event, SessionEvent::SessionRejected { .. }));
     }
 
     #[test]
@@ -438,5 +620,80 @@ mod tests {
         let json = serde_json::to_string(&env).unwrap();
         let back: EventEnvelope = serde_json::from_str(&json).unwrap();
         assert!(matches!(back.event, SessionEvent::EdgeTransportDegraded { .. }));
+    }
+
+    #[test]
+    fn canonical_envelope_roundtrip() {
+        let env = make_envelope(SessionEvent::TextDelta {
+            message_id: "msg-1".into(),
+            content: "hello".into(),
+        });
+        let canonical = CanonicalSessionEventEnvelope::from_event_envelope(&env);
+        assert_eq!(canonical.event_type, "text_delta");
+        assert_eq!(canonical.event_payload["content"], "hello");
+
+        let back = canonical.into_event_envelope().unwrap();
+        assert_eq!(back.event_id.0, "evt-1");
+        assert!(matches!(back.event, SessionEvent::TextDelta { .. }));
+    }
+
+    #[test]
+    fn canonical_envelope_rejects_event_type_payload_mismatch() {
+        let canonical = CanonicalSessionEventEnvelope {
+            event_id: "evt-1".into(),
+            correlation_id: "corr-1".into(),
+            parent_event_id: None,
+            timestamp: Utc::now(),
+            event_type: "turn_finished".into(),
+            event_payload: serde_json::to_value(SessionEvent::TextDelta {
+                message_id: "msg-1".into(),
+                content: "hello".into(),
+            })
+            .unwrap(),
+        };
+
+        let error = canonical
+            .into_event_envelope()
+            .expect_err("mismatched canonical envelope should fail");
+        assert!(error.to_string().contains("event_type"));
+    }
+
+    #[test]
+    fn resume_summary_ready_serializes_summary_field() {
+        let snapshot = crate::session::snapshot::SessionSnapshot {
+            session_id: "sess-1".into(),
+            turn_index: 1,
+            current_goal: None,
+            current_phase: None,
+            next_expected_step: None,
+            last_approved_physical_action: None,
+            last_verifier_result: None,
+            telemetry_freshness: crate::session::snapshot::FreshnessState::Unknown,
+            spatial_freshness: crate::session::snapshot::FreshnessState::Unknown,
+            pending_blocker: None,
+            open_risks: Vec::new(),
+            control_mode: crate::session::control::ControlMode::Autonomous,
+            safe_pause_state: SafePauseState::Running,
+            host_trust_posture: TrustPosture::default(),
+            environment_trust_posture: TrustPosture::default(),
+            edge_transport_state: EdgeTransportHealth::Healthy,
+            active_controller_id: None,
+            last_controller_verdict: None,
+            last_failure: None,
+            updated_at: Utc::now(),
+        };
+        let json = serde_json::to_value(SessionEvent::resume_summary(snapshot.clone())).unwrap();
+
+        assert!(json.get("summary").is_some());
+        assert!(json.get("snapshot").is_none());
+
+        assert_eq!(json["type"], "resume_summary");
+
+        let restored: SessionEvent = serde_json::from_value(serde_json::json!({
+            "type": "resume_summary",
+            "snapshot": snapshot,
+        }))
+        .unwrap();
+        assert!(matches!(restored, SessionEvent::ResumeSummaryReady { .. }));
     }
 }

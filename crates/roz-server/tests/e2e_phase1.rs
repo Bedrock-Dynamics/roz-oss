@@ -12,7 +12,27 @@
 //! ```
 
 use reqwest::StatusCode;
+use roz_server::grpc::roz_v1;
 use serde_json::{Value, json};
+
+fn session_started_from_response(
+    response: &Option<roz_server::grpc::roz_v1::session_response::Response>,
+) -> Option<(String, String)> {
+    match response {
+        Some(roz_server::grpc::roz_v1::session_response::Response::SessionEvent(event))
+            if event.event_type == "session_started" =>
+        {
+            match event.typed_event.as_ref()? {
+                roz_v1::session_event_envelope::TypedEvent::SessionStarted(payload) => Some((
+                    payload.session_id.clone(),
+                    payload.model_name.clone().unwrap_or_default(),
+                )),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shared helpers (same pattern as e2e_live.rs)
@@ -150,7 +170,7 @@ async fn grpc_session_with_host_id() {
     use tonic::metadata::MetadataValue;
 
     use roz_server::grpc::roz_v1::agent_service_client::AgentServiceClient;
-    use roz_server::grpc::roz_v1::{StartSession, session_request, session_response};
+    use roz_server::grpc::roz_v1::{StartSession, session_request};
 
     // 1. Create a host via REST
     let (status, body) = post(
@@ -216,12 +236,12 @@ async fn grpc_session_with_host_id() {
         .unwrap();
 
     // 6. Wait for SessionStarted acknowledgement (timeout 10s)
-    let started = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let (session_id, _model_name) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
             let Some(msg) = resp.message().await.expect("stream error") else {
                 panic!("stream ended before SessionStarted");
             };
-            if let Some(session_response::Response::SessionStarted(s)) = msg.response {
+            if let Some(s) = session_started_from_response(&msg.response) {
                 return s;
             }
         }
@@ -229,7 +249,7 @@ async fn grpc_session_with_host_id() {
     .await
     .expect("timed out waiting for SessionStarted");
 
-    assert!(!started.session_id.is_empty(), "session_id should not be empty");
+    assert!(!session_id.is_empty(), "session_id should not be empty");
 
     // 7. Cleanup
     drop(req_tx);
@@ -318,7 +338,7 @@ async fn telemetry_arrives_on_grpc_session() {
             let Some(msg) = resp.message().await.expect("stream error") else {
                 panic!("stream ended before SessionStarted");
             };
-            if matches!(msg.response, Some(session_response::Response::SessionStarted(_))) {
+            if session_started_from_response(&msg.response).is_some() {
                 break;
             }
         }
@@ -412,7 +432,7 @@ async fn agent_placement_field_accepted() {
         .await
         .unwrap();
 
-    // 4. Wait for either SessionStarted or an Error -- both are acceptable.
+    // 4. Wait for either SessionStarted or a canonical session_rejected event.
     //    The key assertion: the server does NOT crash or return an RPC-level error.
     let response = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
@@ -420,8 +440,10 @@ async fn agent_placement_field_accepted() {
                 return None;
             };
             match &msg.response {
-                Some(session_response::Response::SessionStarted(_)) => return Some(msg),
-                Some(session_response::Response::Error(_)) => return Some(msg),
+                _ if session_started_from_response(&msg.response).is_some() => return Some(msg),
+                Some(session_response::Response::SessionEvent(event)) if event.event_type == "session_rejected" => {
+                    return Some(msg);
+                }
                 _ => continue,
             }
         }
@@ -429,7 +451,7 @@ async fn agent_placement_field_accepted() {
     .await
     .expect("timed out waiting for server response to agent_placement=EDGE");
 
-    // Server responded (didn't crash). Either SessionStarted or Error is fine.
+    // Server responded (didn't crash). Either SessionStarted or session_rejected is fine.
     assert!(
         response.is_some(),
         "server should respond to StartSession with agent_placement=EDGE"

@@ -110,6 +110,7 @@ impl SensorSource for WsSensorSource {
             joint_positions: current.joint_positions.clone(),
             joint_velocities: Vec::new(),
             sim_time_ns: 0,
+            frame_snapshot_input: Default::default(),
         })
     }
 }

@@ -31,7 +31,7 @@ impl StateInjector for NullStateInjector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use roz_core::channels::ChannelManifest;
+    use roz_core::manifest::RobotManifest;
 
     struct FakeInjector {
         values: Vec<f64>,
@@ -47,16 +47,17 @@ mod tests {
         }
     }
 
-    fn load_reachy_mini_manifest() -> ChannelManifest {
+    fn load_reachy_mini_manifest() -> RobotManifest {
         let toml_str = include_str!("../../../examples/reachy-mini/robot.toml");
-        let robot: crate::manifest::RobotManifest = toml::from_str(toml_str).unwrap();
-        robot.channel_manifest().unwrap()
+        toml::from_str(toml_str).unwrap()
     }
 
     #[test]
     fn fake_injector_writes_state_values() {
         let manifest = load_reachy_mini_manifest();
-        let mut ctx = HostContext::with_manifest(manifest);
+        let control_manifest = manifest.control_interface_manifest().unwrap();
+        let state_count = manifest.channels.as_ref().map_or(0, |channels| channels.states.len());
+        let mut ctx = HostContext::with_control_manifest_state_count(&control_manifest, state_count);
         assert!(ctx.state_values.iter().all(|&v| v == 0.0));
 
         let mut injector = FakeInjector {
@@ -72,7 +73,9 @@ mod tests {
     #[test]
     fn null_injector_is_noop() {
         let manifest = load_reachy_mini_manifest();
-        let mut ctx = HostContext::with_manifest(manifest);
+        let control_manifest = manifest.control_interface_manifest().unwrap();
+        let state_count = manifest.channels.as_ref().map_or(0, |channels| channels.states.len());
+        let mut ctx = HostContext::with_control_manifest_state_count(&control_manifest, state_count);
         let mut injector = NullStateInjector;
         injector.inject(&mut ctx);
         assert!(ctx.state_values.iter().all(|&v| v == 0.0));

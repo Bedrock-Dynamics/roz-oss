@@ -306,7 +306,7 @@ fn device_trust_firmware_verification() {
 fn device_trust_evaluation() {
     use chrono::Utc;
     use roz_core::device_trust::evaluator::{TrustPolicy, evaluate_trust};
-    use roz_core::device_trust::{DeviceTrust, FirmwareManifest, FlashPartition, TrustPosture};
+    use roz_core::device_trust::{DeviceTrust, DeviceTrustPosture, FirmwareManifest, FlashPartition};
     use uuid::Uuid;
 
     let now = Utc::now();
@@ -321,7 +321,7 @@ fn device_trust_evaluation() {
     let trusted_device = DeviceTrust {
         host_id: Uuid::new_v4(),
         tenant_id: "tenant-1".to_string(),
-        posture: TrustPosture::Untrusted,
+        posture: DeviceTrustPosture::Untrusted,
         firmware: Some(FirmwareManifest {
             version: "2.0.0".to_string(),
             sha256: "abc123".to_string(),
@@ -335,7 +335,10 @@ fn device_trust_evaluation() {
         updated_at: now,
     };
 
-    assert_eq!(evaluate_trust(&trusted_device, &policy, now), TrustPosture::Trusted);
+    assert_eq!(
+        evaluate_trust(&trusted_device, &policy, now),
+        DeviceTrustPosture::Trusted
+    );
 
     // Untrusted: unknown firmware
     let untrusted_device = DeviceTrust {
@@ -349,7 +352,10 @@ fn device_trust_evaluation() {
         ..trusted_device.clone()
     };
 
-    assert_eq!(evaluate_trust(&untrusted_device, &policy, now), TrustPosture::Untrusted);
+    assert_eq!(
+        evaluate_trust(&untrusted_device, &policy, now),
+        DeviceTrustPosture::Untrusted
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +365,7 @@ fn device_trust_evaluation() {
 #[test]
 fn recording_manifest_serde() {
     use chrono::Utc;
-    use roz_core::recording::{ChannelManifest, RecordingManifest, RecordingSource};
+    use roz_core::recording::{RecordingChannel, RecordingManifest, RecordingSource};
     use uuid::Uuid;
 
     let manifest = RecordingManifest {
@@ -368,7 +374,7 @@ fn recording_manifest_serde() {
         environment_id: Uuid::new_v4(),
         host_id: Uuid::new_v4(),
         source: RecordingSource::Simulation,
-        channels: vec![ChannelManifest {
+        channels: vec![RecordingChannel {
             name: "joint_velocity".to_string(),
             topic: "/joint/vel".to_string(),
             schema_name: "Float64".to_string(),

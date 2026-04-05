@@ -58,7 +58,7 @@ pub struct SpawnWorkerInput {
 /// before the NATS request.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PhaseSpecInput {
-    /// Execution mode: `"react"` or `"ooda_re_act"`.
+    /// Execution mode: `"react"` or `"ooda_react"`.
     pub mode: PhaseModeInput,
     /// Tool set filter: `"all"`, `"none"`, or `{ "named": ["tool1", "tool2"] }`.
     pub tools: ToolSetFilterInput,
@@ -171,6 +171,13 @@ impl SpawnWorkerTool {
             trigger: PhaseTrigger::Immediate,
         }]
     }
+
+    fn resolve_delegation_scope(ctx: &ToolContext) -> roz_core::tasks::DelegationScope {
+        ctx.extensions
+            .get::<roz_core::tasks::DelegationScope>()
+            .cloned()
+            .unwrap_or_else(roz_core::tasks::DelegationScope::fail_closed)
+    }
 }
 
 #[async_trait]
@@ -192,7 +199,7 @@ impl TypedToolExecutor for SpawnWorkerTool {
     async fn execute(
         &self,
         input: Self::Input,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
         // 1. Resolve phases: use supplied list or fall back to default.
         let effective_phases: Vec<PhaseSpec> = if input.phases.is_empty() {
@@ -209,6 +216,11 @@ impl TypedToolExecutor for SpawnWorkerTool {
             environment_id: self.environment_id,
             phases: effective_phases,
             parent_task_id: self.parent_task_id,
+            control_interface_manifest: ctx
+                .extensions
+                .get::<roz_core::embodiment::binding::ControlInterfaceManifest>()
+                .cloned(),
+            delegation_scope: Some(Self::resolve_delegation_scope(ctx)),
         };
 
         let payload =
@@ -360,7 +372,7 @@ mod tests {
     fn default_phases_serialise_correctly() {
         let phases = SpawnWorkerTool::default_phases();
         let json = serde_json::to_value(&phases).expect("phases should serialise");
-        assert_eq!(json[0]["mode"], "ooda_re_act");
+        assert_eq!(json[0]["mode"], "ooda_react");
         assert_eq!(json[0]["tools"], "all");
         assert_eq!(json[0]["trigger"], "immediate");
     }
@@ -448,6 +460,8 @@ mod tests {
             environment_id: env_id,
             phases: SpawnWorkerTool::default_phases(),
             parent_task_id: parent_id,
+            control_interface_manifest: None,
+            delegation_scope: None,
         };
 
         let serialised = serde_json::to_value(&req).expect("SpawnRequest should serialise");
@@ -474,7 +488,7 @@ mod tests {
         // Verify default_phases() serialises to the expected NATS payload shape.
         let phases = SpawnWorkerTool::default_phases();
         let json = serde_json::to_value(&phases).expect("phases should serialise");
-        assert_eq!(json[0]["mode"], "ooda_re_act");
+        assert_eq!(json[0]["mode"], "ooda_react");
         assert_eq!(json[0]["tools"], "all");
         assert_eq!(json[0]["trigger"], "immediate");
     }
@@ -485,6 +499,39 @@ mod tests {
         let json = json!({ "task_id": task_id.to_string() });
         let reply: SpawnReply = serde_json::from_value(json).expect("SpawnReply should deserialise");
         assert_eq!(reply.task_id, task_id);
+    }
+
+    #[test]
+    fn resolve_delegation_scope_fails_closed_when_missing() {
+        let ctx = crate::dispatch::ToolContext {
+            task_id: Uuid::new_v4().to_string(),
+            tenant_id: Uuid::new_v4().to_string(),
+            call_id: "call-1".into(),
+            extensions: crate::dispatch::Extensions::default(),
+        };
+
+        let scope = SpawnWorkerTool::resolve_delegation_scope(&ctx);
+        assert!(scope.allowed_tools.is_empty());
+        assert_eq!(scope.trust_posture.tool_trust, roz_core::trust::TrustLevel::Untrusted);
+    }
+
+    #[test]
+    fn resolve_delegation_scope_preserves_parent_scope() {
+        let expected = roz_core::tasks::DelegationScope {
+            allowed_tools: vec!["capture_frame".into()],
+            trust_posture: roz_core::trust::TrustPosture::default(),
+        };
+        let mut extensions = crate::dispatch::Extensions::default();
+        extensions.insert(expected.clone());
+        let ctx = crate::dispatch::ToolContext {
+            task_id: Uuid::new_v4().to_string(),
+            tenant_id: Uuid::new_v4().to_string(),
+            call_id: "call-2".into(),
+            extensions,
+        };
+
+        let scope = SpawnWorkerTool::resolve_delegation_scope(&ctx);
+        assert_eq!(scope, expected);
     }
 
     // -----------------------------------------------------------------------

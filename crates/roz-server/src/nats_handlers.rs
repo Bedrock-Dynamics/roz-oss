@@ -8,6 +8,7 @@
 
 use async_nats::Client as NatsClient;
 use futures::StreamExt as _;
+use roz_core::phases::PhaseMode;
 use roz_core::safety::SafetyLevel;
 use roz_core::tasks::{SpawnReply, SpawnRequest};
 use sqlx::PgPool;
@@ -26,6 +27,20 @@ async fn send_error(nats: &NatsClient, reply_subject: &str, message: &str) {
     if let Err(e) = nats.publish(reply_subject.to_owned(), payload.into()).await {
         tracing::error!(error = %e, "failed to send NATS error reply");
     }
+}
+
+fn mode_from_phases(phases: &[roz_core::phases::PhaseSpec]) -> roz_nats::dispatch::ExecutionMode {
+    match phases.first().map(|phase| phase.mode) {
+        Some(PhaseMode::OodaReAct) => roz_nats::dispatch::ExecutionMode::OodaReAct,
+        Some(PhaseMode::React) | None => roz_nats::dispatch::ExecutionMode::React,
+    }
+}
+
+fn validate_child_task_delegation_scope(req: &SpawnRequest) -> Result<(), &'static str> {
+    if req.delegation_scope.is_none() {
+        return Err("child tasks require delegation_scope");
+    }
+    Ok(())
 }
 
 /// Handle `roz.internal.tasks.spawn` request-reply messages.
@@ -59,6 +74,12 @@ async fn spawn_task_handler(nats: NatsClient, pool: PgPool, restate_ingress_url:
                 continue;
             }
         };
+
+        if let Err(message) = validate_child_task_delegation_scope(&req) {
+            tracing::warn!(parent_task_id = %req.parent_task_id, "rejecting child task without delegation scope");
+            send_error(&nats, &reply_subject, message).await;
+            continue;
+        }
 
         let phases_json = match serde_json::to_value(&req.phases) {
             Ok(v) => v,
@@ -146,11 +167,13 @@ async fn spawn_task_handler(nats: NatsClient, pool: PgPool, restate_ingress_url:
             safety_policy_id: None,
             host_id: host_uuid,
             timeout_secs: 300,
-            mode: roz_nats::dispatch::ExecutionMode::React,
+            mode: mode_from_phases(&req.phases),
             parent_task_id: Some(req.parent_task_id),
             restate_url: restate_ingress_url.clone(),
             traceparent: roz_nats::dispatch::current_traceparent(),
             phases: req.phases.clone(),
+            control_interface_manifest: req.control_interface_manifest.clone(),
+            delegation_scope: req.delegation_scope.clone(),
         };
         let invoke_subject = format!("invoke.{host_name}.{}", task.id);
         if let Ok(payload) = serde_json::to_vec(&invocation)
@@ -174,4 +197,40 @@ async fn spawn_task_handler(nats: NatsClient, pool: PgPool, restate_ingress_url:
     }
 
     tracing::info!(%subject, "internal NATS handler exiting");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use roz_core::tasks::SpawnRequest;
+    use uuid::Uuid;
+
+    fn spawn_request() -> SpawnRequest {
+        SpawnRequest {
+            tenant_id: Uuid::nil(),
+            parent_task_id: Uuid::new_v4(),
+            host_id: Uuid::new_v4().to_string(),
+            environment_id: Uuid::new_v4(),
+            prompt: "delegate this".to_string(),
+            phases: Vec::new(),
+            control_interface_manifest: None,
+            delegation_scope: None,
+        }
+    }
+
+    #[test]
+    fn child_tasks_require_delegation_scope() {
+        let req = spawn_request();
+        assert_eq!(
+            validate_child_task_delegation_scope(&req),
+            Err("child tasks require delegation_scope")
+        );
+    }
+
+    #[test]
+    fn child_tasks_with_delegation_scope_are_allowed() {
+        let mut req = spawn_request();
+        req.delegation_scope = Some(roz_core::tasks::DelegationScope::fail_closed());
+        validate_child_task_delegation_scope(&req).expect("scope should satisfy validation");
+    }
 }

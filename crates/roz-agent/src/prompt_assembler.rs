@@ -7,7 +7,7 @@
 //! | 0 | Constitution text (verbatim) | Stable across turns |
 //! | 1 | Tool catalog + embodiment manifest summary | Stable when tools don't change |
 //! | 2 | Blueprint-injected project/domain context | Stable per session |
-//! | 3 | Memory context (placeholder; populated when `MemoryStore` is wired) | Per-turn |
+//! | 3 | Memory context (runtime-owned retrieval from `MemoryStore`) | Per-turn |
 //! | 4 | Volatile per-turn context (snapshot, spatial, trust, edge) | Per-turn |
 //!
 //! Blocks 0–2 are designed to be stable across turns, maximising prompt cache
@@ -18,9 +18,18 @@
 //! `Vec<SystemBlock>`.
 
 use roz_core::edge_health::EdgeTransportHealth;
+use roz_core::memory::MemoryEntry;
 use roz_core::session::snapshot::SessionSnapshot;
-use roz_core::spatial::SpatialContext;
+use roz_core::spatial::WorldState;
 use roz_core::trust::TrustPosture;
+use serde::{Deserialize, Serialize};
+
+fn format_runtime_failure(failure: roz_core::session::activity::RuntimeFailureKind) -> String {
+    serde_json::to_value(failure)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "model_error".to_string())
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -36,7 +45,7 @@ pub struct SystemBlock {
 }
 
 /// Schema for a tool visible to the model.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolSchema {
     /// Tool name as registered with the dispatcher.
     pub name: String,
@@ -53,15 +62,19 @@ pub struct AssemblyContext<'a> {
     /// Most recent session snapshot, if one has been produced.
     pub snapshot: Option<&'a SessionSnapshot>,
     /// Spatial context from the OODA observe step, if available.
-    pub spatial_context: Option<&'a SpatialContext>,
+    pub spatial_context: Option<&'a WorldState>,
     /// Tool schemas to advertise in block 1.
     pub tool_schemas: &'a [ToolSchema],
     /// Current aggregate trust posture.
     pub trust_posture: &'a TrustPosture,
     /// Current edge transport health.
     pub edge_state: &'a EdgeTransportHealth,
+    /// Retrieved memory entries for this turn.
+    pub memory_entries: &'a [MemoryEntry],
     /// Blueprint / project context strings (joined into block 2).
     pub custom_blocks: Vec<String>,
+    /// Volatile per-turn context strings appended into block 4.
+    pub volatile_blocks: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -94,7 +107,7 @@ impl PromptAssembler {
             self.block_constitution(),
             Self::block_tool_catalog(context),
             Self::block_custom_context(context),
-            Self::block_memory_context(),
+            Self::block_memory_context(context),
             Self::block_volatile_context(context),
         ]
     }
@@ -150,17 +163,24 @@ impl PromptAssembler {
         }
     }
 
-    /// Block 3 — memory context placeholder.
-    ///
-    /// # Future integration
-    /// When `MemoryStore` is wired into `SessionRuntime`, this block will be
-    /// populated with budget-capped (≤ 2,000 tokens) memory summaries retrieved
-    /// from the store before the turn begins. For now the block is intentionally
-    /// empty so block offsets stay stable as the codebase grows.
-    fn block_memory_context() -> SystemBlock {
+    /// Block 3 — runtime-owned memory context retrieved before the turn begins.
+    fn block_memory_context(context: &AssemblyContext<'_>) -> SystemBlock {
+        let content = if context.memory_entries.is_empty() {
+            String::new()
+        } else {
+            let mut parts = vec!["## Memory Context".to_string()];
+            for entry in context.memory_entries {
+                parts.push(format!(
+                    "- [{} | verified={} | confidence={:?}] {}",
+                    entry.memory_id, entry.verified, entry.confidence, entry.fact
+                ));
+            }
+            parts.join("\n")
+        };
+
         SystemBlock {
             label: "memory_context".into(),
-            content: String::new(),
+            content,
         }
     }
 
@@ -172,6 +192,8 @@ impl PromptAssembler {
         if let Some(snap) = context.snapshot {
             parts.push("## Session State".into());
             parts.push(format!("Turn: {}", snap.turn_index));
+            parts.push(format!("Can execute physical: {}", snap.can_execute_physical()));
+            parts.push(format!("Control mode: {:?}", snap.control_mode));
 
             if let Some(goal) = &snap.current_goal {
                 parts.push(format!("Current goal: {goal}"));
@@ -182,6 +204,18 @@ impl PromptAssembler {
             if let Some(step) = &snap.next_expected_step {
                 parts.push(format!("Next expected step: {step}"));
             }
+            if let Some(action) = &snap.last_approved_physical_action {
+                parts.push(format!("Last approved physical action: {action}"));
+            }
+            if let Some(controller_id) = &snap.active_controller_id {
+                parts.push(format!("Active controller: {controller_id}"));
+            }
+            if let Some(verdict) = &snap.last_controller_verdict {
+                parts.push(format!("Last controller verdict: {verdict:?}"));
+            }
+            if let Some(verdict) = &snap.last_verifier_result {
+                parts.push(format!("Last verifier result: {verdict:?}"));
+            }
             if let Some(blocker) = &snap.pending_blocker {
                 parts.push(format!("BLOCKER: {blocker}"));
             }
@@ -189,8 +223,12 @@ impl PromptAssembler {
                 parts.push(format!("Open risks: {}", snap.open_risks.join("; ")));
             }
             if let Some(failure) = &snap.last_failure {
-                parts.push(format!("Last failure: {failure:?}"));
+                parts.push(format!("Last failure: {}", format_runtime_failure(*failure)));
             }
+            parts.push(format!(
+                "Freshness: telemetry={:?}, spatial={:?}",
+                snap.telemetry_freshness, snap.spatial_freshness
+            ));
         }
 
         // Trust posture summary
@@ -240,6 +278,12 @@ impl PromptAssembler {
             }
         }
 
+        if !context.volatile_blocks.is_empty() {
+            parts.push(String::new());
+            parts.push("## Turn Context".into());
+            parts.extend(context.volatile_blocks.iter().cloned());
+        }
+
         SystemBlock {
             label: "volatile_context".into(),
             content: parts.join("\n"),
@@ -256,6 +300,7 @@ mod tests {
     use super::*;
     use crate::agent_loop::AgentLoopMode;
     use roz_core::edge_health::EdgeTransportHealth;
+    use roz_core::memory::{Confidence, MemoryClass, MemoryEntry, MemorySourceKind};
     use roz_core::session::activity::{RuntimeFailureKind, SafePauseState};
     use roz_core::session::control::ControlMode;
     use roz_core::session::snapshot::{FreshnessState, SessionSnapshot};
@@ -281,7 +326,25 @@ mod tests {
             tool_schemas: &[],
             trust_posture: trust,
             edge_state: edge,
+            memory_entries: &[],
             custom_blocks: vec![],
+            volatile_blocks: vec![],
+        }
+    }
+
+    fn sample_memory() -> MemoryEntry {
+        MemoryEntry {
+            memory_id: "mem-1".into(),
+            class: MemoryClass::Safety,
+            scope_key: "session:test".into(),
+            fact: "Operator requested slower approach speed near the cup.".into(),
+            source_kind: MemorySourceKind::OperatorStated,
+            source_ref: None,
+            confidence: Confidence::High,
+            verified: true,
+            stale_after: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
         }
     }
 
@@ -359,7 +422,9 @@ mod tests {
             tool_schemas: &schemas,
             trust_posture: &trust,
             edge_state: &edge,
+            memory_entries: &[],
             custom_blocks: vec![],
+            volatile_blocks: vec![],
         };
         let blocks = assembler.assemble(&ctx);
         assert_eq!(blocks[1].label, "tool_catalog");
@@ -389,7 +454,9 @@ mod tests {
             tool_schemas: &[],
             trust_posture: &trust,
             edge_state: &edge,
+            memory_entries: &[],
             custom_blocks: vec!["Project: RoboArm v2".into(), "Domain: industrial pick-and-place".into()],
+            volatile_blocks: vec![],
         };
         let blocks = assembler.assemble(&ctx);
         assert_eq!(blocks[2].label, "blueprint_context");
@@ -416,7 +483,9 @@ mod tests {
             tool_schemas: &[],
             trust_posture: &trust,
             edge_state: &edge,
+            memory_entries: &[],
             custom_blocks: vec![],
+            volatile_blocks: vec![],
         };
         let blocks = assembler.assemble(&ctx);
         assert_eq!(blocks[4].label, "volatile_context");
@@ -426,8 +495,12 @@ mod tests {
             content.contains("waiting for arm calibration"),
             "blocker must appear in block 4"
         );
+        assert!(
+            content.contains("Can execute physical: false"),
+            "physical execution gate must appear in block 4"
+        );
         assert!(content.contains("cup near table edge"), "risk must appear in block 4");
-        assert!(content.contains("ToolError"), "last failure must appear in block 4");
+        assert!(content.contains("tool_error"), "last failure must appear in block 4");
     }
 
     #[test]
@@ -452,7 +525,9 @@ mod tests {
             tool_schemas: &[],
             trust_posture: &trust2,
             edge_state: &edge2,
+            memory_entries: &[],
             custom_blocks: vec!["some project context".into()],
+            volatile_blocks: vec![],
         };
 
         let blocks1 = assembler.assemble(&ctx1);
@@ -475,17 +550,37 @@ mod tests {
     }
 
     #[test]
-    fn block_3_is_empty_placeholder() {
+    fn block_3_is_empty_when_no_memory_entries() {
         let assembler = default_assembler();
         let trust = default_trust();
         let edge = default_edge();
         let ctx = minimal_context(&trust, &edge);
         let blocks = assembler.assemble(&ctx);
         assert_eq!(blocks[3].label, "memory_context");
-        assert_eq!(
-            blocks[3].content, "",
-            "memory block must be empty until MemoryStore is wired"
-        );
+        assert_eq!(blocks[3].content, "");
+    }
+
+    #[test]
+    fn block_3_renders_memory_entries() {
+        let assembler = default_assembler();
+        let trust = default_trust();
+        let edge = default_edge();
+        let memory = vec![sample_memory()];
+        let ctx = AssemblyContext {
+            mode: AgentLoopMode::React,
+            snapshot: None,
+            spatial_context: None,
+            tool_schemas: &[],
+            trust_posture: &trust,
+            edge_state: &edge,
+            memory_entries: &memory,
+            custom_blocks: vec![],
+            volatile_blocks: vec![],
+        };
+        let blocks = assembler.assemble(&ctx);
+        assert_eq!(blocks[3].label, "memory_context");
+        assert!(blocks[3].content.contains("Memory Context"));
+        assert!(blocks[3].content.contains("slower approach speed"));
     }
 
     #[test]

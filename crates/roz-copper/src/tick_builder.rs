@@ -1,5 +1,7 @@
 //! Builds a [`TickInput`] from sensor/state data each tick.
 
+use roz_core::embodiment::{TickInputProjection, TickJointStateProjection, WatchedPoseProjection};
+
 use crate::tick_contract::{ContactState, DerivedFeatures, DigestSet, JointState, Pose, TickInput, Wrench};
 
 /// Sensor and state data for a single tick, passed to [`TickInputBuilder::build`].
@@ -24,6 +26,85 @@ pub struct TickInputBuilder {
 }
 
 impl TickInputBuilder {
+    fn contract_joint_states_from_projection(joint_state_projections: &[TickJointStateProjection]) -> Vec<JointState> {
+        joint_state_projections
+            .iter()
+            .map(|projection| JointState {
+                name: projection.name.clone(),
+                position: projection.position,
+                velocity: projection.velocity,
+                effort: projection.effort,
+            })
+            .collect()
+    }
+
+    fn contract_poses_from_projections(watched_pose_projections: &[WatchedPoseProjection]) -> Vec<Pose> {
+        watched_pose_projections
+            .iter()
+            .map(|projection| Pose {
+                frame: projection.frame_id.clone(),
+                translation: (
+                    projection.transform.translation[0],
+                    projection.transform.translation[1],
+                    projection.transform.translation[2],
+                ),
+                rotation: (
+                    projection.transform.rotation[0],
+                    projection.transform.rotation[1],
+                    projection.transform.rotation[2],
+                    projection.transform.rotation[3],
+                ),
+            })
+            .collect()
+    }
+
+    fn build_with_watched_pose_vec(&self, data: TickSensorData<'_>, watched_poses: Vec<Pose>) -> TickInput {
+        let joints: Vec<JointState> = self
+            .joint_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| JointState {
+                name: name.clone(),
+                position: data.positions.get(i).copied().unwrap_or(0.0),
+                velocity: data.velocities.get(i).copied().unwrap_or(0.0),
+                effort: data.efforts.and_then(|e| e.get(i).copied()),
+            })
+            .collect();
+
+        TickInput {
+            tick: data.tick,
+            monotonic_time_ns: data.time_ns,
+            digests: self.digests.clone(),
+            joints,
+            watched_poses,
+            wrench: data.wrench,
+            contact: data.contact,
+            features: data.features,
+            config_json: self.config_json.clone(),
+        }
+    }
+
+    fn build_with_projection_parts(
+        &self,
+        tick: u64,
+        monotonic_time_ns: u64,
+        joints: Vec<JointState>,
+        watched_poses: Vec<Pose>,
+        features: DerivedFeatures,
+    ) -> TickInput {
+        TickInput {
+            tick,
+            monotonic_time_ns,
+            digests: self.digests.clone(),
+            joints,
+            watched_poses,
+            wrench: None,
+            contact: None,
+            features,
+            config_json: self.config_json.clone(),
+        }
+    }
+
     /// Create a new builder with the given digests, joint names, watched frames, and config JSON.
     pub const fn new(
         digests: DigestSet,
@@ -46,29 +127,32 @@ impl TickInputBuilder {
     /// default to `0.0`.  `efforts`, if provided, follows the same convention
     /// and missing entries become `None`.
     pub fn build(&self, data: TickSensorData<'_>) -> TickInput {
-        let joints: Vec<JointState> = self
-            .joint_names
-            .iter()
-            .enumerate()
-            .map(|(i, name)| JointState {
-                name: name.clone(),
-                position: data.positions.get(i).copied().unwrap_or(0.0),
-                velocity: data.velocities.get(i).copied().unwrap_or(0.0),
-                effort: data.efforts.and_then(|e| e.get(i).copied()),
-            })
-            .collect();
+        let watched_poses = data.watched_poses.to_vec();
+        self.build_with_watched_pose_vec(data, watched_poses)
+    }
 
-        TickInput {
-            tick: data.tick,
-            monotonic_time_ns: data.time_ns,
-            digests: self.digests.clone(),
-            joints,
-            watched_poses: data.watched_poses.to_vec(),
-            wrench: data.wrench,
-            contact: data.contact,
-            features: data.features,
-            config_json: self.config_json.clone(),
-        }
+    /// Build a [`TickInput`] using runtime-owned watched-pose projections.
+    pub fn build_with_projected_watched_poses(
+        &self,
+        data: TickSensorData<'_>,
+        watched_pose_projections: &[WatchedPoseProjection],
+    ) -> TickInput {
+        self.build_with_watched_pose_vec(data, Self::contract_poses_from_projections(watched_pose_projections))
+    }
+
+    /// Build a [`TickInput`] from a runtime-owned core projection.
+    pub fn build_with_runtime_projection(
+        &self,
+        projection: &TickInputProjection,
+        features: DerivedFeatures,
+    ) -> TickInput {
+        self.build_with_projection_parts(
+            projection.tick,
+            projection.monotonic_time_ns,
+            Self::contract_joint_states_from_projection(&projection.joints),
+            Self::contract_poses_from_projections(&projection.watched_poses),
+            features,
+        )
     }
 
     /// Update the config JSON (e.g., from an `UpdateParams` command).
@@ -85,12 +169,19 @@ impl TickInputBuilder {
     pub fn watched_frames(&self) -> &[String] {
         &self.watched_frames
     }
+
+    /// The channel names this builder was constructed with.
+    pub fn channel_names(&self) -> &[String] {
+        &self.joint_names
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tick_contract::{ContactState, DerivedFeatures, DigestSet, Pose, Wrench};
+    use roz_core::embodiment::Transform3D;
+    use roz_core::session::snapshot::FreshnessState;
 
     fn make_digests() -> DigestSet {
         DigestSet {
@@ -290,5 +381,115 @@ mod tests {
         assert!((input.joints[2].velocity - 0.0).abs() < f64::EPSILON);
         // watched_poses passed through
         assert_eq!(input.watched_poses.len(), 1);
+    }
+
+    #[test]
+    fn build_with_projected_watched_poses() {
+        let builder = make_builder();
+        let input = builder.build_with_projected_watched_poses(
+            TickSensorData {
+                tick: 2,
+                time_ns: 200,
+                positions: &[],
+                velocities: &[],
+                efforts: None,
+                watched_poses: &[],
+                wrench: None,
+                contact: None,
+                features: DerivedFeatures::default(),
+            },
+            &[WatchedPoseProjection {
+                frame_id: "ee_link".into(),
+                relative_to: "world".into(),
+                transform: Transform3D {
+                    translation: [0.1, 0.2, 0.3],
+                    rotation: [1.0, 0.0, 0.0, 0.0],
+                    timestamp_ns: 200,
+                },
+                freshness: FreshnessState::Fresh,
+            }],
+        );
+
+        assert_eq!(input.watched_poses.len(), 1);
+        assert_eq!(input.watched_poses[0].frame, "ee_link");
+        assert_eq!(input.watched_poses[0].translation, (0.1, 0.2, 0.3));
+    }
+
+    #[test]
+    fn build_with_runtime_projection_uses_runtime_owned_joint_and_pose_data() {
+        let builder = make_builder();
+        let mut frame_tree = roz_core::embodiment::FrameTree::new();
+        frame_tree.set_root("world", roz_core::embodiment::FrameSource::Static);
+        let projection = TickInputProjection {
+            tick: 11,
+            monotonic_time_ns: 2_000,
+            snapshot: roz_core::embodiment::FrameGraphSnapshot {
+                snapshot_id: 0,
+                timestamp_ns: 0,
+                clock_domain: roz_core::clock::ClockDomain::Monotonic,
+                frame_tree,
+                freshness: FreshnessState::Unknown,
+                model_digest: String::new(),
+                calibration_digest: String::new(),
+                active_calibration_id: None,
+                dynamic_transforms: Vec::new(),
+                watched_frames: Vec::new(),
+                frame_freshness: std::collections::BTreeMap::new(),
+                sources: vec![roz_core::embodiment::FrameSource::Static],
+                world_anchors: Vec::new(),
+                validation_issues: Vec::new(),
+            },
+            joints: vec![TickJointStateProjection {
+                name: "runtime_joint".into(),
+                position: 0.4,
+                velocity: 0.05,
+                effort: Some(1.2),
+            }],
+            watched_poses: vec![WatchedPoseProjection {
+                frame_id: "ee_link".into(),
+                relative_to: "world".into(),
+                transform: Transform3D {
+                    translation: [0.4, 0.5, 0.6],
+                    rotation: [1.0, 0.0, 0.0, 0.0],
+                    timestamp_ns: 0,
+                },
+                freshness: FreshnessState::Fresh,
+            }],
+            features: roz_core::embodiment::TickDerivedFeaturesProjection {
+                calibration_valid: true,
+                workspace_margin: Some(0.25),
+                collision_margin: None,
+                force_margin: None,
+                observation_confidence: Some(0.8),
+                active_perception_available: true,
+                alerts: vec!["near_boundary".into()],
+            },
+            validation_issues: Vec::new(),
+        };
+        let features = DerivedFeatures {
+            calibration_valid: projection.features.calibration_valid,
+            workspace_margin: projection.features.workspace_margin,
+            collision_margin: projection.features.collision_margin,
+            force_margin: projection.features.force_margin,
+            observation_confidence: projection.features.observation_confidence,
+            active_perception_available: projection.features.active_perception_available,
+            alerts: projection.features.alerts.clone(),
+        };
+
+        let input = builder.build_with_runtime_projection(&projection, features);
+
+        assert_eq!(input.tick, 11);
+        assert_eq!(input.monotonic_time_ns, 2_000);
+        assert_eq!(input.joints.len(), 1);
+        assert_eq!(input.joints[0].name, "runtime_joint");
+        assert_eq!(input.joints[0].position, 0.4);
+        assert_eq!(input.joints[0].velocity, 0.05);
+        assert_eq!(input.joints[0].effort, Some(1.2));
+        assert_eq!(input.watched_poses.len(), 1);
+        assert_eq!(input.watched_poses[0].frame, "ee_link");
+        assert_eq!(input.watched_poses[0].translation, (0.4, 0.5, 0.6));
+        assert_eq!(input.features.workspace_margin, Some(0.25));
+        assert_eq!(input.features.observation_confidence, Some(0.8));
+        assert!(input.features.active_perception_available);
     }
 }

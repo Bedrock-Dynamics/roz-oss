@@ -110,7 +110,7 @@ async fn execute_byok(config: &ProviderConfig, task: &str) -> anyhow::Result<()>
     let all_tools = crate::tui::tools::build_all_tools_with_copper(std::path::Path::new("."));
     let _copper_handle = all_tools.copper_handle; // kept alive for session lifetime
     let safety = roz_agent::safety::SafetyStack::new(vec![]);
-    let spatial = roz_agent::spatial_provider::NullSpatialContextProvider;
+    let spatial = roz_agent::spatial_provider::NullWorldStateProvider;
     let mut agent_loop = roz_agent::agent_loop::AgentLoop::new(model, all_tools.dispatcher, safety, Box::new(spatial))
         .with_extensions(all_tools.extensions);
 
@@ -120,8 +120,7 @@ async fn execute_byok(config: &ProviderConfig, task: &str) -> anyhow::Result<()>
         task_id: uuid::Uuid::new_v4().to_string(),
         tenant_id: "cli".to_string(),
         model_name: String::new(),
-        system_prompt,
-        user_message: task.to_string(),
+        seed: roz_agent::agent_loop::AgentInputSeed::new(system_prompt, Vec::new(), task.to_string()),
         max_cycles: 20,
         max_tokens: 8192,
         max_context_tokens: 200_000,
@@ -129,7 +128,6 @@ async fn execute_byok(config: &ProviderConfig, task: &str) -> anyhow::Result<()>
         tool_choice: None,
         response_schema: None,
         streaming: false,
-        history: Vec::new(),
         phases: Vec::new(),
         cancellation_token: None,
         control_mode: roz_core::safety::ControlMode::default(),

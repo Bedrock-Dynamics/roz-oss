@@ -13,7 +13,7 @@ pub enum TrustLevel {
     Verified = 4,
 }
 
-/// The aggregate trust posture across all layers.
+/// The aggregate trust posture across all runtime layers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrustPosture {
     pub workspace_trust: TrustLevel,
@@ -24,6 +24,10 @@ pub struct TrustPosture {
     pub controller_artifact_trust: TrustLevel,
     pub edge_transport_trust: TrustLevel,
 }
+
+/// Spec-facing alias for the session/runtime trust posture carried by
+/// `SessionRuntime` and session events.
+pub type SessionTrustPosture = TrustPosture;
 
 impl Default for TrustPosture {
     fn default() -> Self {

@@ -1,5 +1,5 @@
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use roz_core::device_trust::{DeviceTrust, FirmwareManifest, FlashPartition, TrustPosture};
+use roz_core::device_trust::{DeviceTrust, DeviceTrustPosture, FirmwareManifest, FlashPartition};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -78,15 +78,15 @@ impl TrustReporter {
         });
 
         let posture = if self.is_sim {
-            TrustPosture::Provisional
+            DeviceTrustPosture::Provisional
         } else {
             match (firmware.is_some(), sig_result) {
                 // Firmware present with verified signature
-                (true, Some(true)) => TrustPosture::Trusted,
+                (true, Some(true)) => DeviceTrustPosture::Trusted,
                 // Firmware present but no signature provided (unknown state)
-                (true, None) => TrustPosture::Provisional,
+                (true, None) => DeviceTrustPosture::Provisional,
                 // Failed verification (actively suspicious) or no firmware at all
-                (true, Some(false)) | (false, _) => TrustPosture::Untrusted,
+                (true, Some(false)) | (false, _) => DeviceTrustPosture::Untrusted,
             }
         };
 
@@ -112,14 +112,14 @@ mod tests {
     fn sim_worker_gets_provisional() {
         let reporter = TrustReporter::new(Uuid::new_v4(), "tenant-1".into(), true);
         let trust = reporter.attest(Some(b"firmware"), Some(b"sbom"));
-        assert_eq!(trust.posture, TrustPosture::Provisional);
+        assert_eq!(trust.posture, DeviceTrustPosture::Provisional);
     }
 
     #[test]
     fn physical_worker_with_firmware_but_no_signature_gets_provisional() {
         let reporter = TrustReporter::new(Uuid::new_v4(), "tenant-1".into(), false);
         let trust = reporter.attest(Some(b"real firmware"), None);
-        assert_eq!(trust.posture, TrustPosture::Provisional);
+        assert_eq!(trust.posture, DeviceTrustPosture::Provisional);
         assert!(trust.firmware.is_some());
     }
 
@@ -127,7 +127,7 @@ mod tests {
     fn physical_worker_without_firmware_gets_untrusted() {
         let reporter = TrustReporter::new(Uuid::new_v4(), "tenant-1".into(), false);
         let trust = reporter.attest(None, None);
-        assert_eq!(trust.posture, TrustPosture::Untrusted);
+        assert_eq!(trust.posture, DeviceTrustPosture::Untrusted);
     }
 
     #[test]
@@ -154,7 +154,7 @@ mod tests {
             Some(&signature),
         );
 
-        assert_eq!(trust.posture, TrustPosture::Trusted);
+        assert_eq!(trust.posture, DeviceTrustPosture::Trusted);
         assert!(trust.firmware.is_some());
         let fw = trust.firmware.unwrap();
         assert!(fw.ed25519_signature.is_some(), "signature must be stored in manifest");
@@ -178,7 +178,7 @@ mod tests {
 
         assert_eq!(
             trust.posture,
-            TrustPosture::Untrusted,
+            DeviceTrustPosture::Untrusted,
             "failed signature verification must produce Untrusted (actively suspicious)"
         );
     }

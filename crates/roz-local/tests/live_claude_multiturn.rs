@@ -8,13 +8,20 @@ use std::time::Duration;
 
 use roz_agent::agent_loop::{AgentInput, AgentLoop, AgentLoopMode};
 use roz_agent::dispatch::ToolDispatcher;
-use roz_agent::model::types::Message;
+use roz_agent::model::types::{ContentPart, Message};
 use roz_agent::safety::SafetyStack;
 use roz_agent::spatial_provider::MockSpatialContextProvider;
 use roz_local::mcp::{McpManager, McpToolExecutor};
 
-const SYSTEM_PROMPT: &str = "You are controlling a UR5 robot arm via MCP tools. Use the available tools to inspect and move the arm. \
-     Always call the appropriate tool rather than guessing. Report results precisely.";
+const SYSTEM_PROMPT: &str = "You are controlling a UR5 robot arm via MCP tools. Physical execution is authorized for this live test, and you should rely on fresh tool observations rather than assumptions. \
+     Use the available tools to inspect and move the arm. Always call the appropriate tool rather than guessing. Report results precisely.";
+
+fn used_tool(messages: &[Message], tool_name: &str) -> bool {
+    messages
+        .iter()
+        .flat_map(|message| message.parts.iter())
+        .any(|part| matches!(part, ContentPart::ToolUse { name, .. } if name == tool_name))
+}
 
 /// Build a fresh `ToolDispatcher` with MCP tools registered.
 /// Each turn needs its own dispatcher because `AgentLoop::new` takes ownership.
@@ -35,8 +42,7 @@ fn build_input(user_message: &str, history: Vec<Message>) -> AgentInput {
         task_id: format!("multiturn-{}", uuid::Uuid::new_v4()),
         tenant_id: "test".into(),
         model_name: String::new(),
-        system_prompt: vec![SYSTEM_PROMPT.into()],
-        user_message: user_message.into(),
+        seed: roz_agent::agent_loop::AgentInputSeed::new(vec![SYSTEM_PROMPT.into()], history, user_message),
         max_cycles: 5,
         max_tokens: 4096,
         max_context_tokens: 100_000,
@@ -45,7 +51,6 @@ fn build_input(user_message: &str, history: Vec<Message>) -> AgentInput {
         tool_choice: None,
         response_schema: None,
         streaming: false,
-        history,
         cancellation_token: None,
         control_mode: roz_core::safety::ControlMode::default(),
     }
@@ -109,6 +114,11 @@ async fn real_claude_multiturn_observe_act_reason() {
     println!("Turn 2 cycles: {}", output2.cycles);
 
     assert!(output2.cycles > 1, "Turn 2 should have used tools (cycles > 1)");
+    assert!(
+        used_tool(&output2.messages, "arm__move_to_named_target"),
+        "Turn 2 should invoke arm__move_to_named_target for the physical move, got messages: {:?}",
+        output2.messages
+    );
 
     let turn2_messages = output2.messages;
 

@@ -5,6 +5,8 @@
 //!
 //! Run: cargo test -p roz-copper --test e2e_wasm_actuator_bridge -- --ignored --nocapture
 
+mod live_controller_support;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -14,36 +16,6 @@ use arc_swap::ArcSwap;
 use roz_copper::channels::{ControllerCommand, ControllerState};
 use roz_copper::io::ActuatorSink;
 use roz_copper::io_grpc::GrpcActuatorSink;
-
-fn test_artifact() -> roz_core::controller::artifact::ControllerArtifact {
-    use roz_core::controller::artifact::*;
-    ControllerArtifact {
-        controller_id: "e2e-actuator".into(),
-        sha256: "test".into(),
-        source_kind: SourceKind::LlmGenerated,
-        controller_class: ControllerClass::LowRiskCommandGenerator,
-        generator_model: None,
-        generator_provider: None,
-        channel_manifest_version: 1,
-        host_abi_version: 2,
-        evidence_bundle_id: None,
-        created_at: chrono::Utc::now(),
-        promoted_at: None,
-        replaced_controller_id: None,
-        verification_key: VerificationKey {
-            controller_digest: "test".into(),
-            wit_world_version: "bedrock:controller@1.0.0".into(),
-            model_digest: "test".into(),
-            calibration_digest: "test".into(),
-            manifest_digest: "test".into(),
-            execution_mode: ExecutionMode::Verify,
-            compiler_version: "wasmtime".into(),
-            embodiment_family: None,
-        },
-        wit_world: "tick-controller".into(),
-        verifier_result: None,
-    }
-}
 
 /// WASM controller sends velocity commands through GrpcActuatorSink → bridge → Gazebo.
 ///
@@ -71,20 +43,7 @@ async fn wasm_velocity_reaches_gazebo_via_grpc() {
         tokio::runtime::Handle::current(),
     );
 
-    // WASM that uses the tick contract to output velocity 0.42.
-    let output_json = br#"{"command_values":[0.42],"estop":false,"metrics":[]}"#;
-    let len = output_json.len();
-    let data_hex: String = output_json.iter().map(|b| format!("\\{b:02x}")).collect();
-    let wat = format!(
-        r#"(module
-            (import "tick" "set_output" (func $sout (param i32 i32)))
-            (memory (export "memory") 1)
-            (data (i32.const 256) "{data_hex}")
-            (func (export "process") (param i64)
-                (call $sout (i32.const 256) (i32.const {len}))
-            )
-        )"#
-    );
+    let wat = live_controller_support::constant_output_controller_wat(&[0.42]);
 
     let (tx, rx) = std::sync::mpsc::sync_channel(64);
     let (_emergency_tx, emergency_rx) = std::sync::mpsc::sync_channel(1);
@@ -96,7 +55,7 @@ async fn wasm_velocity_reaches_gazebo_via_grpc() {
     let sd = Arc::clone(&shutdown);
 
     let handle = std::thread::spawn(move || {
-        roz_copper::controller::run_controller_loop(
+        roz_copper::controller::run_controller_loop_with_compatibility_fallback(
             &rx,
             &s,
             1.5,
@@ -110,13 +69,45 @@ async fn wasm_velocity_reaches_gazebo_via_grpc() {
     });
 
     // Load WASM controller via artifact.
-    let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-    tx.send(ControllerCommand::LoadArtifact(
-        Box::new(test_artifact()),
-        wat.into_bytes(),
-        manifest,
-    ))
+    let mut control_manifest = roz_core::embodiment::binding::ControlInterfaceManifest {
+        version: 1,
+        manifest_digest: String::new(),
+        channels: vec![roz_core::embodiment::binding::ControlChannelDef {
+            name: "joint0/velocity".into(),
+            interface_type: roz_core::embodiment::binding::CommandInterfaceType::JointVelocity,
+            units: "rad/s".into(),
+            frame_id: "joint0_link".into(),
+        }],
+        bindings: vec![roz_core::embodiment::binding::ChannelBinding {
+            physical_name: "joint0".into(),
+            channel_index: 0,
+            binding_type: roz_core::embodiment::binding::BindingType::JointVelocity,
+            frame_id: "joint0_link".into(),
+            units: "rad/s".into(),
+            semantic_role: None,
+        }],
+    };
+    control_manifest.stamp_digest();
+    let embodiment_runtime = live_controller_support::compile_test_embodiment_runtime(&control_manifest);
+    let (artifact, component_bytes) = live_controller_support::build_live_artifact(
+        "e2e-actuator",
+        wat.as_bytes(),
+        &control_manifest,
+        &embodiment_runtime,
+    );
+    tx.send(
+        ControllerCommand::load_artifact_with_embodiment_runtime(
+            artifact,
+            component_bytes,
+            &control_manifest,
+            &embodiment_runtime,
+        )
+        .into_runtime()
+        .expect("prepare runtime command"),
+    )
     .unwrap();
+    tx.send(roz_copper::channels::CopperRuntimeCommand::PromoteActive)
+        .unwrap();
 
     // Let it tick for 500ms — sends ~50 velocity commands to the bridge.
     tokio::time::sleep(Duration::from_millis(500)).await;

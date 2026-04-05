@@ -4,7 +4,7 @@
 use chrono::Utc;
 use roz_core::embodiment::prediction::PredictionEvidence;
 use roz_core::interfaces::WorldModelPredictor;
-use roz_core::spatial::SpatialContext;
+use roz_core::spatial::WorldState;
 
 /// Configuration for world model verification.
 pub struct WorldModelVerifierConfig {
@@ -35,7 +35,7 @@ pub struct WorldModelResult {
 /// Run world model predictions for a controller evaluation.
 pub fn evaluate_with_world_model(
     predictor: &dyn WorldModelPredictor,
-    history: &[SpatialContext],
+    history: &[WorldState],
     proposed_actions: &[Vec<f64>],
     controller_id: &str,
     config: &WorldModelVerifierConfig,
@@ -95,7 +95,7 @@ mod tests {
     impl WorldModelPredictor for MockPredictor {
         fn predict(
             &self,
-            _history: &[SpatialContext],
+            _history: &[WorldState],
             _actions: &[Vec<f64>],
             _horizon_ticks: u32,
         ) -> Result<Vec<PredictedState>, Box<dyn std::error::Error + Send + Sync>> {
@@ -108,7 +108,7 @@ mod tests {
     impl WorldModelPredictor for ErrorPredictor {
         fn predict(
             &self,
-            _history: &[SpatialContext],
+            _history: &[WorldState],
             _actions: &[Vec<f64>],
             _horizon_ticks: u32,
         ) -> Result<Vec<PredictedState>, Box<dyn std::error::Error + Send + Sync>> {

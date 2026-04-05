@@ -17,7 +17,9 @@ pub mod ci;
 pub mod controller;
 pub mod controller_adapter;
 pub mod controller_lifecycle;
+#[doc(hidden)]
 pub mod deployment_manager;
+pub mod evidence_archive;
 pub mod evidence_collector;
 #[cfg(feature = "gazebo")]
 pub mod gazebo_cmd;
@@ -38,4 +40,5 @@ pub mod tick_builder;
 pub mod tick_contract;
 pub mod tick_dispatch;
 pub mod wasm;
+pub mod wit_bindings;
 pub mod wit_host;

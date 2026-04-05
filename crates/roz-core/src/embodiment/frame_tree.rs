@@ -195,6 +195,28 @@ impl FrameTree {
         Ok(())
     }
 
+    /// Override the transform of any existing frame, including static frames.
+    ///
+    /// This is intended for snapshot/replay reconstruction where a point-in-time
+    /// graph needs to materialize caller-supplied dynamic state on top of the
+    /// compiled tree without mutating the canonical runtime model.
+    pub fn overlay_transform(
+        &mut self,
+        frame_id: &str,
+        transform: Transform3D,
+        source: Option<FrameSource>,
+    ) -> Result<(), FrameTreeError> {
+        let node = self
+            .frames
+            .get_mut(frame_id)
+            .ok_or_else(|| FrameTreeError::FrameNotFound(frame_id.to_string()))?;
+        node.static_transform = transform;
+        if let Some(source) = source {
+            node.source = source;
+        }
+        Ok(())
+    }
+
     /// Look up the transform from `from` frame to `to` frame.
     /// Returns `T_from_to` such that `p_to = T_from_to * p_from`.
     ///

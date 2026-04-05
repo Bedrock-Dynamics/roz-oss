@@ -83,13 +83,14 @@ impl RuleCheck for TickLatencyCheck {
     }
 
     fn check(&self, evidence: &ControllerEvidenceBundle) -> CheckResult {
-        if evidence.tick_latency_p99_us <= self.p99_budget_us {
+        if evidence.tick_latency_p99.as_micros() <= self.p99_budget_us {
             CheckResult::Pass
         } else {
             CheckResult::Fail {
                 reason: format!(
                     "p99 tick latency {}µs exceeds budget of {}µs",
-                    evidence.tick_latency_p99_us, self.p99_budget_us
+                    evidence.tick_latency_p99.as_micros(),
+                    self.p99_budget_us
                 ),
                 severity: FailureSeverity::Warning,
             }
@@ -185,7 +186,7 @@ impl RuleCheck for OscillationCheck {
     }
 
     fn check(&self, evidence: &ControllerEvidenceBundle) -> CheckResult {
-        if evidence.stability.command_oscillation_detected {
+        if evidence.controller_stability_summary.command_oscillation_detected {
             CheckResult::Fail {
                 reason: "command oscillation detected — controller output is unstable".to_string(),
                 severity: FailureSeverity::Critical,
@@ -205,7 +206,7 @@ impl RuleCheck for SteadyStateCheck {
     }
 
     fn check(&self, evidence: &ControllerEvidenceBundle) -> CheckResult {
-        if evidence.stability.steady_state_reached {
+        if evidence.controller_stability_summary.steady_state_reached {
             CheckResult::Pass
         } else {
             CheckResult::Fail {

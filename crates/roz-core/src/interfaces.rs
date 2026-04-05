@@ -3,7 +3,7 @@
 use crate::edge_health::EdgeTransportHealth;
 use crate::embodiment::prediction::PredictedState;
 use crate::memory::MemoryEntry;
-use crate::spatial::SpatialContext;
+use crate::spatial::WorldState;
 
 /// Adapter for edge transport (Zenoh, NATS, etc.).
 pub trait EdgeAdapter: Send + Sync {
@@ -43,7 +43,7 @@ pub trait SharedBlackboard: Send + Sync {
 pub trait WorldModelPredictor: Send + Sync {
     fn predict(
         &self,
-        history: &[SpatialContext],
+        history: &[WorldState],
         actions: &[Vec<f64>],
         horizon_ticks: u32,
     ) -> Result<Vec<PredictedState>, Box<dyn std::error::Error + Send + Sync>>;

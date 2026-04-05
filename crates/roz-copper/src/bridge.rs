@@ -81,6 +81,8 @@ mod tests {
             restate_url: "http://localhost:8080".to_owned(),
             traceparent: None,
             phases: vec![],
+            control_interface_manifest: None,
+            delegation_scope: None,
         };
 
         let result = bridge.execute_task(&invocation);

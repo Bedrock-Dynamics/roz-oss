@@ -5,6 +5,11 @@ use std::fmt::Write;
 
 use serde::{Deserialize, Serialize};
 
+/// Validation issue stamped onto channel-only runtimes synthesized from
+/// `robot.toml`. These runtimes are transitional helpers, not authoritative
+/// embodiment authority for live controller promotion.
+pub const SYNTHETIC_EMBODIMENT_RUNTIME_ISSUE: &str = "embodiment runtime synthesized from robot.toml channel metadata";
+
 /// Top-level manifest parsed from `robot.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RobotManifest {
@@ -19,7 +24,9 @@ pub struct RobotManifest {
     /// Safety parameters.
     pub safety: Option<SafetyConfig>,
     /// Channel manifest for the WASM controller interface.
-    /// If present, used to build the [`crate::channels::ChannelManifest`] for this robot.
+    /// If present, prefer projecting this into the canonical
+    /// `ControlInterfaceManifest`; the legacy runtime manifest is retained only
+    /// for compatibility with older Copper surfaces.
     pub channels: Option<ChannelConfig>,
     /// Daemon REST/WebSocket configuration for agent tools.
     pub daemon: Option<DaemonConfig>,
@@ -69,11 +76,12 @@ pub struct Sensor {
 
 /// Channel configuration section of `robot.toml`.
 ///
-/// Maps directly to [`crate::channels::ChannelManifest`] via
-/// [`RobotManifest::channel_manifest`].
+/// Supports both the legacy runtime manifest projection
+/// and the canonical [`crate::embodiment::binding::ControlInterfaceManifest`]
+/// projection exposed by [`RobotManifest`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelConfig {
-    /// Robot identifier (matches `ChannelManifest::robot_id`).
+    /// Robot identifier for the legacy runtime manifest.
     pub robot_id: String,
     /// Robot class (e.g. `"manipulator"`, `"expressive"`, `"drone"`).
     pub robot_class: String,
@@ -97,6 +105,12 @@ pub struct ChannelDef {
     pub interface_type: String,
     /// Physical unit string (e.g. `"rad"`, `"m"`, `"rad/s"`).
     pub unit: String,
+    /// Coordinate frame this channel is expressed in.
+    ///
+    /// Optional for legacy manifests; omitted values currently degrade to
+    /// the empty string and should be filled explicitly in new manifests.
+    #[serde(default)]
+    pub frame_id: String,
     /// `[min, max]` value limits.
     pub limits: [f64; 2],
     /// Safe default value (usually `0.0`).
@@ -203,6 +217,53 @@ pub fn is_valid_channel_name(name: &str) -> bool {
         && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
 }
 
+fn warn_if_invalid_channel_name(name: &str) {
+    if !is_valid_channel_name(name) {
+        tracing::warn!(
+            "channel name '{}' contains invalid characters — must be [a-zA-Z][a-zA-Z0-9_]{{0,63}}",
+            name
+        );
+    }
+}
+
+fn parse_interface_type(
+    name: &str,
+    interface_type: &str,
+) -> Option<(
+    crate::channels::InterfaceType,
+    crate::embodiment::binding::CommandInterfaceType,
+    crate::embodiment::binding::BindingType,
+)> {
+    use crate::channels::InterfaceType;
+    use crate::embodiment::binding::{BindingType, CommandInterfaceType};
+
+    warn_if_invalid_channel_name(name);
+    match interface_type {
+        "position" => Some((
+            InterfaceType::Position,
+            CommandInterfaceType::JointPosition,
+            BindingType::JointPosition,
+        )),
+        "velocity" => Some((
+            InterfaceType::Velocity,
+            CommandInterfaceType::JointVelocity,
+            BindingType::JointVelocity,
+        )),
+        "effort" => Some((
+            InterfaceType::Effort,
+            CommandInterfaceType::JointTorque,
+            BindingType::Command,
+        )),
+        other => {
+            tracing::warn!(
+                channel = %name,
+                "unknown interface_type in robot.toml: {other:?}, skipping channel"
+            );
+            None
+        }
+    }
+}
+
 impl RobotManifest {
     /// Load a `RobotManifest` from a `robot.toml` file.
     ///
@@ -215,37 +276,26 @@ impl RobotManifest {
         Ok(manifest)
     }
 
-    /// Build a [`crate::channels::ChannelManifest`] from the `[channels]` section.
+    /// Build a legacy runtime manifest from the `[channels]` section.
     ///
     /// Returns `None` if no `[channels]` section is present in the manifest.
     ///
     /// Channels with an unrecognised `interface_type` are skipped with a warning
     /// rather than panicking, so callers always get a best-effort manifest.
+    ///
+    /// Prefer [`Self::control_interface_manifest`] on production paths. This
+    /// legacy projection remains only for compatibility with older Copper
+    /// entrypoints that still consume the legacy shape.
+    #[doc(hidden)]
+    #[deprecated(note = "compatibility-only projection; prefer control_interface_manifest")]
     #[must_use]
-    pub fn channel_manifest(&self) -> Option<crate::channels::ChannelManifest> {
-        use crate::channels::{ChannelDescriptor, ChannelManifest, InterfaceType};
+    pub fn legacy_runtime_manifest(&self) -> Option<crate::channels::LegacyRuntimeManifest> {
+        use crate::channels::{ChannelDescriptor, LegacyRuntimeManifest};
 
         let ch = self.channels.as_ref()?;
 
         let convert = |def: &ChannelDef| -> Option<ChannelDescriptor> {
-            if !is_valid_channel_name(&def.name) {
-                tracing::warn!(
-                    "channel name '{}' contains invalid characters — must be [a-zA-Z][a-zA-Z0-9_]{{0,63}}",
-                    def.name
-                );
-            }
-            let interface_type = match def.interface_type.as_str() {
-                "position" => InterfaceType::Position,
-                "velocity" => InterfaceType::Velocity,
-                "effort" => InterfaceType::Effort,
-                other => {
-                    tracing::warn!(
-                        channel = %def.name,
-                        "unknown interface_type in robot.toml: {other:?}, skipping channel"
-                    );
-                    return None;
-                }
-            };
+            let (interface_type, _, _) = parse_interface_type(&def.name, &def.interface_type)?;
             Some(ChannelDescriptor {
                 name: def.name.clone(),
                 interface_type,
@@ -268,12 +318,206 @@ impl RobotManifest {
             })
         };
 
-        Some(ChannelManifest {
+        Some(LegacyRuntimeManifest {
             robot_id: ch.robot_id.clone(),
             robot_class: ch.robot_class.clone(),
             control_rate_hz: ch.control_rate_hz,
             commands: ch.commands.iter().filter_map(&convert).collect(),
             states: ch.states.iter().filter_map(&convert).collect(),
+        })
+    }
+
+    /// Build a canonical [`crate::embodiment::binding::ControlInterfaceManifest`]
+    /// from the `[channels]` section.
+    ///
+    /// This avoids routing local/control surfaces through the lossy legacy
+    /// legacy runtime manifest shape when only the controller I/O contract is needed.
+    ///
+    /// Returns `None` if no `[channels]` section is present in the manifest.
+    #[must_use]
+    pub fn control_interface_manifest(&self) -> Option<crate::embodiment::binding::ControlInterfaceManifest> {
+        use crate::embodiment::binding::{
+            BindingType, ChannelBinding, CommandInterfaceType, ControlChannelDef, ControlInterfaceManifest,
+        };
+
+        let ch = self.channels.as_ref()?;
+
+        let command_defs: Vec<(&ChannelDef, CommandInterfaceType, BindingType)> = ch
+            .commands
+            .iter()
+            .filter_map(|def| {
+                let (_, interface_type, binding_type) = parse_interface_type(&def.name, &def.interface_type)?;
+                Some((def, interface_type, binding_type))
+            })
+            .collect();
+
+        let channels: Vec<ControlChannelDef> = command_defs
+            .iter()
+            .map(|(def, interface_type, _)| ControlChannelDef {
+                name: def.name.clone(),
+                interface_type: interface_type.clone(),
+                units: def.unit.clone(),
+                frame_id: def.frame_id.clone(),
+            })
+            .collect();
+
+        let bindings: Vec<ChannelBinding> = command_defs
+            .iter()
+            .enumerate()
+            .map(|(channel_index, (def, _, binding_type))| ChannelBinding {
+                physical_name: (*def).name.clone(),
+                channel_index: channel_index as u32,
+                binding_type: binding_type.clone(),
+                frame_id: def.frame_id.clone(),
+                units: (*def).unit.clone(),
+                semantic_role: None,
+            })
+            .collect();
+
+        let mut manifest = ControlInterfaceManifest {
+            version: 1,
+            manifest_digest: String::new(),
+            channels,
+            bindings,
+        };
+        manifest.stamp_digest();
+        Some(manifest)
+    }
+
+    /// Build a minimal canonical [`crate::embodiment::EmbodimentRuntime`] from
+    /// `robot.toml` channel metadata.
+    ///
+    /// This is a transitional adapter for projects that only declare
+    /// `robot.toml` control channels today. It preserves canonical control
+    /// bindings and non-empty frame IDs so downstream helper code can stop
+    /// depending purely on placeholder digest tuples, but it is not
+    /// authoritative enough for live controller promotion.
+    ///
+    /// The synthesized model is intentionally conservative:
+    /// - root frame is `world`
+    /// - declared channel frame IDs become direct children of `world`
+    /// - joint records are inferred from joint-like channel bindings
+    #[must_use]
+    pub fn embodiment_runtime(&self) -> Option<crate::embodiment::EmbodimentRuntime> {
+        use std::collections::BTreeSet;
+
+        use crate::embodiment::binding::BindingType;
+        use crate::embodiment::frame_tree::{FrameSource, FrameTree, Transform3D};
+        use crate::embodiment::limits::JointSafetyLimits;
+        use crate::embodiment::model::{EmbodimentModel, Joint, JointType, Link};
+
+        let control_manifest = self.control_interface_manifest()?;
+
+        let mut frame_tree = FrameTree::new();
+        frame_tree.set_root("world", FrameSource::Static);
+
+        let mut links = vec![Link {
+            name: "world".into(),
+            parent_joint: None,
+            inertial: None,
+            visual_geometry: None,
+            collision_geometry: None,
+        }];
+        let mut watched_frames = vec!["world".to_string()];
+        let mut seen_frames = BTreeSet::from(["world".to_string()]);
+
+        for channel in &control_manifest.channels {
+            if channel.frame_id.is_empty() || !seen_frames.insert(channel.frame_id.clone()) {
+                continue;
+            }
+            let _ = frame_tree.add_frame(
+                &channel.frame_id,
+                "world",
+                Transform3D::identity(),
+                FrameSource::Dynamic,
+            );
+            links.push(Link {
+                name: channel.frame_id.clone(),
+                parent_joint: None,
+                inertial: None,
+                visual_geometry: None,
+                collision_geometry: None,
+            });
+            watched_frames.push(channel.frame_id.clone());
+        }
+
+        let joints: Vec<Joint> = control_manifest
+            .bindings
+            .iter()
+            .filter_map(|binding| {
+                let joint_type = match binding.binding_type {
+                    BindingType::JointPosition => JointType::Revolute,
+                    BindingType::JointVelocity => JointType::Continuous,
+                    BindingType::Command => JointType::Continuous,
+                    BindingType::GripperPosition => JointType::Prismatic,
+                    BindingType::GripperForce => JointType::Prismatic,
+                    BindingType::ForceTorque
+                    | BindingType::ImuOrientation
+                    | BindingType::ImuAngularVelocity
+                    | BindingType::ImuLinearAcceleration => return None,
+                };
+
+                Some(Joint {
+                    name: binding.physical_name.clone(),
+                    joint_type,
+                    parent_link: "world".into(),
+                    child_link: if binding.frame_id.is_empty() {
+                        "world".into()
+                    } else {
+                        binding.frame_id.clone()
+                    },
+                    axis: [0.0, 0.0, 1.0],
+                    origin: Transform3D::identity(),
+                    limits: JointSafetyLimits {
+                        joint_name: binding.physical_name.clone(),
+                        max_velocity: f64::INFINITY,
+                        max_acceleration: f64::INFINITY,
+                        max_jerk: f64::INFINITY,
+                        position_min: f64::NEG_INFINITY,
+                        position_max: f64::INFINITY,
+                        max_torque: None,
+                    },
+                })
+            })
+            .collect();
+
+        let model = EmbodimentModel {
+            model_id: self.robot.name.clone(),
+            model_digest: String::new(),
+            embodiment_family: None,
+            links,
+            joints,
+            frame_tree,
+            collision_bodies: Vec::new(),
+            allowed_collision_pairs: Vec::new(),
+            tcps: Vec::new(),
+            sensor_mounts: Vec::new(),
+            workspace_zones: Vec::new(),
+            watched_frames,
+            channel_bindings: control_manifest.bindings.clone(),
+        };
+        let mut runtime = crate::embodiment::EmbodimentRuntime::compile(model, None, None);
+        runtime
+            .validation_issues
+            .push(SYNTHETIC_EMBODIMENT_RUNTIME_ISSUE.into());
+        runtime.validation_issues.sort();
+        runtime.validation_issues.dedup();
+        Some(runtime)
+    }
+
+    /// Return an embodiment runtime only when `robot.toml` carries
+    /// controller-authoritative embodiment data.
+    ///
+    /// The current channel-only `robot.toml` shape synthesizes a placeholder
+    /// runtime for compatibility helpers, so this method intentionally fails
+    /// closed until a real embodiment source is available.
+    #[must_use]
+    pub fn authoritative_embodiment_runtime(&self) -> Option<crate::embodiment::EmbodimentRuntime> {
+        self.embodiment_runtime().filter(|runtime| {
+            !runtime
+                .validation_issues
+                .iter()
+                .any(|issue| issue == SYNTHETIC_EMBODIMENT_RUNTIME_ISSUE)
         })
     }
 
@@ -376,6 +620,7 @@ watchdog_timeout_ms = 500
     }
 
     #[test]
+    #[allow(deprecated)]
     fn channel_manifest_from_robot_toml() {
         let toml_str = r#"
 [robot]
@@ -401,7 +646,7 @@ unit = "rad"
 limits = [-1.0, 1.0]
 "#;
         let manifest: RobotManifest = toml::from_str(toml_str).unwrap();
-        let ch = manifest.channel_manifest().unwrap();
+        let ch = manifest.legacy_runtime_manifest().unwrap();
         assert_eq!(ch.robot_id, "test");
         assert_eq!(ch.control_rate_hz, 50);
         assert_eq!(ch.commands.len(), 1);
@@ -412,12 +657,136 @@ limits = [-1.0, 1.0]
     }
 
     #[test]
+    #[allow(deprecated)]
     fn channel_manifest_none_when_no_channels_section() {
         let manifest: RobotManifest = toml::from_str(EXAMPLE_TOML).unwrap();
-        assert!(manifest.channel_manifest().is_none());
+        assert!(manifest.legacy_runtime_manifest().is_none());
     }
 
     #[test]
+    fn control_interface_manifest_from_robot_toml() {
+        let toml_str = r#"
+[robot]
+name = "test"
+description = "test"
+
+[channels]
+robot_id = "test"
+robot_class = "test"
+control_rate_hz = 50
+
+[[channels.commands]]
+name = "joint_velocity"
+type = "velocity"
+unit = "rad/s"
+frame_id = "shoulder_link"
+limits = [-1.0, 1.0]
+
+[[channels.commands]]
+name = "joint_effort"
+type = "effort"
+unit = "Nm"
+frame_id = "wrist_link"
+limits = [-5.0, 5.0]
+"#;
+        let manifest: RobotManifest = toml::from_str(toml_str).unwrap();
+        let control = manifest.control_interface_manifest().unwrap();
+        assert_eq!(control.version, 1);
+        assert_eq!(control.channels.len(), 2);
+        assert_eq!(control.bindings.len(), 2);
+        assert!(!control.manifest_digest.is_empty());
+        assert_eq!(
+            control.channels[0].interface_type,
+            crate::embodiment::binding::CommandInterfaceType::JointVelocity
+        );
+        assert_eq!(
+            control.bindings[1].binding_type,
+            crate::embodiment::binding::BindingType::Command
+        );
+        assert_eq!(control.channels[0].frame_id, "shoulder_link");
+        assert_eq!(control.bindings[1].frame_id, "wrist_link");
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn control_interface_manifest_matches_legacy_projection() {
+        let toml_str = r#"
+[robot]
+name = "test"
+description = "test"
+
+[channels]
+robot_id = "test"
+robot_class = "test"
+control_rate_hz = 100
+
+[[channels.commands]]
+name = "a_position"
+type = "position"
+unit = "rad"
+limits = [-3.14, 3.14]
+
+[[channels.commands]]
+name = "b_velocity"
+type = "velocity"
+unit = "rad/s"
+limits = [-2.0, 2.0]
+"#;
+        let manifest: RobotManifest = toml::from_str(toml_str).unwrap();
+        let channel_manifest = manifest.legacy_runtime_manifest().unwrap();
+        let control_manifest = manifest.control_interface_manifest().unwrap();
+        assert!(
+            channel_manifest
+                .legacy_compatibility_issues_with_control_manifest(&control_manifest)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn embodiment_runtime_from_robot_toml_uses_canonical_channel_frames() {
+        let toml_str = r#"
+[robot]
+name = "test"
+description = "test"
+
+[channels]
+robot_id = "test"
+robot_class = "test"
+control_rate_hz = 100
+
+[[channels.commands]]
+name = "joint_velocity"
+type = "velocity"
+unit = "rad/s"
+frame_id = "shoulder_link"
+limits = [-1.0, 1.0]
+"#;
+        let manifest: RobotManifest = toml::from_str(toml_str).unwrap();
+        let runtime = manifest.embodiment_runtime().unwrap();
+        assert!(runtime.frame_graph.frame_exists("world"));
+        assert!(runtime.frame_graph.frame_exists("shoulder_link"));
+        assert!(runtime.watched_frames.iter().any(|frame| frame == "shoulder_link"));
+        assert_eq!(runtime.model.channel_bindings[0].frame_id, "shoulder_link");
+        assert!(
+            runtime
+                .validation_issues
+                .iter()
+                .any(|issue| issue.contains("synthesized from robot.toml"))
+        );
+        assert!(
+            manifest.authoritative_embodiment_runtime().is_none(),
+            "channel-only robot.toml must not be treated as authoritative embodiment runtime"
+        );
+    }
+
+    #[test]
+    fn control_interface_manifest_none_when_no_channels_section() {
+        let manifest: RobotManifest = toml::from_str(EXAMPLE_TOML).unwrap();
+        assert!(manifest.control_interface_manifest().is_none());
+    }
+
+    #[test]
+    #[allow(deprecated)]
     fn channel_manifest_with_max_delta_from() {
         let toml_str = r#"
 [robot]
@@ -443,7 +812,7 @@ unit = "rad"
 limits = [-3.14, 3.14]
 "#;
         let manifest: RobotManifest = toml::from_str(toml_str).unwrap();
-        let ch = manifest.channel_manifest().unwrap();
+        let ch = manifest.legacy_runtime_manifest().unwrap();
         assert_eq!(ch.commands[0].max_delta_from, Some((1, 1.5)));
         assert_eq!(ch.commands[1].max_delta_from, None);
     }

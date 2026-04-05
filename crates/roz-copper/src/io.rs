@@ -1,6 +1,7 @@
 //! Pluggable IO traits for the controller loop.
 
 use roz_core::command::CommandFrame;
+use roz_core::embodiment::FrameSnapshotInput;
 use roz_core::spatial::EntityState;
 
 /// Sensor data received each tick.
@@ -14,6 +15,8 @@ pub struct SensorFrame {
     pub joint_velocities: Vec<f64>,
     /// Simulation time in nanoseconds.
     pub sim_time_ns: i64,
+    /// Typed runtime snapshot input carried with this sensor frame.
+    pub frame_snapshot_input: FrameSnapshotInput,
 }
 
 /// Delivers clamped command frames to hardware or simulation.

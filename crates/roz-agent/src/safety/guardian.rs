@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use roz_core::safety::SafetyVerdict;
-use roz_core::spatial::SpatialContext;
+use roz_core::spatial::WorldState;
 use roz_core::tools::ToolCall;
 
 use crate::model::{CompletionRequest, ContentPart, Message, Model};
@@ -41,7 +41,7 @@ Rules:\n\
 - Allow read-only or informational calls.\n\
 - When in doubt, block and explain why.";
 
-fn build_evaluation_prompt(action: &ToolCall, state: &SpatialContext) -> String {
+fn build_evaluation_prompt(action: &ToolCall, state: &WorldState) -> String {
     let params = serde_json::to_string_pretty(&action.params).unwrap_or_default();
 
     let entity_summary: Vec<String> = state
@@ -73,7 +73,7 @@ impl SafetyGuard for LlmGuardian {
         "llm_guardian"
     }
 
-    async fn check(&self, action: &ToolCall, state: &SpatialContext) -> SafetyVerdict {
+    async fn check(&self, action: &ToolCall, state: &WorldState) -> SafetyVerdict {
         let user_prompt = build_evaluation_prompt(action, state);
 
         let request = CompletionRequest {
@@ -207,16 +207,14 @@ mod tests {
     #[tokio::test]
     async fn safe_action_returns_allow() {
         let guard = LlmGuardian::new(Box::new(MockGuardianModel::safe()));
-        let result = guard
-            .check(&test_action("read_sensor"), &SpatialContext::default())
-            .await;
+        let result = guard.check(&test_action("read_sensor"), &WorldState::default()).await;
         assert_eq!(result, SafetyVerdict::Allow);
     }
 
     #[tokio::test]
     async fn unsafe_action_returns_block() {
         let guard = LlmGuardian::new(Box::new(MockGuardianModel::unsafe_action()));
-        let result = guard.check(&test_action("move_arm"), &SpatialContext::default()).await;
+        let result = guard.check(&test_action("move_arm"), &WorldState::default()).await;
         match result {
             SafetyVerdict::Block { reason } => {
                 assert!(reason.contains("collide"), "reason should mention collision: {reason}");
@@ -228,7 +226,7 @@ mod tests {
     #[tokio::test]
     async fn unparseable_response_blocks_defensively() {
         let guard = LlmGuardian::new(Box::new(MockGuardianModel::garbage()));
-        let result = guard.check(&test_action("move_arm"), &SpatialContext::default()).await;
+        let result = guard.check(&test_action("move_arm"), &WorldState::default()).await;
         match result {
             SafetyVerdict::Block { reason } => {
                 assert!(reason.contains("unparseable"), "reason: {reason}");
@@ -240,7 +238,7 @@ mod tests {
     #[tokio::test]
     async fn model_failure_blocks_defensively() {
         let guard = LlmGuardian::new(Box::new(FailingModel));
-        let result = guard.check(&test_action("move_arm"), &SpatialContext::default()).await;
+        let result = guard.check(&test_action("move_arm"), &WorldState::default()).await;
         match result {
             SafetyVerdict::Block { reason } => {
                 assert!(reason.contains("guardian model error"), "reason: {reason}");
@@ -252,7 +250,7 @@ mod tests {
     #[test]
     fn build_prompt_includes_tool_and_params() {
         let action = test_action("move_arm");
-        let prompt = build_evaluation_prompt(&action, &SpatialContext::default());
+        let prompt = build_evaluation_prompt(&action, &WorldState::default());
         assert!(prompt.contains("move_arm"));
         assert!(prompt.contains("5.0"));
     }
@@ -260,7 +258,7 @@ mod tests {
     #[test]
     fn build_prompt_includes_entities() {
         let action = test_action("move_arm");
-        let state = SpatialContext {
+        let state = WorldState {
             entities: vec![roz_core::spatial::EntityState {
                 id: "robot-1".into(),
                 kind: "arm".into(),
@@ -269,7 +267,7 @@ mod tests {
                 velocity: Some([0.0, 0.0, 0.0]),
                 properties: Default::default(),
                 timestamp_ns: None,
-                frame_id: None,
+                frame_id: "world".into(),
                 ..Default::default()
             }],
             ..Default::default()

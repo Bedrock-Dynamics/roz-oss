@@ -71,6 +71,12 @@ impl EventEmitter {
         self.tx.subscribe()
     }
 
+    /// Current correlation group for newly-emitted events.
+    #[must_use]
+    pub fn correlation_id(&self) -> CorrelationId {
+        self.correlation_id.clone()
+    }
+
     /// Start a new correlation group (e.g., for a new turn).
     ///
     /// Subsequent events will carry the new `CorrelationId`.
@@ -88,8 +94,10 @@ mod tests {
     fn lifecycle_event() -> SessionEvent {
         SessionEvent::SessionStarted {
             session_id: "sess-1".into(),
-            mode: SessionMode::LocalCanonical,
+            mode: SessionMode::Local,
             blueprint_version: "0.1.0".into(),
+            model_name: None,
+            permissions: vec![],
         }
     }
 

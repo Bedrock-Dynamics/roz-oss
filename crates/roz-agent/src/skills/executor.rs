@@ -5,7 +5,7 @@ use roz_core::skills::SkillKind;
 use roz_core::tools::ToolCategory;
 use serde::{Deserialize, Serialize};
 
-use crate::agent_loop::{AgentInput, AgentLoop, AgentLoopMode};
+use crate::agent_loop::{AgentInput, AgentInputSeed, AgentLoop, AgentLoopMode};
 use crate::bt::registry::ExecutorRegistry;
 use crate::dispatch::ToolDispatcher;
 use crate::error::AgentError;
@@ -66,8 +66,11 @@ impl SkillExecutor {
             task_id: req.task_id.to_string(),
             tenant_id: req.tenant_id.to_string(),
             model_name: String::new(),
-            system_prompt: vec![req.system_prompt.to_string()],
-            user_message: req.user_message.to_string(),
+            seed: AgentInputSeed::new(
+                vec![req.system_prompt.to_string()],
+                Vec::new(),
+                req.user_message.to_string(),
+            ),
             max_cycles: 10,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -76,7 +79,6 @@ impl SkillExecutor {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -139,7 +141,7 @@ mod tests {
     use crate::spatial_provider::MockSpatialContextProvider;
     use roz_core::bt::skill_def::{ConditionSet, HardwareSpec};
     use roz_core::bt::tree::TreeNode;
-    use roz_core::spatial::{EntityState, SpatialContext};
+    use roz_core::spatial::{EntityState, WorldState};
     use serde_json::json;
     use std::collections::HashMap;
     use std::time::Duration;
@@ -180,7 +182,7 @@ mod tests {
         let json = serde_json::to_string(&ExecutionStrategy::AgentLoopReAct).unwrap();
         assert_eq!(json, "\"agent_loop_re_act\"");
         let json = serde_json::to_string(&ExecutionStrategy::AgentLoopOodaReAct).unwrap();
-        assert_eq!(json, "\"agent_loop_ooda_re_act\"");
+        assert_eq!(json, "\"agent_loop_ooda_react\"");
     }
 
     #[test]
@@ -282,7 +284,7 @@ mod tests {
             roz_core::tools::ToolResult::success(json!({"status": "ok"})),
         )));
         let safety = SafetyStack::new(vec![]);
-        let spatial_ctx = SpatialContext {
+        let spatial_ctx = WorldState {
             entities: vec![EntityState {
                 id: "arm_1".to_string(),
                 kind: "robot_arm".to_string(),
@@ -291,7 +293,7 @@ mod tests {
                 velocity: None,
                 properties: HashMap::new(),
                 timestamp_ns: None,
-                frame_id: None,
+                frame_id: "world".into(),
                 ..Default::default()
             }],
             relations: vec![],

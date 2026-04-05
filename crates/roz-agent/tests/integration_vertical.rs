@@ -2,7 +2,7 @@
 //!
 //! Run: cargo test -p roz-agent --test integration_vertical
 
-use roz_agent::agent_loop::{AgentInput, AgentLoop, AgentLoopMode};
+use roz_agent::agent_loop::{AgentInput, AgentInputSeed, AgentLoop, AgentLoopMode};
 use roz_agent::dispatch::ToolDispatcher;
 use roz_agent::model::FallbackChain;
 use roz_agent::model::types::*;
@@ -27,8 +27,7 @@ fn build_input(system_prompt: Vec<String>, user_message: &str) -> AgentInput {
         task_id: "test-1".to_string(),
         tenant_id: "test".to_string(),
         model_name: String::new(),
-        system_prompt,
-        user_message: user_message.to_string(),
+        seed: AgentInputSeed::new(system_prompt, Vec::new(), user_message.to_string()),
         max_cycles: 10,
         max_tokens: 4096,
         max_context_tokens: 200_000,
@@ -37,7 +36,6 @@ fn build_input(system_prompt: Vec<String>, user_message: &str) -> AgentInput {
         tool_choice: None,
         response_schema: None,
         streaming: false,
-        history: vec![],
         cancellation_token: None,
         control_mode: roz_core::safety::ControlMode::default(),
     }

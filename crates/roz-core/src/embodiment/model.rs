@@ -171,6 +171,10 @@ pub struct EmbodimentModel {
     pub tcps: Vec<ToolCenterPoint>,
     pub sensor_mounts: Vec<SensorMount>,
     pub workspace_zones: Vec<WorkspaceZone>,
+    /// Runtime-owned frame subset that should be surfaced into snapshots,
+    /// replay, and controller-facing watched-pose projection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watched_frames: Vec<String>,
     /// Channel bindings mapping physical names to control interface indices.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub channel_bindings: Vec<crate::embodiment::binding::ChannelBinding>,
@@ -224,6 +228,20 @@ impl EmbodimentModel {
     #[must_use]
     pub fn get_tcp(&self, name: &str) -> Option<&ToolCenterPoint> {
         self.tcps.iter().find(|t| t.name == name)
+    }
+
+    /// Whether the model explicitly declares a runtime-owned watched-frame set.
+    #[must_use]
+    pub fn has_declared_watched_frames(&self) -> bool {
+        !self.watched_frames.is_empty()
+    }
+
+    /// Whether a collision pair is explicitly allowed by the model.
+    #[must_use]
+    pub fn is_allowed_collision_pair(&self, left: &str, right: &str) -> bool {
+        self.allowed_collision_pairs
+            .iter()
+            .any(|(a, b)| (a == left && b == right) || (a == right && b == left))
     }
 }
 
@@ -338,6 +356,7 @@ mod tests {
                 zone_type: ZoneType::Allowed,
                 margin_m: 0.1,
             }],
+            watched_frames: vec!["world".into(), "base_link".into(), "shoulder_link".into()],
             channel_bindings: vec![],
         }
     }

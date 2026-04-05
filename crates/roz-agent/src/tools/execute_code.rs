@@ -65,6 +65,18 @@ fn compile_rust_to_wasm(_code: &str) -> Result<Vec<u8>, String> {
 /// and optionally verifies it by running ticks in the WASM sandbox.
 pub struct ExecuteCodeTool;
 
+fn control_manifest_from_ctx(
+    ctx: &ToolContext,
+) -> Result<roz_core::embodiment::binding::ControlInterfaceManifest, Box<dyn std::error::Error + Send + Sync>> {
+    ctx.extensions
+        .get::<roz_core::embodiment::binding::ControlInterfaceManifest>()
+        .cloned()
+        .ok_or_else(|| {
+            "no ControlInterfaceManifest in ToolContext — configure the canonical robot control interface before executing code"
+                .into()
+        })
+}
+
 #[async_trait]
 impl TypedToolExecutor for ExecuteCodeTool {
     type Input = ExecuteCodeInput;
@@ -101,16 +113,8 @@ impl TypedToolExecutor for ExecuteCodeTool {
         }
 
         // Read manifest from context — no UR5 fallback.
-        let manifest = ctx
-            .extensions
-            .get::<roz_core::channels::ChannelManifest>()
-            .cloned()
-            .ok_or_else(|| {
-                Box::<dyn std::error::Error + Send + Sync>::from(
-                    "no ChannelManifest in ToolContext — configure the robot type before executing code",
-                )
-            })?;
-        let host_ctx = roz_copper::wit_host::HostContext::with_manifest(manifest);
+        let control_manifest = control_manifest_from_ctx(ctx)?;
+        let host_ctx = roz_copper::wit_host::HostContext::with_control_manifest(&control_manifest);
         let wasm_result = roz_copper::wasm::CuWasmTask::from_source_with_host(input.code.as_bytes(), host_ctx);
         let mut task = match wasm_result {
             Ok(t) => t,
@@ -191,12 +195,37 @@ mod tests {
 
     use super::*;
 
+    fn compatible_control_manifest() -> roz_core::embodiment::binding::ControlInterfaceManifest {
+        let mut manifest = roz_core::embodiment::binding::ControlInterfaceManifest {
+            version: 1,
+            manifest_digest: String::new(),
+            channels: (0..6)
+                .map(|index| roz_core::embodiment::binding::ControlChannelDef {
+                    name: format!("joint{index}/velocity"),
+                    interface_type: roz_core::embodiment::binding::CommandInterfaceType::JointVelocity,
+                    units: "rad/s".into(),
+                    frame_id: format!("joint{index}_link"),
+                })
+                .collect(),
+            bindings: (0..6)
+                .map(|index| roz_core::embodiment::binding::ChannelBinding {
+                    physical_name: format!("joint{index}"),
+                    channel_index: index as u32,
+                    binding_type: roz_core::embodiment::binding::BindingType::JointVelocity,
+                    frame_id: format!("joint{index}_link"),
+                    units: "rad/s".into(),
+                    semantic_role: None,
+                })
+                .collect(),
+        };
+        manifest.stamp_digest();
+        manifest
+    }
+
     fn test_ctx() -> ToolContext {
         let mut ext = crate::dispatch::Extensions::new();
-        ext.insert(roz_core::channels::ChannelManifest::generic_velocity(
-            6,
-            std::f64::consts::PI,
-        ));
+        let control_manifest = compatible_control_manifest();
+        ext.insert(control_manifest);
         ToolContext {
             task_id: "test-task".to_string(),
             tenant_id: "test-tenant".to_string(),
@@ -357,5 +386,30 @@ mod tests {
             !output_str.contains("Warning") && !output_str.contains("rejected"),
             "clean tick contract module should not produce warnings, got: {output_str}"
         );
+    }
+
+    #[test]
+    fn control_manifest_from_ctx_prefers_canonical_manifest() {
+        let ctx = test_ctx();
+        let manifest = control_manifest_from_ctx(&ctx).expect("manifest resolution should succeed");
+        assert_eq!(manifest.version, 1);
+        assert_eq!(manifest.channels.len(), 6);
+        assert_eq!(manifest.channels[0].name, "joint0/velocity");
+    }
+
+    #[test]
+    fn control_manifest_from_ctx_accepts_control_manifest_without_legacy_fallback() {
+        let control_manifest = compatible_control_manifest();
+        let mut ext = crate::dispatch::Extensions::new();
+        ext.insert(control_manifest.clone());
+        let ctx = ToolContext {
+            task_id: "test-task".into(),
+            tenant_id: "test-tenant".into(),
+            call_id: String::new(),
+            extensions: ext,
+        };
+
+        let manifest = control_manifest_from_ctx(&ctx).expect("control manifest should resolve");
+        assert_eq!(manifest, control_manifest);
     }
 }

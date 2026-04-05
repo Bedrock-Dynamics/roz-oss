@@ -1,16 +1,81 @@
 //! Controller verification and validation checks.
 
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 
 /// The status of a verification check.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VerifierStatus {
+    #[serde(rename = "pending")]
     Pending,
+    #[serde(rename = "running")]
     Running,
+    #[serde(rename = "pass")]
     Complete,
+    #[serde(rename = "fail")]
     Failed,
+    #[serde(rename = "unavailable")]
     Unavailable,
+}
+
+impl VerifierStatus {
+    /// Stable wire label used for compatibility surfaces that still expose a string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Complete => "pass",
+            Self::Failed => "fail",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    /// Parse canonical verifier labels.
+    #[must_use]
+    pub fn from_wire_label(label: &str) -> Option<Self> {
+        match label {
+            "pending" => Some(Self::Pending),
+            "running" => Some(Self::Running),
+            "pass" => Some(Self::Complete),
+            "fail" => Some(Self::Failed),
+            "unavailable" => Some(Self::Unavailable),
+            _ => None,
+        }
+    }
+
+    /// Whether this status is a passing verifier outcome.
+    #[must_use]
+    pub const fn is_pass(self) -> bool {
+        matches!(self, Self::Complete)
+    }
+}
+
+impl std::fmt::Display for VerifierStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for VerifierStatus {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::from_wire_label(s).ok_or(())
+    }
+}
+
+impl From<&str> for VerifierStatus {
+    fn from(value: &str) -> Self {
+        Self::from_wire_label(value).unwrap_or(Self::Unavailable)
+    }
+}
+
+impl From<String> for VerifierStatus {
+    fn from(value: String) -> Self {
+        Self::from(value.as_str())
+    }
 }
 
 /// A single verification failure.
@@ -142,5 +207,13 @@ mod tests {
             let back: VerifierStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(s, back);
         }
+    }
+
+    #[test]
+    fn verifier_status_rejects_legacy_labels() {
+        assert!(serde_json::from_str::<VerifierStatus>("\"complete\"").is_err());
+        assert!(serde_json::from_str::<VerifierStatus>("\"failed\"").is_err());
+        assert_eq!(VerifierStatus::Complete.to_string(), "pass");
+        assert_eq!(VerifierStatus::Failed.to_string(), "fail");
     }
 }

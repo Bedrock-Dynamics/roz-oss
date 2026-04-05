@@ -31,11 +31,17 @@ mod tests {
             environment_id: "env-1".into(),
             host_id: Some("host-1".into()),
             timeout_secs: Some(300),
+            control_interface_manifest: None,
+            delegation_scope: None,
+            phases: vec![],
+            parent_task_id: None,
         };
         assert_eq!(req.prompt, "do something");
         assert_eq!(req.environment_id, "env-1");
         assert_eq!(req.host_id, Some("host-1".into()));
         assert_eq!(req.timeout_secs, Some(300));
+        assert!(req.phases.is_empty());
+        assert!(req.parent_task_id.is_none());
     }
 
     #[test]

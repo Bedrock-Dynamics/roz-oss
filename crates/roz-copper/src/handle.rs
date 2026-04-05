@@ -1,8 +1,11 @@
 //! Lifecycle manager for the Copper controller thread.
 //!
-//! `CopperHandle::spawn()` creates all channels, starts the command bridge,
-//! and spawns the controller loop on a dedicated thread. `shutdown()` stops
-//! everything cleanly.
+//! Production callers should either keep Copper in explicit execution-only
+//! mode via [`CopperHandle::spawn_execution_only`] or inject rollout policy
+//! explicitly via [`CopperHandle::spawn_with_deployment_manager`] or
+//! [`CopperHandle::spawn_with_io_and_deployment_manager`]. Compatibility
+//! fallback constructors remain available for legacy scaffolding but do not
+//! authorize staged rollout. `shutdown()` stops everything cleanly.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,17 +14,26 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use tokio::sync::mpsc;
 
-use crate::channels::{ControllerCommand, ControllerState};
+use crate::channels::{ControllerCommand, ControllerState, CopperRuntimeCommand};
+use crate::deployment_manager::DeploymentManager;
 
 /// Default agent watchdog timeout for production use.
 ///
 /// If the agent does not send any command within this duration, the controller
 /// autonomously halts and sends zero velocity to prevent unsupervised motion.
 const AGENT_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default execution-only policy for live controller loops that have no
+/// rollout authority delegated into Copper.
+const EXECUTION_ONLY_DEPLOYMENT_MANAGER: DeploymentManager = DeploymentManager::execution_only();
+/// Quarantined compatibility fallback retained only for legacy scaffolding.
+const COMPATIBILITY_DEPLOYMENT_MANAGER: DeploymentManager = DeploymentManager::compatibility_default();
 
 /// Handle to a running Copper controller loop.
 ///
-/// Created by [`spawn()`](Self::spawn), stopped by [`shutdown()`](Self::shutdown).
+/// Created by an explicit-policy spawn method, by the execution-only default
+/// spawn path, or by a compatibility fallback constructor when older
+/// scaffolding has not been migrated yet. Stopped by
+/// [`shutdown()`](Self::shutdown).
 ///
 /// On drop, sends `Halt` through a dedicated `std::sync::mpsc` emergency channel
 /// that bypasses the tokio bridge, ensuring the controller stops even if the async
@@ -30,7 +42,7 @@ pub struct CopperHandle {
     /// Agent-side sender for commands (tokio mpsc). `Option` so `shutdown()` can drop it.
     cmd_tx: Option<mpsc::Sender<ControllerCommand>>,
     /// Emergency halt sender (sync, bypasses tokio bridge). Capacity 1.
-    emergency_tx: std::sync::mpsc::SyncSender<ControllerCommand>,
+    emergency_tx: std::sync::mpsc::SyncSender<CopperRuntimeCommand>,
     /// Shared controller state (agent reads lock-free).
     state: Arc<ArcSwap<ControllerState>>,
     /// Shutdown flag for the controller thread.
@@ -46,86 +58,67 @@ pub struct CopperHandle {
 }
 
 impl CopperHandle {
+    #[doc(hidden)]
+    /// Spawn Copper with the quarantined compatibility fallback.
+    ///
+    /// This keeps the controller loop alive for older integrations but does
+    /// not grant rollout-policy authority. Production callers should prefer
+    /// [`spawn`](Self::spawn) for execution-only mode or
+    /// [`spawn_with_deployment_manager`](Self::spawn_with_deployment_manager)
+    /// when rollout authority is supplied by the runtime.
+    pub fn spawn_with_compatibility_fallback(max_velocity: f64) -> Self {
+        tracing::warn!(
+            "CopperHandle::spawn_with_compatibility_fallback is compatibility-only; staged rollout remains disabled"
+        );
+        Self::spawn_with_deployment_manager(max_velocity, COMPATIBILITY_DEPLOYMENT_MANAGER)
+    }
+
+    /// Spawn the full Copper pipeline in explicit execution-only mode.
+    ///
+    /// This keeps Copper on the execution boundary only: no rollout policy is
+    /// delegated into the controller thread, so staged promotion remains
+    /// disabled until the runtime injects policy explicitly.
+    pub fn spawn_execution_only(max_velocity: f64) -> Self {
+        Self::spawn_with_deployment_manager(max_velocity, EXECUTION_ONLY_DEPLOYMENT_MANAGER)
+    }
+
+    /// Compatibility alias for execution-only spawn.
+    ///
+    /// Prefer [`spawn_execution_only`](Self::spawn_execution_only) on new
+    /// call sites so the no-rollout boundary stays explicit.
+    pub fn spawn(max_velocity: f64) -> Self {
+        Self::spawn_execution_only(max_velocity)
+    }
+
+    #[doc(hidden)]
+    /// Spawn Copper with an explicit staged-promotion policy.
+    pub fn spawn_with_deployment_manager(max_velocity: f64, deployment_manager: DeploymentManager) -> Self {
+        Self::spawn_with_io_and_deployment_manager(max_velocity, None, None, deployment_manager)
+    }
+
     /// Spawn the full Copper pipeline:
     /// 1. Create async command channel (agent → bridge)
     /// 2. Create sync command channel (bridge → Copper thread)
     /// 3. Create shared state (Copper → agent)
     /// 4. Spawn command bridge task
     /// 5. Spawn controller thread
-    pub fn spawn(max_velocity: f64) -> Self {
-        // Agent-side channel (tokio mpsc).
-        let (cmd_tx, agent_rx) = mpsc::channel::<ControllerCommand>(64);
-
-        // Copper-side channel (std sync mpsc).
-        let (copper_tx, copper_rx) = std::sync::mpsc::sync_channel::<ControllerCommand>(64);
-
-        // Emergency halt channel (sync, capacity 1, bypasses tokio bridge).
-        let (emergency_tx, emergency_rx) = std::sync::mpsc::sync_channel::<ControllerCommand>(1);
-
-        // Shared state (ArcSwap — lock-free reads).
-        let state = Arc::new(ArcSwap::from_pointee(ControllerState::default()));
-
-        // Shutdown flag.
-        let shutdown = Arc::new(AtomicBool::new(false));
-
-        // E-stop notification channel.
-        let (estop_tx, estop_rx) = mpsc::channel::<String>(4);
-
-        // Spawn bridge task (tokio → std forwarding).
-        let bridge = crate::channels::spawn_command_bridge(agent_rx, copper_tx);
-
-        // Spawn controller thread.
-        let state_clone = Arc::clone(&state);
-        let shutdown_clone = Arc::clone(&shutdown);
-        let thread = std::thread::Builder::new()
-            .name("copper-controller".into())
-            .spawn(move || {
-                crate::controller::run_controller_loop(
-                    &copper_rx,
-                    &state_clone,
-                    max_velocity,
-                    &shutdown_clone,
-                    None,
-                    None,
-                    AGENT_WATCHDOG_TIMEOUT,
-                    Some(&emergency_rx),
-                    &estop_tx,
-                );
-            })
-            .expect("failed to spawn copper controller thread");
-
-        Self {
-            cmd_tx: Some(cmd_tx),
-            emergency_tx,
-            state,
-            shutdown,
-            thread: Some(thread),
-            bridge: Some(bridge),
-            estop_rx: Some(estop_rx),
-        }
-    }
-
-    /// Spawn the full Copper pipeline with pluggable IO backends.
     ///
-    /// Like [`spawn()`](Self::spawn), but accepts an actuator sink and/or sensor
-    /// source that the controller loop will use for hardware communication.
-    ///
-    /// `ActuatorSink` is `Send + Sync` so it can be shared via `Arc`.
-    /// `SensorSource` is `Send` but **not** `Sync` — it is moved into the
-    /// controller thread, not shared.
-    pub fn spawn_with_io(
+    #[doc(hidden)]
+    /// This variant accepts an explicit staged-promotion policy.
+    pub fn spawn_with_io_and_deployment_manager(
         max_velocity: f64,
         actuator: Option<Arc<dyn crate::io::ActuatorSink>>,
         sensor: Option<Box<dyn crate::io::SensorSource>>,
+        deployment_manager: DeploymentManager,
     ) -> Self {
         // Agent-side channel (tokio mpsc).
         let (cmd_tx, agent_rx) = mpsc::channel::<ControllerCommand>(64);
 
         // Copper-side channel (std sync mpsc).
-        let (copper_tx, copper_rx) = std::sync::mpsc::sync_channel::<ControllerCommand>(64);
+        let (copper_tx, copper_rx) = crate::channels::create_copper_channel();
 
         // Emergency halt channel (sync, capacity 1, bypasses tokio bridge).
-        let (emergency_tx, emergency_rx) = std::sync::mpsc::sync_channel::<ControllerCommand>(1);
+        let (emergency_tx, emergency_rx) = std::sync::mpsc::sync_channel::<CopperRuntimeCommand>(1);
 
         // Shared state (ArcSwap — lock-free reads).
         let state = Arc::new(ArcSwap::from_pointee(ControllerState::default()));
@@ -145,18 +138,10 @@ impl CopperHandle {
         let thread = std::thread::Builder::new()
             .name("copper-controller".into())
             .spawn(move || {
-                // Actuator: Arc is Send+Sync, pass a reference into the loop.
                 let actuator_ref = actuator.as_deref();
-
-                // Sensor: Send but NOT Sync — moved into this thread.
-                // We must match rather than use `as_deref_mut()` because the
-                // borrow checker sees a drop-glue conflict between the Box
-                // destructor and the `&mut dyn` reference on `Option<Box<dyn T>>`.
-                // Matching on `Some(ref mut s)` creates a reborrow that the
-                // borrow checker can prove does not alias the destructor.
                 match sensor {
                     Some(mut s) => {
-                        crate::controller::run_controller_loop(
+                        crate::controller::run_controller_loop_with_policy(
                             &copper_rx,
                             &state_clone,
                             max_velocity,
@@ -166,10 +151,11 @@ impl CopperHandle {
                             AGENT_WATCHDOG_TIMEOUT,
                             Some(&emergency_rx),
                             &estop_tx,
+                            deployment_manager,
                         );
                     }
                     None => {
-                        crate::controller::run_controller_loop(
+                        crate::controller::run_controller_loop_with_policy(
                             &copper_rx,
                             &state_clone,
                             max_velocity,
@@ -179,6 +165,7 @@ impl CopperHandle {
                             AGENT_WATCHDOG_TIMEOUT,
                             Some(&emergency_rx),
                             &estop_tx,
+                            deployment_manager,
                         );
                     }
                 }
@@ -194,6 +181,48 @@ impl CopperHandle {
             bridge: Some(bridge),
             estop_rx: Some(estop_rx),
         }
+    }
+
+    #[doc(hidden)]
+    /// Spawn the full Copper pipeline with pluggable IO backends.
+    ///
+    /// Like [`spawn`](Self::spawn),
+    /// but accepts an actuator sink and/or sensor source that the controller
+    /// loop will use for hardware communication.
+    ///
+    /// `ActuatorSink` is `Send + Sync` so it can be shared via `Arc`.
+    /// `SensorSource` is `Send` but **not** `Sync` — it is moved into the
+    /// controller thread, not shared.
+    pub fn spawn_with_io_compatibility_fallback(
+        max_velocity: f64,
+        actuator: Option<Arc<dyn crate::io::ActuatorSink>>,
+        sensor: Option<Box<dyn crate::io::SensorSource>>,
+    ) -> Self {
+        tracing::warn!(
+            "CopperHandle::spawn_with_io_compatibility_fallback is compatibility-only; staged rollout remains disabled"
+        );
+        Self::spawn_with_io_and_deployment_manager(max_velocity, actuator, sensor, COMPATIBILITY_DEPLOYMENT_MANAGER)
+    }
+
+    /// Spawn Copper with pluggable IO backends in explicit execution-only mode.
+    pub fn spawn_with_io_execution_only(
+        max_velocity: f64,
+        actuator: Option<Arc<dyn crate::io::ActuatorSink>>,
+        sensor: Option<Box<dyn crate::io::SensorSource>>,
+    ) -> Self {
+        Self::spawn_with_io_and_deployment_manager(max_velocity, actuator, sensor, EXECUTION_ONLY_DEPLOYMENT_MANAGER)
+    }
+
+    /// Compatibility alias for execution-only IO spawn.
+    ///
+    /// Prefer [`spawn_with_io_execution_only`](Self::spawn_with_io_execution_only)
+    /// on new call sites so the no-rollout boundary stays explicit.
+    pub fn spawn_with_io(
+        max_velocity: f64,
+        actuator: Option<Arc<dyn crate::io::ActuatorSink>>,
+        sensor: Option<Box<dyn crate::io::SensorSource>>,
+    ) -> Self {
+        Self::spawn_with_io_execution_only(max_velocity, actuator, sensor)
     }
 
     /// Send a command to the Copper controller.
@@ -254,7 +283,7 @@ impl Drop for CopperHandle {
     fn drop(&mut self) {
         // Send emergency halt through direct sync channel (bypasses tokio bridge).
         // try_send is best-effort — if channel is full, the shutdown flag is the backstop.
-        let _ = self.emergency_tx.try_send(ControllerCommand::Halt);
+        let _ = self.emergency_tx.try_send(CopperRuntimeCommand::Halt);
         self.shutdown.store(true, Ordering::Relaxed);
     }
 }
@@ -262,12 +291,48 @@ impl Drop for CopperHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roz_core::controller::verification::VerifierVerdict;
+    use roz_core::embodiment::binding::{
+        BindingType, ChannelBinding, CommandInterfaceType, ControlChannelDef, ControlInterfaceManifest,
+    };
+    use sha2::Digest;
 
-    fn test_artifact() -> roz_core::controller::artifact::ControllerArtifact {
+    fn test_control_manifest(channel_count: usize) -> ControlInterfaceManifest {
+        let mut manifest = ControlInterfaceManifest {
+            version: 1,
+            manifest_digest: String::new(),
+            channels: (0..channel_count)
+                .map(|index| ControlChannelDef {
+                    name: format!("joint{index}/velocity"),
+                    interface_type: CommandInterfaceType::JointVelocity,
+                    units: "rad/s".into(),
+                    frame_id: format!("joint{index}_link"),
+                })
+                .collect(),
+            bindings: (0..channel_count)
+                .map(|index| ChannelBinding {
+                    physical_name: format!("joint{index}"),
+                    channel_index: index as u32,
+                    binding_type: BindingType::JointVelocity,
+                    frame_id: format!("joint{index}_link"),
+                    units: "rad/s".into(),
+                    semantic_role: None,
+                })
+                .collect(),
+        };
+        manifest.stamp_digest();
+        manifest
+    }
+
+    fn test_artifact(
+        bytes: &[u8],
+        control_manifest: &roz_core::embodiment::binding::ControlInterfaceManifest,
+    ) -> roz_core::controller::artifact::ControllerArtifact {
         use roz_core::controller::artifact::*;
+        let sha256 = hex::encode(sha2::Sha256::digest(bytes));
         ControllerArtifact {
             controller_id: "test-ctrl".into(),
-            sha256: "test".into(),
+            sha256: sha256.clone(),
             source_kind: SourceKind::LlmGenerated,
             controller_class: ControllerClass::LowRiskCommandGenerator,
             generator_model: None,
@@ -279,27 +344,33 @@ mod tests {
             promoted_at: None,
             replaced_controller_id: None,
             verification_key: VerificationKey {
-                controller_digest: "test".into(),
+                controller_digest: sha256,
                 wit_world_version: "bedrock:controller@1.0.0".into(),
-                model_digest: "test".into(),
-                calibration_digest: "test".into(),
-                manifest_digest: "test".into(),
+                model_digest: "not_available".into(),
+                calibration_digest: "not_available".into(),
+                manifest_digest: control_manifest.manifest_digest.clone(),
                 execution_mode: ExecutionMode::Verify,
                 compiler_version: "wasmtime".into(),
                 embodiment_family: None,
             },
-            wit_world: "tick-controller".into(),
-            verifier_result: None,
+            wit_world: "live-controller".into(),
+            verifier_result: Some(VerifierVerdict::Pass {
+                evidence_summary: "test".into(),
+            }),
         }
     }
 
-    fn load_artifact_cmd(bytes: &[u8], manifest: roz_core::channels::ChannelManifest) -> ControllerCommand {
-        ControllerCommand::LoadArtifact(Box::new(test_artifact()), bytes.to_vec(), manifest)
+    fn load_artifact_cmd(
+        bytes: &[u8],
+        control_manifest: roz_core::embodiment::binding::ControlInterfaceManifest,
+    ) -> ControllerCommand {
+        let artifact = test_artifact(bytes, &control_manifest);
+        ControllerCommand::LoadArtifact(Box::new(artifact), bytes.to_vec(), control_manifest, None)
     }
 
     #[tokio::test]
     async fn handle_spawns_and_shuts_down() {
-        let handle = CopperHandle::spawn(1.5);
+        let handle = CopperHandle::spawn_with_compatibility_fallback(1.5);
 
         // Verify the Copper thread is ticking.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -310,10 +381,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_sends_commands_to_controller() {
-        let handle = CopperHandle::spawn(1.5);
+    async fn handle_rejects_legacy_core_live_artifacts() {
+        let handle = CopperHandle::spawn_with_compatibility_fallback(1.5);
 
-        // Load a trivial WASM module.
+        // Load a trivial legacy core-WASM module. Live artifacts now require
+        // a real component-model controller and should be rejected before the
+        // control thread ever activates it.
         let wat = r#"
             (module
                 (func (export "process") (param i64)
@@ -321,13 +394,20 @@ mod tests {
                 )
             )
         "#;
-        let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-        handle.send(load_artifact_cmd(wat.as_bytes(), manifest)).await.unwrap();
+        let control_manifest = test_control_manifest(1);
+        handle
+            .send(load_artifact_cmd(wat.as_bytes(), control_manifest))
+            .await
+            .unwrap();
 
-        // Wait for it to load and tick.
+        // Wait for the bridge to reject it.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let state = handle.state().load();
-        assert!(state.running, "should be running after LoadArtifact");
+        assert!(!state.running, "legacy core-WASM live artifacts should be rejected");
+        assert!(
+            state.active_controller_id.is_none(),
+            "rejected artifact must not become active"
+        );
 
         // Halt it.
         handle.send(ControllerCommand::Halt).await.unwrap();
@@ -339,12 +419,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_with_io_receives_commands() {
+    async fn spawn_with_io_rejects_legacy_core_live_artifacts() {
         let sink = Arc::new(crate::io_log::LogActuatorSink::new());
-        let handle =
-            CopperHandle::spawn_with_io(1.5, Some(Arc::clone(&sink) as Arc<dyn crate::io::ActuatorSink>), None);
+        let handle = CopperHandle::spawn_with_io_compatibility_fallback(
+            1.5,
+            Some(Arc::clone(&sink) as Arc<dyn crate::io::ActuatorSink>),
+            None,
+        );
 
-        // WASM that uses tick contract: writes a TickOutput with command_values=[0.5].
+        // Legacy core-WASM tick-contract modules are no longer valid live
+        // controller artifacts. The bridge should reject this before any
+        // actuator traffic is emitted.
         let output_json = br#"{"command_values":[0.5],"estop":false,"metrics":[]}"#;
         let len = output_json.len();
         let data_hex: String = output_json.iter().map(|b| format!("\\{b:02x}")).collect();
@@ -358,46 +443,47 @@ mod tests {
                 )
             )"#
         );
-        let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
+        let control_manifest = test_control_manifest(1);
         handle
-            .send(load_artifact_cmd(&wat.into_bytes(), manifest))
+            .send(load_artifact_cmd(&wat.into_bytes(), control_manifest))
             .await
             .unwrap();
+        handle.send(ControllerCommand::PromoteActive).await.unwrap();
 
         // Wait for a few ticks so the WASM runs and output reaches the sink.
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         let commands = sink.commands();
-        assert!(!commands.is_empty(), "sink should have received command frames");
-        // The first channel should carry the 0.5 value.
         assert!(
-            commands
-                .iter()
-                .any(|f| !f.values.is_empty() && (f.values[0] - 0.5).abs() < f64::EPSILON),
-            "expected a frame with channel 0 = 0.5, got: {commands:?}",
+            commands.is_empty(),
+            "rejected legacy artifacts must not emit actuator frames"
         );
 
         handle.shutdown().await;
     }
 
     #[tokio::test]
-    async fn handle_drop_sends_halt_to_controller() {
+    async fn handle_drop_stops_controller_thread() {
         let state;
         {
-            let handle = CopperHandle::spawn(1.5);
+            let handle = CopperHandle::spawn_with_compatibility_fallback(1.5);
             state = Arc::clone(handle.state());
-
-            // Minimal tick-contract WASM (no-op controller).
-            let wat = r#"(module (func (export "process") (param i64) nop))"#;
-            let manifest = roz_core::channels::ChannelManifest::generic_velocity(1, 1.5);
-            handle.send(load_artifact_cmd(wat.as_bytes(), manifest)).await.unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;
-            assert!(state.load().running, "should be running before drop");
+            assert!(
+                state.load().last_tick > 0,
+                "controller thread should be ticking before drop"
+            );
             // handle dropped here
         }
 
-        // Give controller time to process the emergency halt.
+        // Give controller time to observe the shutdown flag and exit.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!state.load().running, "Drop should have halted the controller");
+        let stopped_tick = state.load().last_tick;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            state.load().last_tick,
+            stopped_tick,
+            "Drop should stop the controller thread"
+        );
     }
 }

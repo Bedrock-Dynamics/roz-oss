@@ -102,10 +102,10 @@ mod tests {
             channels_touched: vec!["shoulder".into(), "elbow".into()],
             channels_untouched: vec![],
             config_reads: 1,
-            tick_latency_p50_us: 200,
-            tick_latency_p95_us: 400,
-            tick_latency_p99_us: 500,
-            stability: StabilitySummary {
+            tick_latency_p50: 200.into(),
+            tick_latency_p95: 400.into(),
+            tick_latency_p99: 500.into(),
+            controller_stability_summary: StabilitySummary {
                 command_oscillation_detected: false,
                 idle_output_stable: true,
                 runtime_jitter_us: 30.0,
@@ -114,6 +114,7 @@ mod tests {
             },
             verifier_status: "pass".into(),
             verifier_reason: None,
+            controller_digest: "ctrl-sha".into(),
             model_digest: "abc".into(),
             calibration_digest: "def".into(),
             frame_snapshot_id: 1,
@@ -144,7 +145,7 @@ mod tests {
     #[test]
     fn latency_check_fails_over_budget() {
         let mut ev = clean_evidence();
-        ev.tick_latency_p99_us = 2_000;
+        ev.tick_latency_p99 = 2_000.into();
         let check = TickLatencyCheck { p99_budget_us: 1_000 };
         assert!(matches!(check.check(&ev), CheckResult::Fail { .. }));
     }
@@ -152,7 +153,7 @@ mod tests {
     #[test]
     fn latency_check_passes_within_budget() {
         let mut ev = clean_evidence();
-        ev.tick_latency_p99_us = 500;
+        ev.tick_latency_p99 = 500.into();
         let check = TickLatencyCheck { p99_budget_us: 1_000 };
         assert!(matches!(check.check(&ev), CheckResult::Pass));
     }
@@ -168,7 +169,7 @@ mod tests {
     #[test]
     fn oscillation_check_fails() {
         let mut ev = clean_evidence();
-        ev.stability.command_oscillation_detected = true;
+        ev.controller_stability_summary.command_oscillation_detected = true;
         let check = OscillationCheck;
         assert!(matches!(check.check(&ev), CheckResult::Fail { .. }));
     }
@@ -186,7 +187,7 @@ mod tests {
     fn verifier_multiple_failures() {
         let mut ev = clean_evidence();
         ev.trap_count = 2;
-        ev.stability.command_oscillation_detected = true;
+        ev.controller_stability_summary.command_oscillation_detected = true;
         let verifier = Verifier::with_default_checks();
         let verdict = verifier.verify(&ev);
         match &verdict {

@@ -1329,7 +1329,7 @@ mod tests {
 
         // Approve as tenant B -> 404 (tenant isolation)
         let approve_body = serde_json::json!({
-            "tool_call_id": "tc-001",
+            "approval_id": "apr-001",
             "approved": true,
         });
         let req = Request::builder()
@@ -1349,7 +1349,7 @@ mod tests {
 
         let fake_id = uuid::Uuid::new_v4();
         let approve_body = serde_json::json!({
-            "tool_call_id": "tc-ghost",
+            "approval_id": "apr-ghost",
             "approved": false,
         });
         let req = Request::builder()
@@ -1388,7 +1388,7 @@ mod tests {
 
         // Approve with correct tenant but no Restate -> 500
         let approve_body = serde_json::json!({
-            "tool_call_id": "tc-002",
+            "approval_id": "apr-002",
             "approved": true,
         });
         let req = Request::builder()

@@ -82,6 +82,36 @@ pub struct ControllerPromotionConfig {
     pub require_shadow: bool,
     pub require_canary: bool,
     pub auto_rollback_on_watchdog: bool,
+    #[serde(default = "default_shadow_ticks_required")]
+    pub shadow_ticks_required: u64,
+    #[serde(default = "default_canary_ticks_required")]
+    pub canary_ticks_required: u64,
+    #[serde(default = "default_max_stage_normalized_command_delta_bps")]
+    pub max_stage_normalized_command_delta_bps: u32,
+    #[serde(default = "default_canary_max_command_delta_bps")]
+    pub canary_max_command_delta_bps: u32,
+    #[serde(default = "default_max_bounded_canary_ticks")]
+    pub max_bounded_canary_ticks: u64,
+}
+
+const fn default_shadow_ticks_required() -> u64 {
+    10
+}
+
+const fn default_canary_ticks_required() -> u64 {
+    10
+}
+
+const fn default_max_stage_normalized_command_delta_bps() -> u32 {
+    2_500
+}
+
+const fn default_canary_max_command_delta_bps() -> u32 {
+    2_500
+}
+
+const fn default_max_bounded_canary_ticks() -> u64 {
+    u64::MAX
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,6 +263,11 @@ unknown_egress = "ask"
         assert!(bp.verification.rule_checks_always);
         assert!(bp.controller_promotion.require_shadow);
         assert!(!bp.controller_promotion.require_canary);
+        assert_eq!(bp.controller_promotion.shadow_ticks_required, 10);
+        assert_eq!(bp.controller_promotion.canary_ticks_required, 10);
+        assert_eq!(bp.controller_promotion.max_stage_normalized_command_delta_bps, 2_500);
+        assert_eq!(bp.controller_promotion.canary_max_command_delta_bps, 2_500);
+        assert_eq!(bp.controller_promotion.max_bounded_canary_ticks, u64::MAX);
         assert!(bp.edge.allow_local_safe_without_cloud);
     }
 

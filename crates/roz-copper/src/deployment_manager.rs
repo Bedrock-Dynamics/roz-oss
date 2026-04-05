@@ -1,31 +1,125 @@
-//! Blueprint-driven deployment policy for controller promotion.
+//! Legacy staged-rollout policy support for controller promotion.
 //!
 //! [`DeploymentManager`] wraps [`DeploymentState`] transitions with policy
 //! derived from a [`RuntimeBlueprint`]'s `controller_promotion` section.
 //! It determines which stages (shadow, canary) are required and whether
 //! watchdog events should trigger automatic rollback.
+//!
+//! Normal production callers should keep Copper in execution-only mode and
+//! delegate rollout authority to the runtime layer. This module remains for
+//! compatibility scaffolding and rollout-focused tests.
 
 use roz_core::blueprint::RuntimeBlueprint;
 use roz_core::controller::deployment::DeploymentState;
 
-/// Blueprint-driven deployment policy.
+/// Where the staged rollout policy came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicySource {
+    /// Bound from the runtime blueprint authority.
+    RuntimeBlueprint,
+    /// Ad-hoc override created directly by Copper callers.
+    ExplicitOverride,
+    /// Execution-only runtime launched without rollout authority.
+    ExecutionOnly,
+    /// Compatibility fallback used when no external policy is wired yet.
+    CompatibilityFallback,
+}
+
+/// Legacy blueprint-driven deployment policy.
 ///
 /// Controls which promotion stages are required and rollback behavior.
 /// Construct via [`DeploymentManager::from_blueprint`] or [`DeploymentManager::new`].
+#[derive(Debug, Clone, Copy)]
 pub struct DeploymentManager {
+    policy_source: PolicySource,
     require_shadow: bool,
     require_canary: bool,
     auto_rollback_on_watchdog: bool,
+    shadow_ticks_required: u64,
+    canary_ticks_required: u64,
+    max_stage_normalized_command_delta_bps: u32,
+    canary_max_command_delta_bps: u32,
+    max_bounded_canary_ticks: u64,
 }
 
 impl DeploymentManager {
-    /// Create a new deployment manager with explicit policy flags.
+    const DEFAULT_SHADOW_TICKS_REQUIRED: u64 = 10;
+    const DEFAULT_CANARY_TICKS_REQUIRED: u64 = 10;
+    const DEFAULT_MAX_STAGE_NORMALIZED_COMMAND_DELTA_BPS: u32 = 2_500;
+    const DEFAULT_CANARY_MAX_COMMAND_DELTA_BPS: u32 = 2_500;
+    const DEFAULT_MAX_BOUNDED_CANARY_TICKS: u64 = u64::MAX;
+
+    /// Compatibility fallback used when no runtime blueprint has been injected yet.
+    /// This keeps the controller loop alive but does not authorize staged rollout.
+    #[must_use]
+    pub const fn compatibility_default() -> Self {
+        Self {
+            policy_source: PolicySource::CompatibilityFallback,
+            require_shadow: true,
+            require_canary: true,
+            auto_rollback_on_watchdog: true,
+            shadow_ticks_required: Self::DEFAULT_SHADOW_TICKS_REQUIRED,
+            canary_ticks_required: Self::DEFAULT_CANARY_TICKS_REQUIRED,
+            max_stage_normalized_command_delta_bps: Self::DEFAULT_MAX_STAGE_NORMALIZED_COMMAND_DELTA_BPS,
+            canary_max_command_delta_bps: Self::DEFAULT_CANARY_MAX_COMMAND_DELTA_BPS,
+            max_bounded_canary_ticks: Self::DEFAULT_MAX_BOUNDED_CANARY_TICKS,
+        }
+    }
+
+    /// Execution-only default used for live controller loops when rollout
+    /// policy is intentionally not delegated to Copper.
+    #[must_use]
+    pub const fn execution_only() -> Self {
+        Self {
+            policy_source: PolicySource::ExecutionOnly,
+            require_shadow: true,
+            require_canary: true,
+            auto_rollback_on_watchdog: true,
+            shadow_ticks_required: Self::DEFAULT_SHADOW_TICKS_REQUIRED,
+            canary_ticks_required: Self::DEFAULT_CANARY_TICKS_REQUIRED,
+            max_stage_normalized_command_delta_bps: Self::DEFAULT_MAX_STAGE_NORMALIZED_COMMAND_DELTA_BPS,
+            canary_max_command_delta_bps: Self::DEFAULT_CANARY_MAX_COMMAND_DELTA_BPS,
+            max_bounded_canary_ticks: Self::DEFAULT_MAX_BOUNDED_CANARY_TICKS,
+        }
+    }
+
+    /// Create a new deployment manager with explicit policy overrides.
     #[must_use]
     pub const fn new(require_shadow: bool, require_canary: bool, auto_rollback_on_watchdog: bool) -> Self {
-        Self {
+        Self::with_rollout_policy(
             require_shadow,
             require_canary,
             auto_rollback_on_watchdog,
+            Self::DEFAULT_SHADOW_TICKS_REQUIRED,
+            Self::DEFAULT_CANARY_TICKS_REQUIRED,
+            Self::DEFAULT_MAX_STAGE_NORMALIZED_COMMAND_DELTA_BPS,
+            Self::DEFAULT_CANARY_MAX_COMMAND_DELTA_BPS,
+            Self::DEFAULT_MAX_BOUNDED_CANARY_TICKS,
+        )
+    }
+
+    /// Create a new deployment manager with explicit stage timing and divergence policy.
+    #[must_use]
+    pub const fn with_rollout_policy(
+        require_shadow: bool,
+        require_canary: bool,
+        auto_rollback_on_watchdog: bool,
+        shadow_ticks_required: u64,
+        canary_ticks_required: u64,
+        max_stage_normalized_command_delta_bps: u32,
+        canary_max_command_delta_bps: u32,
+        max_bounded_canary_ticks: u64,
+    ) -> Self {
+        Self {
+            policy_source: PolicySource::ExplicitOverride,
+            require_shadow,
+            require_canary,
+            auto_rollback_on_watchdog,
+            shadow_ticks_required,
+            canary_ticks_required,
+            max_stage_normalized_command_delta_bps,
+            canary_max_command_delta_bps,
+            max_bounded_canary_ticks,
         }
     }
 
@@ -33,10 +127,31 @@ impl DeploymentManager {
     #[must_use]
     pub const fn from_blueprint(bp: &RuntimeBlueprint) -> Self {
         Self {
+            policy_source: PolicySource::RuntimeBlueprint,
             require_shadow: bp.controller_promotion.require_shadow,
             require_canary: bp.controller_promotion.require_canary,
             auto_rollback_on_watchdog: bp.controller_promotion.auto_rollback_on_watchdog,
+            shadow_ticks_required: bp.controller_promotion.shadow_ticks_required,
+            canary_ticks_required: bp.controller_promotion.canary_ticks_required,
+            max_stage_normalized_command_delta_bps: bp.controller_promotion.max_stage_normalized_command_delta_bps,
+            canary_max_command_delta_bps: bp.controller_promotion.canary_max_command_delta_bps,
+            max_bounded_canary_ticks: bp.controller_promotion.max_bounded_canary_ticks,
         }
+    }
+
+    /// Where this policy was sourced from.
+    #[must_use]
+    pub const fn policy_source(&self) -> PolicySource {
+        self.policy_source
+    }
+
+    /// Whether this policy is authoritative enough for Copper to execute staged rollout.
+    #[must_use]
+    pub const fn allows_rollout(&self) -> bool {
+        !matches!(
+            self.policy_source,
+            PolicySource::CompatibilityFallback | PolicySource::ExecutionOnly
+        )
     }
 
     /// Determine the next promotion target given current state and policy.
@@ -50,6 +165,9 @@ impl DeploymentManager {
     /// are not explicitly required by policy.
     #[must_use]
     pub const fn next_target(&self, current: DeploymentState) -> Option<DeploymentState> {
+        if !self.allows_rollout() {
+            return None;
+        }
         match current {
             DeploymentState::VerifiedOnly => {
                 if self.require_shadow {
@@ -79,6 +197,44 @@ impl DeploymentManager {
     #[must_use]
     pub const fn should_auto_rollback_on_watchdog(&self) -> bool {
         self.auto_rollback_on_watchdog
+    }
+
+    /// Minimum successful shadow ticks required before stage promotion.
+    #[must_use]
+    pub const fn shadow_ticks_required(&self) -> u64 {
+        if self.shadow_ticks_required == 0 {
+            1
+        } else {
+            self.shadow_ticks_required
+        }
+    }
+
+    /// Minimum successful canary ticks required before stage promotion.
+    #[must_use]
+    pub const fn canary_ticks_required(&self) -> u64 {
+        if self.canary_ticks_required == 0 {
+            1
+        } else {
+            self.canary_ticks_required
+        }
+    }
+
+    /// Maximum normalized command delta allowed during staged comparison.
+    #[must_use]
+    pub fn max_stage_normalized_command_delta(&self) -> f64 {
+        f64::from(self.max_stage_normalized_command_delta_bps) / 10_000.0
+    }
+
+    /// Maximum normalized command delta the canary may actuate relative to the active command.
+    #[must_use]
+    pub fn canary_max_command_delta(&self) -> f64 {
+        f64::from(self.canary_max_command_delta_bps) / 10_000.0
+    }
+
+    /// Maximum number of canary ticks that may require bounded actuation before rejection.
+    #[must_use]
+    pub const fn max_bounded_canary_ticks(&self) -> u64 {
+        self.max_bounded_canary_ticks
     }
 }
 
@@ -126,6 +282,11 @@ policy = "local_only"
 require_shadow = {require_shadow}
 require_canary = {require_canary}
 auto_rollback_on_watchdog = {auto_rollback}
+shadow_ticks_required = 12
+canary_ticks_required = 18
+max_stage_normalized_command_delta_bps = 1750
+canary_max_command_delta_bps = 900
+max_bounded_canary_ticks = 4
 
 [edge]
 require_zenoh = false
@@ -143,6 +304,7 @@ unknown_egress = "ask"
     #[test]
     fn next_target_with_both_required() {
         let mgr = DeploymentManager::new(true, true, true);
+        assert_eq!(mgr.policy_source(), PolicySource::ExplicitOverride);
         // VerifiedOnly -> Shadow
         assert_eq!(
             mgr.next_target(DeploymentState::VerifiedOnly),
@@ -212,6 +374,7 @@ unknown_egress = "ask"
     fn from_blueprint() {
         let bp = test_blueprint(true, false, true);
         let mgr = DeploymentManager::from_blueprint(&bp);
+        assert_eq!(mgr.policy_source(), PolicySource::RuntimeBlueprint);
         // VerifiedOnly -> Shadow (require_shadow = true)
         assert_eq!(
             mgr.next_target(DeploymentState::VerifiedOnly),
@@ -220,6 +383,26 @@ unknown_egress = "ask"
         // Shadow -> Active (require_canary = false)
         assert_eq!(mgr.next_target(DeploymentState::Shadow), Some(DeploymentState::Active));
         assert!(mgr.should_auto_rollback_on_watchdog());
+        assert_eq!(mgr.shadow_ticks_required(), 12);
+        assert_eq!(mgr.canary_ticks_required(), 18);
+        assert!((mgr.max_stage_normalized_command_delta() - 0.175).abs() < f64::EPSILON);
+        assert!((mgr.canary_max_command_delta() - 0.09).abs() < f64::EPSILON);
+        assert_eq!(mgr.max_bounded_canary_ticks(), 4);
+    }
+
+    #[test]
+    fn with_rollout_policy_overrides_defaults() {
+        let mgr = DeploymentManager::with_rollout_policy(true, false, false, 2, 3, 900, 700, 5);
+        assert_eq!(
+            mgr.next_target(DeploymentState::VerifiedOnly),
+            Some(DeploymentState::Shadow)
+        );
+        assert_eq!(mgr.shadow_ticks_required(), 2);
+        assert_eq!(mgr.canary_ticks_required(), 3);
+        assert!((mgr.max_stage_normalized_command_delta() - 0.09).abs() < f64::EPSILON);
+        assert!((mgr.canary_max_command_delta() - 0.07).abs() < f64::EPSILON);
+        assert_eq!(mgr.max_bounded_canary_ticks(), 5);
+        assert!(!mgr.should_auto_rollback_on_watchdog());
     }
 
     #[test]
@@ -240,5 +423,14 @@ unknown_egress = "ask"
 
         let without = DeploymentManager::new(false, false, false);
         assert!(!without.should_auto_rollback_on_watchdog());
+    }
+
+    #[test]
+    fn compatibility_default_is_marked_as_fallback() {
+        let mgr = DeploymentManager::compatibility_default();
+        assert_eq!(mgr.policy_source(), PolicySource::CompatibilityFallback);
+        assert!(!mgr.allows_rollout());
+        assert_eq!(mgr.next_target(DeploymentState::VerifiedOnly), None);
+        assert!(mgr.should_auto_rollback_on_watchdog());
     }
 }
