@@ -27,6 +27,13 @@ enum ObservationTool {
     JointState(String),
 }
 
+fn current_timestamp_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
 impl DockerSpatialProvider {
     pub const fn new(mcp: Arc<McpManager>) -> Self {
         Self {
@@ -99,6 +106,7 @@ struct TelemetryData {
 
 impl TelemetryData {
     fn into_world_state(self) -> WorldState {
+        let timestamp_ns = current_timestamp_ns();
         let mut entities = Vec::new();
         let mut alerts = Vec::new();
         let mut properties = std::collections::HashMap::new();
@@ -128,7 +136,7 @@ impl TelemetryData {
             velocity: self.velocity,
             properties,
             frame_id: "world".into(),
-            timestamp_ns: None,
+            timestamp_ns: Some(timestamp_ns),
             ..Default::default()
         });
 
@@ -171,6 +179,7 @@ struct JointStateData {
 
 impl JointStateData {
     fn into_world_state(self) -> WorldState {
+        let timestamp_ns = current_timestamp_ns();
         let joints = self.joints.unwrap_or(JointStateArrays {
             name: self.name,
             position: self.position,
@@ -201,7 +210,7 @@ impl JointStateData {
                 velocity: None,
                 properties,
                 frame_id: "world".into(),
-                timestamp_ns: None,
+                timestamp_ns: Some(timestamp_ns),
                 ..Default::default()
             }],
             ..Default::default()
@@ -225,6 +234,7 @@ impl WorldStateProvider for DockerSpatialProvider {
                 ObservationTool::Telemetry(_) => match serde_json::from_str::<TelemetryData>(&output) {
                     Ok(data) => data.into_world_state(),
                     Err(e) => {
+                        let timestamp_ns = current_timestamp_ns();
                         tracing::debug!("Failed to parse telemetry: {e}");
                         let mut properties = std::collections::HashMap::new();
                         properties.insert("raw_telemetry".into(), serde_json::json!(output));
@@ -237,7 +247,7 @@ impl WorldStateProvider for DockerSpatialProvider {
                                 velocity: None,
                                 properties,
                                 frame_id: "world".into(),
-                                timestamp_ns: None,
+                                timestamp_ns: Some(timestamp_ns),
                                 ..Default::default()
                             }],
                             ..Default::default()
@@ -247,6 +257,7 @@ impl WorldStateProvider for DockerSpatialProvider {
                 ObservationTool::JointState(_) => match serde_json::from_str::<JointStateData>(&output) {
                     Ok(data) => data.into_world_state(),
                     Err(e) => {
+                        let timestamp_ns = current_timestamp_ns();
                         tracing::debug!("Failed to parse joint state: {e}");
                         let mut properties = std::collections::HashMap::new();
                         properties.insert("raw_joint_state".into(), serde_json::json!(output));
@@ -259,7 +270,7 @@ impl WorldStateProvider for DockerSpatialProvider {
                                 velocity: None,
                                 properties,
                                 frame_id: "world".into(),
-                                timestamp_ns: None,
+                                timestamp_ns: Some(timestamp_ns),
                                 ..Default::default()
                             }],
                             ..Default::default()
@@ -302,6 +313,7 @@ mod tests {
             ctx.entities[0].properties.get("mode").unwrap(),
             &serde_json::json!("OFFBOARD")
         );
+        assert!(ctx.entities[0].timestamp_ns.is_some());
         assert!(ctx.alerts.is_empty()); // 85% battery, no alert
     }
 
@@ -327,6 +339,7 @@ mod tests {
         let ctx = data.into_world_state();
         assert_eq!(ctx.entities.len(), 1);
         assert!(ctx.entities[0].position.is_none());
+        assert!(ctx.entities[0].timestamp_ns.is_some());
         assert!(ctx.alerts.is_empty());
     }
 
@@ -346,6 +359,7 @@ mod tests {
         assert_eq!(ctx.entities[0].kind, "manipulator");
         assert_eq!(ctx.entities[0].properties["joint_names"][0], "shoulder_pan_joint");
         assert_eq!(ctx.entities[0].properties["joint_positions"][1], -0.4);
+        assert!(ctx.entities[0].timestamp_ns.is_some());
     }
 
     #[tokio::test]

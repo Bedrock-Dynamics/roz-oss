@@ -1,7 +1,10 @@
 //! Multi-turn conversation: real Claude + MCP + Docker sim.
 //! Proves agent reasons across turns using accumulated context.
 //!
-//! Requires: ANTHROPIC_API_KEY + ros2-manipulator on port 8094
+//! Requires: `ANTHROPIC_API_KEY`, Docker daemon, and the local
+//! `bedrockdynamics/substrate-sim:ros2-manipulator` image.
+
+mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,16 +60,21 @@ fn build_input(user_message: &str, history: Vec<Message>) -> AgentInput {
 }
 
 #[tokio::test]
-#[ignore = "requires ANTHROPIC_API_KEY + running Docker sim"]
+#[ignore = "requires ANTHROPIC_API_KEY + Docker daemon + local manipulator image"]
 async fn real_claude_multiturn_observe_act_reason() {
     let api_key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY required");
+    let _guard = common::live_test_mutex().lock().await;
+    if let Err(error) = common::recreate_docker_sim(&common::MANIPULATOR_SIM).await {
+        eprintln!("SKIP: failed to launch isolated ros2-manipulator test container: {error}");
+        return;
+    }
 
     // --- Setup: MCP connection (shared across all turns) ---
     let mcp = Arc::new(McpManager::new());
     match mcp.connect("arm", 8094, Duration::from_secs(15)).await {
         Ok(_) => {}
         Err(e) => {
-            eprintln!("SKIP: MCP connect failed (is ros2-manipulator running on 8094?): {e}");
+            eprintln!("SKIP: MCP connect failed against isolated ros2-manipulator test container on 8094: {e}");
             return;
         }
     }

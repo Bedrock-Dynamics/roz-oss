@@ -37,6 +37,8 @@ const MOBILE_DOCKER_ARGS: &[&str] = &[
     "-p",
     "8096:8090",
     "-e",
+    "ROS_LOCALHOST_ONLY=1",
+    "-e",
     "ROBOT_MODEL=turtlebot3_waffle",
     "-e",
     "GZ_WORLD=turtlebot3_world",
@@ -51,7 +53,8 @@ const MOBILE_SIM: common::DockerSimSpec = common::DockerSimSpec {
     image: "bedrockdynamics/substrate-sim:ros2-nav2",
     args: MOBILE_DOCKER_ARGS,
     grpc_port: 9096,
-    startup_timeout: Duration::from_secs(120),
+    ros_domain_id: 41,
+    startup_timeout: Duration::from_secs(240),
 };
 
 const PX4_SIM: common::DockerSimSpec = common::DockerSimSpec {
@@ -59,6 +62,7 @@ const PX4_SIM: common::DockerSimSpec = common::DockerSimSpec {
     image: "bedrockdynamics/substrate-sim:px4-gazebo-humble",
     args: PX4_DOCKER_ARGS,
     grpc_port: 9090,
+    ros_domain_id: 42,
     startup_timeout: Duration::from_secs(120),
 };
 
@@ -67,6 +71,7 @@ const ARDUPILOT_SIM: common::DockerSimSpec = common::DockerSimSpec {
     image: "bedrockdynamics/substrate-sim:ardupilot-gazebo",
     args: ARDUPILOT_DOCKER_ARGS,
     grpc_port: 9097,
+    ros_domain_id: 43,
     startup_timeout: Duration::from_secs(120),
 };
 
@@ -77,7 +82,7 @@ fn live_test_mutex() -> &'static tokio::sync::Mutex<()> {
 
 fn load_diff_drive_control_manifest() -> (ControlInterfaceManifest, String) {
     let toml_str = include_str!("../../../examples/diff_drive/robot.toml");
-    let robot: roz_copper::manifest::RobotManifest = toml::from_str(toml_str).unwrap();
+    let robot: roz_copper::manifest::EmbodimentManifest = toml::from_str(toml_str).unwrap();
     (
         robot.control_interface_manifest().unwrap(),
         robot
@@ -90,7 +95,7 @@ fn load_diff_drive_control_manifest() -> (ControlInterfaceManifest, String) {
 
 fn load_quadcopter_control_manifest() -> (ControlInterfaceManifest, String) {
     let toml_str = include_str!("../../../examples/quadcopter/robot.toml");
-    let robot: roz_copper::manifest::RobotManifest = toml::from_str(toml_str).unwrap();
+    let robot: roz_copper::manifest::EmbodimentManifest = toml::from_str(toml_str).unwrap();
     (
         robot.control_interface_manifest().unwrap(),
         robot
@@ -318,10 +323,10 @@ async fn real_claude_mobile_wasm_cmd_vel_through_bridge() {
     let api_key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY required");
     common::recreate_docker_sim(&MOBILE_SIM)
         .await
-        .expect("mobile paper test should be able to launch a fresh Nav2 sim container");
+        .expect("mobile authored-WAT live test should be able to launch a fresh Nav2 sim container");
     wait_for_scene_stream(MOBILE_BRIDGE_URL, Some("turtlebot"), Duration::from_secs(120))
         .await
-        .expect("mobile paper test should observe turtlebot scene data before starting Copper");
+        .expect("mobile authored-WAT live test should observe turtlebot scene data before starting Copper");
 
     let sensor = match GrpcSensorSource::connect(MOBILE_BRIDGE_URL).await {
         Ok(sensor) => sensor,
@@ -439,10 +444,10 @@ async fn real_claude_px4_wasm_velocity_through_bridge() {
     let api_key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY required");
     common::recreate_docker_sim(&PX4_SIM)
         .await
-        .expect("PX4 paper test should be able to launch a fresh PX4 sim container");
+        .expect("PX4 authored-WAT live test should be able to launch a fresh PX4 sim container");
     wait_for_scene_stream(PX4_BRIDGE_URL, Some("x500"), Duration::from_secs(120))
         .await
-        .expect("PX4 paper test should observe x500 scene data before starting Copper");
+        .expect("PX4 authored-WAT live test should observe x500 scene data before starting Copper");
 
     let sensor = match GrpcSensorSource::connect(PX4_BRIDGE_URL).await {
         Ok(sensor) => {
@@ -569,10 +574,10 @@ async fn real_claude_ardupilot_wasm_velocity_through_bridge() {
     let api_key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY required");
     common::recreate_docker_sim(&ARDUPILOT_SIM)
         .await
-        .expect("ArduPilot paper test should be able to launch a fresh ArduPilot sim container");
+        .expect("ArduPilot authored-WAT live test should be able to launch a fresh ArduPilot sim container");
     wait_for_scene_stream(ARDUPILOT_BRIDGE_URL, None, Duration::from_secs(120))
         .await
-        .expect("ArduPilot paper test should observe scene data before starting Copper");
+        .expect("ArduPilot authored-WAT live test should observe scene data before starting Copper");
 
     let sensor = match GrpcSensorSource::connect(ARDUPILOT_BRIDGE_URL).await {
         Ok(sensor) => sensor,

@@ -1,5 +1,8 @@
 //! Live test: real Claude + MCP tools + Docker sim.
-//! Requires: `ANTHROPIC_API_KEY` + ros2-manipulator container on port 8094
+//! Requires: `ANTHROPIC_API_KEY`, Docker daemon, and the local
+//! `bedrockdynamics/substrate-sim:ros2-manipulator` image.
+
+mod common;
 
 use roz_agent::model::types::{ContentPart, Message};
 
@@ -11,9 +14,14 @@ fn used_tool(messages: &[Message], tool_name: &str) -> bool {
 }
 
 #[tokio::test]
-#[ignore = "requires ANTHROPIC_API_KEY + running Docker sim"]
+#[ignore = "requires ANTHROPIC_API_KEY + Docker daemon + local manipulator image"]
 async fn real_claude_moves_arm_via_mcp() {
     let api_key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY required");
+    let _guard = common::live_test_mutex().lock().await;
+    if let Err(error) = common::recreate_docker_sim(&common::MANIPULATOR_SIM).await {
+        eprintln!("SKIP: failed to launch isolated ros2-manipulator test container: {error}");
+        return;
+    }
 
     // 1. Connect MCP to manipulator container
     let mcp = std::sync::Arc::new(roz_local::mcp::McpManager::new());

@@ -1,4 +1,5 @@
-//! Generic daemon REST tools configured via robot.toml `[daemon]` section.
+//! Generic daemon REST tools configured via the embodiment manifest `[daemon]`
+//! section, with legacy `robot.toml` accepted as fallback.
 //!
 //! Body templates use `{{channel_name}}` placeholders resolved from the
 //! canonical control manifest at runtime. The LLM agent sees the same tool names

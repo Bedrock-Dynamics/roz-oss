@@ -2,7 +2,10 @@
 //! `CopperHandle` with real `GrpcActuatorSink` +
 //! `GrpcSensorSource` -> bridge -> verify.
 //!
-//! Requires: `ANTHROPIC_API_KEY` + ros2-manipulator on ports 8094/9094
+//! Requires: `ANTHROPIC_API_KEY`, Docker daemon, and the local
+//! `bedrockdynamics/substrate-sim:ros2-manipulator` image.
+
+mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +25,14 @@ use roz_local::mcp::McpManager;
 
 const BRIDGE_CONTROL_URL: &str = "http://127.0.0.1:9094";
 const MCP_PORT: u16 = 8094;
+const EXPECTED_ARM_JOINTS: &[&str] = &[
+    "shoulder_pan_joint",
+    "shoulder_lift_joint",
+    "elbow_joint",
+    "wrist_1_joint",
+    "wrist_2_joint",
+    "wrist_3_joint",
+];
 
 /// Read joint state via MCP, returning the result string (empty on failure).
 async fn read_joint_state(mcp: &McpManager, label: &str) -> String {
@@ -43,26 +54,42 @@ async fn wait_for_joint_delta(
     baseline: f64,
     min_delta: f64,
     timeout: Duration,
-) -> Option<(String, f64)> {
+) -> Result<(String, f64), String> {
     let start = tokio::time::Instant::now();
     let mut attempt = 0_u32;
-    let mut last_sample = None;
+    let mut last_sample = String::new();
+    let mut last_delta = None;
 
     while start.elapsed() < timeout {
         attempt += 1;
         let label = format!("AFTER poll #{attempt}");
         let sample = read_joint_state(mcp, &label).await;
+        if sample.is_empty() {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            continue;
+        }
+        last_sample = sample.clone();
+        if !missing_expected_arm_joints(&sample).is_empty() {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            continue;
+        }
         if let Some(position) = find_joint_position(&sample, joint_name) {
             let delta = (position - baseline).abs();
-            last_sample = Some((sample.clone(), delta));
+            last_delta = Some(delta);
             if delta > min_delta {
-                return Some((sample, delta));
+                return Ok((sample, delta));
             }
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
-    last_sample
+    Err(format!(
+        "expected joint '{joint_name}' to move by more than {min_delta:.3} rad; last_delta={}; {}",
+        last_delta
+            .map(|delta| format!("{delta:.4}"))
+            .unwrap_or_else(|| "none".to_string()),
+        describe_joint_surface(&last_sample)
+    ))
 }
 
 /// Try to connect the sensor source; returns `None` on failure (non-fatal).
@@ -162,6 +189,71 @@ fn find_joint_position(json_str: &str, joint_name: &str) -> Option<f64> {
     let positions = v["joints"]["position"].as_array()?;
     let idx = names.iter().position(|n| n.as_str() == Some(joint_name))?;
     positions.get(idx)?.as_f64()
+}
+
+fn joint_names(json_str: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) else {
+        return Vec::new();
+    };
+    value["joints"]["name"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|name| name.as_str().map(|joint| joint.to_owned()))
+        .collect()
+}
+
+fn missing_expected_arm_joints(json_str: &str) -> Vec<&'static str> {
+    let observed = joint_names(json_str);
+    EXPECTED_ARM_JOINTS
+        .iter()
+        .copied()
+        .filter(|joint| !observed.iter().any(|observed_name| observed_name == joint))
+        .collect()
+}
+
+fn describe_joint_surface(json_str: &str) -> String {
+    if json_str.is_empty() {
+        return "no joint-state sample returned from MCP".to_string();
+    }
+    let names = joint_names(json_str);
+    if names.is_empty() {
+        return format!("MCP joint-state had no named joints; raw sample: {json_str}");
+    }
+    let missing = missing_expected_arm_joints(json_str);
+    if missing.is_empty() {
+        format!("observed UR arm joints: {}", names.join(", "))
+    } else {
+        format!(
+            "observed joints: {}; missing expected UR arm joints: {}",
+            names.join(", "),
+            missing.join(", ")
+        )
+    }
+}
+
+async fn wait_for_expected_arm_joint_state(mcp: &McpManager, label: &str, timeout: Duration) -> Result<String, String> {
+    let start = tokio::time::Instant::now();
+    let mut attempt = 0_u32;
+    let mut last_sample = String::new();
+
+    while start.elapsed() < timeout {
+        attempt += 1;
+        let sample = read_joint_state(mcp, &format!("{label} poll #{attempt}")).await;
+        if !sample.is_empty() {
+            last_sample = sample.clone();
+            if missing_expected_arm_joints(&sample).is_empty() {
+                return Ok(sample);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    Err(format!(
+        "expected manipulator MCP surface to expose UR arm joints [{}], but {}",
+        EXPECTED_ARM_JOINTS.join(", "),
+        describe_joint_surface(&last_sample)
+    ))
 }
 
 fn compile_test_embodiment_runtime(
@@ -271,17 +363,24 @@ fn escape_bytes(bytes: &[u8]) -> String {
 }
 
 #[tokio::test]
-#[ignore = "requires ANTHROPIC_API_KEY + running Docker sim"]
+#[ignore = "requires ANTHROPIC_API_KEY + Docker daemon + local manipulator image"]
 async fn full_vertical_claude_wasm_gazebo() {
     let api_key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY required");
+    let _guard = common::live_test_mutex().lock().await;
+    if let Err(error) = common::recreate_docker_sim(&common::MANIPULATOR_SIM).await {
+        eprintln!("SKIP: failed to launch isolated ros2-manipulator test container: {error}");
+        return;
+    }
 
     // 1. MCP connection + BEFORE joint state
     let mcp = Arc::new(McpManager::new());
     if let Err(e) = mcp.connect("arm", MCP_PORT, Duration::from_secs(15)).await {
-        eprintln!("SKIP: MCP connect failed (is ros2-manipulator running on {MCP_PORT}?): {e}");
+        eprintln!("SKIP: MCP connect failed against isolated ros2-manipulator test container on {MCP_PORT}: {e}");
         return;
     }
-    let before = read_joint_state(&mcp, "BEFORE").await;
+    let before = wait_for_expected_arm_joint_state(&mcp, "BEFORE", Duration::from_secs(10))
+        .await
+        .expect("manipulator authored-WAT live test requires MCP-reported UR arm joint state");
 
     // 2. IO backends
     let _sensor = try_connect_sensor().await;
@@ -292,7 +391,7 @@ async fn full_vertical_claude_wasm_gazebo() {
         .expect("gRPC channel to bridge should connect");
     let (mut control_manifest, robot_class) = {
         let toml_str = include_str!("../../../examples/ur5/robot.toml");
-        let robot: roz_core::manifest::RobotManifest = toml::from_str(toml_str).unwrap();
+        let robot: roz_core::manifest::EmbodimentManifest = toml::from_str(toml_str).unwrap();
         (
             robot.control_interface_manifest().unwrap(),
             robot.channels.as_ref().unwrap().robot_class.clone(),
@@ -421,11 +520,8 @@ async fn full_vertical_claude_wasm_gazebo() {
     // 7. Wait for Copper to tick
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    let before_pan = if before.is_empty() {
-        None
-    } else {
-        find_joint_position(&before, "shoulder_pan_joint")
-    };
+    let before_pan = find_joint_position(&before, "shoulder_pan_joint")
+        .expect("expected MCP joint-state to include shoulder_pan_joint once UR arm surface is ready");
 
     // 9. Assert: command frames produced
     let cmds = log_sink.commands();
@@ -466,32 +562,18 @@ async fn full_vertical_claude_wasm_gazebo() {
     }
 
     // 10. AFTER joint state — poll because MCP state can lag behind the streamed controller frames.
-    let after_sample = if let Some(before_pan) = before_pan {
-        wait_for_joint_delta(&mcp, "shoulder_pan_joint", before_pan, 0.05, Duration::from_secs(6)).await
-    } else {
-        read_joint_state(&mcp, "AFTER").await;
-        None
-    };
+    let (after, delta) = wait_for_joint_delta(&mcp, "shoulder_pan_joint", before_pan, 0.05, Duration::from_secs(6))
+        .await
+        .expect("manipulator authored-WAT live test requires observed motion on a real UR arm joint");
 
     // 11. Position change — the arm should have moved at velocity, not jumped to a position
-    if !before.is_empty() {
-        if let (Some(_before_pan), Some((after, delta))) = (before_pan, after_sample) {
-            println!("shoulder_pan delta: {delta:.4} rad (expected ~0.6 for 0.2 rad/s * 3s)");
-            assert!(
-                delta > 0.05,
-                "shoulder_pan should have moved significantly at 0.2 rad/s, delta was {delta:.4}"
-            );
-            assert_ne!(before, after, "Joint positions should change");
-        } else {
-            println!("WARNING: Could not observe shoulder_pan delta via MCP, falling back to raw JSON comparison");
-            let after = read_joint_state(&mcp, "AFTER fallback").await;
-            assert!(!after.is_empty(), "expected a post-command joint-state sample");
-            assert_ne!(before, after, "Joint positions should change");
-        }
-        println!("Joint positions CHANGED — velocity integration working!");
-    } else {
-        println!("WARNING: Could not compare positions (initial MCP read failed), skipping position assertion");
-    }
+    println!("shoulder_pan delta: {delta:.4} rad (expected ~0.6 for 0.2 rad/s * 3s)");
+    assert!(
+        delta > 0.05,
+        "shoulder_pan should have moved significantly at 0.2 rad/s, delta was {delta:.4}"
+    );
+    assert_ne!(before, after, "Joint positions should change");
+    println!("Joint positions CHANGED on the UR arm surface — velocity integration working!");
 
     println!(
         "\nPASS: Full vertical — {} command frames, velocity integration working",

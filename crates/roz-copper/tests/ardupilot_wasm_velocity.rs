@@ -37,7 +37,7 @@ const BRIDGE_URL: &str = "http://127.0.0.1:9097";
 
 fn load_quadcopter_control_manifest() -> (ControlInterfaceManifest, String) {
     let toml_str = include_str!("../../../examples/quadcopter/robot.toml");
-    let robot: roz_copper::manifest::RobotManifest = toml::from_str(toml_str).unwrap();
+    let robot: roz_copper::manifest::EmbodimentManifest = toml::from_str(toml_str).unwrap();
     (
         robot.control_interface_manifest().unwrap(),
         robot

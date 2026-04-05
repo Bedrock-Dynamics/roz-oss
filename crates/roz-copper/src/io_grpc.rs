@@ -655,7 +655,7 @@ mod tests {
 
     #[tokio::test]
     async fn grpc_actuator_sink_uses_ros_joint_names_for_ur5_manipulator_manifest() {
-        let robot: roz_core::manifest::RobotManifest =
+        let robot: roz_core::manifest::EmbodimentManifest =
             toml::from_str(include_str!("../../../examples/ur5/robot.toml")).expect("ur5 manifest");
         let control_manifest = robot.control_interface_manifest().expect("control manifest");
         let runtime = tokio::runtime::Handle::current();

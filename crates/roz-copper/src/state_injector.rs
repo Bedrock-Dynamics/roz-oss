@@ -31,7 +31,7 @@ impl StateInjector for NullStateInjector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use roz_core::manifest::RobotManifest;
+    use roz_core::manifest::EmbodimentManifest;
 
     struct FakeInjector {
         values: Vec<f64>,
@@ -47,8 +47,8 @@ mod tests {
         }
     }
 
-    fn load_reachy_mini_manifest() -> RobotManifest {
-        let toml_str = include_str!("../../../examples/reachy-mini/robot.toml");
+    fn load_reachy_mini_manifest() -> EmbodimentManifest {
+        let toml_str = include_str!("../../../examples/reachy-mini/embodiment.toml");
         toml::from_str(toml_str).unwrap()
     }
 

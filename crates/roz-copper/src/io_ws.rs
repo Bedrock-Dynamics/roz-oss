@@ -132,7 +132,7 @@ pub fn create_ws_bridge(
     assert!(
         !config.body_template.is_empty() || config.channel_names.is_empty(),
         "WsBridgeConfig has {} command channels but no body_template — \
-         commands will never reach the daemon. Add set_target_body to [daemon.websocket] in robot.toml",
+         commands will never reach the daemon. Add set_target_body to [daemon.websocket] in embodiment.toml (legacy robot.toml also accepted)",
         config.channel_names.len(),
     );
 
@@ -341,8 +341,8 @@ pub fn render_frame(config: &WsBridgeConfig, frame: &CommandFrame) -> String {
 /// - `{"type": "head_pose", "head_pose": [[r00,r01,r02,r03],[r10,r11,r12,r13],[r20,r21,r22,r23],[r30,r31,r32,r33]]}`
 ///   -> extracts Euler angles (roll, pitch, yaw) from the 4x4 rotation matrix.
 ///
-/// This parsing is Reachy-specific for now. A generic parser driven by
-/// `robot.toml` configuration is a follow-up.
+/// This parsing is Reachy-specific for now. A generic parser driven by the
+/// embodiment manifest is a follow-up.
 fn parse_sensor_message(text: &str) -> Option<Vec<f64>> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     let obj = value.as_object()?;

@@ -1,15 +1,23 @@
-//! Live MCP integration test against running Docker sim containers.
+//! Live MCP integration test against isolated Docker sim containers.
 //!
 //! Run with:
 //! ```bash
 //! cargo test -p roz-local --test mcp_live_integration -- --ignored --nocapture
 //! ```
 
+mod common;
+
 use std::time::Duration;
 
 #[tokio::test]
 #[ignore]
 async fn discovers_mcp_tools_from_manipulator() {
+    let _guard = common::live_test_mutex().lock().await;
+    if let Err(error) = common::recreate_docker_sim(&common::MANIPULATOR_SIM).await {
+        eprintln!("SKIP: failed to launch isolated ros2-manipulator test container: {error}");
+        return;
+    }
+
     let manager = roz_local::mcp::McpManager::new();
 
     let tools = match manager.connect("test-arm", 8094, Duration::from_secs(10)).await {
@@ -43,6 +51,12 @@ async fn discovers_mcp_tools_from_manipulator() {
 #[tokio::test]
 #[ignore]
 async fn calls_mcp_get_joint_state() {
+    let _guard = common::live_test_mutex().lock().await;
+    if let Err(error) = common::recreate_docker_sim(&common::MANIPULATOR_SIM).await {
+        eprintln!("SKIP: failed to launch isolated ros2-manipulator test container: {error}");
+        return;
+    }
+
     let manager = roz_local::mcp::McpManager::new();
 
     let tools = match manager.connect("test-arm", 8094, Duration::from_secs(10)).await {
@@ -66,8 +80,8 @@ async fn calls_mcp_get_joint_state() {
         Ok(output) => {
             println!("Result: {output}");
             assert!(
-                output.contains("shoulder") || output.contains("position") || output.contains("joint"),
-                "should contain joint data: {output}"
+                output.contains("shoulder_pan_joint") && output.contains("wrist_3_joint"),
+                "should contain the canonical UR arm joint surface: {output}"
             );
             println!("PASS: get_joint_state returned real joint data");
         }

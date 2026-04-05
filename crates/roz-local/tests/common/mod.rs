@@ -19,7 +19,24 @@ pub struct DockerSimSpec {
     pub image: &'static str,
     pub args: &'static [&'static str],
     pub grpc_port: u16,
+    pub ros_domain_id: u8,
     pub startup_timeout: Duration,
+}
+
+const MANIPULATOR_DOCKER_ARGS: &[&str] = &["-p", "9094:9090", "-p", "8094:8090", "-e", "ROS_LOCALHOST_ONLY=1"];
+
+pub const MANIPULATOR_SIM: DockerSimSpec = DockerSimSpec {
+    name: "roz-test-manip",
+    image: "bedrockdynamics/substrate-sim:ros2-manipulator",
+    args: MANIPULATOR_DOCKER_ARGS,
+    grpc_port: 9094,
+    ros_domain_id: 44,
+    startup_timeout: Duration::from_secs(180),
+};
+
+pub fn live_test_mutex() -> &'static tokio::sync::Mutex<()> {
+    static LIVE_TEST_MUTEX: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LIVE_TEST_MUTEX.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 pub fn compile_test_embodiment_runtime(control_manifest: &ControlInterfaceManifest) -> EmbodimentRuntime {
@@ -96,9 +113,17 @@ pub async fn recreate_docker_sim(spec: &DockerSimSpec) -> Result<(), String> {
         .status()
         .await;
 
-    let mut args = vec!["run", "-d", "--rm", "--name", spec.name];
-    args.extend(spec.args.iter().copied());
-    args.push(spec.image);
+    let mut args = vec![
+        "run".to_string(),
+        "-d".to_string(),
+        "--rm".to_string(),
+        "--name".to_string(),
+        spec.name.to_string(),
+    ];
+    args.extend(spec.args.iter().map(|arg| (*arg).to_string()));
+    args.push("-e".to_string());
+    args.push(format!("ROS_DOMAIN_ID={}", spec.ros_domain_id));
+    args.push(spec.image.to_string());
 
     let output = AsyncCommand::new("docker")
         .args(&args)
@@ -115,8 +140,57 @@ pub async fn recreate_docker_sim(spec: &DockerSimSpec) -> Result<(), String> {
     }
 
     wait_for_tcp_port(spec.grpc_port, spec.startup_timeout).await?;
+    wait_for_container_health(spec.name, spec.startup_timeout).await?;
     tokio::time::sleep(Duration::from_secs(2)).await;
     Ok(())
+}
+
+async fn wait_for_container_health(name: &str, timeout: Duration) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut saw_healthcheck = false;
+
+    loop {
+        let output = AsyncCommand::new("docker")
+            .args([
+                "inspect",
+                "-f",
+                "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
+                name,
+            ])
+            .output()
+            .await
+            .map_err(|error| format!("failed to inspect container {name}: {error}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(format!("docker inspect for {name} failed: {stderr}"));
+        }
+
+        let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        match status.as_str() {
+            "healthy" => return Ok(()),
+            "none" => {
+                if !saw_healthcheck {
+                    return Ok(());
+                }
+            }
+            "starting" => {
+                saw_healthcheck = true;
+            }
+            "unhealthy" => {
+                return Err(format!("container {name} reported unhealthy"));
+            }
+            _ => {}
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "container {name} did not become healthy before timeout; last health status was `{last_status}`",
+                last_status = status
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 pub fn extract_wat_blob(response: &str) -> &str {

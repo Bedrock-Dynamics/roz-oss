@@ -30,6 +30,7 @@ use crate::channels::{ControllerState, EvidenceSummaryState};
 use crate::controller_lifecycle::{ControllerLifecycle, LifecycleRetirement, LifecycleTransition, RuntimeDigests};
 use crate::deployment_manager::DeploymentManager;
 use crate::evidence_collector::{EvidenceCollector, EvidenceFinalizeContext};
+#[cfg(feature = "gazebo")]
 use crate::io::{ActuatorSink, SensorFrame, SensorSource};
 use crate::safety_filter::HotPathSafetyFilter;
 use crate::tick_builder::TickInputBuilder;

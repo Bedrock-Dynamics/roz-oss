@@ -1,5 +1,3 @@
-# Legacy compatibility copy of `embodiment.toml`.
-# Keep this file until legacy manifest fallback is removed.
 [robot]
 name = "reachy-mini"
 description = "Pollen Robotics Reachy Mini — expressive tabletop robot with head, body, and antennas"
