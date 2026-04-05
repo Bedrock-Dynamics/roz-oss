@@ -19,7 +19,7 @@ pub struct TaskArgs {
 /// Available task subcommands.
 #[derive(Debug, Subcommand)]
 pub enum TaskCommands {
-    /// Run a task from a spec file or inline definition.
+    /// Run a task from a spec file or inline definition. Use global `--host` or include `host_id` in the spec.
     Run {
         /// Path to the task spec or inline task definition.
         spec: String,
@@ -66,9 +66,9 @@ pub enum TaskCommands {
 }
 
 /// Execute a task subcommand.
-pub async fn execute(cmd: &TaskCommands, config: &CliConfig) -> anyhow::Result<()> {
+pub async fn execute(cmd: &TaskCommands, config: &CliConfig, host_flag: Option<&str>) -> anyhow::Result<()> {
     match cmd {
-        TaskCommands::Run { spec, follow, phases } => run(config, spec, *follow, phases.as_deref()).await,
+        TaskCommands::Run { spec, follow, phases } => run(config, spec, *follow, phases.as_deref(), host_flag).await,
         TaskCommands::List => list(config).await,
         TaskCommands::Status { id } => status(config, id).await,
         TaskCommands::Watch { id } => watch(config, id).await,
@@ -84,7 +84,55 @@ fn is_yaml_extension(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"))
 }
 
-async fn run(config: &CliConfig, spec: &str, follow: bool, phases: Option<&str>) -> anyhow::Result<()> {
+fn task_body_object_mut(
+    body: &mut serde_json::Value,
+) -> anyhow::Result<&mut serde_json::Map<String, serde_json::Value>> {
+    body.as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("task spec must deserialize to a JSON/YAML object"))
+}
+
+fn body_host_id(body: &serde_json::Value) -> Option<&str> {
+    body.get("host_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+async fn ensure_task_host_id<F, Fut>(
+    body: &mut serde_json::Value,
+    host_flag: Option<&str>,
+    mut resolve_host_id: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<String>>,
+{
+    if body_host_id(body).is_some() {
+        return Ok(());
+    }
+
+    let host = host_flag.ok_or_else(|| {
+        anyhow::anyhow!("task creation requires a target host; pass global `--host <name-or-uuid>` or include `host_id` in the task spec")
+    })?;
+    let resolved = resolve_host_id(host.to_string()).await?;
+    task_body_object_mut(body)?.insert("host_id".to_string(), serde_json::Value::String(resolved));
+    Ok(())
+}
+
+fn task_status_from_response(resp: &serde_json::Value) -> Option<&str> {
+    resp.get("data")
+        .and_then(|data| data.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| resp.get("status").and_then(serde_json::Value::as_str))
+        .or_else(|| resp.get("state").and_then(serde_json::Value::as_str))
+}
+
+async fn run(
+    config: &CliConfig,
+    spec: &str,
+    follow: bool,
+    phases: Option<&str>,
+    host_flag: Option<&str>,
+) -> anyhow::Result<()> {
     let client = config.api_client()?;
     let spec_path = Path::new(spec);
 
@@ -104,8 +152,17 @@ async fn run(config: &CliConfig, spec: &str, follow: bool, phases: Option<&str>)
     if let Some(phases_json) = phases {
         let parsed: Vec<roz_core::phases::PhaseSpec> =
             serde_json::from_str(phases_json).map_err(|e| anyhow::anyhow!("invalid --phases JSON: {e}"))?;
-        body["phases"] = serde_json::to_value(&parsed)?;
+        task_body_object_mut(&mut body)?.insert("phases".to_string(), serde_json::to_value(&parsed)?);
     }
+
+    let resolve_client = client.clone();
+    let resolve_api_url = config.api_url.clone();
+    ensure_task_host_id(&mut body, host_flag, move |host| {
+        let client = resolve_client.clone();
+        let api_url = resolve_api_url.clone();
+        async move { super::estop::resolve_host_id(&client, &api_url, &host).await }
+    })
+    .await?;
 
     let resp: serde_json::Value = client
         .post(format!("{}/v1/tasks", config.api_url))
@@ -288,7 +345,7 @@ async fn watch(config: &CliConfig, task_id: &str) -> anyhow::Result<()> {
 }
 
 /// Terminal task states that indicate completion.
-const TERMINAL_STATES: &[&str] = &["completed", "failed", "cancelled", "error"];
+const TERMINAL_STATES: &[&str] = &["succeeded", "failed", "timed_out", "cancelled", "safety_stop"];
 
 async fn wait(config: &CliConfig, id: &str, timeout: Option<u64>) -> anyhow::Result<()> {
     let client = config.api_client()?;
@@ -308,12 +365,15 @@ async fn wait(config: &CliConfig, id: &str, timeout: Option<u64>) -> anyhow::Res
             .json()
             .await?;
 
-        if let Some(state) = resp["status"].as_str().or_else(|| resp["state"].as_str())
+        if let Some(state) = task_status_from_response(&resp)
             && TERMINAL_STATES.contains(&state)
         {
             spinner.finish_with_message(format!("Task {id}: {state}"));
             crate::output::render_json(&resp)?;
-            return Ok(());
+            if state == "succeeded" {
+                return Ok(());
+            }
+            anyhow::bail!("Task {id} reached terminal state: {state}");
         }
 
         if let Some(dl) = deadline
@@ -409,7 +469,73 @@ async fn logs(config: &CliConfig, id: &str, follow: bool) -> anyhow::Result<()> 
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use roz_core::phases::{PhaseMode, PhaseSpec, PhaseTrigger, ToolSetFilter};
+
+    #[test]
+    fn task_status_from_response_prefers_nested_data_status() {
+        let resp = serde_json::json!({
+            "data": { "status": "succeeded" },
+            "status": "failed"
+        });
+        assert_eq!(task_status_from_response(&resp), Some("succeeded"));
+    }
+
+    #[test]
+    fn terminal_states_match_current_task_model() {
+        assert!(TERMINAL_STATES.contains(&"succeeded"));
+        assert!(TERMINAL_STATES.contains(&"timed_out"));
+        assert!(TERMINAL_STATES.contains(&"safety_stop"));
+        assert!(!TERMINAL_STATES.contains(&"completed"));
+    }
+
+    #[tokio::test]
+    async fn ensure_task_host_id_injects_resolved_host_when_missing() {
+        let mut body = serde_json::json!({
+            "prompt": "scan bay",
+            "environment_id": "env-1"
+        });
+        ensure_task_host_id(&mut body, Some("robot-alpha"), |host| async move {
+            assert_eq!(host, "robot-alpha");
+            Ok("00000000-0000-0000-0000-000000000123".to_string())
+        })
+        .await
+        .expect("host should resolve");
+        assert_eq!(
+            body.get("host_id").and_then(serde_json::Value::as_str),
+            Some("00000000-0000-0000-0000-000000000123")
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_task_host_id_preserves_explicit_host_id() {
+        let mut body = serde_json::json!({
+            "prompt": "scan bay",
+            "environment_id": "env-1",
+            "host_id": "existing-host-id"
+        });
+        ensure_task_host_id(&mut body, Some("robot-alpha"), |_host| async move {
+            anyhow::bail!("resolver should not be called when host_id is already present")
+        })
+        .await
+        .expect("existing host_id should win");
+        assert_eq!(
+            body.get("host_id").and_then(serde_json::Value::as_str),
+            Some("existing-host-id")
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_task_host_id_requires_host_target() {
+        let mut body = serde_json::json!({
+            "prompt": "scan bay",
+            "environment_id": "env-1"
+        });
+        let error = ensure_task_host_id(&mut body, None, |_host| async move { Ok(String::new()) })
+            .await
+            .expect_err("missing host target should fail");
+        assert!(error.to_string().contains("requires a target host"));
+    }
 
     #[test]
     fn parse_phases_json() {

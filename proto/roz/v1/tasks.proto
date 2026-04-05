@@ -16,7 +16,7 @@ service TaskService {
 message CreateTaskRequest {
   string prompt = 1;
   string environment_id = 2;
-  optional string host_id = 3;
+  string host_id = 3;
   optional uint32 timeout_secs = 4;
   optional google.protobuf.Struct control_interface_manifest = 5;
   optional google.protobuf.Struct delegation_scope = 6;

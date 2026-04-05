@@ -247,9 +247,12 @@ impl TaskService for TaskServiceImpl {
 
         validate_child_task_delegation_scope(parent_task_id, delegation_scope.as_ref())?;
 
-        let host_id_str = host_id
-            .as_deref()
-            .ok_or_else(|| Status::invalid_argument("host_id is required until deferred assignment is implemented"))?;
+        let host_id_str = host_id.trim();
+        if host_id_str.is_empty() {
+            return Err(Status::invalid_argument(
+                "host_id is required until deferred assignment is implemented",
+            ));
+        }
         let nats = self
             .nats_client
             .as_ref()
@@ -286,7 +289,7 @@ impl TaskService for TaskServiceImpl {
             task_id: task.id,
             environment_id: task.environment_id,
             prompt: task.prompt.clone(),
-            host_id: host_id.clone(),
+            host_id: Some(host_id.clone()),
             safety_level: roz_core::safety::SafetyLevel::Normal,
             parent_task_id,
         };

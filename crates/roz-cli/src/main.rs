@@ -36,7 +36,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(cmd) => match cmd {
             cli::Commands::Auth(args) => commands::auth::execute(&args.command, &config).await,
-            cli::Commands::Task(args) => commands::task::execute(&args.command, &config).await,
+            cli::Commands::Task(args) => {
+                commands::task::execute(&args.command, &config, cli.global.host.as_deref()).await
+            }
             cli::Commands::Host(args) => commands::host::execute(&args.command, &config).await,
             cli::Commands::Env(args) => commands::env::execute(&args.command, &config).await,
             cli::Commands::Trigger(args) => commands::trigger::execute(&args.command, &config).await,

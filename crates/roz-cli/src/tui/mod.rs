@@ -666,7 +666,9 @@ fn dispatch(
         // Handle /team inline — placeholder for team event streaming.
         if text.trim() == "/team" {
             stdout.println("Team monitoring: not connected to a team session.".to_string());
-            stdout.println("Use `roz task create --phases '...'` to create a phased team task.".to_string());
+            stdout.println(
+                "Use `roz task run SPEC --host HOST --phases '...'` to create a phased team task.".to_string(),
+            );
             return;
         }
 
