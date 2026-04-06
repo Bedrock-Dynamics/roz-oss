@@ -3,7 +3,7 @@
 
 use chrono::Utc;
 use roz_core::embodiment::prediction::PredictionEvidence;
-use roz_core::interfaces::WorldModelPredictor;
+use roz_core::interfaces::{WorldModelPredictor, WorldModelPredictorMetadata};
 use roz_core::spatial::WorldState;
 
 /// Configuration for world model verification.
@@ -65,13 +65,21 @@ pub fn evaluate_with_world_model(
         None
     };
 
+    let WorldModelPredictorMetadata {
+        model_id,
+        model_version,
+    } = predictor.metadata().unwrap_or_else(|| WorldModelPredictorMetadata {
+        model_id: "unknown".into(),
+        model_version: "unknown".into(),
+    });
+
     let evidence = PredictionEvidence {
         prediction_id: uuid::Uuid::new_v4().to_string(),
         controller_id: controller_id.into(),
         horizon_ticks: config.horizon_ticks,
         predictions,
-        model_id: "world_model".into(),
-        model_version: "0.1.0".into(),
+        model_id,
+        model_version,
         created_at: Utc::now(),
     };
 
@@ -90,6 +98,7 @@ mod tests {
 
     struct MockPredictor {
         predictions: Vec<PredictedState>,
+        metadata: Option<WorldModelPredictorMetadata>,
     }
 
     impl WorldModelPredictor for MockPredictor {
@@ -100,6 +109,10 @@ mod tests {
             _horizon_ticks: u32,
         ) -> Result<Vec<PredictedState>, Box<dyn std::error::Error + Send + Sync>> {
             Ok(self.predictions.clone())
+        }
+
+        fn metadata(&self) -> Option<WorldModelPredictorMetadata> {
+            self.metadata.clone()
         }
     }
 
@@ -113,6 +126,13 @@ mod tests {
             _horizon_ticks: u32,
         ) -> Result<Vec<PredictedState>, Box<dyn std::error::Error + Send + Sync>> {
             Err("simulated world model failure".into())
+        }
+
+        fn metadata(&self) -> Option<WorldModelPredictorMetadata> {
+            Some(WorldModelPredictorMetadata {
+                model_id: "predictor-error".into(),
+                model_version: "test".into(),
+            })
         }
     }
 
@@ -156,6 +176,10 @@ mod tests {
     fn evaluate_clean_predictions_no_advisory() {
         let predictor = MockPredictor {
             predictions: vec![low_risk_state()],
+            metadata: Some(WorldModelPredictorMetadata {
+                model_id: "predictor-clean".into(),
+                model_version: "1.2.3".into(),
+            }),
         };
         let config = WorldModelVerifierConfig::default();
         let result = evaluate_with_world_model(&predictor, &[], &[vec![0.1, 0.2]], "ctrl-001", &config).unwrap();
@@ -164,7 +188,8 @@ mod tests {
         assert!(!result.high_contact_risk);
         assert!(result.advisory_message.is_none());
         assert_eq!(result.evidence.controller_id, "ctrl-001");
-        assert_eq!(result.evidence.model_id, "world_model");
+        assert_eq!(result.evidence.model_id, "predictor-clean");
+        assert_eq!(result.evidence.model_version, "1.2.3");
         assert_eq!(result.evidence.horizon_ticks, 50);
         assert_eq!(result.evidence.predictions.len(), 1);
     }
@@ -173,6 +198,7 @@ mod tests {
     fn evaluate_high_collision_risk_produces_advisory() {
         let predictor = MockPredictor {
             predictions: vec![low_risk_state(), high_collision_state()],
+            metadata: None,
         };
         let config = WorldModelVerifierConfig::default();
         let result = evaluate_with_world_model(&predictor, &[], &[vec![0.5, 0.5]], "ctrl-002", &config).unwrap();
@@ -182,12 +208,18 @@ mod tests {
         let msg = result.advisory_message.unwrap();
         assert!(msg.contains("collision"), "advisory should mention collision: {msg}");
         assert!(msg.contains("50"), "advisory should mention horizon ticks: {msg}");
+        assert_eq!(result.evidence.model_id, "unknown");
+        assert_eq!(result.evidence.model_version, "unknown");
     }
 
     #[test]
     fn evaluate_high_contact_risk_produces_advisory() {
         let predictor = MockPredictor {
             predictions: vec![low_risk_state(), high_contact_state()],
+            metadata: Some(WorldModelPredictorMetadata {
+                model_id: "predictor-contact".into(),
+                model_version: "2.0.0".into(),
+            }),
         };
         let config = WorldModelVerifierConfig::default();
         let result = evaluate_with_world_model(&predictor, &[], &[vec![0.3, 0.3]], "ctrl-003", &config).unwrap();
@@ -211,6 +243,10 @@ mod tests {
     fn evidence_fields_are_populated() {
         let predictor = MockPredictor {
             predictions: vec![low_risk_state()],
+            metadata: Some(WorldModelPredictorMetadata {
+                model_id: "predictor-fields".into(),
+                model_version: "9.9.9".into(),
+            }),
         };
         let config = WorldModelVerifierConfig {
             collision_risk_threshold: 0.5,
@@ -221,7 +257,8 @@ mod tests {
 
         assert!(!result.evidence.prediction_id.is_empty());
         assert_eq!(result.evidence.horizon_ticks, 100);
-        assert_eq!(result.evidence.model_version, "0.1.0");
+        assert_eq!(result.evidence.model_id, "predictor-fields");
+        assert_eq!(result.evidence.model_version, "9.9.9");
     }
 
     #[test]
@@ -229,6 +266,10 @@ mod tests {
         // When both collision and contact thresholds are exceeded, collision advisory wins
         let predictor = MockPredictor {
             predictions: vec![high_collision_state(), high_contact_state()],
+            metadata: Some(WorldModelPredictorMetadata {
+                model_id: "predictor-both".into(),
+                model_version: "3.1.4".into(),
+            }),
         };
         let config = WorldModelVerifierConfig::default();
         let result = evaluate_with_world_model(&predictor, &[], &[], "ctrl-both", &config).unwrap();

@@ -451,7 +451,8 @@ fn verify_wasm(
 
     // Use EvidenceCollector for real evidence — no fabrication.
     let mut collector = roz_copper::evidence_collector::EvidenceCollector::new(controller_id, &channel_names);
-    let mut safety_filter = roz_copper::safety_filter::HotPathSafetyFilter::new(joint_limits, None, 1.0 / 100.0);
+    let mut safety_filter = roz_copper::safety_filter::HotPathSafetyFilter::new(joint_limits, None, 1.0 / 100.0)
+        .expect("promote_controller uses a positive control tick period");
 
     for tick in 0..VERIFY_TICK_COUNT {
         let tick_start = std::time::Instant::now();

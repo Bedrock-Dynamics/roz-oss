@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use roz_core::safety::SafetyVerdict;
-use roz_core::spatial::WorldState;
+use roz_core::spatial::{Alert, AlertSeverity, WorldState};
 use roz_core::tools::ToolCall;
 
 use crate::agent_loop::AgentLoopMode;
@@ -28,6 +28,59 @@ pub struct ModeTransitionGuard {
 impl ModeTransitionGuard {
     pub const fn new(mode: AgentLoopMode) -> Self {
         Self { mode }
+    }
+
+    fn alert_tokens(alert: &Alert) -> Vec<String> {
+        format!("{} {}", alert.source, alert.message)
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|token| !token.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect()
+    }
+
+    fn has_keyword(tokens: &[String], keyword: &str) -> bool {
+        match keyword {
+            "estop" => {
+                tokens.iter().any(|token| token == "estop")
+                    || tokens.windows(2).any(|window| window[0] == "e" && window[1] == "stop")
+            }
+            other => tokens.iter().any(|token| token == other),
+        }
+    }
+
+    fn has_any_keyword(tokens: &[String], keywords: &[&str]) -> bool {
+        keywords.iter().any(|keyword| Self::has_keyword(tokens, keyword))
+    }
+
+    fn is_blocking_heartbeat_alert(alert: &Alert) -> bool {
+        if alert.severity < AlertSeverity::Warning {
+            return false;
+        }
+
+        let tokens = Self::alert_tokens(alert);
+        Self::has_keyword(&tokens, "heartbeat")
+            && Self::has_any_keyword(
+                &tokens,
+                &[
+                    "degraded", "lost", "timeout", "timed", "missing", "stale", "offline", "failed",
+                ],
+            )
+    }
+
+    fn is_blocking_estop_alert(alert: &Alert) -> bool {
+        if alert.severity < AlertSeverity::Warning {
+            return false;
+        }
+
+        let tokens = Self::alert_tokens(alert);
+        if !Self::has_keyword(&tokens, "estop") {
+            return false;
+        }
+
+        !Self::has_any_keyword(
+            &tokens,
+            &["cleared", "restored", "inactive", "released", "reset", "resolved"],
+        )
     }
 }
 
@@ -58,11 +111,7 @@ impl SafetyGuard for ModeTransitionGuard {
             };
         }
 
-        if state.alerts.iter().any(|alert| {
-            let source = alert.source.to_ascii_lowercase();
-            let message = alert.message.to_ascii_lowercase();
-            source.contains("heartbeat") || message.contains("heartbeat")
-        }) {
+        if state.alerts.iter().any(Self::is_blocking_heartbeat_alert) {
             return SafetyVerdict::Block {
                 reason:
                     "OODA mode requires a healthy observation heartbeat; runtime alerts indicate heartbeat degradation"
@@ -70,17 +119,15 @@ impl SafetyGuard for ModeTransitionGuard {
             };
         }
 
-        if state.alerts.iter().any(|alert| {
-            let source = alert.source.to_ascii_lowercase();
-            let message = alert.message.to_ascii_lowercase();
-            source.contains("estop") || message.contains("e-stop") || message.contains("estop")
-        }) || state.entities.iter().any(|entity| {
-            entity
-                .properties
-                .get("estop_active")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-        }) {
+        if state.alerts.iter().any(Self::is_blocking_estop_alert)
+            || state.entities.iter().any(|entity| {
+                entity
+                    .properties
+                    .get("estop_active")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            })
+        {
             return SafetyVerdict::Block {
                 reason: "OODA mode requires e-stop clear; runtime world-state indicates an active safety stop"
                     .to_string(),
@@ -102,7 +149,7 @@ impl SafetyGuard for ModeTransitionGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use roz_core::spatial::{EntityState, SimScreenshot};
+    use roz_core::spatial::{Alert, EntityState, SimScreenshot};
     use serde_json::json;
 
     fn make_action() -> ToolCall {
@@ -209,6 +256,54 @@ mod tests {
             SafetyVerdict::Block { reason } => assert!(reason.contains("e-stop") || reason.contains("safety stop")),
             other => panic!("expected Block for estop signal, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn blocks_ooda_when_heartbeat_degraded_alert_present() {
+        let guard = ModeTransitionGuard::new(AgentLoopMode::OodaReAct);
+        let mut state = context_with_entities();
+        state.alerts.push(Alert {
+            severity: AlertSeverity::Warning,
+            message: "Observation heartbeat degraded".into(),
+            source: "edge_heartbeat".into(),
+        });
+
+        let result = guard.check(&make_action(), &state).await;
+
+        match result {
+            SafetyVerdict::Block { reason } => assert!(reason.contains("heartbeat")),
+            other => panic!("expected Block for degraded heartbeat, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn allows_ooda_when_heartbeat_restored_alert_present() {
+        let guard = ModeTransitionGuard::new(AgentLoopMode::OodaReAct);
+        let mut state = context_with_entities();
+        state.alerts.push(Alert {
+            severity: AlertSeverity::Info,
+            message: "Observation heartbeat restored".into(),
+            source: "edge_heartbeat".into(),
+        });
+
+        let result = guard.check(&make_action(), &state).await;
+
+        assert_eq!(result, SafetyVerdict::Allow);
+    }
+
+    #[tokio::test]
+    async fn allows_ooda_when_estop_cleared_alert_present() {
+        let guard = ModeTransitionGuard::new(AgentLoopMode::OodaReAct);
+        let mut state = context_with_entities();
+        state.alerts.push(Alert {
+            severity: AlertSeverity::Warning,
+            message: "E-stop cleared by operator".into(),
+            source: "safety_monitor".into(),
+        });
+
+        let result = guard.check(&make_action(), &state).await;
+
+        assert_eq!(result, SafetyVerdict::Allow);
     }
 
     // --- React mode (no spatial requirement) ---

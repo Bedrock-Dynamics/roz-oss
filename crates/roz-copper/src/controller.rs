@@ -428,6 +428,7 @@ fn runtime_digests_for_artifact(artifact: &ControllerArtifact) -> RuntimeDigests
         manifest_digest: artifact.verification_key.manifest_digest.clone(),
         execution_mode: artifact.verification_key.execution_mode,
         compiler_version: artifact.verification_key.compiler_version.clone(),
+        embodiment_family: artifact.verification_key.embodiment_family.clone(),
     }
 }
 
@@ -1219,7 +1220,8 @@ fn build_tick_infrastructure(
     );
 
     let tick_period_s = 1.0 / f64::from(profile.control_rate_hz.max(1));
-    let hot_path_filter = HotPathSafetyFilter::new(profile.joint_limits.clone(), None, tick_period_s);
+    let hot_path_filter = HotPathSafetyFilter::new(profile.joint_limits.clone(), None, tick_period_s)
+        .expect("control profile tick period must be valid");
 
     (tick_builder, hot_path_filter)
 }

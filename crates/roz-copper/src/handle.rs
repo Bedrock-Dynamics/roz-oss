@@ -130,7 +130,7 @@ impl CopperHandle {
         let (estop_tx, estop_rx) = mpsc::channel::<String>(4);
 
         // Spawn bridge task (tokio → std forwarding).
-        let bridge = crate::channels::spawn_command_bridge(agent_rx, copper_tx);
+        let bridge = crate::channels::spawn_command_bridge(agent_rx, Arc::clone(&state), copper_tx);
 
         // Spawn controller thread.
         let state_clone = Arc::clone(&state);

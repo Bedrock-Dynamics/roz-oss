@@ -42,6 +42,7 @@ use roz_agent::spatial_provider::{
     PrimedWorldStateProvider, WorldStateProvider, format_runtime_world_state_bootstrap_note,
     world_state_has_runtime_data,
 };
+use roz_core::recovery::{RecoveryConfig, recovery_action_for};
 use roz_core::session::activity::RuntimeFailureKind;
 use roz_core::session::event::{
     CanonicalSessionEventEnvelope, CorrelationId, EventEnvelope, EventId, SessionEvent, SessionPermissionRule,
@@ -1130,6 +1131,14 @@ fn runtime_error_event(error: &SessionRuntimeError) -> Option<SessionEvent> {
             message: "session already completed".to_string(),
             retryable: false,
         }),
+        SessionRuntimeError::TurnFailed(failure) => {
+            let action = recovery_action_for(failure, &RecoveryConfig::default());
+            Some(SessionEvent::SessionRejected {
+                code: "turn_failed".to_string(),
+                message: format!("turn failed: {failure:?}"),
+                retryable: action.retry,
+            })
+        }
         SessionRuntimeError::SessionFailed(_) => None,
     }
 }
@@ -1425,6 +1434,29 @@ mod tests {
 
         let error = parse_runtime_bootstrap("sess-edge-missing", &start_msg).expect_err("bootstrap should be required");
         assert!(error.to_string().contains("missing edge runtime bootstrap"));
+    }
+
+    #[test]
+    fn runtime_error_event_marks_retryable_turn_failures() {
+        let retryable = runtime_error_event(&SessionRuntimeError::TurnFailed(RuntimeFailureKind::ModelError))
+            .expect("turn failure should produce relay event");
+        let blocking = runtime_error_event(&SessionRuntimeError::TurnFailed(RuntimeFailureKind::SafetyBlocked))
+            .expect("turn failure should produce relay event");
+
+        match retryable {
+            SessionEvent::SessionRejected { code, retryable, .. } => {
+                assert_eq!(code, "turn_failed");
+                assert!(retryable, "model errors should surface as retryable");
+            }
+            other => panic!("expected SessionRejected, got {other:?}"),
+        }
+
+        match blocking {
+            SessionEvent::SessionRejected { retryable, .. } => {
+                assert!(!retryable, "safety failures should not surface as retryable");
+            }
+            other => panic!("expected SessionRejected, got {other:?}"),
+        }
     }
 
     #[test]

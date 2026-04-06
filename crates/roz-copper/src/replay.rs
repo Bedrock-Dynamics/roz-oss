@@ -194,8 +194,16 @@ impl ReplayEngine {
             }
         }
 
-        let passed = mismatches.is_empty();
-        let verifier_reason = replay_failure_reason(&mismatches);
+        let has_tick_error = mismatches.iter().any(|mismatch| mismatch.field == "tick_error");
+        let passed = match self.mode {
+            ReplayMode::RegressionTest => mismatches.is_empty(),
+            ReplayMode::VerifyOnly | ReplayMode::CompareAgainstCurrent => !has_tick_error,
+        };
+        let verifier_reason = if passed {
+            None
+        } else {
+            replay_failure_reason(&mismatches)
+        };
 
         let evidence = make_evidence(
             collector,
@@ -378,6 +386,21 @@ fn verification_key_mismatch(
             field: "verification_key.execution_mode".to_string(),
             expected: format!("{:?}", verification_key.execution_mode),
             actual: format!("{:?}", runtime_digests.execution_mode),
+        });
+    }
+
+    if verification_key.embodiment_family != runtime_digests.embodiment_family {
+        return Some(ReplayMismatch {
+            tick: 0,
+            field: "verification_key.embodiment_family".to_string(),
+            expected: verification_key
+                .embodiment_family
+                .clone()
+                .unwrap_or_else(|| "<none>".to_string()),
+            actual: runtime_digests
+                .embodiment_family
+                .clone()
+                .unwrap_or_else(|| "<none>".to_string()),
         });
     }
 
@@ -648,9 +671,33 @@ mod tests {
             }
         });
         assert_eq!(result.ticks_run, 4, "all ticks should run despite mismatch");
-        assert!(!result.passed, "mismatch should fail");
+        assert!(result.passed, "compare-only mode should stay non-failing");
         assert_eq!(result.mismatches.len(), 1);
         assert_eq!(result.mismatches[0].tick, 2);
+        assert_eq!(result.evidence.verifier_status_typed(), Some(VerifierStatus::Complete));
+    }
+
+    #[test]
+    fn compare_against_current_still_fails_on_tick_error() {
+        let trace = make_trace(4, true);
+        let engine = ReplayEngine::new(ReplayMode::CompareAgainstCurrent);
+        let runtime_digests = runtime_digests_for_trace(&trace);
+        let result = engine.replay_with(&trace, &runtime_digests, |input| {
+            if input.tick == 1 {
+                Err("controller trap".into())
+            } else {
+                Ok(TickOutput {
+                    command_values: vec![input.tick as f64 * 0.1],
+                    estop: false,
+                    estop_reason: None,
+                    metrics: vec![],
+                })
+            }
+        });
+        assert!(!result.passed, "tick errors should still fail compare mode");
+        assert_eq!(result.mismatches.len(), 1);
+        assert_eq!(result.mismatches[0].field, "tick_error");
+        assert_eq!(result.evidence.verifier_status_typed(), Some(VerifierStatus::Failed));
     }
 
     #[test]
@@ -686,6 +733,7 @@ mod tests {
             manifest_digest: "sha256:mfst".into(),
             execution_mode: ExecutionMode::Replay,
             compiler_version: "wasmtime-43".into(),
+            embodiment_family: None,
         };
         let result = engine.replay_with(&trace, &runtime_digests, |_| unreachable!("replay should not run"));
         assert_eq!(result.ticks_run, 0);

@@ -408,12 +408,15 @@ async fn full_vertical_claude_wasm_gazebo() {
         }
     }
     control_manifest.stamp_digest();
-    let grpc_sink = Arc::new(GrpcActuatorSink::from_control_manifest(
-        channel,
-        &control_manifest,
-        robot_class,
-        tokio::runtime::Handle::current(),
-    ));
+    let grpc_sink = Arc::new(
+        GrpcActuatorSink::from_control_manifest(
+            channel,
+            &control_manifest,
+            robot_class,
+            tokio::runtime::Handle::current(),
+        )
+        .expect("valid manipulator actuator manifest"),
+    );
     let grpc_sink_ref = Arc::clone(&grpc_sink);
     let log_sink = Arc::new(roz_copper::io_log::LogActuatorSink::new());
     let tee_sink = Arc::new(TeeActuatorSink::new(

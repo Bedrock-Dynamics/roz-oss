@@ -178,6 +178,9 @@ impl TypedToolExecutor for ReplayControllerTool {
             manifest_digest,
             execution_mode: ExecutionMode::Replay,
             compiler_version: trace.verification_key.compiler_version.clone(),
+            embodiment_family: embodiment_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.embodiment_family.clone()),
         };
 
         let replay_mode = input.mode.unwrap_or(ReplayControllerMode::RegressionTest);

@@ -155,12 +155,19 @@ fn session_runtime_error_to_agent_error(error: &SessionRuntimeError, estop_activ
     match error {
         SessionRuntimeError::SessionPaused => AgentError::Safety("session paused".into()),
         SessionRuntimeError::SessionCompleted => AgentError::Internal(anyhow::anyhow!("session already completed")),
-        SessionRuntimeError::SessionFailed(RuntimeFailureKind::OperatorAbort) => AgentError::Cancelled {
+        SessionRuntimeError::TurnFailed(RuntimeFailureKind::OperatorAbort)
+        | SessionRuntimeError::SessionFailed(RuntimeFailureKind::OperatorAbort) => AgentError::Cancelled {
             partial_input_tokens: 0,
             partial_output_tokens: 0,
         },
-        SessionRuntimeError::SessionFailed(RuntimeFailureKind::SafetyBlocked) if estop_active => {
+        SessionRuntimeError::TurnFailed(RuntimeFailureKind::SafetyBlocked)
+        | SessionRuntimeError::SessionFailed(RuntimeFailureKind::SafetyBlocked)
+            if estop_active =>
+        {
             AgentError::Safety("E-STOP activated during task execution".into())
+        }
+        SessionRuntimeError::TurnFailed(failure) => {
+            AgentError::Internal(anyhow::anyhow!("turn runtime failed: {failure:?}"))
         }
         SessionRuntimeError::SessionFailed(failure) => {
             AgentError::Internal(anyhow::anyhow!("session runtime failed: {failure:?}"))

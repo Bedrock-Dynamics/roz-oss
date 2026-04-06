@@ -426,9 +426,8 @@ impl CuWasmTask {
         match &mut self.task {
             TaskKind::Core { store, process_fn, .. } => {
                 store.data_mut().reset_commands();
-                if let Some(input) = input {
-                    store.data_mut().set_tick_input(input);
-                }
+                let local_input = input.cloned().unwrap_or_else(|| empty_tick_input(tick, store.data()));
+                store.data_mut().set_tick_input(&local_input);
                 store.set_epoch_deadline(8);
                 process_fn.call(&mut *store, tick)?;
                 if store.data().estop_requested {
@@ -771,6 +770,74 @@ mod tests {
 
         // Command values should also be reflected in host context.
         assert!((task.host_context().command_values[0] - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn wasm_core_tick_resets_stale_input_when_none() {
+        let empty_input = empty_tick_input(1, &HostContext::default());
+        let populated_input = TickInput {
+            tick: 0,
+            monotonic_time_ns: 123,
+            digests: crate::tick_contract::DigestSet {
+                model: "m".into(),
+                calibration: "c".into(),
+                manifest: "man".into(),
+                interface_version: "1.0".into(),
+            },
+            joints: vec![],
+            watched_poses: vec![],
+            wrench: None,
+            contact: None,
+            features: crate::tick_contract::DerivedFeatures::default(),
+            config_json: "{\"present\":true}".into(),
+        };
+        let empty_len = serde_json::to_vec(&empty_input).unwrap().len();
+        let populated_len = serde_json::to_vec(&populated_input).unwrap().len();
+        let threshold = ((empty_len + populated_len) / 2) as i32;
+        let short_output_json = r#"{"command_values":[1.0],"estop":false,"metrics":[]}"#;
+        let short_len = short_output_json.len();
+        let short_hex: String = short_output_json
+            .as_bytes()
+            .iter()
+            .map(|b| format!("\\{b:02x}"))
+            .collect();
+        let long_output_json = r#"{"command_values":[9.0],"estop":false,"metrics":[]}"#;
+        let long_len = long_output_json.len();
+        let long_hex: String = long_output_json
+            .as_bytes()
+            .iter()
+            .map(|b| format!("\\{b:02x}"))
+            .collect();
+        let wat = format!(
+            r#"(module
+                (import "tick" "input_len" (func $ilen (result i32)))
+                (import "tick" "get_input" (func $gin (param i32 i32) (result i32)))
+                (import "tick" "set_output" (func $sout (param i32 i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 256) "{short_hex}")
+                (data (i32.const 512) "{long_hex}")
+                (func (export "process") (param i64)
+                    (if
+                        (i32.gt_s (call $ilen) (i32.const {threshold}))
+                        (then (call $sout (i32.const 512) (i32.const {long_len})))
+                        (else (call $sout (i32.const 256) (i32.const {short_len})))
+                    )
+                )
+            )"#
+        );
+
+        let mut task = CuWasmTask::from_source(wat.as_bytes()).unwrap();
+        let first = task
+            .tick_with_contract(0, Some(&populated_input))
+            .unwrap()
+            .expect("core controller should emit output for populated input");
+        assert_eq!(first.command_values, vec![9.0]);
+
+        let second = task
+            .tick_with_contract(1, None)
+            .unwrap()
+            .expect("core controller should emit output when empty input is provided");
+        assert_eq!(second.command_values, vec![1.0]);
     }
 
     #[test]

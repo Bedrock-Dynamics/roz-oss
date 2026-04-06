@@ -287,6 +287,8 @@ pub enum SessionRuntimeError {
     SessionCompleted,
     #[error("session failed: {0:?}")]
     SessionFailed(RuntimeFailureKind),
+    #[error("turn failed: {0:?}")]
+    TurnFailed(RuntimeFailureKind),
 }
 
 /// Rich turn-execution failure surfaced back into `SessionRuntime`.
@@ -935,6 +937,99 @@ impl SessionRuntime {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn drain_stream_buffers(
+        &mut self,
+        message_id: &str,
+        chunk_rx: &mut mpsc::Receiver<StreamChunk>,
+        presence_rx: &mut mpsc::Receiver<PresenceSignal>,
+        tool_call_rx: &mut Option<mpsc::Receiver<RemoteToolCall>>,
+        chunks_open: &mut bool,
+        presence_open: &mut bool,
+        tool_calls_open: &mut bool,
+    ) {
+        loop {
+            let mut drained_any = false;
+            if *chunks_open {
+                loop {
+                    match chunk_rx.try_recv() {
+                        Ok(chunk) => {
+                            self.emit_stream_chunk(message_id, chunk);
+                            drained_any = true;
+                        }
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                            *chunks_open = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if *presence_open {
+                loop {
+                    match presence_rx.try_recv() {
+                        Ok(signal) => {
+                            self.emit_presence_signal(signal);
+                            drained_any = true;
+                        }
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                            *presence_open = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if *tool_calls_open {
+                loop {
+                    let Some(rx) = tool_call_rx.as_mut() else {
+                        *tool_calls_open = false;
+                        break;
+                    };
+                    match rx.try_recv() {
+                        Ok(call) => {
+                            self.emit(SessionEvent::ToolCallRequested {
+                                call_id: call.id,
+                                tool_name: call.name,
+                                parameters: call.parameters,
+                                timeout_ms: call.timeout_ms,
+                            });
+                            drained_any = true;
+                        }
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                            *tool_calls_open = false;
+                            *tool_call_rx = None;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !drained_any {
+                break;
+            }
+        }
+    }
+
+    fn handle_turn_failure(&mut self, failure: RuntimeFailureKind) -> SessionRuntimeError {
+        let action = self.handle_failure(failure);
+        self.clear_turn_approvals();
+        self.state.snapshot.turn_index = self.state.turn_index;
+        if !action.safe_pause && !action.terminal {
+            self.state.activity = RuntimeActivity::Idle;
+            self.emit_activity_changed(
+                RuntimeActivity::Idle,
+                format!("turn {} failed", self.state.turn_index),
+                None,
+            );
+        }
+        if action.terminal {
+            SessionRuntimeError::SessionFailed(failure)
+        } else {
+            SessionRuntimeError::TurnFailed(failure)
+        }
+    }
+
     /// Begin a turn lifecycle without immediately executing it.
     ///
     /// Used by streaming surfaces that need the prompt blocks and turn index
@@ -971,6 +1066,7 @@ impl SessionRuntime {
 
     /// Mark the active turn as completed and return the runtime to `Idle`.
     pub fn complete_active_turn(&mut self, reason: impl Into<String>) {
+        self.clear_turn_approvals();
         self.state.snapshot.turn_index = self.state.turn_index;
         self.state.snapshot.updated_at = chrono::Utc::now();
         self.state.activity = RuntimeActivity::Idle;
@@ -990,6 +1086,7 @@ impl SessionRuntime {
 
     /// Mark the active turn as cancelled but keep the session alive.
     pub fn cancel_active_turn(&mut self, reason: impl Into<String>) {
+        self.clear_turn_approvals();
         self.state.snapshot.turn_index = self.state.turn_index;
         self.state.snapshot.updated_at = chrono::Utc::now();
         self.state.activity = RuntimeActivity::Idle;
@@ -998,6 +1095,7 @@ impl SessionRuntime {
 
     /// Mark the active turn as failed and transition the session to `Degraded`.
     pub fn fail_active_turn(&mut self, failure: RuntimeFailureKind) {
+        self.clear_turn_approvals();
         self.state.failure = Some(failure);
         self.state.activity = RuntimeActivity::Degraded;
         self.state.snapshot.last_failure = Some(failure);
@@ -1018,6 +1116,12 @@ impl SessionRuntime {
                 self.fail_active_turn(failure);
             }
         }
+    }
+
+    fn clear_turn_approvals(&mut self) {
+        self.state.replace_pending_approvals(Vec::new());
+        self.approval_runtime.clear_pending_approvals();
+        self.state.snapshot.updated_at = chrono::Utc::now();
     }
 
     // -- Turn lifecycle methods --
@@ -1057,16 +1161,16 @@ impl SessionRuntime {
     ) -> Result<TurnOutput, SessionRuntimeError> {
         let prepared = self.begin_turn(&input, input.volatile_blocks.clone())?;
 
-        // Execute turn via the surface-provided executor
-        let output = executor.execute_turn(prepared.clone()).await.map_err(|e| {
-            // On executor failure, transition to degraded and emit failure event.
-            let failure = e
-                .downcast_ref::<TurnExecutionFailure>()
-                .map_or(RuntimeFailureKind::ModelError, |err| err.kind);
-            self.fail_active_turn(failure);
-            tracing::error!(error = %e, ?failure, "TurnExecutor failed");
-            SessionRuntimeError::SessionFailed(failure)
-        })?;
+        let output = match executor.execute_turn(prepared.clone()).await {
+            Ok(output) => output,
+            Err(error) => {
+                let failure = error
+                    .downcast_ref::<TurnExecutionFailure>()
+                    .map_or(RuntimeFailureKind::ModelError, |err| err.kind);
+                tracing::error!(error = %error, ?failure, "TurnExecutor failed");
+                return Err(self.handle_turn_failure(failure));
+            }
+        };
 
         let message_id = uuid::Uuid::new_v4().to_string();
         if !output.assistant_message.is_empty() {
@@ -1102,15 +1206,29 @@ impl SessionRuntime {
     ) -> Result<StreamingTurnResult, SessionRuntimeError> {
         let prepared = self.begin_turn(&input, input.volatile_blocks.clone())?;
         let message_id = message_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let mut handle = executor.execute_turn_streaming(prepared.clone());
-        let mut completion = handle.completion;
+        let StreamingTurnHandle {
+            completion,
+            mut chunk_rx,
+            mut presence_rx,
+            mut tool_call_rx,
+        } = executor.execute_turn_streaming(prepared.clone());
+        let mut completion = completion;
         let mut chunks_open = true;
         let mut presence_open = true;
-        let mut tool_calls_open = handle.tool_call_rx.is_some();
+        let mut tool_calls_open = tool_call_rx.is_some();
 
         loop {
             tokio::select! {
                 result = &mut completion => {
+                    self.drain_stream_buffers(
+                        &message_id,
+                        &mut chunk_rx,
+                        &mut presence_rx,
+                        &mut tool_call_rx,
+                        &mut chunks_open,
+                        &mut presence_open,
+                        &mut tool_calls_open,
+                    );
                     return match result {
                         Ok(output) => {
                             self.emit(SessionEvent::TurnFinished {
@@ -1154,26 +1272,25 @@ impl SessionRuntime {
                                         retryable: turn_error.retryable(),
                                     });
                                 }
-                                self.fail_active_turn(failure);
                                 tracing::error!(error = %error, ?failure, "StreamingTurnExecutor failed");
-                                Err(SessionRuntimeError::SessionFailed(failure))
+                                Err(self.handle_turn_failure(failure))
                             }
                         }
                     };
                 }
-                chunk = handle.chunk_rx.recv(), if chunks_open => {
+                chunk = chunk_rx.recv(), if chunks_open => {
                     match chunk {
                         Some(chunk) => self.emit_stream_chunk(&message_id, chunk),
                         None => chunks_open = false,
                     }
                 }
-                signal = handle.presence_rx.recv(), if presence_open => {
+                signal = presence_rx.recv(), if presence_open => {
                     match signal {
                         Some(signal) => self.emit_presence_signal(signal),
                         None => presence_open = false,
                     }
                 }
-                tool_call = Self::recv_tool_call(&mut handle.tool_call_rx), if tool_calls_open => {
+                tool_call = Self::recv_tool_call(&mut tool_call_rx), if tool_calls_open => {
                     match tool_call {
                         Some(call) => {
                             self.emit(SessionEvent::ToolCallRequested {
@@ -1185,7 +1302,7 @@ impl SessionRuntime {
                         }
                         None => {
                             tool_calls_open = false;
-                            handle.tool_call_rx = None;
+                            tool_call_rx = None;
                         }
                     }
                 }
@@ -1324,6 +1441,65 @@ mod tests {
                     messages: vec![Message::user("hello"), Message::assistant_text("ok")],
                 })
             })
+        }
+    }
+
+    struct FailingExecutor {
+        failure: RuntimeFailureKind,
+    }
+
+    impl TurnExecutor for FailingExecutor {
+        fn execute_turn(&mut self, _prepared: PreparedTurn) -> TurnFuture<'_> {
+            let failure = self.failure;
+            Box::pin(async move {
+                Err(Box::new(TurnExecutionFailure::new(failure, "executor failed"))
+                    as Box<dyn std::error::Error + Send + Sync>)
+            })
+        }
+    }
+
+    struct BufferedStreamingExecutor {
+        output: Result<TurnOutput, RuntimeFailureKind>,
+        chunks: Vec<StreamChunk>,
+        signals: Vec<PresenceSignal>,
+        tool_calls: Vec<RemoteToolCall>,
+    }
+
+    impl StreamingTurnExecutor for BufferedStreamingExecutor {
+        fn execute_turn_streaming(&mut self, _prepared: PreparedTurn) -> StreamingTurnHandle<'_> {
+            let (chunk_tx, chunk_rx) = mpsc::channel(8);
+            for chunk in self.chunks.drain(..) {
+                chunk_tx.try_send(chunk).unwrap();
+            }
+            drop(chunk_tx);
+
+            let (presence_tx, presence_rx) = mpsc::channel(8);
+            for signal in self.signals.drain(..) {
+                presence_tx.try_send(signal).unwrap();
+            }
+            drop(presence_tx);
+
+            let (tool_call_tx, tool_call_rx) = mpsc::channel(8);
+            for tool_call in self.tool_calls.drain(..) {
+                tool_call_tx.try_send(tool_call).unwrap();
+            }
+            drop(tool_call_tx);
+
+            let output = self.output.clone();
+            StreamingTurnHandle {
+                completion: Box::pin(async move {
+                    match output {
+                        Ok(output) => Ok(output),
+                        Err(failure) => Err(
+                            Box::new(TurnExecutionFailure::new(failure, "streaming executor failed"))
+                                as Box<dyn std::error::Error + Send + Sync>,
+                        ),
+                    }
+                }),
+                chunk_rx,
+                presence_rx,
+                tool_call_rx: Some(tool_call_rx),
+            }
         }
     }
 
@@ -1767,6 +1943,51 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn finish_active_turn_clears_pending_approvals_everywhere() {
+        let mut rt = make_runtime();
+        let approval_handle = rt.approval_handle();
+        let (decision_tx, _decision_rx) = tokio::sync::oneshot::channel();
+        approval_handle.register_pending_approval("apr-runtime", decision_tx);
+        rt.state.record_pending_approval(PendingApprovalState {
+            approval_id: "apr-runtime".into(),
+            action: "move_arm".into(),
+            reason: "awaiting approval".into(),
+            timeout_secs: 30,
+        });
+
+        rt.finish_active_turn(ActiveTurnOutcome::Cancelled {
+            reason: "cancelled".into(),
+        });
+
+        assert!(rt.state.pending_approvals.is_empty());
+        assert!(
+            approval_handle
+                .pending_approvals()
+                .lock()
+                .expect("pending approvals mutex poisoned")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn run_turn_recoverable_executor_failure_keeps_session_alive() {
+        let mut rt = make_runtime();
+        let mut executor = FailingExecutor {
+            failure: RuntimeFailureKind::ModelError,
+        };
+
+        let err = rt.run_turn(test_turn_input("hello"), &mut executor).await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            SessionRuntimeError::TurnFailed(RuntimeFailureKind::ModelError)
+        ));
+        assert!(!rt.has_failed());
+        assert!(!rt.is_paused());
+        assert_eq!(rt.activity(), RuntimeActivity::Idle);
+    }
+
     #[tokio::test]
     async fn complete_session_emits_event() {
         let mut rt = make_runtime();
@@ -1827,6 +2048,92 @@ mod tests {
                 failure: RuntimeFailureKind::ControllerTrap
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn run_turn_streaming_drains_buffered_events_before_return() {
+        let mut rt = make_runtime();
+        let mut rx = rt.subscribe_events();
+        let mut executor = BufferedStreamingExecutor {
+            output: Ok(TurnOutput {
+                assistant_message: "done".into(),
+                tool_calls_made: 1,
+                input_tokens: 10,
+                output_tokens: 12,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                messages: vec![Message::user("hello"), Message::assistant_text("done")],
+            }),
+            chunks: vec![StreamChunk::TextDelta("hello world".into())],
+            signals: vec![PresenceSignal::ActivityUpdate {
+                state: ActivityState::CallingTool,
+                detail: "calling remote tool".into(),
+                progress: None,
+            }],
+            tool_calls: vec![RemoteToolCall {
+                id: "call-1".into(),
+                name: "capture_frame".into(),
+                parameters: json!({"camera": "front"}),
+                timeout_ms: 5000,
+            }],
+        };
+
+        let result = rt
+            .run_turn_streaming(test_turn_input("hello"), Some("msg-1".into()), &mut executor)
+            .await
+            .expect("streaming turn should succeed");
+
+        assert!(matches!(result, StreamingTurnResult::Completed(_)));
+
+        let mut saw_text_delta = false;
+        let mut saw_tool_call = false;
+        let mut saw_turn_finished = false;
+        for _ in 0..8 {
+            let env = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                .await
+                .expect("event should arrive")
+                .expect("broadcast should stay open");
+            match env.event {
+                SessionEvent::TextDelta { ref content, .. } if content == "hello world" => {
+                    saw_text_delta = true;
+                }
+                SessionEvent::ToolCallRequested { ref tool_name, .. } if tool_name == "capture_frame" => {
+                    saw_tool_call = true;
+                }
+                SessionEvent::TurnFinished { .. } => {
+                    saw_turn_finished = true;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_text_delta, "buffered chunk should be emitted before return");
+        assert!(saw_tool_call, "buffered tool call should be emitted before return");
+        assert!(saw_turn_finished, "turn completion event should still be emitted");
+    }
+
+    #[tokio::test]
+    async fn run_turn_streaming_recoverable_failure_keeps_session_alive() {
+        let mut rt = make_runtime();
+        let mut executor = BufferedStreamingExecutor {
+            output: Err(RuntimeFailureKind::ModelError),
+            chunks: vec![],
+            signals: vec![],
+            tool_calls: vec![],
+        };
+
+        let err = rt
+            .run_turn_streaming(test_turn_input("hello"), Some("msg-2".into()), &mut executor)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            SessionRuntimeError::TurnFailed(RuntimeFailureKind::ModelError)
+        ));
+        assert!(!rt.has_failed());
+        assert!(!rt.is_paused());
+        assert_eq!(rt.activity(), RuntimeActivity::Idle);
     }
 
     #[tokio::test]

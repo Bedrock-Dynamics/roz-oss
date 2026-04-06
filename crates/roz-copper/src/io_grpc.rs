@@ -152,14 +152,22 @@ pub struct GrpcActuatorSink {
     command_mode: i32,
     /// Stable owner identity for this sink's low-level control lease.
     owner_id: String,
-    /// Whether the sink has successfully acquired low-level control.
-    control_acquired: Arc<AtomicBool>,
+    /// Serialized low-level control lease state shared with background sends.
+    lease_state: Arc<parking_lot::Mutex<LeaseState>>,
     /// Tokio runtime handle for spawning fire-and-forget sends.
     runtime: tokio::runtime::Handle,
     /// Set by a background send task on failure; cleared on the next [`send`].
     last_error: Arc<AtomicBool>,
     /// Most recent background send error, if any.
     last_error_message: Arc<parking_lot::Mutex<Option<String>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseState {
+    Idle,
+    Acquiring,
+    Owned,
+    DropRequested,
 }
 
 impl GrpcActuatorSink {
@@ -178,31 +186,17 @@ impl GrpcActuatorSink {
         )
     }
 
-    fn command_mode_from_control_manifest(control_manifest: &ControlInterfaceManifest) -> i32 {
-        control_manifest
-            .channels
-            .iter()
-            .find(|channel| Self::is_actuator_channel(&channel.interface_type))
-            .map_or(proto::JointCommandMode::JointVelocity as i32, |channel| {
-                match channel.interface_type {
-                    CommandInterfaceType::JointPosition | CommandInterfaceType::GripperPosition => {
-                        proto::JointCommandMode::JointPosition.into()
-                    }
-                    CommandInterfaceType::JointVelocity => proto::JointCommandMode::JointVelocity.into(),
-                    CommandInterfaceType::JointTorque | CommandInterfaceType::GripperForce => {
-                        tracing::warn!(
-                            "Effort-oriented control interface not natively supported by bridge; falling back to JointVelocity mode"
-                        );
-                        proto::JointCommandMode::JointVelocity.into()
-                    }
-                    CommandInterfaceType::ForceTorqueSensor | CommandInterfaceType::ImuSensor => {
-                        tracing::warn!(
-                            "Sensor-oriented control interface is not an actuator command mode; falling back to JointVelocity mode"
-                        );
-                        proto::JointCommandMode::JointVelocity.into()
-                    }
-                }
-            })
+    const fn command_mode_for_interface(interface_type: &CommandInterfaceType) -> Option<i32> {
+        match interface_type {
+            CommandInterfaceType::JointPosition | CommandInterfaceType::GripperPosition => {
+                Some(proto::JointCommandMode::JointPosition as i32)
+            }
+            CommandInterfaceType::JointVelocity => Some(proto::JointCommandMode::JointVelocity as i32),
+            CommandInterfaceType::JointTorque
+            | CommandInterfaceType::GripperForce
+            | CommandInterfaceType::ForceTorqueSensor
+            | CommandInterfaceType::ImuSensor => None,
+        }
     }
 
     const fn is_actuator_binding(binding_type: &BindingType) -> bool {
@@ -259,29 +253,84 @@ impl GrpcActuatorSink {
             .collect()
     }
 
+    fn validate_actuator_layout(
+        control_manifest: &ControlInterfaceManifest,
+        robot_class: &str,
+    ) -> anyhow::Result<(Vec<String>, i32)> {
+        let actuator_channels: Vec<&roz_core::embodiment::binding::ControlChannelDef> = control_manifest
+            .channels
+            .iter()
+            .filter(|channel| Self::is_actuator_channel(&channel.interface_type))
+            .collect();
+        let first = actuator_channels
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("control manifest has no actuator channels for gRPC output"))?;
+        let command_mode = Self::command_mode_for_interface(&first.interface_type).ok_or_else(|| {
+            anyhow::anyhow!(
+                "gRPC actuator sink does not support {:?} command channels",
+                first.interface_type
+            )
+        })?;
+        for channel in actuator_channels.iter().skip(1) {
+            let mode = Self::command_mode_for_interface(&channel.interface_type).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "gRPC actuator sink does not support {:?} command channels",
+                    channel.interface_type
+                )
+            })?;
+            if mode != command_mode {
+                anyhow::bail!(
+                    "gRPC actuator sink requires homogeneous actuator interfaces, found {:?} and {:?}",
+                    first.interface_type,
+                    channel.interface_type
+                );
+            }
+        }
+        Ok((
+            Self::actuator_names_from_control_manifest(control_manifest, robot_class),
+            command_mode,
+        ))
+    }
+
+    async fn release_low_level_control_best_effort(
+        client: &mut ControlServiceClient<tonic::transport::Channel>,
+        robot_class: &str,
+        owner_id: &str,
+    ) {
+        if let Err(error) = client
+            .release_low_level_control(proto::ReleaseLowLevelControlRequest {
+                robot_class: robot_class.to_string(),
+                owner_id: owner_id.to_string(),
+            })
+            .await
+        {
+            tracing::warn!(error = %error, "ReleaseLowLevelControl RPC failed");
+        }
+    }
+
     /// Create a new actuator sink from the canonical control interface manifest.
     ///
     /// `robot_class` remains explicit because it is not encoded by
     /// [`ControlInterfaceManifest`].
-    #[must_use]
     pub fn from_control_manifest(
         channel: tonic::transport::Channel,
         control_manifest: &ControlInterfaceManifest,
         robot_class: impl Into<String>,
         runtime: tokio::runtime::Handle,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let robot_class = robot_class.into();
-        Self {
+        let (channel_names, command_mode) = Self::validate_actuator_layout(control_manifest, &robot_class)?;
+        Ok(Self {
             client: ControlServiceClient::new(channel),
-            channel_names: Self::actuator_names_from_control_manifest(control_manifest, &robot_class),
+            channel_names,
             robot_class,
-            command_mode: Self::command_mode_from_control_manifest(control_manifest),
+            command_mode,
             owner_id: Self::new_owner_id(),
-            control_acquired: Arc::new(AtomicBool::new(false)),
+            lease_state: Arc::new(parking_lot::Mutex::new(LeaseState::Idle)),
             runtime,
             last_error: Arc::new(AtomicBool::new(false)),
             last_error_message: Arc::new(parking_lot::Mutex::new(None)),
-        }
+        })
     }
 
     /// Create a new actuator sink with explicit names (backward compat).
@@ -295,7 +344,7 @@ impl GrpcActuatorSink {
             robot_class: "manipulator".into(),
             command_mode: proto::JointCommandMode::JointVelocity.into(),
             owner_id: Self::new_owner_id(),
-            control_acquired: Arc::new(AtomicBool::new(false)),
+            lease_state: Arc::new(parking_lot::Mutex::new(LeaseState::Idle)),
             runtime,
             last_error: Arc::new(AtomicBool::new(false)),
             last_error_message: Arc::new(parking_lot::Mutex::new(None)),
@@ -316,10 +365,19 @@ impl GrpcActuatorSink {
 }
 
 impl ActuatorSink for GrpcActuatorSink {
+    #[allow(clippy::too_many_lines)]
     fn send(&self, frame: &CommandFrame) -> anyhow::Result<()> {
         // Log (don't bail) previous async errors — bailing would throttle 100Hz sends.
         if self.last_error.swap(false, Ordering::Relaxed) {
             tracing::warn!("previous gRPC send failed (see logs for details)");
+        }
+        if frame.values.len() != self.channel_names.len() {
+            anyhow::bail!(
+                "command frame width mismatch: expected {} values for {:?}, got {}",
+                self.channel_names.len(),
+                self.channel_names,
+                frame.values.len()
+            );
         }
 
         let mut client = self.client.clone(); // tonic client clone is cheap (Arc-based)
@@ -328,12 +386,27 @@ impl ActuatorSink for GrpcActuatorSink {
         let robot_class = self.robot_class.clone();
         let command_mode = self.command_mode;
         let owner_id = self.owner_id.clone();
-        let control_acquired = Arc::clone(&self.control_acquired);
+        let lease_state = Arc::clone(&self.lease_state);
         let error_flag = Arc::clone(&self.last_error);
         let error_message = Arc::clone(&self.last_error_message);
+        let should_acquire = {
+            let mut state = lease_state.lock();
+            let should_acquire = match *state {
+                LeaseState::Idle => {
+                    *state = LeaseState::Acquiring;
+                    true
+                }
+                LeaseState::Acquiring | LeaseState::Owned => false,
+                LeaseState::DropRequested => {
+                    anyhow::bail!("gRPC actuator sink is shutting down");
+                }
+            };
+            drop(state);
+            should_acquire
+        };
 
         self.runtime.spawn(async move {
-            if !control_acquired.load(Ordering::Relaxed) {
+            if should_acquire {
                 match client
                     .acquire_low_level_control(proto::AcquireLowLevelControlRequest {
                         robot_class: robot_class.clone(),
@@ -348,14 +421,29 @@ impl ActuatorSink for GrpcActuatorSink {
                             tracing::warn!(error = inner.error, "AcquireLowLevelControl returned error");
                             error_flag.store(true, Ordering::Relaxed);
                             *error_message.lock() = Some(inner.error);
+                            *lease_state.lock() = LeaseState::Idle;
                             return;
                         }
-                        control_acquired.store(true, Ordering::Relaxed);
+                        let should_release = {
+                            let mut state = lease_state.lock();
+                            if *state == LeaseState::DropRequested {
+                                *state = LeaseState::Idle;
+                                true
+                            } else {
+                                *state = LeaseState::Owned;
+                                false
+                            }
+                        };
+                        if should_release {
+                            Self::release_low_level_control_best_effort(&mut client, &robot_class, &owner_id).await;
+                            return;
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "AcquireLowLevelControl RPC failed");
                         error_flag.store(true, Ordering::Relaxed);
                         *error_message.lock() = Some(e.to_string());
+                        *lease_state.lock() = LeaseState::Idle;
                         return;
                     }
                 }
@@ -366,8 +454,8 @@ impl ActuatorSink for GrpcActuatorSink {
                 joint_names: names,
                 values,
                 world_name: String::new(),
-                robot_class,
-                owner_id,
+                robot_class: robot_class.clone(),
+                owner_id: owner_id.clone(),
                 acquire_low_level_if_needed: true,
             };
 
@@ -375,19 +463,34 @@ impl ActuatorSink for GrpcActuatorSink {
                 Ok(response) => {
                     let inner = response.into_inner();
                     if inner.success {
+                        let should_release = {
+                            let mut state = lease_state.lock();
+                            if *state == LeaseState::DropRequested {
+                                *state = LeaseState::Idle;
+                                true
+                            } else {
+                                *state = LeaseState::Owned;
+                                false
+                            }
+                        };
+                        if should_release {
+                            Self::release_low_level_control_best_effort(&mut client, &robot_class, &owner_id).await;
+                        }
                         *error_message.lock() = None;
                     } else {
                         tracing::warn!(error = inner.error, "SendJointCommand returned error");
-                        control_acquired.store(false, Ordering::Relaxed);
                         error_flag.store(true, Ordering::Relaxed);
                         *error_message.lock() = Some(inner.error);
+                        *lease_state.lock() = LeaseState::Idle;
+                        Self::release_low_level_control_best_effort(&mut client, &robot_class, &owner_id).await;
                     }
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "SendJointCommand RPC failed");
-                    control_acquired.store(false, Ordering::Relaxed);
                     error_flag.store(true, Ordering::Relaxed);
                     *error_message.lock() = Some(e.to_string());
+                    *lease_state.lock() = LeaseState::Idle;
+                    Self::release_low_level_control_best_effort(&mut client, &robot_class, &owner_id).await;
                 }
             }
         });
@@ -398,20 +501,28 @@ impl ActuatorSink for GrpcActuatorSink {
 
 impl Drop for GrpcActuatorSink {
     fn drop(&mut self) {
-        if !self.control_acquired.load(Ordering::Relaxed) {
+        let current_state = {
+            let mut state = self.lease_state.lock();
+            match *state {
+                LeaseState::Idle | LeaseState::DropRequested => return,
+                LeaseState::Acquiring => {
+                    *state = LeaseState::DropRequested;
+                    return;
+                }
+                LeaseState::Owned => {
+                    *state = LeaseState::Idle;
+                    LeaseState::Owned
+                }
+            }
+        };
+        if current_state != LeaseState::Owned {
             return;
         }
-
         let mut client = self.client.clone();
         let robot_class = self.robot_class.clone();
         let owner_id = self.owner_id.clone();
         self.runtime.spawn(async move {
-            if let Err(error) = client
-                .release_low_level_control(proto::ReleaseLowLevelControlRequest { robot_class, owner_id })
-                .await
-            {
-                tracing::warn!(error = %error, "ReleaseLowLevelControl RPC failed");
-            }
+            Self::release_low_level_control_best_effort(&mut client, &robot_class, &owner_id).await;
         });
     }
 }
@@ -614,7 +725,8 @@ mod tests {
         let runtime = tokio::runtime::Handle::current();
         let channel = tonic::transport::Channel::from_static("http://127.0.0.1:9999").connect_lazy();
 
-        let canonical = GrpcActuatorSink::from_control_manifest(channel, &control_manifest, "manipulator", runtime);
+        let canonical =
+            GrpcActuatorSink::from_control_manifest(channel, &control_manifest, "manipulator", runtime).unwrap();
 
         assert_eq!(
             canonical.channel_names,
@@ -648,10 +760,60 @@ mod tests {
         let runtime = tokio::runtime::Handle::current();
         let channel = tonic::transport::Channel::from_static("http://127.0.0.1:9999").connect_lazy();
 
-        let canonical = GrpcActuatorSink::from_control_manifest(channel, &control_manifest, "mobile", runtime);
+        let canonical = GrpcActuatorSink::from_control_manifest(channel, &control_manifest, "mobile", runtime).unwrap();
 
         assert_eq!(canonical.channel_names, vec!["body/vx".to_string()]);
         assert_eq!(canonical.robot_class, "mobile");
+    }
+
+    #[tokio::test]
+    async fn grpc_actuator_sink_rejects_mixed_actuator_layouts() {
+        let mut control_manifest = ControlInterfaceManifest {
+            version: 1,
+            manifest_digest: String::new(),
+            channels: vec![
+                roz_core::embodiment::binding::ControlChannelDef {
+                    name: "joint0/velocity".into(),
+                    interface_type: roz_core::embodiment::binding::CommandInterfaceType::JointVelocity,
+                    units: "rad/s".into(),
+                    frame_id: "joint0_link".into(),
+                },
+                roz_core::embodiment::binding::ControlChannelDef {
+                    name: "joint1/position".into(),
+                    interface_type: roz_core::embodiment::binding::CommandInterfaceType::JointPosition,
+                    units: "rad".into(),
+                    frame_id: "joint1_link".into(),
+                },
+            ],
+            bindings: vec![
+                roz_core::embodiment::binding::ChannelBinding {
+                    physical_name: "joint0".into(),
+                    channel_index: 0,
+                    binding_type: roz_core::embodiment::binding::BindingType::JointVelocity,
+                    frame_id: "joint0_link".into(),
+                    units: "rad/s".into(),
+                    semantic_role: None,
+                },
+                roz_core::embodiment::binding::ChannelBinding {
+                    physical_name: "joint1".into(),
+                    channel_index: 1,
+                    binding_type: roz_core::embodiment::binding::BindingType::JointPosition,
+                    frame_id: "joint1_link".into(),
+                    units: "rad".into(),
+                    semantic_role: None,
+                },
+            ],
+        };
+        control_manifest.stamp_digest();
+        let runtime = tokio::runtime::Handle::current();
+        let channel = tonic::transport::Channel::from_static("http://127.0.0.1:9999").connect_lazy();
+
+        let error = match GrpcActuatorSink::from_control_manifest(channel, &control_manifest, "manipulator", runtime) {
+            Ok(_) => panic!("mixed actuator layouts should be rejected"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("homogeneous actuator interfaces"));
     }
 
     #[tokio::test]
@@ -662,7 +824,8 @@ mod tests {
         let runtime = tokio::runtime::Handle::current();
         let channel = tonic::transport::Channel::from_static("http://127.0.0.1:9999").connect_lazy();
 
-        let canonical = GrpcActuatorSink::from_control_manifest(channel, &control_manifest, "manipulator", runtime);
+        let canonical =
+            GrpcActuatorSink::from_control_manifest(channel, &control_manifest, "manipulator", runtime).unwrap();
 
         assert_eq!(
             canonical.channel_names,
@@ -691,6 +854,24 @@ mod tests {
 
         // Error flag should be cleared after surfacing.
         assert!(!sink.had_error());
+    }
+
+    #[tokio::test]
+    async fn grpc_actuator_sink_rejects_frame_width_mismatch_before_rpc() {
+        let channel = tonic::transport::Channel::from_static("http://127.0.0.1:9999").connect_lazy();
+        let sink = GrpcActuatorSink::new(
+            channel,
+            vec!["j1".into(), "j2".into()],
+            tokio::runtime::Handle::current(),
+        );
+
+        let error = sink.send(&CommandFrame::zero(1)).unwrap_err();
+
+        assert!(error.to_string().contains("command frame width mismatch"));
+        assert!(
+            !sink.had_error(),
+            "local validation should fail before any background RPC"
+        );
     }
 
     #[tokio::test]

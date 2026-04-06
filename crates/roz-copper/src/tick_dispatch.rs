@@ -150,7 +150,7 @@ mod tests {
     }
 
     fn make_filter(n: usize) -> HotPathSafetyFilter {
-        HotPathSafetyFilter::new(make_joint_limits(n), None, 0.01)
+        HotPathSafetyFilter::new(make_joint_limits(n), None, 0.01).expect("test tick period must be valid")
     }
 
     fn make_filter_with_force(n: usize, max_force: f64) -> HotPathSafetyFilter {
@@ -160,6 +160,7 @@ mod tests {
             force_rate_limit: 1000.0,
         };
         HotPathSafetyFilter::new(make_joint_limits(n), Some(force_limits), 0.01)
+            .expect("test tick period must be valid")
     }
 
     fn make_tick_input() -> TickInput {

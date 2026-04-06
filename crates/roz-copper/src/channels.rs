@@ -274,6 +274,7 @@ pub fn create_sync_pair() -> SyncPair {
 /// Returns a `JoinHandle` that can be aborted on shutdown.
 pub fn spawn_command_bridge(
     mut agent_rx: mpsc::Receiver<ControllerCommand>,
+    shared_state: Arc<ArcSwap<ControllerState>>,
     copper_tx: std::sync::mpsc::SyncSender<CopperRuntimeCommand>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -289,10 +290,20 @@ pub fn spawn_command_bridge(
                         Ok(Ok(prepared)) => prepared,
                         Ok(Err(error)) => {
                             tracing::error!(%error, "rejecting controller artifact load before control thread");
+                            let mut next_state = shared_state.load_full().as_ref().clone();
+                            next_state.candidate_last_rejection_reason = Some(format!(
+                                "rejected: controller preparation failed before control thread: {error}"
+                            ));
+                            shared_state.store(Arc::new(next_state));
                             continue;
                         }
                         Err(error) => {
                             tracing::error!(%error, "controller preparation task failed before control thread");
+                            let mut next_state = shared_state.load_full().as_ref().clone();
+                            next_state.candidate_last_rejection_reason = Some(format!(
+                                "rejected: controller preparation task failed before control thread: {error}"
+                            ));
+                            shared_state.store(Arc::new(next_state));
                             continue;
                         }
                     }
@@ -502,10 +513,10 @@ mod tests {
 
     #[tokio::test]
     async fn bridge_forwards_commands() {
-        let (agent_tx, agent_rx) = tokio::sync::mpsc::channel(64);
+        let (agent_tx, agent_rx, state, _estop_tx, _estop_rx) = create_sync_pair();
         let (copper_tx, copper_rx) = std::sync::mpsc::sync_channel(64);
 
-        let bridge = spawn_command_bridge(agent_rx, copper_tx);
+        let bridge = spawn_command_bridge(agent_rx, state, copper_tx);
 
         // Send from agent side (tokio).
         agent_tx.send(ControllerCommand::Halt).await.unwrap();
@@ -519,6 +530,80 @@ mod tests {
         assert!(matches!(cmd1, CopperRuntimeCommand::Halt));
         let cmd2 = copper_rx.try_recv().unwrap();
         assert!(matches!(cmd2, CopperRuntimeCommand::Resume));
+
+        bridge.abort();
+    }
+
+    #[tokio::test]
+    async fn bridge_surfaces_controller_preparation_failure_in_shared_state() {
+        let (agent_tx, agent_rx, state, _estop_tx, _estop_rx) = create_sync_pair();
+        let (copper_tx, _copper_rx) = std::sync::mpsc::sync_channel(64);
+        let bridge = spawn_command_bridge(agent_rx, Arc::clone(&state), copper_tx);
+
+        let mut control_manifest = ControlInterfaceManifest {
+            version: 1,
+            manifest_digest: String::new(),
+            channels: vec![ControlChannelDef {
+                name: "joint0/velocity".into(),
+                interface_type: CommandInterfaceType::JointVelocity,
+                units: "rad/s".into(),
+                frame_id: "joint0_link".into(),
+            }],
+            bindings: vec![ChannelBinding {
+                physical_name: "joint0".into(),
+                channel_index: 0,
+                binding_type: BindingType::JointVelocity,
+                frame_id: "joint0_link".into(),
+                units: "rad/s".into(),
+                semantic_role: None,
+            }],
+        };
+        control_manifest.stamp_digest();
+        let artifact = ControllerArtifact {
+            controller_id: "bad".into(),
+            sha256: "sha".into(),
+            source_kind: roz_core::controller::artifact::SourceKind::LlmGenerated,
+            controller_class: roz_core::controller::artifact::ControllerClass::LowRiskCommandGenerator,
+            generator_model: None,
+            generator_provider: None,
+            channel_manifest_version: 1,
+            host_abi_version: 2,
+            evidence_bundle_id: None,
+            created_at: chrono::Utc::now(),
+            promoted_at: None,
+            replaced_controller_id: None,
+            verification_key: roz_core::controller::artifact::VerificationKey {
+                controller_digest: "sha".into(),
+                wit_world_version: "bedrock:controller@1.0.0".into(),
+                model_digest: "model".into(),
+                calibration_digest: "calibration".into(),
+                manifest_digest: control_manifest.manifest_digest.clone(),
+                execution_mode: ExecutionMode::Verify,
+                compiler_version: "wasmtime".into(),
+                embodiment_family: None,
+            },
+            wit_world: "live-controller".into(),
+            verifier_result: None,
+        };
+
+        agent_tx
+            .send(ControllerCommand::load_artifact_from_control_manifest(
+                artifact,
+                b"(module)".to_vec(),
+                &control_manifest,
+            ))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let rejection_reason = state.load().candidate_last_rejection_reason.clone();
+        assert!(
+            rejection_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("controller preparation failed")),
+            "expected bridge rejection reason in shared state, got {rejection_reason:?}"
+        );
 
         bridge.abort();
     }

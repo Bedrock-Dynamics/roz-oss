@@ -349,12 +349,15 @@ async fn real_claude_mobile_wasm_cmd_vel_through_bridge() {
     };
 
     let (control_manifest, robot_class) = load_diff_drive_control_manifest();
-    let grpc_sink = Arc::new(GrpcActuatorSink::from_control_manifest(
-        channel,
-        &control_manifest,
-        robot_class,
-        tokio::runtime::Handle::current(),
-    ));
+    let grpc_sink = Arc::new(
+        GrpcActuatorSink::from_control_manifest(
+            channel,
+            &control_manifest,
+            robot_class,
+            tokio::runtime::Handle::current(),
+        )
+        .expect("valid mobile actuator manifest"),
+    );
     let grpc_sink_ref = Arc::clone(&grpc_sink);
     let log_sink = Arc::new(LogActuatorSink::new());
     let tee_sink = Arc::new(TeeActuatorSink::new(
@@ -466,12 +469,15 @@ async fn real_claude_px4_wasm_velocity_through_bridge() {
         .connect()
         .await
         .expect("gRPC channel to PX4 bridge");
-    let grpc_sink = Arc::new(GrpcActuatorSink::from_control_manifest(
-        grpc_channel.clone(),
-        &control_manifest,
-        robot_class,
-        tokio::runtime::Handle::current(),
-    ));
+    let grpc_sink = Arc::new(
+        GrpcActuatorSink::from_control_manifest(
+            grpc_channel.clone(),
+            &control_manifest,
+            robot_class,
+            tokio::runtime::Handle::current(),
+        )
+        .expect("valid PX4 actuator manifest"),
+    );
     let grpc_sink_ref = Arc::clone(&grpc_sink);
     let log_sink = Arc::new(LogActuatorSink::new());
     let tee_sink = Arc::new(TeeActuatorSink::new(
@@ -593,12 +599,15 @@ async fn real_claude_ardupilot_wasm_velocity_through_bridge() {
         .connect()
         .await
         .expect("gRPC channel to ArduPilot bridge");
-    let grpc_sink = Arc::new(GrpcActuatorSink::from_control_manifest(
-        grpc_channel.clone(),
-        &control_manifest,
-        robot_class,
-        tokio::runtime::Handle::current(),
-    ));
+    let grpc_sink = Arc::new(
+        GrpcActuatorSink::from_control_manifest(
+            grpc_channel.clone(),
+            &control_manifest,
+            robot_class,
+            tokio::runtime::Handle::current(),
+        )
+        .expect("valid ArduPilot actuator manifest"),
+    );
     let grpc_sink_ref = Arc::clone(&grpc_sink);
     let log_sink = Arc::new(LogActuatorSink::new());
     let tee_sink = Arc::new(TeeActuatorSink::new(

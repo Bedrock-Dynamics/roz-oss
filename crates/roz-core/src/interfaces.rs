@@ -39,6 +39,13 @@ pub trait SharedBlackboard: Send + Sync {
     fn write_key(&self, key: &str, value: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
+/// Identity metadata for a predictive world model backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorldModelPredictorMetadata {
+    pub model_id: String,
+    pub model_version: String,
+}
+
 /// Predictive world model for verification.
 pub trait WorldModelPredictor: Send + Sync {
     fn predict(
@@ -47,4 +54,8 @@ pub trait WorldModelPredictor: Send + Sync {
         actions: &[Vec<f64>],
         horizon_ticks: u32,
     ) -> Result<Vec<PredictedState>, Box<dyn std::error::Error + Send + Sync>>;
+
+    fn metadata(&self) -> Option<WorldModelPredictorMetadata> {
+        None
+    }
 }

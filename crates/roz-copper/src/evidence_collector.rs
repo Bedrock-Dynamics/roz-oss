@@ -36,7 +36,7 @@ pub struct EvidenceCollector {
     trap_count: u32,
     watchdog_near_miss_count: u32,
     channels_touched: BTreeSet<String>,
-    all_channels: BTreeSet<String>,
+    all_channels: Vec<String>,
     config_reads: u32,
     tick_latencies: Vec<Duration>,
     command_oscillation_detected: bool,
@@ -82,7 +82,7 @@ impl EvidenceCollector {
             trap_count: 0,
             watchdog_near_miss_count: 0,
             channels_touched: BTreeSet::new(),
-            all_channels: channel_names.iter().cloned().collect(),
+            all_channels: channel_names.to_vec(),
             config_reads: 0,
             tick_latencies: Vec::new(),
             command_oscillation_detected: false,
@@ -108,8 +108,7 @@ impl EvidenceCollector {
                 // Use the actual channel name from all_channels if available.
                 let channel_name = self
                     .all_channels
-                    .iter()
-                    .nth(i)
+                    .get(i)
                     .cloned()
                     .unwrap_or_else(|| format!("channel_{i}"));
                 self.channels_touched.insert(channel_name);
@@ -236,8 +235,18 @@ impl EvidenceCollector {
         let (p50, p95, p99) = compute_percentiles(&self.tick_latencies);
         let jitter_us = compute_jitter_us(&self.tick_latencies);
 
-        let channels_touched: Vec<String> = self.channels_touched.iter().cloned().collect();
-        let channels_untouched: Vec<String> = self.all_channels.difference(&self.channels_touched).cloned().collect();
+        let channels_touched: Vec<String> = self
+            .all_channels
+            .iter()
+            .filter(|channel| self.channels_touched.contains(channel.as_str()))
+            .cloned()
+            .collect();
+        let channels_untouched: Vec<String> = self
+            .all_channels
+            .iter()
+            .filter(|channel| !self.channels_touched.contains(channel.as_str()))
+            .cloned()
+            .collect();
 
         let steady_state_reached = self.steady_state_ticks >= STEADY_STATE_THRESHOLD;
 
@@ -429,6 +438,22 @@ mod tests {
         assert!(bundle.channels_touched.contains(&"channel_1".to_string()));
         assert!(bundle.channels_touched.contains(&"channel_2".to_string()));
         assert!(bundle.channels_untouched.is_empty(), "all channels should be touched");
+    }
+
+    #[test]
+    fn evidence_collector_preserves_manifest_channel_order() {
+        let all_channels: Vec<String> = vec!["joint_b".into(), "joint_a".into(), "joint_c".into()];
+        let mut collector = EvidenceCollector::new("ctrl-order", &all_channels);
+        let output = make_output(vec![0.5, 0.0]);
+        collector.record_tick(Duration::from_micros(150), &output, &[]);
+
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+
+        assert_eq!(
+            bundle.channels_touched,
+            vec!["joint_b".to_string(), "joint_a".to_string()]
+        );
+        assert_eq!(bundle.channels_untouched, vec!["joint_c".to_string()]);
     }
 
     #[test]

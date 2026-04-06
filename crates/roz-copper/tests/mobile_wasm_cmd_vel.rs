@@ -155,12 +155,15 @@ async fn mobile_wasm_cmd_vel_through_bridge() {
     };
 
     let (control_manifest, robot_class) = load_diff_drive_control_manifest();
-    let grpc_sink = Arc::new(GrpcActuatorSink::from_control_manifest(
-        channel,
-        &control_manifest,
-        robot_class,
-        tokio::runtime::Handle::current(),
-    ));
+    let grpc_sink = Arc::new(
+        GrpcActuatorSink::from_control_manifest(
+            channel,
+            &control_manifest,
+            robot_class,
+            tokio::runtime::Handle::current(),
+        )
+        .expect("valid mobile actuator manifest"),
+    );
     let grpc_sink_ref = Arc::clone(&grpc_sink);
     let log_sink = Arc::new(LogActuatorSink::new());
     let tee_sink = Arc::new(TeeActuatorSink::new(

@@ -22,6 +22,7 @@ pub struct RuntimeDigests {
     pub manifest_digest: String,
     pub execution_mode: ExecutionMode,
     pub compiler_version: String,
+    pub embodiment_family: Option<String>,
 }
 
 impl From<&roz_core::controller::artifact::VerificationKey> for RuntimeDigests {
@@ -34,6 +35,7 @@ impl From<&roz_core::controller::artifact::VerificationKey> for RuntimeDigests {
             manifest_digest: key.manifest_digest.clone(),
             execution_mode: key.execution_mode,
             compiler_version: key.compiler_version.clone(),
+            embodiment_family: key.embodiment_family.clone(),
         }
     }
 }
@@ -363,6 +365,13 @@ impl ControllerLifecycle {
                 actual: format!("{:?}", runtime_digests.execution_mode),
             });
         }
+        if vk.embodiment_family != runtime_digests.embodiment_family {
+            return Err(LifecycleError::DigestMismatch {
+                field: "embodiment_family".into(),
+                expected: format_optional_field(vk.embodiment_family.as_deref()),
+                actual: format_optional_field(runtime_digests.embodiment_family.as_deref()),
+            });
+        }
 
         // Gate 8: advance the state machine to the next promotion target.
         let new_state = current.transition(target).map_err(LifecycleError::InvalidTransition)?;
@@ -403,8 +412,13 @@ impl ControllerLifecycle {
     /// returns in `VerifiedOnly` so the caller can re-run verification before
     /// re-promoting.
     pub fn rollback(&mut self) -> Result<LifecycleRetirement, LifecycleError> {
+        let lkg = self
+            .last_known_good
+            .as_ref()
+            .cloned()
+            .ok_or(LifecycleError::NoLastKnownGood)?;
         let mut retirement = self.retire_current()?;
-        let lkg = self.last_known_good.take().ok_or(LifecycleError::NoLastKnownGood)?;
+        self.last_known_good = None;
         self.current_artifact = Some(lkg.clone());
         self.current_state = Some(DeploymentState::VerifiedOnly);
         self.evidence = None;
@@ -418,12 +432,12 @@ impl ControllerLifecycle {
     /// Used by the live Copper loop when a staged candidate is rejected or
     /// rolled back but the already-active controller remains healthy and in control.
     pub fn restore_last_known_good_active(&mut self) -> Result<LifecycleRetirement, LifecycleError> {
-        let mut retirement = self.retire_current()?;
         let lkg = self
             .last_known_good
             .as_ref()
             .cloned()
             .ok_or(LifecycleError::NoLastKnownGood)?;
+        let mut retirement = self.retire_current()?;
         self.current_artifact = Some(lkg.clone());
         self.current_state = Some(DeploymentState::Active);
         self.evidence = None;
@@ -480,6 +494,10 @@ const fn evidence_mode_for_state(current: DeploymentState) -> ExecutionMode {
         DeploymentState::Canary => ExecutionMode::Canary,
         DeploymentState::Active | DeploymentState::RolledBack | DeploymentState::Rejected => ExecutionMode::Live,
     }
+}
+
+fn format_optional_field(value: Option<&str>) -> String {
+    value.unwrap_or("<none>").to_string()
 }
 
 fn retirement_state_for(current: DeploymentState) -> Result<DeploymentState, TransitionError> {
@@ -599,6 +617,7 @@ mod tests {
             manifest_digest: "man_sha".into(),
             execution_mode: ExecutionMode::Verify,
             compiler_version: "wasmtime-22.0".into(),
+            embodiment_family: None,
         }
     }
 
@@ -762,6 +781,20 @@ mod tests {
         lc.load_artifact(make_artifact("ctrl-1")).unwrap();
         let err = lc.rollback().unwrap_err();
         assert!(matches!(err, super::LifecycleError::NoLastKnownGood));
+        assert_eq!(lc.current_artifact().unwrap().controller_id, "ctrl-1");
+        assert_eq!(lc.current_state(), Some(DeploymentState::VerifiedOnly));
+    }
+
+    #[test]
+    fn restore_without_lkg_preserves_current_state() {
+        let mut lc = ControllerLifecycle::new();
+        lc.load_artifact(make_artifact("ctrl-1")).unwrap();
+
+        let err = lc.restore_last_known_good_active().unwrap_err();
+
+        assert!(matches!(err, super::LifecycleError::NoLastKnownGood));
+        assert_eq!(lc.current_artifact().unwrap().controller_id, "ctrl-1");
+        assert_eq!(lc.current_state(), Some(DeploymentState::VerifiedOnly));
     }
 
     #[test]
@@ -894,5 +927,23 @@ mod tests {
         lc.submit_evidence(ev).unwrap();
         let err = lc.promote(&good_digests()).unwrap_err();
         assert!(matches!(err, super::LifecycleError::UntouchedChannels(_)));
+    }
+
+    #[test]
+    fn promote_with_embodiment_family_mismatch_fails() {
+        let mut lc = ControllerLifecycle::new();
+        let mut artifact = make_artifact("ctrl-1");
+        artifact.verification_key.embodiment_family = Some("ur-family".into());
+        lc.load_artifact(artifact).unwrap();
+        lc.submit_evidence(make_clean_evidence("ctrl-1")).unwrap();
+        let mut digests = good_digests();
+        digests.embodiment_family = Some("mobile-family".into());
+
+        let err = lc.promote(&digests).unwrap_err();
+
+        assert!(matches!(
+            err,
+            super::LifecycleError::DigestMismatch { ref field, .. } if field == "embodiment_family"
+        ));
     }
 }

@@ -104,12 +104,15 @@ async fn drone_wasm_velocity_through_bridge() {
         .connect()
         .await
         .expect("gRPC channel to bridge");
-    let grpc_sink = Arc::new(GrpcActuatorSink::from_control_manifest(
-        grpc_channel.clone(),
-        &control_manifest,
-        robot_class,
-        tokio::runtime::Handle::current(),
-    ));
+    let grpc_sink = Arc::new(
+        GrpcActuatorSink::from_control_manifest(
+            grpc_channel.clone(),
+            &control_manifest,
+            robot_class,
+            tokio::runtime::Handle::current(),
+        )
+        .expect("valid PX4 actuator manifest"),
+    );
     let log_sink = Arc::new(LogActuatorSink::new());
     let tee_sink = Arc::new(TeeActuatorSink::new(
         Arc::clone(&grpc_sink) as Arc<dyn ActuatorSink>,
