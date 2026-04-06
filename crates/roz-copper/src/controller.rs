@@ -37,7 +37,7 @@ use roz_core::controller::artifact::{ControllerArtifact, ExecutionMode};
 use roz_core::controller::deployment::DeploymentState;
 use roz_core::controller::evidence::ControllerEvidenceBundle;
 use roz_core::embodiment::binding::{CommandInterfaceType, ControlInterfaceManifest};
-use roz_core::embodiment::limits::JointSafetyLimits;
+use roz_core::embodiment::limits::{ForceSafetyLimits, JointSafetyLimits};
 #[cfg(test)]
 use roz_core::embodiment::{EmbodimentModel, FrameSource, Joint, Link, Transform3D};
 use roz_core::embodiment::{EmbodimentRuntime, FrameSnapshotInput};
@@ -50,7 +50,7 @@ use crate::evidence_collector::{EvidenceCollector, EvidenceFinalizeContext};
 use crate::io::{ActuatorSink, SensorFrame, SensorSource};
 use crate::safety_filter::HotPathSafetyFilter;
 use crate::tick_builder::TickInputBuilder;
-use crate::tick_contract::{DerivedFeatures, DigestSet};
+use crate::tick_contract::{ContactState, DerivedFeatures, DigestSet, Wrench};
 use crate::wasm::CuWasmTask;
 
 /// Default tick rate: 100 Hz = 10 ms per tick.
@@ -218,6 +218,7 @@ struct PreparedControlProfile {
     command_count: usize,
     command_limit_spans: Vec<f64>,
     joint_limits: Vec<JointSafetyLimits>,
+    force_limits: Option<ForceSafetyLimits>,
     watched_frames: Vec<String>,
 }
 
@@ -958,6 +959,8 @@ fn tick_controller(
     sensor_positions: &[f64],
     sensor_velocities: &[f64],
     sensor_sim_time_ns: i64,
+    sensor_wrench: Option<&Wrench>,
+    sensor_contact: Option<&ContactState>,
     sensor_frame_snapshot_input: &FrameSnapshotInput,
     loop_origin: Instant,
     tick_start: Instant,
@@ -985,15 +988,22 @@ fn tick_controller(
     }
     controller.last_evidence_context = evidence_context_from_snapshot(&runtime_tick_projection.snapshot);
     let runtime_features = contract_features_from_projection(&runtime_tick_projection.features);
-    let tick_input = controller
-        .tick_builder
-        .build_with_runtime_projection(&runtime_tick_projection, runtime_features);
+    let tick_input = controller.tick_builder.build_with_runtime_projection(
+        &runtime_tick_projection,
+        sensor_wrench.cloned(),
+        sensor_contact.cloned(),
+        runtime_features,
+    );
 
     match controller.task.tick_with_contract(tick, Some(&tick_input)) {
         Ok(tick_output) => {
             let ctx = controller.task.host_context();
             let raw_values = &ctx.command_values;
             let output = tick_output.unwrap_or_default();
+            let wrench = tick_input
+                .wrench
+                .as_ref()
+                .map(|w| (w.force.0, w.force.1, w.force.2, w.torque.0, w.torque.1, w.torque.2));
             let filter_result = controller.hot_path_filter.filter(
                 raw_values,
                 if ctx.state_values.is_empty() {
@@ -1001,7 +1011,7 @@ fn tick_controller(
                 } else {
                     Some(&ctx.state_values)
                 },
-                None,
+                wrench.as_ref(),
             );
             controller
                 .evidence_collector
@@ -1177,6 +1187,10 @@ fn build_control_profile_from_runtime(
         command_count: control_manifest.channels.len(),
         command_limit_spans,
         joint_limits,
+        force_limits: embodiment_runtime
+            .safety_overlay
+            .as_ref()
+            .and_then(|overlay| overlay.force_limits.clone()),
         watched_frames: embodiment_runtime.watched_frames.clone(),
     }
 }
@@ -1220,8 +1234,12 @@ fn build_tick_infrastructure(
     );
 
     let tick_period_s = 1.0 / f64::from(profile.control_rate_hz.max(1));
-    let hot_path_filter = HotPathSafetyFilter::new(profile.joint_limits.clone(), None, tick_period_s)
-        .expect("control profile tick period must be valid");
+    let hot_path_filter = HotPathSafetyFilter::new(
+        profile.joint_limits.clone(),
+        profile.force_limits.clone(),
+        tick_period_s,
+    )
+    .expect("control profile tick period must be valid");
 
     (tick_builder, hot_path_filter)
 }
@@ -1847,6 +1865,8 @@ pub fn run_controller_loop_with_policy(
     let mut sensor_joint_positions: Vec<f64> = Vec::new();
     let mut sensor_joint_velocities: Vec<f64> = Vec::new();
     let mut sensor_sim_time_ns: i64 = 0;
+    let mut sensor_wrench: Option<Wrench> = None;
+    let mut sensor_contact: Option<ContactState> = None;
     let mut sensor_frame_snapshot_input = FrameSnapshotInput::default();
 
     tracing::info!(max_velocity, ?watchdog_timeout, "copper controller loop started");
@@ -1886,6 +1906,8 @@ pub fn run_controller_loop_with_policy(
             sensor_joint_positions = frame.joint_positions;
             sensor_joint_velocities = frame.joint_velocities;
             sensor_sim_time_ns = frame.sim_time_ns;
+            sensor_wrench = frame.wrench;
+            sensor_contact = frame.contact;
             sensor_frame_snapshot_input = frame.frame_snapshot_input;
         }
 
@@ -1956,6 +1978,8 @@ pub fn run_controller_loop_with_policy(
                 &sensor_joint_positions,
                 &sensor_joint_velocities,
                 sensor_sim_time_ns,
+                sensor_wrench.as_ref(),
+                sensor_contact.as_ref(),
                 &sensor_frame_snapshot_input,
                 loop_origin,
                 tick_start,
@@ -2037,6 +2061,8 @@ pub fn run_controller_loop_with_policy(
                 &sensor_joint_positions,
                 &sensor_joint_velocities,
                 sensor_sim_time_ns,
+                sensor_wrench.as_ref(),
+                sensor_contact.as_ref(),
                 &sensor_frame_snapshot_input,
                 loop_origin,
                 tick_start,
@@ -2486,7 +2512,9 @@ mod tests {
     use roz_core::embodiment::binding::{
         BindingType, ChannelBinding, CommandInterfaceType, ControlChannelDef, ControlInterfaceManifest,
     };
+    use roz_core::embodiment::safety_overlay::SafetyOverlay;
     use sha2::Digest;
+    use std::collections::BTreeMap;
 
     fn test_control_manifest(channel_count: usize) -> ControlInterfaceManifest {
         let mut manifest = ControlInterfaceManifest {
@@ -2556,6 +2584,24 @@ mod tests {
         }
     }
 
+    fn test_safety_overlay_with_force_limits(max_force: f64, max_torque: f64) -> SafetyOverlay {
+        SafetyOverlay {
+            overlay_digest: "test-force-overlay".into(),
+            workspace_restrictions: Vec::new(),
+            joint_limit_overrides: BTreeMap::new(),
+            max_payload_kg: None,
+            human_presence_zones: Vec::new(),
+            force_limits: Some(ForceSafetyLimits {
+                max_contact_force_n: max_force,
+                max_contact_torque_nm: max_torque,
+                force_rate_limit: 1_000.0,
+            }),
+            contact_force_envelopes: Vec::new(),
+            contact_allowed_zones: Vec::new(),
+            force_rate_limits: BTreeMap::new(),
+        }
+    }
+
     /// Build a prepared controller command from WAT source and manifest.
     fn prepared_test_controller(
         controller_id: &str,
@@ -2563,6 +2609,30 @@ mod tests {
         control_manifest: ControlInterfaceManifest,
     ) -> PreparedController {
         let embodiment_runtime = synthesize_embodiment_runtime(&control_manifest);
+        prepared_test_controller_with_runtime(controller_id, wat, control_manifest, embodiment_runtime)
+    }
+
+    fn prepared_test_controller_with_force_limits(
+        controller_id: &str,
+        wat: &[u8],
+        control_manifest: ControlInterfaceManifest,
+        max_force: f64,
+        max_torque: f64,
+    ) -> PreparedController {
+        let embodiment_runtime = EmbodimentRuntime::compile(
+            synthesize_embodiment_runtime(&control_manifest).model,
+            None,
+            Some(test_safety_overlay_with_force_limits(max_force, max_torque)),
+        );
+        prepared_test_controller_with_runtime(controller_id, wat, control_manifest, embodiment_runtime)
+    }
+
+    fn prepared_test_controller_with_runtime(
+        controller_id: &str,
+        wat: &[u8],
+        control_manifest: ControlInterfaceManifest,
+        embodiment_runtime: EmbodimentRuntime,
+    ) -> PreparedController {
         let artifact = test_artifact(controller_id, wat, &control_manifest, Some(&embodiment_runtime));
         let control_profile = build_control_profile_from_runtime(&control_manifest, &embodiment_runtime);
         let channel_names = control_profile.channel_names.clone();
@@ -3363,6 +3433,8 @@ mod tests {
             &[0.0],
             &[0.0],
             10_000_000,
+            None,
+            None,
             &FrameSnapshotInput::default(),
             loop_origin,
             tick_start,
@@ -3375,6 +3447,92 @@ mod tests {
 
         let evidence = controller.rotate_evidence(ExecutionMode::Verify);
         assert_eq!(evidence.frame_snapshot_id, 7);
+    }
+
+    #[test]
+    fn tick_controller_without_wrench_does_not_trigger_force_estop() {
+        let manifest = test_control_manifest(1);
+        let wat = constant_output_wat(0.25);
+        let prepared =
+            prepared_test_controller_with_force_limits("force-safe-ctrl", wat.as_bytes(), manifest, 10.0, 2.0);
+        let mut controller = LoadedController::from_prepared(prepared);
+        let loop_origin = Instant::now();
+        let tick_start = loop_origin + Duration::from_millis(10);
+
+        controller.inject_sensor_state(&[0.0], &[0.0], 10_000_000);
+        let result = tick_controller(
+            &mut controller,
+            7,
+            &[0.0],
+            &[0.0],
+            10_000_000,
+            None,
+            None,
+            &FrameSnapshotInput::default(),
+            loop_origin,
+            tick_start,
+            ExecutionMode::Live,
+        );
+
+        assert!(!result.halted, "missing wrench should not trigger a force estop");
+        assert_eq!(result.estop_reason, None);
+        assert_eq!(result.command.as_ref().map(|cmd| cmd.values.clone()), Some(vec![0.25]));
+    }
+
+    #[test]
+    fn controller_loop_estops_on_live_force_limit_from_sensor_wrench() {
+        use crate::io::SensorFrame;
+        use crate::io_log::MockSensorSource;
+
+        let manifest = test_control_manifest(1);
+        let wat = constant_output_wat(0.25);
+        let prepared =
+            prepared_test_controller_with_force_limits("force-trip-ctrl", wat.as_bytes(), manifest, 20.0, 2.0);
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        let state = Arc::new(ArcSwap::from_pointee(ControllerState::default()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (estop_tx, mut estop_rx) = tokio::sync::mpsc::channel(4);
+        let s = Arc::clone(&state);
+        let sd = Arc::clone(&shutdown);
+
+        let handle = std::thread::spawn(move || {
+            let mut sensor = MockSensorSource::new(SensorFrame {
+                wrench: Some(Wrench {
+                    force: (30.0, 30.0, 0.0),
+                    torque: (0.0, 0.0, 0.0),
+                }),
+                ..SensorFrame::default()
+            });
+            run_controller_loop_with_compatibility_fallback(
+                &rx,
+                &s,
+                1.5,
+                &sd,
+                None,
+                Some(&mut sensor),
+                Duration::from_secs(60),
+                None,
+                &estop_tx,
+            );
+        });
+
+        tx.send(crate::channels::CopperRuntimeCommand::PreparedArtifact(prepared))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(250));
+
+        let current = state.load();
+        assert!(!current.running, "controller should halt on force-limit estop");
+        assert_eq!(current.estop_reason.as_deref(), Some("safety_filter_estop"));
+        assert_eq!(
+            current.last_output.as_ref().and_then(|output| output["error"].as_str()),
+            Some("safety_filter_estop")
+        );
+        drop(current);
+
+        let msg = estop_rx.try_recv().expect("force-limit estop should notify channel");
+        assert_eq!(msg, "safety_filter_estop");
+
+        stop(&shutdown, handle);
     }
 
     #[test]

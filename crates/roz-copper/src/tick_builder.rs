@@ -84,12 +84,15 @@ impl TickInputBuilder {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_with_projection_parts(
         &self,
         tick: u64,
         monotonic_time_ns: u64,
         joints: Vec<JointState>,
         watched_poses: Vec<Pose>,
+        wrench: Option<Wrench>,
+        contact: Option<ContactState>,
         features: DerivedFeatures,
     ) -> TickInput {
         TickInput {
@@ -98,8 +101,8 @@ impl TickInputBuilder {
             digests: self.digests.clone(),
             joints,
             watched_poses,
-            wrench: None,
-            contact: None,
+            wrench,
+            contact,
             features,
             config_json: self.config_json.clone(),
         }
@@ -144,6 +147,8 @@ impl TickInputBuilder {
     pub fn build_with_runtime_projection(
         &self,
         projection: &TickInputProjection,
+        wrench: Option<Wrench>,
+        contact: Option<ContactState>,
         features: DerivedFeatures,
     ) -> TickInput {
         self.build_with_projection_parts(
@@ -151,6 +156,8 @@ impl TickInputBuilder {
             projection.monotonic_time_ns,
             Self::contract_joint_states_from_projection(&projection.joints),
             Self::contract_poses_from_projections(&projection.watched_poses),
+            wrench,
+            contact,
             features,
         )
     }
@@ -476,7 +483,20 @@ mod tests {
             alerts: projection.features.alerts.clone(),
         };
 
-        let input = builder.build_with_runtime_projection(&projection, features);
+        let wrench = Wrench {
+            force: (12.0, 0.0, 0.0),
+            torque: (0.0, 0.0, 3.0),
+        };
+        let contact = ContactState {
+            in_contact: true,
+            contact_force: Some(12.0),
+            contact_location: Some("ee_link".into()),
+            slip_detected: false,
+            contact_confidence: 0.9,
+        };
+
+        let input =
+            builder.build_with_runtime_projection(&projection, Some(wrench.clone()), Some(contact.clone()), features);
 
         assert_eq!(input.tick, 11);
         assert_eq!(input.monotonic_time_ns, 2_000);
@@ -488,6 +508,8 @@ mod tests {
         assert_eq!(input.watched_poses.len(), 1);
         assert_eq!(input.watched_poses[0].frame, "ee_link");
         assert_eq!(input.watched_poses[0].translation, (0.4, 0.5, 0.6));
+        assert_eq!(input.wrench, Some(wrench));
+        assert_eq!(input.contact, Some(contact));
         assert_eq!(input.features.workspace_margin, Some(0.25));
         assert_eq!(input.features.observation_confidence, Some(0.8));
         assert!(input.features.active_perception_available);

@@ -542,6 +542,8 @@ fn pose_batch_to_sensor_frame(batch: &proto::PoseBatch) -> SensorFrame {
         joint_positions: Vec::new(),
         joint_velocities: Vec::new(),
         sim_time_ns,
+        wrench: None,
+        contact: None,
         frame_snapshot_input: pose_batch_to_snapshot_input(batch, sim_time_ns),
     }
 }
