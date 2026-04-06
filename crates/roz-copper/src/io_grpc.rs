@@ -501,7 +501,7 @@ impl ActuatorSink for GrpcActuatorSink {
 
 impl Drop for GrpcActuatorSink {
     fn drop(&mut self) {
-        let current_state = {
+        {
             let mut state = self.lease_state.lock();
             match *state {
                 LeaseState::Idle | LeaseState::DropRequested => return,
@@ -511,12 +511,8 @@ impl Drop for GrpcActuatorSink {
                 }
                 LeaseState::Owned => {
                     *state = LeaseState::Idle;
-                    LeaseState::Owned
                 }
             }
-        };
-        if current_state != LeaseState::Owned {
-            return;
         }
         let mut client = self.client.clone();
         let robot_class = self.robot_class.clone();

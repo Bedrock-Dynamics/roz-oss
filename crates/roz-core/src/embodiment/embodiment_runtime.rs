@@ -445,11 +445,11 @@ impl EmbodimentRuntime {
                 .iter()
                 .map(|anchor| anchor.confidence.clamp(0.0, 1.0)),
         );
-        (!samples.is_empty()).then(|| {
-            let sample_count =
-                f64::from(u32::try_from(samples.len()).expect("observation sample count exceeds u32::MAX"));
-            samples.iter().sum::<f64>() / sample_count
-        })
+        if samples.is_empty() {
+            return None;
+        }
+        let sample_count = f64::from(u32::try_from(samples.len()).ok()?);
+        Some(samples.iter().sum::<f64>() / sample_count)
     }
 
     fn link_frame_for_frame(&self, frame_id: &str) -> Option<String> {
@@ -1995,6 +1995,9 @@ impl EmbodimentRuntime {
     ) -> Result<TcpTrajectoryPlan, String> {
         if waypoint_count == 0 {
             return Err("waypoint_count must be at least 1".into());
+        }
+        if waypoint_count > u32::MAX as usize {
+            return Err("waypoint_count exceeds u32::MAX".into());
         }
 
         let snapshot = self.build_frame_snapshot_with_input(
