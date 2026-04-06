@@ -120,7 +120,9 @@ fn frame_command_profiles_from_control_manifest(
                     channel.interface_type,
                     CommandInterfaceType::JointVelocity
                         | CommandInterfaceType::JointPosition
+                        | CommandInterfaceType::JointTorque
                         | CommandInterfaceType::GripperPosition
+                        | CommandInterfaceType::GripperForce
                 )
                 .then_some(actuator_index),
                 max_delta_from: None,
@@ -277,14 +279,14 @@ impl SafetyFilterTask {
                 && let Some(&(lower, upper)) = state_limits.get(pos_idx)
             {
                 match desc.interface_type {
-                    FrameInterfaceType::Velocity => {
+                    FrameInterfaceType::Velocity | FrameInterfaceType::Effort => {
                         if (pos >= upper - POSITION_LIMIT_MARGIN && v > 0.0)
                             || (pos <= lower + POSITION_LIMIT_MARGIN && v < 0.0)
                         {
                             v = 0.0;
                         }
                     }
-                    FrameInterfaceType::Position | FrameInterfaceType::Effort => {
+                    FrameInterfaceType::Position => {
                         if (pos >= upper - POSITION_LIMIT_MARGIN && v > pos)
                             || (pos <= lower + POSITION_LIMIT_MARGIN && v < pos)
                         {
@@ -459,6 +461,15 @@ impl HotPathSafetyFilter {
                     });
                     result_commands[i] = 0.0;
                 }
+            } else {
+                result_commands[i] = 0.0;
+                interventions.push(SafetyIntervention {
+                    channel: format!("channel_{i}"),
+                    raw_value: cmd,
+                    clamped_value: 0.0,
+                    kind: InterventionKind::UnconfiguredJoint,
+                    reason: format!("no safety limits configured for actuator index {i}"),
+                });
             }
         }
 
@@ -783,6 +794,44 @@ mod tests {
     }
 
     #[test]
+    fn clamp_frame_with_control_manifest_zeros_effort_at_hard_stop() {
+        let mut control_manifest = ControlInterfaceManifest {
+            version: 1,
+            manifest_digest: String::new(),
+            channels: vec![ControlChannelDef {
+                name: "joint0/torque".into(),
+                interface_type: CommandInterfaceType::JointTorque,
+                units: "Nm".into(),
+                frame_id: "joint0_link".into(),
+            }],
+            bindings: vec![ChannelBinding {
+                physical_name: "joint0".into(),
+                channel_index: 0,
+                binding_type: BindingType::Command,
+                frame_id: "joint0_link".into(),
+                units: "Nm".into(),
+                semantic_role: None,
+            }],
+        };
+        control_manifest.stamp_digest();
+        let joint_limits = vec![JointSafetyLimits {
+            joint_name: "joint_0".into(),
+            max_velocity: 1.5,
+            max_acceleration: f64::INFINITY,
+            max_jerk: f64::INFINITY,
+            position_min: -std::f64::consts::TAU,
+            position_max: std::f64::consts::TAU,
+            max_torque: Some(10.0),
+        }];
+        let mut filter = SafetyFilterTask::new(10.0, 0.0, None).unwrap();
+        filter.update_positions(&[std::f64::consts::TAU - 0.03]);
+
+        let frame = CommandFrame { values: vec![3.0] };
+        let clamped = filter.clamp_frame_with_control_manifest(&frame, &control_manifest, &joint_limits);
+        assert_eq!(clamped.values[0], 0.0);
+    }
+
+    #[test]
     fn clamp_frame_with_control_manifest_ignores_interleaved_sensor_channels() {
         let mut control_manifest = ControlInterfaceManifest {
             version: 1,
@@ -1090,6 +1139,19 @@ mod tests {
                 .iter()
                 .any(|i| i.kind == InterventionKind::AccelerationLimit),
             "acceleration limit should not apply after reset"
+        );
+    }
+
+    #[test]
+    fn hotpath_unconfigured_joint_is_zeroed_and_recorded() {
+        let mut filter = HotPathSafetyFilter::new(vec![sample_limits("j0")], None, 0.01).unwrap();
+        let result = filter.filter(&[0.5, 0.75], None, None);
+        assert_eq!(result.commands, vec![0.5, 0.0]);
+        assert!(
+            result
+                .interventions
+                .iter()
+                .any(|intervention| intervention.kind == InterventionKind::UnconfiguredJoint)
         );
     }
 }

@@ -152,12 +152,7 @@ pub fn build_all_tools_with_copper(project_dir: &Path) -> AllTools {
                     .filter(|channel| is_actuator_channel(&channel.interface_type))
                     .map(|channel| channel.name.clone())
                     .collect(),
-                channel_defaults: control_manifest
-                    .channels
-                    .iter()
-                    .filter(|channel| is_actuator_channel(&channel.interface_type))
-                    .map(|_| 0.0)
-                    .collect(),
+                channel_defaults: Vec::new(),
             };
 
             // Create WS bridge on the current tokio runtime.

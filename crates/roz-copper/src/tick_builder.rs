@@ -26,6 +26,31 @@ pub struct TickInputBuilder {
 }
 
 impl TickInputBuilder {
+    fn validate_joint_array_lengths(&self, data: &TickSensorData<'_>) -> Result<(), String> {
+        let expected = self.joint_names.len();
+        if data.positions.len() != expected {
+            return Err(format!(
+                "tick positions length {} does not match configured joints {expected}",
+                data.positions.len()
+            ));
+        }
+        if data.velocities.len() != expected {
+            return Err(format!(
+                "tick velocities length {} does not match configured joints {expected}",
+                data.velocities.len()
+            ));
+        }
+        if let Some(efforts) = data.efforts
+            && efforts.len() != expected
+        {
+            return Err(format!(
+                "tick efforts length {} does not match configured joints {expected}",
+                efforts.len()
+            ));
+        }
+        Ok(())
+    }
+
     fn contract_joint_states_from_projection(joint_state_projections: &[TickJointStateProjection]) -> Vec<JointState> {
         joint_state_projections
             .iter()
@@ -58,20 +83,25 @@ impl TickInputBuilder {
             .collect()
     }
 
-    fn build_with_watched_pose_vec(&self, data: TickSensorData<'_>, watched_poses: Vec<Pose>) -> TickInput {
+    fn build_with_watched_pose_vec(
+        &self,
+        data: TickSensorData<'_>,
+        watched_poses: Vec<Pose>,
+    ) -> Result<TickInput, String> {
+        self.validate_joint_array_lengths(&data)?;
         let joints: Vec<JointState> = self
             .joint_names
             .iter()
             .enumerate()
             .map(|(i, name)| JointState {
                 name: name.clone(),
-                position: data.positions.get(i).copied().unwrap_or(0.0),
-                velocity: data.velocities.get(i).copied().unwrap_or(0.0),
+                position: data.positions[i],
+                velocity: data.velocities[i],
                 effort: data.efforts.and_then(|e| e.get(i).copied()),
             })
             .collect();
 
-        TickInput {
+        Ok(TickInput {
             tick: data.tick,
             monotonic_time_ns: data.time_ns,
             digests: self.digests.clone(),
@@ -81,7 +111,7 @@ impl TickInputBuilder {
             contact: data.contact,
             features: data.features,
             config_json: self.config_json.clone(),
-        }
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -125,11 +155,10 @@ impl TickInputBuilder {
 
     /// Build a [`TickInput`] for the current tick.
     ///
-    /// `positions` and `velocities` must be ordered to match `joint_names`.  If
-    /// either slice is shorter than the number of joints the missing values
-    /// default to `0.0`.  `efforts`, if provided, follows the same convention
-    /// and missing entries become `None`.
-    pub fn build(&self, data: TickSensorData<'_>) -> TickInput {
+    /// `positions`, `velocities`, and optional `efforts` must exactly match
+    /// the configured joint count. Incomplete telemetry is rejected instead of
+    /// fabricating zeros.
+    pub fn build(&self, data: TickSensorData<'_>) -> Result<TickInput, String> {
         let watched_poses = data.watched_poses.to_vec();
         self.build_with_watched_pose_vec(data, watched_poses)
     }
@@ -139,7 +168,7 @@ impl TickInputBuilder {
         &self,
         data: TickSensorData<'_>,
         watched_pose_projections: &[WatchedPoseProjection],
-    ) -> TickInput {
+    ) -> Result<TickInput, String> {
         self.build_with_watched_pose_vec(data, Self::contract_poses_from_projections(watched_pose_projections))
     }
 
@@ -213,17 +242,19 @@ mod tests {
         let builder = make_builder();
         let positions = [0.1, 0.2, 0.3];
         let velocities = [0.01, 0.02, 0.03];
-        let input = builder.build(TickSensorData {
-            tick: 7,
-            time_ns: 1_000_000,
-            positions: &positions,
-            velocities: &velocities,
-            efforts: None,
-            watched_poses: &[],
-            wrench: None,
-            contact: None,
-            features: DerivedFeatures::default(),
-        });
+        let input = builder
+            .build(TickSensorData {
+                tick: 7,
+                time_ns: 1_000_000,
+                positions: &positions,
+                velocities: &velocities,
+                efforts: None,
+                watched_poses: &[],
+                wrench: None,
+                contact: None,
+                features: DerivedFeatures::default(),
+            })
+            .unwrap();
 
         assert_eq!(input.tick, 7);
         assert_eq!(input.monotonic_time_ns, 1_000_000);
@@ -243,17 +274,19 @@ mod tests {
         let positions = [0.0, 0.0, 0.0];
         let velocities = [0.0, 0.0, 0.0];
         let efforts = [1.1, 2.2, 3.3];
-        let input = builder.build(TickSensorData {
-            tick: 1,
-            time_ns: 0,
-            positions: &positions,
-            velocities: &velocities,
-            efforts: Some(&efforts),
-            watched_poses: &[],
-            wrench: None,
-            contact: None,
-            features: DerivedFeatures::default(),
-        });
+        let input = builder
+            .build(TickSensorData {
+                tick: 1,
+                time_ns: 0,
+                positions: &positions,
+                velocities: &velocities,
+                efforts: Some(&efforts),
+                watched_poses: &[],
+                wrench: None,
+                contact: None,
+                features: DerivedFeatures::default(),
+            })
+            .unwrap();
 
         assert_eq!(input.joints[0].effort, Some(1.1));
         assert_eq!(input.joints[1].effort, Some(2.2));
@@ -265,17 +298,19 @@ mod tests {
         let builder = make_builder();
         let positions = [0.0, 0.0, 0.0];
         let velocities = [0.0, 0.0, 0.0];
-        let input = builder.build(TickSensorData {
-            tick: 1,
-            time_ns: 0,
-            positions: &positions,
-            velocities: &velocities,
-            efforts: None,
-            watched_poses: &[],
-            wrench: None,
-            contact: None,
-            features: DerivedFeatures::default(),
-        });
+        let input = builder
+            .build(TickSensorData {
+                tick: 1,
+                time_ns: 0,
+                positions: &positions,
+                velocities: &velocities,
+                efforts: None,
+                watched_poses: &[],
+                wrench: None,
+                contact: None,
+                features: DerivedFeatures::default(),
+            })
+            .unwrap();
 
         for joint in &input.joints {
             assert!(joint.effort.is_none(), "expected None effort for joint {}", joint.name);
@@ -285,6 +320,8 @@ mod tests {
     #[test]
     fn build_with_wrench_and_contact() {
         let builder = make_builder();
+        let positions = [0.0, 0.0, 0.0];
+        let velocities = [0.0, 0.0, 0.0];
         let wrench = Wrench {
             force: (0.1, -0.2, 9.8),
             torque: (0.0, 0.0, 0.01),
@@ -296,17 +333,19 @@ mod tests {
             slip_detected: false,
             contact_confidence: 0.95,
         };
-        let input = builder.build(TickSensorData {
-            tick: 5,
-            time_ns: 500,
-            positions: &[],
-            velocities: &[],
-            efforts: None,
-            watched_poses: &[],
-            wrench: Some(wrench),
-            contact: Some(contact),
-            features: DerivedFeatures::default(),
-        });
+        let input = builder
+            .build(TickSensorData {
+                tick: 5,
+                time_ns: 500,
+                positions: &positions,
+                velocities: &velocities,
+                efforts: None,
+                watched_poses: &[],
+                wrench: Some(wrench),
+                contact: Some(contact),
+                features: DerivedFeatures::default(),
+            })
+            .unwrap();
 
         let got_wrench = input.wrench.expect("wrench should be present");
         assert_eq!(got_wrench.force, (0.1, -0.2, 9.8));
@@ -324,17 +363,19 @@ mod tests {
     fn build_preserves_digests() {
         let digests = make_digests();
         let builder = TickInputBuilder::new(digests.clone(), vec![], vec![], String::new());
-        let input = builder.build(TickSensorData {
-            tick: 0,
-            time_ns: 0,
-            positions: &[],
-            velocities: &[],
-            efforts: None,
-            watched_poses: &[],
-            wrench: None,
-            contact: None,
-            features: DerivedFeatures::default(),
-        });
+        let input = builder
+            .build(TickSensorData {
+                tick: 0,
+                time_ns: 0,
+                positions: &[],
+                velocities: &[],
+                efforts: None,
+                watched_poses: &[],
+                wrench: None,
+                contact: None,
+                features: DerivedFeatures::default(),
+            })
+            .unwrap();
         assert_eq!(input.digests, digests);
     }
 
@@ -342,17 +383,21 @@ mod tests {
     fn update_config_changes_output() {
         let mut builder = make_builder();
         builder.update_config(r#"{"gain":2.0}"#.to_string());
-        let input = builder.build(TickSensorData {
-            tick: 0,
-            time_ns: 0,
-            positions: &[],
-            velocities: &[],
-            efforts: None,
-            watched_poses: &[],
-            wrench: None,
-            contact: None,
-            features: DerivedFeatures::default(),
-        });
+        let positions = [0.0, 0.0, 0.0];
+        let velocities = [0.0, 0.0, 0.0];
+        let input = builder
+            .build(TickSensorData {
+                tick: 0,
+                time_ns: 0,
+                positions: &positions,
+                velocities: &velocities,
+                efforts: None,
+                watched_poses: &[],
+                wrench: None,
+                contact: None,
+                features: DerivedFeatures::default(),
+            })
+            .unwrap();
         assert_eq!(input.config_json, r#"{"gain":2.0}"#);
     }
 
@@ -361,65 +406,85 @@ mod tests {
         let builder = make_builder(); // 3 joints
         let positions = [1.0]; // only 1 value
         let velocities = [0.5, 0.6]; // only 2 values
-        let input = builder.build(TickSensorData {
-            tick: 1,
-            time_ns: 0,
-            positions: &positions,
-            velocities: &velocities,
-            efforts: None,
-            watched_poses: &[Pose {
-                frame: "base_link".to_string(),
-                translation: (0.0, 0.0, 0.0),
-                rotation: (1.0, 0.0, 0.0, 0.0),
-            }],
-            wrench: None,
-            contact: None,
-            features: DerivedFeatures::default(),
-        });
+        let err = builder
+            .build(TickSensorData {
+                tick: 1,
+                time_ns: 0,
+                positions: &positions,
+                velocities: &velocities,
+                efforts: None,
+                watched_poses: &[Pose {
+                    frame: "base_link".to_string(),
+                    translation: (0.0, 0.0, 0.0),
+                    rotation: (1.0, 0.0, 0.0, 0.0),
+                }],
+                wrench: None,
+                contact: None,
+                features: DerivedFeatures::default(),
+            })
+            .unwrap_err();
 
-        // First joint gets real value
-        assert!((input.joints[0].position - 1.0).abs() < f64::EPSILON);
-        assert!((input.joints[0].velocity - 0.5).abs() < f64::EPSILON);
-        // Second joint: position defaults, velocity from slice
-        assert!((input.joints[1].position - 0.0).abs() < f64::EPSILON);
-        assert!((input.joints[1].velocity - 0.6).abs() < f64::EPSILON);
-        // Third joint: both default to 0.0
-        assert!((input.joints[2].position - 0.0).abs() < f64::EPSILON);
-        assert!((input.joints[2].velocity - 0.0).abs() < f64::EPSILON);
-        // watched_poses passed through
-        assert_eq!(input.watched_poses.len(), 1);
+        assert!(err.contains("positions length 1"), "unexpected error: {err}");
     }
 
     #[test]
     fn build_with_projected_watched_poses() {
         let builder = make_builder();
-        let input = builder.build_with_projected_watched_poses(
-            TickSensorData {
-                tick: 2,
-                time_ns: 200,
-                positions: &[],
-                velocities: &[],
-                efforts: None,
-                watched_poses: &[],
-                wrench: None,
-                contact: None,
-                features: DerivedFeatures::default(),
-            },
-            &[WatchedPoseProjection {
-                frame_id: "ee_link".into(),
-                relative_to: "world".into(),
-                transform: Transform3D {
-                    translation: [0.1, 0.2, 0.3],
-                    rotation: [1.0, 0.0, 0.0, 0.0],
-                    timestamp_ns: 200,
+        let positions = [0.0, 0.0, 0.0];
+        let velocities = [0.0, 0.0, 0.0];
+        let input = builder
+            .build_with_projected_watched_poses(
+                TickSensorData {
+                    tick: 2,
+                    time_ns: 200,
+                    positions: &positions,
+                    velocities: &velocities,
+                    efforts: None,
+                    watched_poses: &[],
+                    wrench: None,
+                    contact: None,
+                    features: DerivedFeatures::default(),
                 },
-                freshness: FreshnessState::Fresh,
-            }],
-        );
+                &[WatchedPoseProjection {
+                    frame_id: "ee_link".into(),
+                    relative_to: "world".into(),
+                    transform: Transform3D {
+                        translation: [0.1, 0.2, 0.3],
+                        rotation: [1.0, 0.0, 0.0, 0.0],
+                        timestamp_ns: 200,
+                    },
+                    freshness: FreshnessState::Fresh,
+                }],
+            )
+            .unwrap();
 
         assert_eq!(input.watched_poses.len(), 1);
         assert_eq!(input.watched_poses[0].frame, "ee_link");
         assert_eq!(input.watched_poses[0].translation, (0.1, 0.2, 0.3));
+    }
+
+    #[test]
+    fn build_rejects_mismatched_effort_lengths() {
+        let builder = make_builder();
+        let positions = [0.0, 0.0, 0.0];
+        let velocities = [0.0, 0.0, 0.0];
+        let efforts = [1.0, 2.0];
+
+        let err = builder
+            .build(TickSensorData {
+                tick: 1,
+                time_ns: 0,
+                positions: &positions,
+                velocities: &velocities,
+                efforts: Some(&efforts),
+                watched_poses: &[],
+                wrench: None,
+                contact: None,
+                features: DerivedFeatures::default(),
+            })
+            .unwrap_err();
+
+        assert!(err.contains("efforts length 2"), "unexpected error: {err}");
     }
 
     #[test]

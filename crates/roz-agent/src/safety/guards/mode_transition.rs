@@ -77,10 +77,23 @@ impl ModeTransitionGuard {
             return false;
         }
 
-        !Self::has_any_keyword(
+        let clear_signal = Self::has_any_keyword(&tokens, &["cleared", "restored", "inactive", "released", "resolved"]);
+        let blocking_context = Self::has_any_keyword(
             &tokens,
-            &["cleared", "restored", "inactive", "released", "reset", "resolved"],
-        )
+            &[
+                "failed",
+                "failure",
+                "error",
+                "active",
+                "pending",
+                "request",
+                "requested",
+                "not",
+                "still",
+            ],
+        );
+
+        !clear_signal || blocking_context
     }
 }
 
@@ -304,6 +317,42 @@ mod tests {
         let result = guard.check(&make_action(), &state).await;
 
         assert_eq!(result, SafetyVerdict::Allow);
+    }
+
+    #[tokio::test]
+    async fn blocks_ooda_when_estop_reset_failed_alert_present() {
+        let guard = ModeTransitionGuard::new(AgentLoopMode::OodaReAct);
+        let mut state = context_with_entities();
+        state.alerts.push(Alert {
+            severity: AlertSeverity::Warning,
+            message: "E-stop reset failed".into(),
+            source: "safety_monitor".into(),
+        });
+
+        let result = guard.check(&make_action(), &state).await;
+
+        match result {
+            SafetyVerdict::Block { reason } => assert!(reason.contains("e-stop") || reason.contains("safety stop")),
+            other => panic!("expected Block for failed estop reset, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn blocks_ooda_when_estop_release_is_requested_but_still_active() {
+        let guard = ModeTransitionGuard::new(AgentLoopMode::OodaReAct);
+        let mut state = context_with_entities();
+        state.alerts.push(Alert {
+            severity: AlertSeverity::Warning,
+            message: "E-stop release requested, still active".into(),
+            source: "safety_monitor".into(),
+        });
+
+        let result = guard.check(&make_action(), &state).await;
+
+        match result {
+            SafetyVerdict::Block { reason } => assert!(reason.contains("e-stop") || reason.contains("safety stop")),
+            other => panic!("expected Block for still-active estop release, got {other:?}"),
+        }
     }
 
     // --- React mode (no spatial requirement) ---

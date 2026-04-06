@@ -109,8 +109,14 @@ pub enum VerifierVerdict {
 impl VerifierVerdict {
     /// Whether the verdict allows promotion.
     #[must_use]
-    pub const fn allows_promotion(&self) -> bool {
-        matches!(self, Self::Pass { .. })
+    pub fn allows_promotion(&self) -> bool {
+        match self {
+            Self::Pass { .. } => true,
+            Self::Fail { failures } => failures
+                .iter()
+                .all(|failure| failure.severity == FailureSeverity::Warning),
+            Self::Partial { .. } | Self::Unavailable { .. } => false,
+        }
     }
 
     /// Whether the verdict has any critical failures.
@@ -161,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn fail_with_only_warnings_still_fails() {
+    fn fail_with_only_warnings_allows_promotion() {
         let v = VerifierVerdict::Fail {
             failures: vec![VerifierFailure {
                 check_name: "timing".into(),
@@ -169,7 +175,7 @@ mod tests {
                 severity: FailureSeverity::Warning,
             }],
         };
-        assert!(!v.allows_promotion());
+        assert!(v.allows_promotion());
         assert!(!v.has_critical_failures());
     }
 

@@ -9,6 +9,7 @@ pub enum InterventionKind {
     VelocityClamp,
     AccelerationLimit,
     PositionLimit,
+    UnconfiguredJoint,
     NanReject,
     JerkLimit,
     ForceLimit,
@@ -54,6 +55,7 @@ mod tests {
             InterventionKind::VelocityClamp,
             InterventionKind::AccelerationLimit,
             InterventionKind::PositionLimit,
+            InterventionKind::UnconfiguredJoint,
             InterventionKind::NanReject,
             InterventionKind::JerkLimit,
             InterventionKind::ForceLimit,
@@ -64,7 +66,7 @@ mod tests {
             InterventionKind::SlipDetected,
             InterventionKind::TactileOverload,
         ];
-        assert_eq!(kinds.len(), 12, "all 12 intervention kinds must be tested");
+        assert_eq!(kinds.len(), 13, "all 13 intervention kinds must be tested");
         for k in kinds {
             let json = serde_json::to_string(&k).unwrap();
             let back: InterventionKind = serde_json::from_str(&json).unwrap();

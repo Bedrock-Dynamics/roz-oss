@@ -127,7 +127,8 @@ impl EvidenceCollector {
                 InterventionKind::NanReject => {
                     self.rejection_count += 1;
                 }
-                InterventionKind::VelocityClamp
+                InterventionKind::UnconfiguredJoint
+                | InterventionKind::VelocityClamp
                 | InterventionKind::JerkLimit
                 | InterventionKind::ForceLimit
                 | InterventionKind::TorqueLimit
