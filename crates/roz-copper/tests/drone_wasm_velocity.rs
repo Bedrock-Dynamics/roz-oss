@@ -35,7 +35,7 @@ use roz_copper::io_log::{LogActuatorSink, TeeActuatorSink};
 use roz_core::embodiment::binding::ControlInterfaceManifest;
 
 fn load_quadcopter_control_manifest() -> (ControlInterfaceManifest, String) {
-    let toml_str = include_str!("../../../examples/quadcopter/robot.toml");
+    let toml_str = include_str!("../../../examples/quadcopter/embodiment.toml");
     let robot: roz_copper::manifest::EmbodimentManifest = toml::from_str(toml_str).unwrap();
     (
         robot.control_interface_manifest().unwrap(),

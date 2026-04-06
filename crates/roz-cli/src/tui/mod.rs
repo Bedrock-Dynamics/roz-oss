@@ -1,3 +1,4 @@
+#[allow(dead_code)] // Legacy stream-chunk adapter retained for compatibility paths.
 mod agent;
 mod commands;
 pub mod context;
@@ -20,6 +21,19 @@ pub mod tools;
 use iocraft::components::TextWrap;
 use iocraft::prelude::*;
 use owo_colors::OwoColorize;
+use roz_agent::agent_loop::{AgentInput, AgentInputSeed, AgentLoop, AgentLoopMode};
+use roz_agent::dispatch::ToolDispatcher;
+use roz_agent::error::AgentError;
+use roz_agent::model::types::{MessageRole, Model};
+use roz_agent::safety::SafetyStack;
+use roz_agent::session_runtime::{
+    PreparedTurn, SessionConfig, SessionRuntime, StreamingTurnExecutor, StreamingTurnHandle, StreamingTurnResult,
+    TurnExecutionFailure, TurnInput, TurnOutput,
+};
+use roz_agent::spatial_provider::NullWorldStateProvider;
+use roz_core::session::activity::RuntimeFailureKind;
+use roz_core::session::control::{CognitionMode, SessionMode};
+use roz_core::session::event::SessionEvent;
 use unicode_width::UnicodeWidthStr;
 
 use commands::CommandResult;
@@ -944,10 +958,247 @@ pub fn run(
     Ok(())
 }
 
+fn prompt_tool_schemas(dispatcher: &ToolDispatcher) -> Vec<roz_agent::prompt_assembler::ToolSchema> {
+    dispatcher
+        .schemas()
+        .into_iter()
+        .map(|schema| roz_agent::prompt_assembler::ToolSchema {
+            name: schema.name,
+            description: schema.description,
+            parameters_json: serde_json::to_string(&schema.parameters).unwrap_or_else(|_| "{}".to_string()),
+        })
+        .collect()
+}
+
+fn agent_error_to_turn_execution_failure(error: AgentError) -> TurnExecutionFailure {
+    match error {
+        AgentError::Safety(message) => TurnExecutionFailure::new(RuntimeFailureKind::SafetyBlocked, message),
+        AgentError::ToolDispatch { message, .. } => TurnExecutionFailure::new(RuntimeFailureKind::ToolError, message),
+        AgentError::CircuitBreakerTripped {
+            consecutive_error_turns,
+        } => TurnExecutionFailure::new(
+            RuntimeFailureKind::CircuitBreakerTripped,
+            format!("circuit breaker tripped after {consecutive_error_turns} consecutive all-error turns"),
+        ),
+        AgentError::Cancelled { .. } => TurnExecutionFailure::new(RuntimeFailureKind::OperatorAbort, "turn cancelled"),
+        other => TurnExecutionFailure::new(RuntimeFailureKind::ModelError, other.to_string()),
+    }
+}
+
+fn build_local_model(config: &ProviderConfig) -> Result<Box<dyn Model>, String> {
+    let Some(api_key) = config.api_key.as_deref() else {
+        return Err("No API key configured".to_string());
+    };
+    let proxy_provider = if config.provider == Provider::Openai {
+        "openai"
+    } else {
+        "anthropic"
+    };
+
+    roz_agent::model::create_model(&config.model, "", "", 120, proxy_provider, Some(api_key))
+        .map_err(|error| format!("Failed to create model: {error}"))
+}
+
+struct TuiStreamingTurnExecutor<'a> {
+    agent_loop: &'a mut AgentLoop,
+}
+
+impl StreamingTurnExecutor for TuiStreamingTurnExecutor<'_> {
+    fn execute_turn_streaming(&mut self, prepared: PreparedTurn) -> StreamingTurnHandle<'_> {
+        let prepared_agent_mode: AgentLoopMode = prepared.cognition_mode().into();
+        debug_assert!(
+            !prepared.system_blocks.is_empty(),
+            "SessionRuntime should always provide system blocks"
+        );
+        let system_prompt: Vec<String> = prepared.system_blocks.into_iter().map(|block| block.content).collect();
+        let seed = AgentInputSeed::new(system_prompt, prepared.history, prepared.user_message);
+        let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel(256);
+        let (presence_tx, presence_rx) = tokio::sync::mpsc::channel(64);
+        let agent_loop = &mut *self.agent_loop;
+        let input = AgentInput::runtime_shell(
+            uuid::Uuid::new_v4().to_string(),
+            "cli",
+            "",
+            prepared_agent_mode,
+            20,
+            8192,
+            200_000,
+            true,
+            None,
+            roz_core::safety::ControlMode::default(),
+        );
+
+        StreamingTurnHandle {
+            completion: Box::pin(async move {
+                let output = agent_loop
+                    .run_streaming_seeded(input, seed, chunk_tx, presence_tx)
+                    .await
+                    .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> {
+                        Box::new(agent_error_to_turn_execution_failure(error))
+                    })?;
+
+                let assistant_message: String = output
+                    .messages
+                    .iter()
+                    .filter(|message| message.role == MessageRole::Assistant)
+                    .filter_map(roz_agent::model::types::Message::text)
+                    .collect();
+
+                Ok(TurnOutput {
+                    assistant_message,
+                    tool_calls_made: output.cycles,
+                    input_tokens: u64::from(output.total_usage.input_tokens),
+                    output_tokens: u64::from(output.total_usage.output_tokens),
+                    cache_read_tokens: u64::from(output.total_usage.cache_read_tokens),
+                    cache_creation_tokens: u64::from(output.total_usage.cache_creation_tokens),
+                    messages: output.messages,
+                })
+            }),
+            chunk_rx,
+            presence_rx,
+            tool_call_rx: None,
+        }
+    }
+}
+
+struct LocalByokRuntimeSession {
+    runtime: SessionRuntime,
+    agent_loop: AgentLoop,
+    _copper_handle: Option<roz_copper::handle::CopperHandle>,
+}
+
+impl LocalByokRuntimeSession {
+    fn new(config: &ProviderConfig) -> Result<Self, String> {
+        let model = build_local_model(config)?;
+        Ok(Self::build_with_model(std::path::Path::new("."), &config.model, model))
+    }
+
+    fn build_with_model(project_dir: &std::path::Path, model_name: &str, model: Box<dyn Model>) -> Self {
+        let all_tools = tools::build_all_tools_with_copper(project_dir);
+        let tool_names = all_tools.dispatcher.tool_names();
+        let tool_name_refs: Vec<&str> = tool_names.iter().map(String::as_str).collect();
+        let system_prompt = tools::build_system_prompt(project_dir, &tool_name_refs);
+        let constitution = system_prompt.first().cloned().unwrap_or_default();
+        let project_context = system_prompt.get(1..).unwrap_or_default().to_vec();
+        let tool_schemas = prompt_tool_schemas(&all_tools.dispatcher);
+
+        let session_config = SessionConfig {
+            session_id: uuid::Uuid::new_v4().to_string(),
+            tenant_id: "cli".to_string(),
+            mode: SessionMode::Local,
+            cognition_mode: CognitionMode::React,
+            constitution_text: constitution,
+            blueprint_toml: String::new(),
+            model_name: Some(model_name.to_string()),
+            permissions: Vec::new(),
+            tool_schemas,
+            project_context,
+            initial_history: Vec::new(),
+        };
+
+        let runtime = SessionRuntime::new(&session_config);
+        let approval_handle = runtime.approval_handle();
+        let safety = SafetyStack::new(vec![]);
+        let spatial = Box::new(NullWorldStateProvider);
+        let agent_loop = AgentLoop::new(model, all_tools.dispatcher, safety, spatial)
+            .with_extensions(all_tools.extensions)
+            .with_approval_runtime(approval_handle);
+
+        Self {
+            runtime,
+            agent_loop,
+            _copper_handle: all_tools.copper_handle,
+        }
+    }
+
+    async fn run_message(
+        &mut self,
+        user_text: String,
+        event_tx: &async_channel::Sender<AgentEvent>,
+    ) -> Result<(), String> {
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let mut runtime_events = self.runtime.subscribe_events();
+        let event_tx_forward = event_tx.clone();
+        let turn_message_id = message_id.clone();
+        let forwarder = tokio::spawn(async move {
+            while let Ok(envelope) = runtime_events.recv().await {
+                match envelope.event {
+                    SessionEvent::TextDelta { message_id, content } if message_id == turn_message_id => {
+                        let _ = event_tx_forward.send(AgentEvent::TextDelta(content)).await;
+                    }
+                    SessionEvent::ThinkingDelta { message_id, content } if message_id == turn_message_id => {
+                        let _ = event_tx_forward.send(AgentEvent::ThinkingDelta(content)).await;
+                    }
+                    SessionEvent::ToolCallRequested {
+                        call_id,
+                        tool_name,
+                        parameters,
+                        ..
+                    } => {
+                        let params =
+                            serde_json::to_string_pretty(&parameters).unwrap_or_else(|_| parameters.to_string());
+                        let _ = event_tx_forward
+                            .send(AgentEvent::ToolRequest {
+                                id: call_id,
+                                name: tool_name,
+                                params,
+                            })
+                            .await;
+                    }
+                    SessionEvent::TurnFinished {
+                        message_id,
+                        input_tokens,
+                        output_tokens,
+                        stop_reason,
+                        ..
+                    } if message_id == turn_message_id => {
+                        let _ = event_tx_forward
+                            .send(AgentEvent::TurnComplete {
+                                input_tokens,
+                                output_tokens,
+                                stop_reason,
+                            })
+                            .await;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let runtime = &mut self.runtime;
+        let agent_loop = &mut self.agent_loop;
+        let mut executor = TuiStreamingTurnExecutor { agent_loop };
+        let result = runtime
+            .run_turn_streaming(
+                TurnInput {
+                    user_message: user_text,
+                    cognition_mode: CognitionMode::React,
+                    custom_context: Vec::new(),
+                    volatile_blocks: Vec::new(),
+                },
+                Some(message_id),
+                &mut executor,
+            )
+            .await;
+
+        match result {
+            Ok(StreamingTurnResult::Completed(_)) | Ok(StreamingTurnResult::Cancelled) => {
+                let _ = forwarder.await;
+                Ok(())
+            }
+            Err(error) => {
+                forwarder.abort();
+                Err(error.to_string())
+            }
+        }
+    }
+}
+
 /// Provider loop: receives user actions and streams responses.
 ///
 /// For Cloud: delegates to a persistent gRPC session.
-/// For BYOK (Anthropic/Ollama): uses `roz-agent`'s `AgentLoop` with streaming.
+/// For local BYOK providers: delegates turns through `SessionRuntime`.
 #[allow(clippy::too_many_lines)]
 async fn provider_loop(
     config: ProviderConfig,
@@ -1003,42 +1254,13 @@ async fn provider_loop(
         return;
     }
 
-    // BYOK mode: create an AgentLoop from roz-agent
-    let Some(api_key) = config.api_key.clone() else {
-        let _ = event_tx
-            .send(AgentEvent::Error("No API key configured".to_string()))
-            .await;
-        return;
-    };
-
-    let model = match roz_agent::model::create_model(
-        &config.model,
-        "",             // gateway_url unused for direct
-        "",             // gateway api_key unused for direct
-        120,            // timeout_secs
-        "anthropic",    // proxy_provider
-        Some(&api_key), // direct_api_key — bypasses gateway, hits api.anthropic.com
-    ) {
-        Ok(m) => m,
-        Err(e) => {
-            let _ = event_tx
-                .send(AgentEvent::Error(format!("Failed to create model: {e}")))
-                .await;
+    let mut local_session = match LocalByokRuntimeSession::new(&config) {
+        Ok(session) => session,
+        Err(error) => {
+            let _ = event_tx.send(AgentEvent::Error(error)).await;
             return;
         }
     };
-
-    let all_tools = tools::build_all_tools_with_copper(std::path::Path::new("."));
-    let _copper_handle = all_tools.copper_handle; // kept alive for session lifetime
-    let safety = roz_agent::safety::SafetyStack::new(vec![]); // no-op for BYOK
-    let spatial = roz_agent::spatial_provider::NullWorldStateProvider;
-
-    let mut agent_loop = roz_agent::agent_loop::AgentLoop::new(model, all_tools.dispatcher, safety, Box::new(spatial))
-        .with_extensions(all_tools.extensions);
-
-    // Build the system prompt once at session start (stable across turns for cache hits).
-    // Unified builder: constitution + embodiment.toml + AGENTS.md / ROBOT.md.
-    let system_prompt = tools::build_system_prompt(std::path::Path::new("."), &[]);
 
     let _ = event_tx
         .send(AgentEvent::Connected {
@@ -1054,64 +1276,16 @@ async fn provider_loop(
                 let _ = event_tx.send(AgentEvent::Connected { model: model_ref }).await;
             }
             UserAction::Message(user_text) => {
-                let input = roz_agent::agent_loop::AgentInput {
-                    task_id: uuid::Uuid::new_v4().to_string(),
-                    tenant_id: "cli".to_string(),
-                    model_name: String::new(),
-                    seed: roz_agent::agent_loop::AgentInputSeed::new(system_prompt.clone(), Vec::new(), user_text),
-                    max_cycles: 20,
-                    max_tokens: 8192,
-                    max_context_tokens: 200_000,
-                    mode: roz_agent::agent_loop::AgentLoopMode::React,
-                    tool_choice: None,
-                    response_schema: None,
-                    streaming: true,
-                    phases: Vec::new(),
-                    cancellation_token: None,
-                    control_mode: roz_core::safety::ControlMode::default(),
-                };
-
-                // Streaming channels
-                let (chunk_tx, mut chunk_rx) = tokio::sync::mpsc::channel(256);
-                let (presence_tx, _presence_rx) = tokio::sync::mpsc::channel(64);
-
-                // Spawn forwarder: chunk_rx -> AgentEvent -> TUI (runs concurrently with agent)
-                let event_tx_fwd = event_tx.clone();
-                let forwarder = tokio::spawn(async move {
-                    while let Some(chunk) = chunk_rx.recv().await {
-                        if let Some(event) = agent::stream_chunk_to_event(&chunk) {
-                            let _ = event_tx_fwd.send(event).await;
-                        }
-                    }
-                });
-
-                // Run the agent turn (blocks until complete, sends chunks via chunk_tx)
-                let result = agent_loop.run_streaming(input, chunk_tx, presence_tx).await;
-
-                // Wait for forwarder to finish
-                let _ = forwarder.await;
-
-                match result {
-                    Ok(output) => {
-                        let _ = event_tx
-                            .send(AgentEvent::TurnComplete {
-                                input_tokens: output.total_usage.input_tokens,
-                                output_tokens: output.total_usage.output_tokens,
-                                stop_reason: "end_turn".to_string(),
-                            })
-                            .await;
-                    }
-                    Err(e) => {
-                        let display = classify_error_message(&e.to_string(), &config);
-                        let _ = event_tx.send(AgentEvent::Error(display)).await;
-                        let _ = event_tx
-                            .send(AgentEvent::TurnComplete {
-                                input_tokens: 0,
-                                output_tokens: 0,
-                                stop_reason: "error".to_string(),
-                            })
-                            .await;
-                    }
+                if let Err(error) = local_session.run_message(user_text, &event_tx).await {
+                    let display = classify_error_message(&error, &config);
+                    let _ = event_tx.send(AgentEvent::Error(display)).await;
+                    let _ = event_tx
+                        .send(AgentEvent::TurnComplete {
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            stop_reason: "error".to_string(),
+                        })
+                        .await;
                 }
             }
         }
@@ -1175,5 +1349,60 @@ mod user_action_tests {
         };
         assert_eq!(c, d);
         assert_ne!(a, c);
+    }
+}
+
+#[cfg(test)]
+mod local_byok_runtime_tests {
+    use super::*;
+    use roz_agent::model::types::{
+        CompletionResponse, ContentPart, MockModel, ModelCapability, StopReason, TokenUsage,
+    };
+
+    fn text_mock(responses: Vec<&str>) -> MockModel {
+        MockModel::new(
+            vec![ModelCapability::TextReasoning],
+            responses
+                .into_iter()
+                .map(|text| CompletionResponse {
+                    parts: vec![ContentPart::Text { text: text.to_string() }],
+                    stop_reason: StopReason::EndTurn,
+                    usage: TokenUsage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        ..Default::default()
+                    },
+                })
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn local_byok_runtime_session_retains_history_across_turns() {
+        let dir = tempfile::tempdir().expect("create temp project dir");
+        let model: Box<dyn Model> = Box::new(text_mock(vec!["First response", "Second response"]));
+        let mut session = LocalByokRuntimeSession::build_with_model(dir.path(), "anthropic/claude-sonnet-4-6", model);
+        let (event_tx, _event_rx) = async_channel::unbounded();
+
+        session
+            .run_message("first turn".to_string(), &event_tx)
+            .await
+            .expect("first turn should succeed");
+        let history_after_first = session.runtime.export_bootstrap().history.len();
+        assert!(
+            history_after_first >= 2,
+            "first turn should persist at least the user + assistant messages"
+        );
+
+        session
+            .run_message("second turn".to_string(), &event_tx)
+            .await
+            .expect("second turn should succeed");
+        let bootstrap = session.runtime.export_bootstrap();
+        assert!(
+            bootstrap.history.len() > history_after_first,
+            "second turn should append to runtime-owned history"
+        );
+        assert_eq!(bootstrap.model_name.as_deref(), Some("anthropic/claude-sonnet-4-6"));
     }
 }

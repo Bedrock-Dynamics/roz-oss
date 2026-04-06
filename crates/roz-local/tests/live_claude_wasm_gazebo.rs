@@ -390,7 +390,7 @@ async fn full_vertical_claude_wasm_gazebo() {
         .await
         .expect("gRPC channel to bridge should connect");
     let (mut control_manifest, robot_class) = {
-        let toml_str = include_str!("../../../examples/ur5/robot.toml");
+        let toml_str = include_str!("../../../examples/ur5/embodiment.toml");
         let robot: roz_core::manifest::EmbodimentManifest = toml::from_str(toml_str).unwrap();
         (
             robot.control_interface_manifest().unwrap(),

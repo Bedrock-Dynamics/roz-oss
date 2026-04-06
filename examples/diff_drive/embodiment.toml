@@ -1,0 +1,47 @@
+[robot]
+name = "diff_drive"
+description = "Differential-drive mobile robot — 2-DOF twist commands"
+
+[safety]
+e_stop_behavior = "hold_position"
+watchdog_timeout_ms = 500
+
+[channels]
+robot_id = "diff_drive"
+robot_class = "mobile"
+control_rate_hz = 100
+
+# 2 twist command channels.
+# PI = 3.141592653589793
+
+[[channels.commands]]
+name = "linear_x"
+type = "velocity"
+unit = "m/s"
+limits = [-1.0, 1.0]
+max_rate_of_change = 0.5
+
+[[channels.commands]]
+name = "angular_z"
+type = "velocity"
+unit = "rad/s"
+limits = [-2.0, 2.0]
+max_rate_of_change = 1.0
+
+[[channels.states]]
+name = "odom_x"
+type = "position"
+unit = "m"
+limits = [-1000.0, 1000.0]
+
+[[channels.states]]
+name = "odom_y"
+type = "position"
+unit = "m"
+limits = [-1000.0, 1000.0]
+
+[[channels.states]]
+name = "odom_yaw"
+type = "position"
+unit = "rad"
+limits = [-3.141592653589793, 3.141592653589793]

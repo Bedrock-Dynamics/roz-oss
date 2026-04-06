@@ -37,7 +37,7 @@ name = "claude-sonnet-4-6"
 fn write_embodiment_manifest(dir: &std::path::Path) {
     std::fs::write(
         dir.join("embodiment.toml"),
-        include_str!("../../../examples/ur5/robot.toml"),
+        include_str!("../../../examples/ur5/embodiment.toml"),
     )
     .unwrap();
 }

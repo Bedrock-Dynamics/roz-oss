@@ -182,7 +182,7 @@ mod tests {
         let json = serde_json::to_string(&ExecutionStrategy::AgentLoopReAct).unwrap();
         assert_eq!(json, "\"agent_loop_re_act\"");
         let json = serde_json::to_string(&ExecutionStrategy::AgentLoopOodaReAct).unwrap();
-        assert_eq!(json, "\"agent_loop_ooda_react\"");
+        assert_eq!(json, "\"agent_loop_ooda_re_act\"");
     }
 
     #[test]

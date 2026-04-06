@@ -104,12 +104,42 @@ pub struct TokenUsage {
     pub cache_creation_tokens: u32,
 }
 
+/// Canonical terminal status reported by a worker once task execution ends.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskTerminalStatus {
+    Succeeded,
+    Failed,
+    TimedOut,
+    Cancelled,
+    SafetyStop,
+}
+
+impl TaskTerminalStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+            Self::SafetyStop => "safety_stop",
+        }
+    }
+}
+
+impl std::fmt::Display for TaskTerminalStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Sent from worker back to Restate when a task completes.
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TaskResult {
     pub task_id: Uuid,
-    pub success: bool,
+    pub status: TaskTerminalStatus,
     pub output: Option<serde_json::Value>,
     pub error: Option<String>,
     pub cycles: u32,
@@ -168,7 +198,7 @@ mod tests {
     fn task_result_roundtrip() {
         let result = TaskResult {
             task_id: Uuid::new_v4(),
-            success: true,
+            status: TaskTerminalStatus::Succeeded,
             output: Some(serde_json::json!({"picked_up": true})),
             error: None,
             cycles: 5,
@@ -225,7 +255,7 @@ mod tests {
         let task_id = Uuid::new_v4();
         let result = TaskResult {
             task_id,
-            success: false,
+            status: TaskTerminalStatus::TimedOut,
             output: None,
             error: Some("timeout".to_string()),
             cycles: 0,
@@ -234,7 +264,7 @@ mod tests {
 
         // Verify the wire format shape for failure results.
         let json = serde_json::to_value(&result).expect("serialize");
-        assert_eq!(json["success"], false);
+        assert_eq!(json["status"], "timed_out");
         assert_eq!(json["error"], "timeout");
         assert!(json["output"].is_null());
         assert_eq!(json["cycles"], 0);
@@ -245,6 +275,15 @@ mod tests {
         let bytes = serde_json::to_vec(&result).expect("serialize to bytes");
         let deserialized: TaskResult = serde_json::from_slice(&bytes).expect("deserialize");
         assert_eq!(result, deserialized);
+    }
+
+    #[test]
+    fn task_terminal_status_strings_are_canonical() {
+        assert_eq!(TaskTerminalStatus::Succeeded.as_str(), "succeeded");
+        assert_eq!(TaskTerminalStatus::Failed.as_str(), "failed");
+        assert_eq!(TaskTerminalStatus::TimedOut.as_str(), "timed_out");
+        assert_eq!(TaskTerminalStatus::Cancelled.as_str(), "cancelled");
+        assert_eq!(TaskTerminalStatus::SafetyStop.as_str(), "safety_stop");
     }
 
     #[test]

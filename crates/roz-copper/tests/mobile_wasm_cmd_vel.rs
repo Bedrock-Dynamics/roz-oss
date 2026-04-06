@@ -34,7 +34,7 @@ use roz_core::embodiment::binding::ControlInterfaceManifest;
 const BRIDGE_URL: &str = "http://127.0.0.1:9096";
 
 fn load_diff_drive_control_manifest() -> (ControlInterfaceManifest, String) {
-    let toml_str = include_str!("../../../examples/diff_drive/robot.toml");
+    let toml_str = include_str!("../../../examples/diff_drive/embodiment.toml");
     let robot: roz_copper::manifest::EmbodimentManifest = toml::from_str(toml_str).unwrap();
     (
         robot.control_interface_manifest().unwrap(),

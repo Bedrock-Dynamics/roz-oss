@@ -538,6 +538,13 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
+    async fn test_pool() -> PgPool {
+        let url = roz_test::pg_url().await;
+        let pool = roz_db::create_pool(url).await.expect("create test pool");
+        roz_db::run_migrations(&pool).await.expect("run test migrations");
+        pool
+    }
+
     struct TestGrpcAuth {
         tenant_id: Uuid,
     }
@@ -639,7 +646,7 @@ mod tests {
     async fn authenticated_tenant_id_rejects_missing_header() {
         let tenant = Uuid::new_v4();
         let service = TaskServiceImpl::new(
-            roz_db::shared_test_pool().await,
+            test_pool().await,
             reqwest::Client::new(),
             "http://localhost:9080".into(),
             None,
@@ -655,7 +662,7 @@ mod tests {
     async fn authenticated_tenant_id_accepts_bearer_authorization_metadata() {
         let tenant = Uuid::new_v4();
         let service = TaskServiceImpl::new(
-            roz_db::shared_test_pool().await,
+            test_pool().await,
             reqwest::Client::new(),
             "http://localhost:9080".into(),
             None,

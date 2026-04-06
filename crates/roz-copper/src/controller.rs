@@ -882,11 +882,7 @@ fn check_watchdog(
     estop_tx: &tokio::sync::mpsc::Sender<String>,
     estop_reason: &mut Option<String>,
     last_output: &mut Option<serde_json::Value>,
-    watchdog_disabled: bool,
 ) -> bool {
-    if watchdog_disabled {
-        return false;
-    }
     if last_agent_contact.elapsed() <= timeout {
         return false;
     }
@@ -1221,18 +1217,6 @@ fn any_controller_running(
         || candidate_controller
             .as_ref()
             .is_some_and(|controller| controller.running)
-}
-
-fn actuating_controller_present(
-    active_controller: &Option<LoadedController>,
-    candidate_controller: &Option<LoadedController>,
-    candidate_state: Option<DeploymentState>,
-) -> bool {
-    active_controller.as_ref().is_some_and(|controller| controller.running)
-        || (matches!(candidate_state, Some(DeploymentState::Canary))
-            && candidate_controller
-                .as_ref()
-                .is_some_and(|controller| controller.running))
 }
 
 #[derive(Debug)]
@@ -1888,8 +1872,6 @@ pub fn run_controller_loop_with_policy(
             sensor_frame_snapshot_input = frame.frame_snapshot_input;
         }
 
-        let watchdog_disabled =
-            actuating_controller_present(&active_controller, &candidate_controller, candidate_state);
         let watchdog_fired = check_watchdog(
             &mut active_controller,
             &mut candidate_controller,
@@ -1900,7 +1882,6 @@ pub fn run_controller_loop_with_policy(
             estop_tx,
             &mut estop_reason,
             &mut last_output,
-            watchdog_disabled,
         );
         if watchdog_fired {
             let running = any_controller_running(&active_controller, &candidate_controller);
@@ -2261,7 +2242,11 @@ pub fn run_controller_loop_with_policy(
         let output = actuated_output
             .or_else(|| candidate_result.output.clone())
             .or_else(|| active_result.output.clone());
-        last_output = apply_lifecycle_annotation(output, lifecycle_annotation.as_ref());
+        match apply_lifecycle_annotation(output, lifecycle_annotation.as_ref()) {
+            Some(output) => last_output = Some(output),
+            None if last_output.as_ref().is_some_and(|output| output.get("error").is_some()) => {}
+            None => last_output = None,
+        }
 
         advance_candidate_stage(
             &mut active_controller,
@@ -2970,7 +2955,7 @@ mod tests {
 
     #[test]
     fn loads_wasm_and_ticks() {
-        let wat = r#"(module (func (export "process") (param i64) nop))"#;
+        let wat = constant_output_wat(0.2);
         let manifest = test_control_manifest(1);
         let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
 
@@ -3087,7 +3072,7 @@ mod tests {
 
     #[test]
     fn resume_after_halt_continues_ticking() {
-        let wat = r#"(module (func (export "process") (param i64) nop))"#;
+        let wat = constant_output_wat(0.2);
         let manifest = test_control_manifest(1);
         let (tx, state, shutdown, handle, _estop_rx) = spawn_controller(1.5);
 
@@ -3130,6 +3115,7 @@ mod tests {
 
         let sink = Arc::new(LogActuatorSink::new());
         let sink_ref: Arc<LogActuatorSink> = Arc::clone(&sink);
+        let deployment_manager = DeploymentManager::new(true, true, true);
 
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
         let state = Arc::new(ArcSwap::from_pointee(ControllerState::default()));
@@ -3138,7 +3124,7 @@ mod tests {
         let s = Arc::clone(&state);
         let sd = Arc::clone(&shutdown);
         let handle = std::thread::spawn(move || {
-            run_controller_loop_with_compatibility_fallback(
+            run_controller_loop_with_policy(
                 &rx,
                 &s,
                 1.5,
@@ -3148,13 +3134,14 @@ mod tests {
                 Duration::from_secs(60),
                 None,
                 &estop_tx,
+                deployment_manager,
             );
         });
 
         let manifest = test_control_manifest(1);
         tx.send(prepared_artifact_cmd(&wat.into_bytes(), manifest)).unwrap();
         tx.send(crate::channels::CopperRuntimeCommand::PromoteActive).unwrap();
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(350));
 
         let cmds = sink.commands();
         assert!(!cmds.is_empty(), "actuator sink should have received commands");
@@ -3174,6 +3161,7 @@ mod tests {
 
         let sink = Arc::new(LogActuatorSink::new());
         let sink_ref: Arc<LogActuatorSink> = Arc::clone(&sink);
+        let deployment_manager = DeploymentManager::new(true, true, true);
 
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
         let state = Arc::new(ArcSwap::from_pointee(ControllerState::default()));
@@ -3182,7 +3170,7 @@ mod tests {
         let s = Arc::clone(&state);
         let sd = Arc::clone(&shutdown);
         let handle = std::thread::spawn(move || {
-            run_controller_loop_with_compatibility_fallback(
+            run_controller_loop_with_policy(
                 &rx,
                 &s,
                 1.5,
@@ -3192,6 +3180,7 @@ mod tests {
                 Duration::from_secs(60),
                 None,
                 &estop_tx,
+                deployment_manager,
             );
         });
 
@@ -3377,6 +3366,8 @@ mod tests {
 
         let sink = Arc::new(LogActuatorSink::new());
         let sink_ref: Arc<LogActuatorSink> = Arc::clone(&sink);
+        let deployment_manager =
+            DeploymentManager::with_rollout_policy(true, true, true, 10, 10, 1_000, 1_000, u64::MAX);
 
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
         let state = Arc::new(ArcSwap::from_pointee(ControllerState::default()));
@@ -3385,7 +3376,7 @@ mod tests {
         let s = Arc::clone(&state);
         let sd = Arc::clone(&shutdown);
         let handle = std::thread::spawn(move || {
-            run_controller_loop_with_compatibility_fallback(
+            run_controller_loop_with_policy(
                 &rx,
                 &s,
                 1.5,
@@ -3395,6 +3386,7 @@ mod tests {
                 Duration::from_secs(60),
                 None,
                 &estop_tx,
+                deployment_manager,
             );
         });
 
@@ -3466,7 +3458,7 @@ mod tests {
 
         let manifest = test_control_manifest(1);
         let active_wat = constant_output_wat(0.2);
-        let candidate_wat = constant_output_wat(0.8);
+        let candidate_wat = constant_output_wat(0.9);
 
         tx.send(prepared_artifact_cmd_with_id(
             "active-ctrl",
@@ -3566,15 +3558,17 @@ mod tests {
         let output = current.last_output.clone().expect("canary output should be published");
         assert_eq!(output["canary_bounded"], true);
         let bounded_value = output["values"][0].as_f64().expect("bounded value should be numeric");
+        let expected_bounded_value = 0.2
+            + deployment_manager.canary_max_command_delta() * fallback_limit_span(&CommandInterfaceType::JointVelocity);
         assert!(
-            (bounded_value - 0.5).abs() < f64::EPSILON,
+            (bounded_value - expected_bounded_value).abs() < f64::EPSILON,
             "unexpected bounded canary value: {bounded_value}"
         );
         drop(current);
 
         let commands = sink.commands();
         let last = commands.last().expect("bounded canary command should actuate");
-        assert!((last.values[0] - 0.5).abs() < f64::EPSILON);
+        assert!((last.values[0] - expected_bounded_value).abs() < f64::EPSILON);
 
         stop(&shutdown, handle);
     }
@@ -3808,6 +3802,7 @@ mod tests {
 
         let sink = Arc::new(LogActuatorSink::new());
         let sink_ref: Arc<LogActuatorSink> = Arc::clone(&sink);
+        let deployment_manager = DeploymentManager::new(true, true, true);
 
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
         let state = Arc::new(ArcSwap::from_pointee(ControllerState::default()));
@@ -3816,7 +3811,7 @@ mod tests {
         let s = Arc::clone(&state);
         let sd = Arc::clone(&shutdown);
         let handle = std::thread::spawn(move || {
-            run_controller_loop_with_compatibility_fallback(
+            run_controller_loop_with_policy(
                 &rx,
                 &s,
                 1.5,
@@ -3826,6 +3821,7 @@ mod tests {
                 Duration::from_secs(60),
                 None,
                 &estop_tx,
+                deployment_manager,
             );
         });
 
@@ -3880,10 +3876,11 @@ mod tests {
     fn controller_halts_on_agent_watchdog_timeout() {
         use crate::io_log::LogActuatorSink;
 
-        let wat = r#"(module (func (export "process") (param i64) nop))"#;
+        let wat = constant_output_wat(0.2);
 
         let sink = Arc::new(LogActuatorSink::new());
         let sink_ref: Arc<LogActuatorSink> = Arc::clone(&sink);
+        let deployment_manager = DeploymentManager::with_rollout_policy(true, true, true, 1, 1, 2_500, 2_500, u64::MAX);
 
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
         let state = Arc::new(ArcSwap::from_pointee(ControllerState::default()));
@@ -3893,28 +3890,30 @@ mod tests {
         let sd = Arc::clone(&shutdown);
 
         let handle = std::thread::spawn(move || {
-            run_controller_loop_with_compatibility_fallback(
+            run_controller_loop_with_policy(
                 &rx,
                 &s,
                 1.5,
                 &sd,
                 Some(&*sink_ref),
                 None,
-                Duration::from_millis(200),
+                Duration::from_millis(500),
                 None,
                 &estop_tx,
+                deployment_manager,
             );
         });
 
         let manifest = test_control_manifest(1);
         tx.send(prepared_artifact_cmd(wat.as_bytes(), manifest)).unwrap();
-        std::thread::sleep(Duration::from_millis(80));
+        tx.send(crate::channels::CopperRuntimeCommand::PromoteActive).unwrap();
+        std::thread::sleep(Duration::from_millis(120));
 
-        assert!(state.load().running, "should still be running at 80ms");
+        assert!(state.load().running, "should still be running before watchdog timeout");
 
         drop(tx);
 
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(700));
 
         let current = state.load();
         assert!(!current.running, "should have halted after watchdog timeout");

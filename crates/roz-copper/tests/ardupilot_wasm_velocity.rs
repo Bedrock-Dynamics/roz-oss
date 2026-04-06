@@ -36,7 +36,7 @@ use roz_core::embodiment::binding::ControlInterfaceManifest;
 const BRIDGE_URL: &str = "http://127.0.0.1:9097";
 
 fn load_quadcopter_control_manifest() -> (ControlInterfaceManifest, String) {
-    let toml_str = include_str!("../../../examples/quadcopter/robot.toml");
+    let toml_str = include_str!("../../../examples/quadcopter/embodiment.toml");
     let robot: roz_copper::manifest::EmbodimentManifest = toml::from_str(toml_str).unwrap();
     (
         robot.control_interface_manifest().unwrap(),

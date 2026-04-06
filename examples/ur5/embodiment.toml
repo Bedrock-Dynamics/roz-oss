@@ -1,0 +1,140 @@
+[robot]
+name = "ur5"
+description = "Universal Robots UR5 — 6-DOF industrial manipulator arm"
+
+[safety]
+e_stop_behavior = "hold_position"
+watchdog_timeout_ms = 500
+max_contact_force_n = 150.0
+
+[channels]
+robot_id = "ur5"
+robot_class = "manipulator"
+control_rate_hz = 100
+
+# 6 velocity command channels — one per joint.
+# PI = 3.141592653589793
+# max_rate_of_change = 0.5 (50 rad/s^2 at 100 Hz)
+
+[[channels.commands]]
+name = "shoulder_pan"
+type = "velocity"
+unit = "rad/s"
+limits = [-3.141592653589793, 3.141592653589793]
+max_rate_of_change = 0.5
+position_state_index = 0
+
+[[channels.commands]]
+name = "shoulder_lift"
+type = "velocity"
+unit = "rad/s"
+limits = [-3.141592653589793, 3.141592653589793]
+max_rate_of_change = 0.5
+position_state_index = 1
+
+[[channels.commands]]
+name = "elbow"
+type = "velocity"
+unit = "rad/s"
+limits = [-3.141592653589793, 3.141592653589793]
+max_rate_of_change = 0.5
+position_state_index = 2
+
+[[channels.commands]]
+name = "wrist_1"
+type = "velocity"
+unit = "rad/s"
+limits = [-3.141592653589793, 3.141592653589793]
+max_rate_of_change = 0.5
+position_state_index = 3
+
+[[channels.commands]]
+name = "wrist_2"
+type = "velocity"
+unit = "rad/s"
+limits = [-3.141592653589793, 3.141592653589793]
+max_rate_of_change = 0.5
+position_state_index = 4
+
+[[channels.commands]]
+name = "wrist_3"
+type = "velocity"
+unit = "rad/s"
+limits = [-3.141592653589793, 3.141592653589793]
+max_rate_of_change = 0.5
+position_state_index = 5
+
+# 12 state channels: 6 position (indices 0-5) + 6 velocity (indices 6-11).
+# TAU = 6.283185307179586
+
+[[channels.states]]
+name = "shoulder_pan_position"
+type = "position"
+unit = "rad"
+limits = [-6.283185307179586, 6.283185307179586]
+
+[[channels.states]]
+name = "shoulder_lift_position"
+type = "position"
+unit = "rad"
+limits = [-6.283185307179586, 6.283185307179586]
+
+[[channels.states]]
+name = "elbow_position"
+type = "position"
+unit = "rad"
+limits = [-6.283185307179586, 6.283185307179586]
+
+[[channels.states]]
+name = "wrist_1_position"
+type = "position"
+unit = "rad"
+limits = [-6.283185307179586, 6.283185307179586]
+
+[[channels.states]]
+name = "wrist_2_position"
+type = "position"
+unit = "rad"
+limits = [-6.283185307179586, 6.283185307179586]
+
+[[channels.states]]
+name = "wrist_3_position"
+type = "position"
+unit = "rad"
+limits = [-6.283185307179586, 6.283185307179586]
+
+[[channels.states]]
+name = "shoulder_pan_velocity"
+type = "velocity"
+unit = "rad/s"
+limits = [-3.141592653589793, 3.141592653589793]
+
+[[channels.states]]
+name = "shoulder_lift_velocity"
+type = "velocity"
+unit = "rad/s"
+limits = [-3.141592653589793, 3.141592653589793]
+
+[[channels.states]]
+name = "elbow_velocity"
+type = "velocity"
+unit = "rad/s"
+limits = [-3.141592653589793, 3.141592653589793]
+
+[[channels.states]]
+name = "wrist_1_velocity"
+type = "velocity"
+unit = "rad/s"
+limits = [-3.141592653589793, 3.141592653589793]
+
+[[channels.states]]
+name = "wrist_2_velocity"
+type = "velocity"
+unit = "rad/s"
+limits = [-3.141592653589793, 3.141592653589793]
+
+[[channels.states]]
+name = "wrist_3_velocity"
+type = "velocity"
+unit = "rad/s"
+limits = [-3.141592653589793, 3.141592653589793]

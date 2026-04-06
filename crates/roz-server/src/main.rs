@@ -1579,77 +1579,37 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     }
 
-    // -- Command routes tests -----------------------------------------------------
+    // -- Legacy commands API tests ------------------------------------------------
 
     #[tokio::test]
-    async fn commands_crud_and_transition() {
+    async fn legacy_command_routes_are_not_mounted() {
         let (pool, app, _auth) = setup_authed_app().await;
 
         let slug = format!("cmd-{}", uuid::Uuid::new_v4());
         let tenant = roz_db::tenant::create_tenant(&pool, "Cmd Test", &slug, "personal")
             .await
             .expect("create tenant");
-        let host = roz_db::hosts::create(&pool, tenant.id, "cmd-host", "edge", &[], &serde_json::json!({}))
-            .await
-            .expect("create host");
         let key = roz_db::api_keys::create_api_key(&pool, tenant.id, "Cmd Key", &["admin".into()], "test")
             .await
             .expect("create key");
         let cmd_auth = format!("Bearer {}", key.full_key);
 
-        // POST /v1/commands -> 201
-        let idem_key = format!("idem-{}", uuid::Uuid::new_v4());
-        let create_body = serde_json::json!({
-            "host_id": host.id.to_string(),
-            "command": "move_forward",
-            "idempotency_key": idem_key,
-            "params": {"speed": 1.5}
-        });
         let req = Request::builder()
             .uri("/v1/commands")
             .method("POST")
             .header("authorization", &cmd_auth)
             .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&create_body).unwrap()))
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "host_id": uuid::Uuid::nil().to_string(),
+                    "command": "move_forward",
+                    "params": {"speed": 1.5}
+                }))
+                .unwrap(),
+            ))
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CREATED);
-
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let cmd_id = json["data"]["id"].as_str().unwrap().to_string();
-        assert_eq!(json["data"]["command"], "move_forward");
-        assert_eq!(json["data"]["state"], "accepted");
-
-        // POST /v1/commands/:id/transition -> started
-        let transition_body = serde_json::json!({"state": "started"});
-        let req = Request::builder()
-            .uri(format!("/v1/commands/{cmd_id}/transition"))
-            .method("POST")
-            .header("authorization", &cmd_auth)
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&transition_body).unwrap()))
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["data"]["state"], "started");
-
-        // POST /v1/commands/:id/transition -> completed
-        let transition_body = serde_json::json!({"state": "completed"});
-        let req = Request::builder()
-            .uri(format!("/v1/commands/{cmd_id}/transition"))
-            .method("POST")
-            .header("authorization", &cmd_auth)
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&transition_body).unwrap()))
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["data"]["state"], "completed");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     // -- Lease routes tests -------------------------------------------------------

@@ -16,7 +16,7 @@ use roz_core::session::activity::RuntimeFailureKind;
 use roz_core::session::event::{EventEnvelope, SessionEvent};
 use roz_core::session::feedback::ApprovalOutcome;
 use roz_core::team::{SequencedTeamEvent, TeamEvent};
-use roz_nats::dispatch::{TaskInvocation, TaskStatusEvent};
+use roz_nats::dispatch::{TaskInvocation, TaskStatusEvent, TaskTerminalStatus};
 use tokio::sync::{Semaphore, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -56,21 +56,21 @@ async fn publish_task_status(nats: &async_nats::Client, event: &TaskStatusEvent)
 fn classify_terminal_status(
     output: &Result<AgentOutput, AgentError>,
     timed_out: bool,
-) -> (&'static str, Option<String>) {
+) -> (TaskTerminalStatus, Option<String>) {
     if timed_out {
         let detail = output
             .as_ref()
             .err()
             .map(ToString::to_string)
             .unwrap_or_else(|| "task timed out".to_string());
-        return ("timed_out", Some(detail));
+        return (TaskTerminalStatus::TimedOut, Some(detail));
     }
 
     match output {
-        Ok(_) => ("succeeded", None),
-        Err(AgentError::Cancelled { .. }) => ("cancelled", Some("task cancelled".into())),
-        Err(AgentError::Safety(message)) => ("safety_stop", Some(message.clone())),
-        Err(error) => ("failed", Some(error.to_string())),
+        Ok(_) => (TaskTerminalStatus::Succeeded, None),
+        Err(AgentError::Cancelled { .. }) => (TaskTerminalStatus::Cancelled, Some("task cancelled".into())),
+        Err(AgentError::Safety(message)) => (TaskTerminalStatus::SafetyStop, Some(message.clone())),
+        Err(error) => (TaskTerminalStatus::Failed, Some(error.to_string())),
     }
 }
 
@@ -368,6 +368,7 @@ async fn execute_task(
         .await;
         let result = roz_worker::dispatch::build_task_result(
             task_id,
+            TaskTerminalStatus::Failed,
             Err(roz_agent::error::AgentError::Safety(
                 "child worker invocation missing delegation scope".into(),
             )),
@@ -394,6 +395,7 @@ async fn execute_task(
         .await;
         let result = roz_worker::dispatch::build_task_result(
             task_id,
+            TaskTerminalStatus::Failed,
             Err(roz_agent::error::AgentError::Safety(error.to_string())),
         );
         if let Err(e) =
@@ -420,7 +422,7 @@ async fn execute_task(
             )
             .await;
             let agent_err = roz_agent::error::AgentError::Model(e.into());
-            let result = roz_worker::dispatch::build_task_result(task_id, Err(agent_err));
+            let result = roz_worker::dispatch::build_task_result(task_id, TaskTerminalStatus::Failed, Err(agent_err));
             if let Err(sig_err) =
                 roz_worker::dispatch::signal_result(&task_http, &restate_url, &task_id.to_string(), &result).await
             {
@@ -676,12 +678,12 @@ async fn execute_task(
     }
 
     let (terminal_status, terminal_detail) = classify_terminal_status(&output, timed_out);
-    let result = roz_worker::dispatch::build_task_result(task_id, output);
+    let result = roz_worker::dispatch::build_task_result(task_id, terminal_status, output);
     publish_task_status(
         &task_nats,
         &TaskStatusEvent {
             task_id,
-            status: terminal_status.into(),
+            status: terminal_status.as_str().into(),
             detail: terminal_detail.or_else(|| result.error.clone()),
             host_id: Some(invocation.host_id),
         },
@@ -926,8 +928,11 @@ async fn main() -> Result<()> {
                 },
             )
             .await;
-            let result =
-                roz_worker::dispatch::build_task_result(task_id, Err(AgentError::Internal(anyhow::anyhow!(error))));
+            let result = roz_worker::dispatch::build_task_result(
+                task_id,
+                TaskTerminalStatus::Failed,
+                Err(AgentError::Internal(anyhow::anyhow!(error))),
+            );
             if let Err(sig_err) =
                 roz_worker::dispatch::signal_result(&task_http, &restate_url, &task_id.to_string(), &result).await
             {

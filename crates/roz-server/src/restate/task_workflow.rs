@@ -19,14 +19,27 @@ pub struct TaskInput {
     pub parent_task_id: Option<Uuid>,
 }
 
-/// Outcome of a completed task
+/// Outcome of a completed task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum TaskOutcome {
-    Success { result: serde_json::Value },
-    Failed { error: String },
-    Cancelled { reason: String },
-    SafetyStop { guard: String, reason: String },
+    Succeeded {
+        result: serde_json::Value,
+    },
+    Failed {
+        error: String,
+    },
+    TimedOut {
+        reason: String,
+    },
+    Cancelled {
+        reason: String,
+    },
+    SafetyStop {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        guard: Option<String>,
+        reason: String,
+    },
 }
 
 /// Tool approval request sent to humans
@@ -42,9 +55,68 @@ pub struct ToolApproval {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum TaskStatus {
     Pending,
-    Running { iteration: u32, tool_calls: u32 },
-    WaitingForApproval { tool_name: String, reason: String },
-    Completed { outcome: TaskOutcome },
+    Running {
+        iteration: u32,
+        tool_calls: u32,
+    },
+    WaitingForApproval {
+        tool_name: String,
+        reason: String,
+    },
+    Succeeded {
+        result: serde_json::Value,
+    },
+    Failed {
+        error: String,
+    },
+    TimedOut {
+        reason: String,
+    },
+    Cancelled {
+        reason: String,
+    },
+    SafetyStop {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        guard: Option<String>,
+        reason: String,
+    },
+}
+
+fn task_outcome_from_result(result: &roz_nats::dispatch::TaskResult) -> TaskOutcome {
+    match result.status {
+        roz_nats::dispatch::TaskTerminalStatus::Succeeded => TaskOutcome::Succeeded {
+            result: result.output.clone().unwrap_or(serde_json::Value::Null),
+        },
+        roz_nats::dispatch::TaskTerminalStatus::Failed => TaskOutcome::Failed {
+            error: result.error.clone().unwrap_or_else(|| "unknown error".to_string()),
+        },
+        roz_nats::dispatch::TaskTerminalStatus::TimedOut => TaskOutcome::TimedOut {
+            reason: result.error.clone().unwrap_or_else(|| "task timed out".to_string()),
+        },
+        roz_nats::dispatch::TaskTerminalStatus::Cancelled => TaskOutcome::Cancelled {
+            reason: result.error.clone().unwrap_or_else(|| "task cancelled".to_string()),
+        },
+        roz_nats::dispatch::TaskTerminalStatus::SafetyStop => TaskOutcome::SafetyStop {
+            guard: None,
+            reason: result
+                .error
+                .clone()
+                .unwrap_or_else(|| "task stopped by safety policy".to_string()),
+        },
+    }
+}
+
+fn task_status_from_outcome(outcome: &TaskOutcome) -> TaskStatus {
+    match outcome {
+        TaskOutcome::Succeeded { result } => TaskStatus::Succeeded { result: result.clone() },
+        TaskOutcome::Failed { error } => TaskStatus::Failed { error: error.clone() },
+        TaskOutcome::TimedOut { reason } => TaskStatus::TimedOut { reason: reason.clone() },
+        TaskOutcome::Cancelled { reason } => TaskStatus::Cancelled { reason: reason.clone() },
+        TaskOutcome::SafetyStop { guard, reason } => TaskStatus::SafetyStop {
+            guard: guard.clone(),
+            reason: reason.clone(),
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -98,23 +170,24 @@ impl TaskWorkflow for TaskWorkflowImpl {
         let result: Json<roz_nats::dispatch::TaskResult> = ctx.promise("task_result").await?;
         let result = result.into_inner();
 
-        let outcome = if result.success {
-            tracing::info!(task_id = %task_id, "workflow completed successfully");
-            TaskOutcome::Success {
-                result: result.output.unwrap_or(serde_json::Value::Null),
+        let outcome = task_outcome_from_result(&result);
+        match &outcome {
+            TaskOutcome::Succeeded { .. } => tracing::info!(task_id = %task_id, "workflow completed successfully"),
+            TaskOutcome::Failed { error } => {
+                tracing::warn!(task_id = %task_id, error = %error, "workflow completed with failure");
             }
-        } else {
-            let error_msg = result.error.unwrap_or_else(|| "unknown error".into());
-            tracing::warn!(task_id = %task_id, error = %error_msg, "workflow completed with failure");
-            TaskOutcome::Failed { error: error_msg }
-        };
+            TaskOutcome::TimedOut { reason } => {
+                tracing::warn!(task_id = %task_id, reason = %reason, "workflow timed out");
+            }
+            TaskOutcome::Cancelled { reason } => {
+                tracing::info!(task_id = %task_id, reason = %reason, "workflow cancelled");
+            }
+            TaskOutcome::SafetyStop { reason, .. } => {
+                tracing::warn!(task_id = %task_id, reason = %reason, "workflow stopped for safety");
+            }
+        }
 
-        ctx.set(
-            "status",
-            Json(TaskStatus::Completed {
-                outcome: outcome.clone(),
-            }),
-        );
+        ctx.set("status", Json(task_status_from_outcome(&outcome)));
 
         Ok(Json(outcome))
     }
@@ -235,17 +308,17 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // TaskOutcome all 4 variants serialize with correct tag
+    // TaskOutcome terminal variants serialize with correct tag
     // -----------------------------------------------------------------------
 
     #[test]
-    fn task_outcome_success_tag() {
-        let outcome = TaskOutcome::Success {
+    fn task_outcome_succeeded_tag() {
+        let outcome = TaskOutcome::Succeeded {
             result: json!({"position": [1.0, 2.0, 3.0]}),
         };
         let json_str = serde_json::to_string(&outcome).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(value["status"], "success");
+        assert_eq!(value["status"], "succeeded");
         let deser: TaskOutcome = serde_json::from_str(&json_str).unwrap();
         assert_eq!(outcome, deser);
     }
@@ -258,6 +331,18 @@ mod tests {
         let json_str = serde_json::to_string(&outcome).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(value["status"], "failed");
+        let deser: TaskOutcome = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(outcome, deser);
+    }
+
+    #[test]
+    fn task_outcome_timed_out_tag() {
+        let outcome = TaskOutcome::TimedOut {
+            reason: "workflow exceeded deadline".to_string(),
+        };
+        let json_str = serde_json::to_string(&outcome).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(value["status"], "timed_out");
         let deser: TaskOutcome = serde_json::from_str(&json_str).unwrap();
         assert_eq!(outcome, deser);
     }
@@ -277,7 +362,7 @@ mod tests {
     #[test]
     fn task_outcome_safety_stop_tag() {
         let outcome = TaskOutcome::SafetyStop {
-            guard: "velocity_limiter".to_string(),
+            guard: Some("velocity_limiter".to_string()),
             reason: "exceeded max velocity".to_string(),
         };
         let json_str = serde_json::to_string(&outcome).unwrap();
@@ -320,7 +405,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // TaskStatus all 4 variants
+    // TaskStatus variants
     // -----------------------------------------------------------------------
 
     #[test]
@@ -358,14 +443,44 @@ mod tests {
     }
 
     #[test]
-    fn task_status_completed_tag() {
-        let outcome = TaskOutcome::Success {
+    fn task_status_succeeded_tag() {
+        let status = TaskStatus::Succeeded {
             result: json!({"ok": true}),
         };
-        let status = TaskStatus::Completed { outcome };
         let json_str = serde_json::to_string(&status).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(value["state"], "completed");
-        assert_eq!(value["outcome"]["status"], "success");
+        assert_eq!(value["state"], "succeeded");
+        assert_eq!(value["result"]["ok"], true);
+    }
+
+    #[test]
+    fn task_status_timed_out_tag() {
+        let status = TaskStatus::TimedOut {
+            reason: "workflow exceeded deadline".to_string(),
+        };
+        let json_str = serde_json::to_string(&status).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(value["state"], "timed_out");
+        assert_eq!(value["reason"], "workflow exceeded deadline");
+    }
+
+    #[test]
+    fn task_outcome_from_result_preserves_canonical_statuses() {
+        let result = roz_nats::dispatch::TaskResult {
+            task_id: Uuid::nil(),
+            status: roz_nats::dispatch::TaskTerminalStatus::SafetyStop,
+            output: None,
+            error: Some("limit exceeded".to_string()),
+            cycles: 0,
+            token_usage: roz_nats::dispatch::TokenUsage::default(),
+        };
+
+        assert_eq!(
+            task_outcome_from_result(&result),
+            TaskOutcome::SafetyStop {
+                guard: None,
+                reason: "limit exceeded".to_string(),
+            }
+        );
     }
 }

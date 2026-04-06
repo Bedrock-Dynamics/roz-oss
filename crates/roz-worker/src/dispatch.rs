@@ -10,7 +10,7 @@ use roz_core::session::control::CognitionMode;
 use roz_core::session::event::SessionPermissionRule;
 use roz_core::tools::ToolCategory;
 use roz_core::trust::{ExecutionCapabilityClass, TrustPosture};
-use roz_nats::dispatch::{ExecutionMode, TaskInvocation, TaskResult, TokenUsage};
+use roz_nats::dispatch::{ExecutionMode, TaskInvocation, TaskResult, TaskTerminalStatus, TokenUsage};
 use uuid::Uuid;
 
 /// Default maximum agent loop cycles.
@@ -329,11 +329,15 @@ pub fn apply_trust_posture(dispatcher: &mut ToolDispatcher, posture: &TrustPostu
 
 /// Converts an agent loop result into a NATS [`TaskResult`] for signaling back to Restate.
 #[tracing::instrument(name = "worker.build_task_result", skip(output))]
-pub fn build_task_result(task_id: Uuid, output: Result<AgentOutput, AgentError>) -> TaskResult {
+pub fn build_task_result(
+    task_id: Uuid,
+    status: TaskTerminalStatus,
+    output: Result<AgentOutput, AgentError>,
+) -> TaskResult {
     match output {
         Ok(agent_output) => TaskResult {
             task_id,
-            success: true,
+            status,
             output: agent_output.final_response.map(serde_json::Value::String),
             error: None,
             cycles: agent_output.cycles,
@@ -346,7 +350,7 @@ pub fn build_task_result(task_id: Uuid, output: Result<AgentOutput, AgentError>)
         },
         Err(err) => TaskResult {
             task_id,
-            success: false,
+            status,
             output: None,
             error: Some(err.to_string()),
             cycles: 0,
@@ -432,8 +436,8 @@ mod tests {
             },
             messages: vec![],
         };
-        let result = build_task_result(Uuid::nil(), Ok(output));
-        assert!(result.success);
+        let result = build_task_result(Uuid::nil(), TaskTerminalStatus::Succeeded, Ok(output));
+        assert_eq!(result.status, TaskTerminalStatus::Succeeded);
         assert_eq!(result.cycles, 3);
         assert_eq!(result.token_usage.input_tokens, 100);
         assert_eq!(result.token_usage.output_tokens, 50);
@@ -444,8 +448,8 @@ mod tests {
     #[test]
     fn build_task_result_failure() {
         let err = AgentError::MaxCyclesExceeded { max: 10 };
-        let result = build_task_result(Uuid::nil(), Err(err));
-        assert!(!result.success);
+        let result = build_task_result(Uuid::nil(), TaskTerminalStatus::Failed, Err(err));
+        assert_eq!(result.status, TaskTerminalStatus::Failed);
         assert!(result.error.as_ref().unwrap().contains("10"));
         assert!(result.output.is_none());
         assert_eq!(result.cycles, 0);
@@ -464,8 +468,8 @@ mod tests {
             },
             messages: vec![],
         };
-        let result = build_task_result(Uuid::nil(), Ok(output));
-        assert!(result.success);
+        let result = build_task_result(Uuid::nil(), TaskTerminalStatus::Succeeded, Ok(output));
+        assert_eq!(result.status, TaskTerminalStatus::Succeeded);
         assert!(result.output.is_none());
         assert!(result.error.is_none());
         assert_eq!(result.cycles, 1);
@@ -502,9 +506,9 @@ mod tests {
         ];
 
         for (variant, expected_substring) in cases {
-            let result = build_task_result(Uuid::nil(), Err(variant));
+            let result = build_task_result(Uuid::nil(), TaskTerminalStatus::Failed, Err(variant));
             assert!(
-                !result.success,
+                result.status == TaskTerminalStatus::Failed,
                 "expected failure for error containing '{expected_substring}'"
             );
             let err_msg = result.error.as_ref().unwrap();
@@ -513,6 +517,19 @@ mod tests {
                 "error '{err_msg}' should contain '{expected_substring}'"
             );
         }
+    }
+
+    #[test]
+    fn build_task_result_preserves_terminal_status() {
+        let result = build_task_result(
+            Uuid::nil(),
+            TaskTerminalStatus::TimedOut,
+            Err(AgentError::Cancelled {
+                partial_input_tokens: 0,
+                partial_output_tokens: 0,
+            }),
+        );
+        assert_eq!(result.status, TaskTerminalStatus::TimedOut);
     }
 
     #[test]
@@ -700,7 +717,25 @@ mod tests {
 
     #[test]
     fn robot_context_teaches_tick_contract_not_legacy_abi() {
-        let inv = sample_invocation(ExecutionMode::React);
+        let mut inv = sample_invocation(ExecutionMode::React);
+        inv.control_interface_manifest = Some(roz_core::embodiment::binding::ControlInterfaceManifest {
+            version: 7,
+            manifest_digest: "tick-contract-digest".into(),
+            channels: vec![roz_core::embodiment::binding::ControlChannelDef {
+                name: "shoulder_velocity".into(),
+                interface_type: roz_core::embodiment::binding::CommandInterfaceType::JointVelocity,
+                units: "rad/s".into(),
+                frame_id: "base".into(),
+            }],
+            bindings: vec![roz_core::embodiment::binding::ChannelBinding {
+                physical_name: "shoulder".into(),
+                channel_index: 0,
+                binding_type: roz_core::embodiment::binding::BindingType::JointVelocity,
+                frame_id: "base".into(),
+                units: "rad/s".into(),
+                semantic_role: None,
+            }],
+        });
         let input = build_agent_input(&inv);
         let ctx = &input.system_prompt[1];
 
@@ -726,7 +761,7 @@ mod tests {
             "robot context must describe the safety filter"
         );
         assert!(
-            ctx.contains("There is no command::set / state::get"),
+            ctx.contains("no legacy `command::set` / `state::get` surface"),
             "robot context must explicitly negate the legacy host functions"
         );
 

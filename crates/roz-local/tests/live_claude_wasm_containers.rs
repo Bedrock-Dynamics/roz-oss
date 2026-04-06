@@ -81,7 +81,7 @@ fn live_test_mutex() -> &'static tokio::sync::Mutex<()> {
 }
 
 fn load_diff_drive_control_manifest() -> (ControlInterfaceManifest, String) {
-    let toml_str = include_str!("../../../examples/diff_drive/robot.toml");
+    let toml_str = include_str!("../../../examples/diff_drive/embodiment.toml");
     let robot: roz_copper::manifest::EmbodimentManifest = toml::from_str(toml_str).unwrap();
     (
         robot.control_interface_manifest().unwrap(),
@@ -94,7 +94,7 @@ fn load_diff_drive_control_manifest() -> (ControlInterfaceManifest, String) {
 }
 
 fn load_quadcopter_control_manifest() -> (ControlInterfaceManifest, String) {
-    let toml_str = include_str!("../../../examples/quadcopter/robot.toml");
+    let toml_str = include_str!("../../../examples/quadcopter/embodiment.toml");
     let robot: roz_copper::manifest::EmbodimentManifest = toml::from_str(toml_str).unwrap();
     (
         robot.control_interface_manifest().unwrap(),
