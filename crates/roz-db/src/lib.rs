@@ -87,6 +87,40 @@ pub(crate) async fn shared_test_pool() -> PgPool {
 }
 
 #[cfg(test)]
+fn is_retryable_public_schema_grant_error(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Database(database_error) => {
+            database_error.code().as_deref() == Some("XX000")
+                && database_error.message().contains("tuple concurrently updated")
+        }
+        _ => false,
+    }
+}
+
+/// Grant `USAGE` on the `public` schema to a transient test role.
+///
+/// Parallel RLS tests occasionally race while Postgres updates the schema ACL,
+/// surfacing `XX000 tuple concurrently updated`. Retry that transient case so
+/// the isolation tests remain deterministic under workspace-wide concurrency.
+#[cfg(test)]
+pub(crate) async fn grant_public_schema_usage_for_test_role(pool: &PgPool, test_role: &str) -> Result<(), sqlx::Error> {
+    const MAX_ATTEMPTS: u32 = 5;
+    let statement = format!("GRANT USAGE ON SCHEMA public TO {test_role}");
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        match sqlx::query(&statement).execute(pool).await {
+            Ok(_) => return Ok(()),
+            Err(error) if attempt < MAX_ATTEMPTS && is_retryable_public_schema_grant_error(&error) => {
+                tokio::time::sleep(std::time::Duration::from_millis(u64::from(attempt) * 25)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("grant_public_schema_usage_for_test_role should return within retry loop");
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

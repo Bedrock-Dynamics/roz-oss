@@ -947,7 +947,8 @@ impl SessionRuntime {
         chunks_open: &mut bool,
         presence_open: &mut bool,
         tool_calls_open: &mut bool,
-    ) {
+    ) -> bool {
+        let mut drained_total = false;
         loop {
             let mut drained_any = false;
             if *chunks_open {
@@ -956,6 +957,7 @@ impl SessionRuntime {
                         Ok(chunk) => {
                             self.emit_stream_chunk(message_id, chunk);
                             drained_any = true;
+                            drained_total = true;
                         }
                         Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                         Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
@@ -971,6 +973,7 @@ impl SessionRuntime {
                         Ok(signal) => {
                             self.emit_presence_signal(signal);
                             drained_any = true;
+                            drained_total = true;
                         }
                         Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                         Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
@@ -995,6 +998,7 @@ impl SessionRuntime {
                                 timeout_ms: call.timeout_ms,
                             });
                             drained_any = true;
+                            drained_total = true;
                         }
                         Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                         Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
@@ -1009,22 +1013,72 @@ impl SessionRuntime {
                 break;
             }
         }
+        drained_total
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn drain_stream_buffers_with_grace(
+        &mut self,
+        message_id: &str,
+        chunk_rx: &mut mpsc::Receiver<StreamChunk>,
+        presence_rx: &mut mpsc::Receiver<PresenceSignal>,
+        tool_call_rx: &mut Option<mpsc::Receiver<RemoteToolCall>>,
+        chunks_open: &mut bool,
+        presence_open: &mut bool,
+        tool_calls_open: &mut bool,
+    ) {
+        let grace_period = std::time::Duration::from_millis(50);
+        let poll_interval = std::time::Duration::from_millis(5);
+        let mut quiet_deadline = tokio::time::Instant::now() + grace_period;
+
+        loop {
+            let drained_any = self.drain_stream_buffers(
+                message_id,
+                chunk_rx,
+                presence_rx,
+                tool_call_rx,
+                chunks_open,
+                presence_open,
+                tool_calls_open,
+            );
+
+            if !*chunks_open && !*presence_open && !*tool_calls_open {
+                break;
+            }
+
+            if drained_any {
+                quiet_deadline = tokio::time::Instant::now() + grace_period;
+                continue;
+            }
+
+            let now = tokio::time::Instant::now();
+            if now >= quiet_deadline {
+                break;
+            }
+
+            tokio::time::sleep(std::cmp::min(poll_interval, quiet_deadline - now)).await;
+        }
     }
 
     fn handle_turn_failure(&mut self, failure: RuntimeFailureKind) -> SessionRuntimeError {
         let action = self.handle_failure(failure);
         self.clear_turn_approvals();
         self.state.snapshot.turn_index = self.state.turn_index;
-        if !action.safe_pause && !action.terminal {
+        if action.terminal {
+            self.state.snapshot.last_failure = Some(failure);
+            self.state.snapshot.updated_at = chrono::Utc::now();
+            if !action.safe_pause {
+                self.state.activity = RuntimeActivity::Degraded;
+            }
+            SessionRuntimeError::SessionFailed(failure)
+        } else if !action.safe_pause {
             self.state.activity = RuntimeActivity::Idle;
             self.emit_activity_changed(
                 RuntimeActivity::Idle,
                 format!("turn {} failed", self.state.turn_index),
                 None,
             );
-        }
-        if action.terminal {
-            SessionRuntimeError::SessionFailed(failure)
+            SessionRuntimeError::TurnFailed(failure)
         } else {
             SessionRuntimeError::TurnFailed(failure)
         }
@@ -1220,7 +1274,7 @@ impl SessionRuntime {
         loop {
             tokio::select! {
                 result = &mut completion => {
-                    self.drain_stream_buffers(
+                    self.drain_stream_buffers_with_grace(
                         &message_id,
                         &mut chunk_rx,
                         &mut presence_rx,
@@ -1228,7 +1282,7 @@ impl SessionRuntime {
                         &mut chunks_open,
                         &mut presence_open,
                         &mut tool_calls_open,
-                    );
+                    ).await;
                     return match result {
                         Ok(output) => {
                             self.emit(SessionEvent::TurnFinished {
@@ -1461,8 +1515,12 @@ mod tests {
     struct BufferedStreamingExecutor {
         output: Result<TurnOutput, RuntimeFailureKind>,
         chunks: Vec<StreamChunk>,
+        delayed_chunks: Vec<(std::time::Duration, StreamChunk)>,
         signals: Vec<PresenceSignal>,
+        delayed_signals: Vec<(std::time::Duration, PresenceSignal)>,
         tool_calls: Vec<RemoteToolCall>,
+        delayed_tool_calls: Vec<(std::time::Duration, RemoteToolCall)>,
+        completion_delay: Option<std::time::Duration>,
     }
 
     impl StreamingTurnExecutor for BufferedStreamingExecutor {
@@ -1471,23 +1529,63 @@ mod tests {
             for chunk in self.chunks.drain(..) {
                 chunk_tx.try_send(chunk).unwrap();
             }
-            drop(chunk_tx);
+            let delayed_chunks = std::mem::take(&mut self.delayed_chunks);
+            if delayed_chunks.is_empty() {
+                drop(chunk_tx);
+            } else {
+                tokio::spawn(async move {
+                    for (delay, chunk) in delayed_chunks {
+                        tokio::time::sleep(delay).await;
+                        if chunk_tx.send(chunk).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
 
             let (presence_tx, presence_rx) = mpsc::channel(8);
             for signal in self.signals.drain(..) {
                 presence_tx.try_send(signal).unwrap();
             }
-            drop(presence_tx);
+            let delayed_signals = std::mem::take(&mut self.delayed_signals);
+            if delayed_signals.is_empty() {
+                drop(presence_tx);
+            } else {
+                tokio::spawn(async move {
+                    for (delay, signal) in delayed_signals {
+                        tokio::time::sleep(delay).await;
+                        if presence_tx.send(signal).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
 
             let (tool_call_tx, tool_call_rx) = mpsc::channel(8);
             for tool_call in self.tool_calls.drain(..) {
                 tool_call_tx.try_send(tool_call).unwrap();
             }
-            drop(tool_call_tx);
+            let delayed_tool_calls = std::mem::take(&mut self.delayed_tool_calls);
+            if delayed_tool_calls.is_empty() {
+                drop(tool_call_tx);
+            } else {
+                tokio::spawn(async move {
+                    for (delay, tool_call) in delayed_tool_calls {
+                        tokio::time::sleep(delay).await;
+                        if tool_call_tx.send(tool_call).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
 
             let output = self.output.clone();
+            let completion_delay = self.completion_delay.take();
             StreamingTurnHandle {
                 completion: Box::pin(async move {
+                    if let Some(delay) = completion_delay {
+                        tokio::time::sleep(delay).await;
+                    }
                     match output {
                         Ok(output) => Ok(output),
                         Err(failure) => Err(
@@ -1989,6 +2087,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_turn_terminal_executor_failure_records_failure_snapshot() {
+        let mut rt = make_runtime();
+        let mut executor = FailingExecutor {
+            failure: RuntimeFailureKind::TrustViolation,
+        };
+
+        let err = rt.run_turn(test_turn_input("hello"), &mut executor).await.unwrap_err();
+
+        assert!(matches!(
+            err,
+            SessionRuntimeError::SessionFailed(RuntimeFailureKind::TrustViolation)
+        ));
+        assert_eq!(rt.state.snapshot.last_failure, Some(RuntimeFailureKind::TrustViolation));
+        assert_eq!(rt.state.failure, Some(RuntimeFailureKind::TrustViolation));
+        assert_eq!(rt.activity(), RuntimeActivity::PausedSafe);
+        assert!(rt.is_paused());
+    }
+
+    #[tokio::test]
     async fn complete_session_emits_event() {
         let mut rt = make_runtime();
         let mut rx = rt.subscribe_events();
@@ -2064,18 +2181,31 @@ mod tests {
                 cache_creation_tokens: 0,
                 messages: vec![Message::user("hello"), Message::assistant_text("done")],
             }),
-            chunks: vec![StreamChunk::TextDelta("hello world".into())],
-            signals: vec![PresenceSignal::ActivityUpdate {
-                state: ActivityState::CallingTool,
-                detail: "calling remote tool".into(),
-                progress: None,
-            }],
-            tool_calls: vec![RemoteToolCall {
-                id: "call-1".into(),
-                name: "capture_frame".into(),
-                parameters: json!({"camera": "front"}),
-                timeout_ms: 5000,
-            }],
+            chunks: vec![],
+            delayed_chunks: vec![(
+                std::time::Duration::from_millis(10),
+                StreamChunk::TextDelta("hello world".into()),
+            )],
+            signals: vec![],
+            delayed_signals: vec![(
+                std::time::Duration::from_millis(10),
+                PresenceSignal::ActivityUpdate {
+                    state: ActivityState::CallingTool,
+                    detail: "calling remote tool".into(),
+                    progress: None,
+                },
+            )],
+            tool_calls: vec![],
+            delayed_tool_calls: vec![(
+                std::time::Duration::from_millis(10),
+                RemoteToolCall {
+                    id: "call-1".into(),
+                    name: "capture_frame".into(),
+                    parameters: json!({"camera": "front"}),
+                    timeout_ms: 5000,
+                },
+            )],
+            completion_delay: None,
         };
 
         let result = rt
@@ -2118,8 +2248,12 @@ mod tests {
         let mut executor = BufferedStreamingExecutor {
             output: Err(RuntimeFailureKind::ModelError),
             chunks: vec![],
+            delayed_chunks: vec![],
             signals: vec![],
+            delayed_signals: vec![],
             tool_calls: vec![],
+            delayed_tool_calls: vec![],
+            completion_delay: None,
         };
 
         let err = rt

@@ -281,7 +281,7 @@ mod tests {
         let guard = ModeTransitionGuard::new(AgentLoopMode::OodaReAct);
         let mut state = context_with_entities();
         state.alerts.push(Alert {
-            severity: AlertSeverity::Info,
+            severity: AlertSeverity::Warning,
             message: "Observation heartbeat restored".into(),
             source: "edge_heartbeat".into(),
         });

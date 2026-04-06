@@ -164,6 +164,10 @@ impl TypedToolExecutor for ReplayControllerTool {
             control_manifest.manifest_digest.clone()
         };
         let embodiment_metadata = resolve_embodiment_metadata(ctx);
+        let embodiment_family = embodiment_metadata.as_ref().map_or_else(
+            || trace.verification_key.embodiment_family.clone(),
+            |metadata| metadata.embodiment_family.clone(),
+        );
         let runtime_digests = RuntimeDigests {
             controller_digest: hex::encode(Sha256::digest(&code_bytes)),
             wit_world_version: trace.verification_key.wit_world_version.clone(),
@@ -178,9 +182,7 @@ impl TypedToolExecutor for ReplayControllerTool {
             manifest_digest,
             execution_mode: ExecutionMode::Replay,
             compiler_version: trace.verification_key.compiler_version.clone(),
-            embodiment_family: embodiment_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.embodiment_family.clone()),
+            embodiment_family: embodiment_family.clone(),
         };
 
         let replay_mode = input.mode.unwrap_or(ReplayControllerMode::RegressionTest);
@@ -218,7 +220,7 @@ impl TypedToolExecutor for ReplayControllerTool {
                 "execution_mode": &evidence.execution_mode,
                 "state_freshness": &evidence.state_freshness,
             },
-            "embodiment_family": embodiment_metadata.and_then(|metadata| metadata.embodiment_family),
+            "embodiment_family": embodiment_family,
         })))
     }
 }
@@ -457,5 +459,39 @@ mod tests {
             result.output["mismatches"][0]["field"],
             "verification_key.execution_mode"
         );
+    }
+
+    #[tokio::test]
+    async fn replay_tool_uses_trace_embodiment_family_without_runtime_metadata() {
+        let code = sample_wat();
+        let mut control_manifest = roz_core::embodiment::binding::ControlInterfaceManifest {
+            version: 1,
+            manifest_digest: String::new(),
+            channels: vec![roz_core::embodiment::binding::ControlChannelDef {
+                name: "joint0/velocity".into(),
+                interface_type: roz_core::embodiment::binding::CommandInterfaceType::JointVelocity,
+                units: "rad/s".into(),
+                frame_id: "base".into(),
+            }],
+            bindings: Vec::new(),
+        };
+        control_manifest.stamp_digest();
+        let dir = tempfile::tempdir().unwrap();
+        let archive = EvidenceArchive::new(dir.path());
+        let ctx = ctx_with_manifest_and_archive(control_manifest.clone(), archive);
+        let tool = ReplayControllerTool::new(&control_manifest);
+        let mut trace = sample_trace(&code, &control_manifest);
+        trace.verification_key.embodiment_family = Some("ur-family".into());
+        let input = ReplayControllerInput {
+            code,
+            trace: serde_json::to_value(trace).unwrap(),
+            mode: Some(ReplayControllerMode::RegressionTest),
+        };
+
+        let result = TypedToolExecutor::execute(&tool, input, &ctx).await.unwrap();
+
+        assert!(result.is_success(), "expected structured replay result");
+        assert_eq!(result.output["passed"], true);
+        assert_eq!(result.output["embodiment_family"], "ur-family");
     }
 }

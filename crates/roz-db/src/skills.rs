@@ -423,8 +423,7 @@ mod tests {
             .execute(&pool)
             .await
             .expect("Failed to create test role");
-        sqlx::query(&format!("GRANT USAGE ON SCHEMA public TO {test_role}"))
-            .execute(&pool)
+        crate::grant_public_schema_usage_for_test_role(&pool, &test_role)
             .await
             .expect("Failed to grant schema usage");
         sqlx::query(&format!("GRANT SELECT ON roz_skills TO {test_role}"))
@@ -512,8 +511,7 @@ mod tests {
             .execute(&pool)
             .await
             .expect("Failed to create test role");
-        sqlx::query(&format!("GRANT USAGE ON SCHEMA public TO {test_role}"))
-            .execute(&pool)
+        crate::grant_public_schema_usage_for_test_role(&pool, &test_role)
             .await
             .expect("Failed to grant schema usage");
         sqlx::query(&format!("GRANT SELECT ON roz_skill_versions TO {test_role}"))
