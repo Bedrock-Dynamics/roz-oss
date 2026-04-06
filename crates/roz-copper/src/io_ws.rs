@@ -24,6 +24,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use roz_core::command::CommandFrame;
+use roz_core::embodiment::FrameSnapshotInput;
 use roz_core::template::render_template;
 
 use crate::io::{ActuatorSink, SensorFrame, SensorSource};
@@ -110,7 +111,7 @@ impl SensorSource for WsSensorSource {
             joint_positions: current.joint_positions.clone(),
             joint_velocities: Vec::new(),
             sim_time_ns: 0,
-            frame_snapshot_input: Default::default(),
+            frame_snapshot_input: FrameSnapshotInput::default(),
         })
     }
 }

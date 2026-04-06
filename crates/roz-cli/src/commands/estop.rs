@@ -19,8 +19,8 @@ fn default_host_status() -> String {
     "unknown".to_string()
 }
 
-fn resolve_host_id_from_candidates(host: &str, matches: Vec<HostListEntry>) -> anyhow::Result<String> {
-    match matches.as_slice() {
+fn resolve_host_id_from_candidates(host: &str, matches: &[HostListEntry]) -> anyhow::Result<String> {
+    match matches {
         [] => anyhow::bail!("host '{host}' not found. Run `roz host list` to see available hosts."),
         [single] => Ok(single.id.clone()),
         _ => {
@@ -86,7 +86,7 @@ pub async fn resolve_host_id(client: &reqwest::Client, api_url: &str, host: &str
         offset += limit;
     }
 
-    resolve_host_id_from_candidates(host, matches)
+    resolve_host_id_from_candidates(host, &matches)
 }
 
 #[cfg(test)]
@@ -97,7 +97,7 @@ mod tests {
     fn resolve_host_id_from_candidates_returns_single_match() {
         let resolved = resolve_host_id_from_candidates(
             "reachy-dev",
-            vec![HostListEntry {
+            &[HostListEntry {
                 id: "00000000-0000-0000-0000-000000000111".to_string(),
                 name: "reachy-dev".to_string(),
                 status: "online".to_string(),
@@ -111,7 +111,7 @@ mod tests {
     fn resolve_host_id_from_candidates_rejects_duplicate_names() {
         let error = resolve_host_id_from_candidates(
             "reachy-dev",
-            vec![
+            &[
                 HostListEntry {
                     id: "00000000-0000-0000-0000-000000000111".to_string(),
                     name: "reachy-dev".to_string(),
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn resolve_host_id_from_candidates_rejects_missing_names() {
-        let error = resolve_host_id_from_candidates("missing-host", Vec::new()).expect_err("missing host should fail");
+        let error = resolve_host_id_from_candidates("missing-host", &Vec::new()).expect_err("missing host should fail");
         assert!(error.to_string().contains("host 'missing-host' not found"));
     }
 

@@ -164,7 +164,7 @@ struct HeadlessTurnExecutor {
 
 impl TurnExecutor for HeadlessTurnExecutor {
     fn execute_turn(&mut self, prepared: PreparedTurn) -> TurnFuture<'_> {
-        let prepared_agent_mode: AgentLoopMode = prepared.cognition_mode().into();
+        let prepared_agent_mode: AgentLoopMode = prepared.cognition_mode();
         let user_msg = prepared.user_message;
         debug_assert!(
             !prepared.system_blocks.is_empty(),

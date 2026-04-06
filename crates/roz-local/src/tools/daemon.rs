@@ -176,7 +176,7 @@ struct DaemonCommandChannel {
     limits: (f64, f64),
 }
 
-fn is_actuator_channel(interface_type: &CommandInterfaceType) -> bool {
+const fn is_actuator_channel(interface_type: &CommandInterfaceType) -> bool {
     matches!(
         interface_type,
         CommandInterfaceType::JointVelocity

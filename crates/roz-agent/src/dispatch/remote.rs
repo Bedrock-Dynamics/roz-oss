@@ -36,7 +36,7 @@ pub type PendingResults = Arc<Mutex<HashMap<String, oneshot::Sender<ToolResult>>
 pub type PendingApprovals = Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>;
 
 /// Approval decision returned by an external approver.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApprovalDecision {
     /// Whether the tool call is approved to proceed.
     pub approved: bool,
@@ -45,7 +45,7 @@ pub struct ApprovalDecision {
 }
 
 /// Notification emitted when a tool call is suspended awaiting external approval.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingApprovalRequest {
     /// Parent task owning this approval.
     pub task_id: String,

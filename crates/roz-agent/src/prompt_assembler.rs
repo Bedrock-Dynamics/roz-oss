@@ -17,6 +17,8 @@
 //! The assembler does **not** depend on any model provider — it only produces
 //! `Vec<SystemBlock>`.
 
+#![allow(clippy::similar_names)]
+
 use roz_core::edge_health::EdgeTransportHealth;
 use roz_core::memory::MemoryEntry;
 use roz_core::session::snapshot::SessionSnapshot;

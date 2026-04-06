@@ -30,7 +30,7 @@ enum ObservationTool {
 fn current_timestamp_ns() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos() as u64)
+        .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
         .unwrap_or(0)
 }
 
@@ -48,7 +48,7 @@ impl DockerSpatialProvider {
     }
 
     /// Returns whether the discovered MCP tool surface can provide bounded
-    /// runtime world-state observations for OodaReAct.
+    /// runtime world-state observations for `OodaReAct`.
     #[must_use]
     pub fn supports_runtime_world_state(tools: &[McpToolInfo]) -> bool {
         Self::detect_observation_tool(tools).is_some()
@@ -78,8 +78,7 @@ impl DockerSpatialProvider {
         let tools = self.mcp.all_tools();
         if let Some(tool) = Self::detect_observation_tool(&tools) {
             let label = match &tool {
-                ObservationTool::Telemetry(name) => name.as_str(),
-                ObservationTool::JointState(name) => name.as_str(),
+                ObservationTool::Telemetry(name) | ObservationTool::JointState(name) => name.as_str(),
             };
             tracing::info!("Auto-detected world-state tool: {label}");
             self.observation_tool = Some(tool);

@@ -158,7 +158,7 @@ fn prompt_tool_schemas(dispatcher: &ToolDispatcher) -> Vec<roz_agent::prompt_ass
 
 /// Effective agent mode for a worker invocation.
 #[must_use]
-pub fn effective_cognition_mode(inv: &TaskInvocation) -> CognitionMode {
+pub const fn effective_cognition_mode(inv: &TaskInvocation) -> CognitionMode {
     match inv.mode {
         ExecutionMode::React => CognitionMode::React,
         ExecutionMode::OodaReAct => CognitionMode::OodaReAct,
@@ -169,7 +169,7 @@ pub fn effective_cognition_mode(inv: &TaskInvocation) -> CognitionMode {
 #[tracing::instrument(name = "worker.build_agent_input", skip(inv), fields(task_id = %inv.task_id))]
 pub fn build_agent_input(inv: &TaskInvocation) -> AgentInput {
     let mode = effective_cognition_mode(inv);
-    let mut system_prompt = vec![build_worker_constitution(mode.into(), &[])];
+    let mut system_prompt = vec![build_worker_constitution(mode, &[])];
     system_prompt.extend(build_project_context(inv));
 
     AgentInput {
@@ -229,7 +229,7 @@ pub fn build_prompt_state(inv: &TaskInvocation, dispatcher: &ToolDispatcher) -> 
     let tool_name_refs: Vec<&str> = tool_names.iter().map(String::as_str).collect();
 
     WorkerPromptState {
-        constitution_text: build_worker_constitution(mode.into(), &tool_name_refs),
+        constitution_text: build_worker_constitution(mode, &tool_name_refs),
         tool_schemas: prompt_tool_schemas(dispatcher),
         project_context: build_project_context(inv),
     }

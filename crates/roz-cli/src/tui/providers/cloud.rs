@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -361,7 +362,7 @@ fn session_event_to_agent_event(event: &roz_v1::SessionEventEnvelope) -> Option<
                 format!("approval requested: {} ({})", payload.action, payload.reason)
             };
             if payload.timeout_secs > 0 {
-                content.push_str(&format!(" [timeout={}s]", payload.timeout_secs));
+                let _ = write!(content, " [timeout={}s]", payload.timeout_secs);
             }
             Some(AgentEvent::ToolResultDisplay {
                 name: "approval_requested".into(),
@@ -370,12 +371,7 @@ fn session_event_to_agent_event(event: &roz_v1::SessionEventEnvelope) -> Option<
             })
         }
         roz_v1::session_event_envelope::TypedEvent::ApprovalResolved(payload) => {
-            let outcome = payload
-                .outcome
-                .as_ref()
-                .cloned()
-                .map(struct_to_value)
-                .unwrap_or(serde_json::Value::Null);
+            let outcome = payload.outcome.clone().map_or(serde_json::Value::Null, struct_to_value);
             let (content, is_error) = format_approval_outcome(&payload.approval_id, &outcome);
             Some(AgentEvent::ToolResultDisplay {
                 name: "approval_resolved".into(),
@@ -420,8 +416,7 @@ fn session_event_to_tool_request(event: &roz_v1::SessionEventEnvelope) -> Option
         parameters: payload
             .parameters
             .clone()
-            .map(struct_to_value)
-            .unwrap_or_else(|| serde_json::json!({})),
+            .map_or_else(|| serde_json::json!({}), struct_to_value),
         timeout_ms: payload.timeout_ms,
     })
 }

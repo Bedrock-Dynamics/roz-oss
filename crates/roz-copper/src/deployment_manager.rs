@@ -9,6 +9,8 @@
 //! delegate rollout authority to the runtime layer. This module remains for
 //! compatibility scaffolding and rollout-focused tests.
 
+#![allow(clippy::too_many_arguments)]
+
 use roz_core::blueprint::RuntimeBlueprint;
 use roz_core::controller::deployment::DeploymentState;
 

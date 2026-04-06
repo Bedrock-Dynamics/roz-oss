@@ -215,10 +215,11 @@ impl LegacyRuntimeManifest {
             }
             let expected = match spec.interface_type {
                 CommandInterfaceType::JointVelocity => InterfaceType::Velocity,
-                CommandInterfaceType::JointPosition => InterfaceType::Position,
+                CommandInterfaceType::JointPosition
+                | CommandInterfaceType::GripperPosition
+                | CommandInterfaceType::ForceTorqueSensor
+                | CommandInterfaceType::ImuSensor => InterfaceType::Position,
                 CommandInterfaceType::JointTorque | CommandInterfaceType::GripperForce => InterfaceType::Effort,
-                CommandInterfaceType::GripperPosition => InterfaceType::Position,
-                CommandInterfaceType::ForceTorqueSensor | CommandInterfaceType::ImuSensor => InterfaceType::Position,
             };
             if legacy.interface_type != expected {
                 issues.push(format!(
@@ -309,9 +310,7 @@ impl From<&LegacyRuntimeManifest> for crate::embodiment::binding::ControlInterfa
     /// This keeps worker and tool surfaces on the newer manifest vocabulary even
     /// while Copper still consumes the legacy runtime manifest internally.
     fn from(manifest: &LegacyRuntimeManifest) -> Self {
-        use crate::embodiment::binding::{
-            BindingType, ChannelBinding, CommandInterfaceType, ControlChannelDef, ControlInterfaceManifest,
-        };
+        use crate::embodiment::binding::{BindingType, ChannelBinding, CommandInterfaceType, ControlChannelDef};
 
         let channels: Vec<ControlChannelDef> = manifest
             .commands
@@ -334,7 +333,7 @@ impl From<&LegacyRuntimeManifest> for crate::embodiment::binding::ControlInterfa
             .enumerate()
             .map(|(i, ch)| ChannelBinding {
                 physical_name: ch.name.clone(),
-                channel_index: i as u32,
+                channel_index: u32::try_from(i).expect("legacy manifest command count exceeds u32::MAX"),
                 binding_type: match ch.interface_type {
                     InterfaceType::Position => BindingType::JointPosition,
                     InterfaceType::Velocity => BindingType::JointVelocity,
@@ -346,7 +345,7 @@ impl From<&LegacyRuntimeManifest> for crate::embodiment::binding::ControlInterfa
             })
             .collect();
 
-        let mut cim = ControlInterfaceManifest {
+        let mut cim = Self {
             version: 1,
             manifest_digest: String::new(),
             channels,

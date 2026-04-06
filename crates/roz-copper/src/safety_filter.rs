@@ -1,3 +1,5 @@
+#![allow(clippy::missing_const_for_fn)]
+
 use roz_core::command::{CommandFrame, MotorCommand};
 use roz_core::controller::intervention::{InterventionKind, SafetyIntervention};
 use roz_core::embodiment::binding::{CommandInterfaceType, ControlInterfaceManifest};
@@ -48,7 +50,7 @@ struct FrameCommandProfile {
     interface_type: FrameInterfaceType,
 }
 
-fn frame_interface_type_from_control(interface_type: &CommandInterfaceType) -> FrameInterfaceType {
+const fn frame_interface_type_from_control(interface_type: &CommandInterfaceType) -> FrameInterfaceType {
     match interface_type {
         CommandInterfaceType::JointVelocity => FrameInterfaceType::Velocity,
         CommandInterfaceType::JointPosition | CommandInterfaceType::GripperPosition => FrameInterfaceType::Position,
@@ -61,12 +63,13 @@ fn frame_interface_type_from_control(interface_type: &CommandInterfaceType) -> F
 
 fn fallback_control_limits(interface_type: &CommandInterfaceType) -> (f64, f64) {
     match interface_type {
-        CommandInterfaceType::JointVelocity => (-1.0, 1.0),
         CommandInterfaceType::JointPosition => (-std::f64::consts::PI, std::f64::consts::PI),
         CommandInterfaceType::JointTorque => (-100.0, 100.0),
         CommandInterfaceType::GripperPosition => (-0.1, 0.1),
         CommandInterfaceType::GripperForce => (-50.0, 50.0),
-        CommandInterfaceType::ForceTorqueSensor | CommandInterfaceType::ImuSensor => (-1.0, 1.0),
+        CommandInterfaceType::JointVelocity
+        | CommandInterfaceType::ForceTorqueSensor
+        | CommandInterfaceType::ImuSensor => (-1.0, 1.0),
     }
 }
 
@@ -81,12 +84,14 @@ fn frame_command_profiles_from_control_manifest(
         .map(|(index, channel)| {
             let limits = joint_limits.get(index);
             let channel_limits = match channel.interface_type {
-                CommandInterfaceType::JointVelocity => limits
-                    .map(|limits| (-limits.max_velocity.abs(), limits.max_velocity.abs()))
-                    .unwrap_or_else(|| fallback_control_limits(&channel.interface_type)),
-                CommandInterfaceType::JointPosition | CommandInterfaceType::GripperPosition => limits
-                    .map(|limits| (limits.position_min, limits.position_max))
-                    .unwrap_or_else(|| fallback_control_limits(&channel.interface_type)),
+                CommandInterfaceType::JointVelocity => limits.map_or_else(
+                    || fallback_control_limits(&channel.interface_type),
+                    |limits| (-limits.max_velocity.abs(), limits.max_velocity.abs()),
+                ),
+                CommandInterfaceType::JointPosition | CommandInterfaceType::GripperPosition => limits.map_or_else(
+                    || fallback_control_limits(&channel.interface_type),
+                    |limits| (limits.position_min, limits.position_max),
+                ),
                 CommandInterfaceType::JointTorque | CommandInterfaceType::GripperForce => limits
                     .and_then(|limits| limits.max_torque.map(|max| (-max.abs(), max.abs())))
                     .unwrap_or_else(|| fallback_control_limits(&channel.interface_type)),

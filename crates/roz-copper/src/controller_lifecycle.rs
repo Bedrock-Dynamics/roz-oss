@@ -4,6 +4,8 @@
 //! no safety issues, all digests must match, and the deployment state machine
 //! transition must be valid. Rollback restores the last known good artifact.
 
+#![allow(clippy::option_as_ref_cloned, clippy::redundant_clone, clippy::too_many_lines)]
+
 use roz_core::controller::artifact::{ControllerArtifact, ExecutionMode};
 use roz_core::controller::deployment::{DeploymentState, TransitionError};
 use roz_core::controller::evidence::ControllerEvidenceBundle;

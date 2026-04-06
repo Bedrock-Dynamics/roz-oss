@@ -43,7 +43,7 @@ fn mode_from_phases(phases: &[roz_core::phases::PhaseSpec]) -> roz_nats::dispatc
     }
 }
 
-fn validate_child_task_delegation_scope(req: &SpawnRequest) -> Result<(), &'static str> {
+const fn validate_child_task_delegation_scope(req: &SpawnRequest) -> Result<(), &'static str> {
     if req.delegation_scope.is_none() {
         return Err("child tasks require delegation_scope");
     }
@@ -58,10 +58,10 @@ fn is_terminal_task_status(status: &str) -> bool {
 }
 
 async fn apply_task_status_event(pool: &PgPool, event: &TaskStatusEvent) {
-    if let Some(host_id) = event.host_id {
-        if let Err(error) = roz_db::tasks::assign_host(pool, event.task_id, host_id).await {
-            tracing::warn!(%error, task_id = %event.task_id, "failed to assign host from task status event");
-        }
+    if let Some(host_id) = event.host_id
+        && let Err(error) = roz_db::tasks::assign_host(pool, event.task_id, host_id).await
+    {
+        tracing::warn!(%error, task_id = %event.task_id, "failed to assign host from task status event");
     }
 
     if event.status == "running" {
@@ -69,7 +69,7 @@ async fn apply_task_status_event(pool: &PgPool, event: &TaskStatusEvent) {
             tracing::warn!(%error, task_id = %event.task_id, "failed to ensure active task run");
         }
     } else if is_terminal_task_status(&event.status) {
-        if let Ok(None) = roz_db::tasks::active_run_for_task(pool, event.task_id).await {
+        if matches!(roz_db::tasks::active_run_for_task(pool, event.task_id).await, Ok(None)) {
             let _ = roz_db::tasks::ensure_active_run(pool, event.task_id, event.host_id).await;
         }
         if let Err(error) =

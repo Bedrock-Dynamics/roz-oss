@@ -46,36 +46,36 @@ mod tests {
 
     fn sim_env() -> EnvironmentConfig {
         EnvironmentConfig::from_yaml(
-            r#"
+            r"
 name: sim
 kind: simulation
 simulation:
   engine: gazebo
-"#,
+",
         )
         .unwrap()
     }
 
     fn hw_env() -> EnvironmentConfig {
         EnvironmentConfig::from_yaml(
-            r#"
+            r"
 name: factory
 kind: hardware
 hardware:
   required_capabilities:
     - gpu
     - ros2
-"#,
+",
         )
         .unwrap()
     }
 
     fn hybrid_env() -> EnvironmentConfig {
         EnvironmentConfig::from_yaml(
-            r#"
+            r"
 name: mixed
 kind: hybrid
-"#,
+",
         )
         .unwrap()
     }

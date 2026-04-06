@@ -9,6 +9,8 @@
 //! forwarding streaming deltas to the client. `ToolResult` messages resolve pending
 //! remote tool calls. `CancelTurn` / `CancelSession` handle lifecycle cleanup.
 
+#![allow(clippy::significant_drop_tightening)]
+
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -115,7 +117,7 @@ struct EdgeSessionMirror {
 }
 
 impl EdgeSessionMirror {
-    fn new(bootstrap: roz_agent::session_runtime::SessionRuntimeBootstrap) -> Self {
+    const fn new(bootstrap: roz_agent::session_runtime::SessionRuntimeBootstrap) -> Self {
         Self { bootstrap }
     }
 
@@ -127,7 +129,7 @@ impl EdgeSessionMirror {
         self.bootstrap = bootstrap;
     }
 
-    fn history_len(&self) -> usize {
+    const fn history_len(&self) -> usize {
         self.bootstrap.history.len()
     }
 
@@ -424,7 +426,7 @@ impl StreamingTurnExecutor for ServerStreamingExecutor {
         &mut self,
         prepared: roz_agent::session_runtime::PreparedTurn,
     ) -> StreamingTurnHandle<'_> {
-        let prepared_agent_mode: AgentLoopMode = prepared.cognition_mode().into();
+        let prepared_agent_mode: AgentLoopMode = prepared.cognition_mode();
         let (chunk_tx, chunk_rx) = mpsc::channel::<StreamChunk>(64);
         let (presence_tx, presence_rx) = mpsc::channel::<roz_agent::agent_loop::PresenceSignal>(16);
         let tool_call_rx = self.tool_request_rx.take();
@@ -771,10 +773,11 @@ async fn run_session_loop(
                     .expect("cloud sessions must retain runtime authority");
                 let current_mode = {
                     let runtime = turn_runtime.lock().await;
-                    runtime.cognition_mode().into()
+                    runtime.cognition_mode()
                 };
-                let mut tools_changed = false;
-                if !msg.tools.is_empty() {
+                let tools_changed = if msg.tools.is_empty() {
+                    false
+                } else {
                     sess.tool_categories = msg
                         .tools
                         .iter()
@@ -787,8 +790,8 @@ async fn run_session_loop(
                         .map(roz_core::tools::ToolSchema::from)
                         .collect();
                     sess.active_permissions = derive_permissions(&sess.tools);
-                    tools_changed = true;
-                }
+                    true
+                };
 
                 let mode = resolved_user_message_mode(msg.ai_mode.as_deref(), current_mode);
                 let session_project_context = sess.project_context.clone();
@@ -978,7 +981,7 @@ async fn run_session_loop(
                         runtime.sync_world_state_with_note(runtime_spatial_context, Some(runtime_spatial_note));
                         let turn_input = roz_agent::session_runtime::TurnInput {
                             user_message: user_content,
-                            cognition_mode: mode.into(),
+                            cognition_mode: mode,
                             custom_context,
                             volatile_blocks,
                         };
@@ -1208,14 +1211,14 @@ async fn run_session_loop(
                 sess.active_permissions = derive_permissions(&sess.tools);
 
                 let runtime = sess.runtime.clone();
-                let session_id = sess.id.clone();
+                let session_id = sess.id;
                 let total_tools = sess.tools.len();
                 let session_project_context = sess.project_context.clone();
                 let active_permissions = sess.active_permissions.clone();
 
                 if let Some(runtime) = runtime {
                     let mut runtime = runtime.lock().await;
-                    let mode: AgentLoopMode = runtime.cognition_mode().into();
+                    let mode: AgentLoopMode = runtime.cognition_mode();
                     sync_cloud_runtime_surface(
                         &mut runtime,
                         mode,
@@ -1917,7 +1920,7 @@ fn sync_cloud_runtime_surface(
     project_context: &[String],
     permissions: &[SessionPermissionRule],
 ) {
-    runtime.sync_cognition_mode(mode.into());
+    runtime.sync_cognition_mode(mode);
     runtime.sync_prompt_surface(
         build_constitution_for_tools(mode, tools),
         prompt_tool_schemas(tools),
@@ -2081,6 +2084,7 @@ fn canonicalize_session_started_envelope(
     }
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn edge_event_envelope_to_response(envelope: &EventEnvelope, model_name: &str) -> Option<session_response::Response> {
     let _ = model_name;
     Some(super::event_mapper::canonical_event_envelope_to_session_response(
@@ -2139,11 +2143,10 @@ async fn drain_cloud_runtime_events(
                     return false;
                 }
             }
-            Err(broadcast::error::TryRecvError::Empty) => return true,
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => return true,
             Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
                 tracing::warn!(skipped, "cloud session event stream lagged");
             }
-            Err(broadcast::error::TryRecvError::Closed) => return true,
         }
     }
 }

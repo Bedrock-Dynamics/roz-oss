@@ -20,7 +20,7 @@ impl TickLatency {
     }
 
     #[must_use]
-    pub fn as_duration(self) -> Duration {
+    pub const fn as_duration(self) -> Duration {
         Duration::from_micros(self.0)
     }
 }
@@ -94,7 +94,7 @@ impl ControllerEvidenceBundle {
     }
 
     /// Update the typed verification status.
-    pub fn set_verifier_status(&mut self, status: VerifierStatus) {
+    pub const fn set_verifier_status(&mut self, status: VerifierStatus) {
         self.verifier_status = status;
     }
 
@@ -112,19 +112,19 @@ impl ControllerEvidenceBundle {
 
     /// Tick latency p50 as a typed duration.
     #[must_use]
-    pub fn tick_latency_p50(&self) -> Duration {
+    pub const fn tick_latency_p50(&self) -> Duration {
         self.tick_latency_p50.as_duration()
     }
 
     /// Tick latency p95 as a typed duration.
     #[must_use]
-    pub fn tick_latency_p95(&self) -> Duration {
+    pub const fn tick_latency_p95(&self) -> Duration {
         self.tick_latency_p95.as_duration()
     }
 
     /// Tick latency p99 as a typed duration.
     #[must_use]
-    pub fn tick_latency_p99(&self) -> Duration {
+    pub const fn tick_latency_p99(&self) -> Duration {
         self.tick_latency_p99.as_duration()
     }
 

@@ -66,7 +66,7 @@ pub struct EventEnvelope {
 /// Mirrors the public `SessionEventEnvelope` wire shape closely enough that
 /// relays can move between NATS JSON and gRPC proto without going back through
 /// ad hoc message families.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalSessionEventEnvelope {
     pub event_id: String,
     pub correlation_id: String,
@@ -115,7 +115,7 @@ impl CanonicalSessionEventEnvelope {
 
 impl SessionEvent {
     #[must_use]
-    pub fn resume_summary(summary: super::snapshot::SessionSnapshot) -> Self {
+    pub const fn resume_summary(summary: super::snapshot::SessionSnapshot) -> Self {
         Self::ResumeSummaryReady { summary }
     }
 

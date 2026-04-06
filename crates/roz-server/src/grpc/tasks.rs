@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 use sqlx::PgPool;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
@@ -44,7 +46,7 @@ impl TaskServiceImpl {
         }
     }
 
-    async fn authenticated_tenant_id<T>(&self, request: &Request<T>) -> Result<Uuid, Status> {
+    async fn authenticated_tenant_id<T: Sync>(&self, request: &Request<T>) -> Result<Uuid, Status> {
         let auth_header = request
             .metadata()
             .get("authorization")
@@ -73,7 +75,7 @@ fn status_update(task_id: Uuid, status: String, detail: Option<String>) -> TaskS
         detail,
         timestamp: Some(prost_types::Timestamp {
             seconds: now.timestamp(),
-            nanos: now.timestamp_subsec_nanos() as i32,
+            nanos: now.timestamp_subsec_nanos().cast_signed(),
         }),
     }
 }
@@ -114,6 +116,11 @@ pub(crate) fn prost_struct_to_json(s: prost_types::Struct) -> serde_json::Value 
 }
 
 /// Convert a protobuf `Value` into a `serde_json::Value`.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 pub(crate) fn prost_value_to_json(v: prost_types::Value) -> serde_json::Value {
     match v.kind {
         Some(prost_types::value::Kind::NumberValue(n)) => {
@@ -174,6 +181,7 @@ fn validate_child_task_delegation_scope(
     Ok(())
 }
 
+#[allow(clippy::missing_const_for_fn)]
 fn approval_resolved_team_event(
     task_id: Uuid,
     approved: bool,
@@ -210,6 +218,7 @@ async fn publish_parent_approval_event(
 // TaskService trait implementation
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 #[tonic::async_trait]
 impl TaskService for TaskServiceImpl {
     async fn create_task(&self, request: Request<CreateTaskRequest>) -> Result<Response<Task>, Status> {

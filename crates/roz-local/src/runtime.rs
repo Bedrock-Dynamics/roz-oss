@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -179,7 +180,7 @@ fn resolve_base_url(manifest_url: &str) -> String {
 }
 
 /// Resolve the permission mode from `ROZ_PERMISSION_MODE` env var.
-fn default_permission_mode(is_interactive: bool) -> PermissionMode {
+const fn default_permission_mode(is_interactive: bool) -> PermissionMode {
     if is_interactive {
         PermissionMode::Ask
     } else {
@@ -289,6 +290,7 @@ impl ModeTransitionAssessment {
     }
 }
 
+#[allow(clippy::fn_params_excessive_bools)]
 fn assess_embodied_mode_readiness(
     has_connections: bool,
     has_embodiment_manifest: bool,
@@ -296,7 +298,7 @@ fn assess_embodied_mode_readiness(
     has_world_state_tools: bool,
     controller_estop_reason: Option<&str>,
     trust_posture: &TrustPosture,
-    telemetry_freshness: FreshnessState,
+    telemetry_freshness: &FreshnessState,
 ) -> ModeTransitionAssessment {
     if !has_connections {
         return ModeTransitionAssessment::react("no connected embodied environment");
@@ -319,10 +321,9 @@ fn assess_embodied_mode_readiness(
             "controller safety interlock active: {reason}; clear e-stop before entering OodaReAct"
         ));
     }
-    if telemetry_freshness != FreshnessState::Fresh {
+    if *telemetry_freshness != FreshnessState::Fresh {
         return ModeTransitionAssessment::react(format!(
-            "telemetry freshness is {:?}; OodaReAct requires fresh runtime telemetry and heartbeat",
-            telemetry_freshness
+            "telemetry freshness is {telemetry_freshness:?}; OodaReAct requires fresh runtime telemetry and heartbeat"
         ));
     }
     if trust_posture.physical_execution_trust < TrustLevel::High {
@@ -387,7 +388,7 @@ impl TurnExecutor for LocalTurnExecutor<'_> {
         &mut self,
         prepared: roz_agent::session_runtime::PreparedTurn,
     ) -> roz_agent::session_runtime::TurnFuture<'_> {
-        let prepared_agent_mode: AgentLoopMode = prepared.cognition_mode().into();
+        let prepared_agent_mode: AgentLoopMode = prepared.cognition_mode();
         let user_msg = prepared.user_message;
         debug_assert!(
             !prepared.system_blocks.is_empty(),
@@ -633,7 +634,7 @@ impl LocalRuntime {
             mode: SessionMode::Local,
             cognition_mode: roz_core::session::control::CognitionMode::React,
             constitution_text: String::new(),
-            blueprint_toml: blueprint_toml.clone(),
+            blueprint_toml,
             model_name: Some(effective_model_name.clone()),
             permissions: Vec::new(),
             tool_schemas: Vec::new(),
@@ -689,7 +690,7 @@ impl LocalRuntime {
             mode: SessionMode::Local,
             cognition_mode: roz_core::session::control::CognitionMode::React,
             constitution_text: String::new(),
-            blueprint_toml: blueprint_toml.clone(),
+            blueprint_toml,
             model_name: Some(effective_model_name.clone()),
             permissions: Vec::new(),
             tool_schemas: Vec::new(),
@@ -800,7 +801,7 @@ impl LocalRuntime {
             DockerSpatialProvider::supports_runtime_world_state(&tools),
             self.controller_estop_reason().as_deref(),
             &state.trust_posture,
-            state.telemetry_freshness.clone(),
+            &state.telemetry_freshness,
         )
     }
 
@@ -888,7 +889,7 @@ impl LocalRuntime {
                 tools.len(),
             );
             if let Some(blocker) = self.mode_transition_blocker() {
-                status.push_str(&format!("; OodaReAct blocked: {blocker}"));
+                let _ = write!(status, "; OodaReAct blocked: {blocker}");
             }
             status
         }
@@ -964,7 +965,7 @@ impl LocalRuntime {
         let robot_manifest = self.load_embodiment_manifest();
         let authoritative_embodiment_runtime = robot_manifest
             .as_ref()
-            .and_then(|manifest| manifest.authoritative_embodiment_runtime());
+            .and_then(roz_core::manifest::EmbodimentManifest::authoritative_embodiment_runtime);
 
         // Register daemon REST tools if [daemon] section present.
         // These register as Physical — the PermissionGuard in the safety stack
@@ -1008,7 +1009,7 @@ impl LocalRuntime {
         {
             let replay_tool = crate::tools::replay_controller::ReplayControllerTool::new(&control_manifest);
             dispatcher.register_with_category(Box::new(replay_tool), ToolCategory::Pure);
-            extensions.insert(control_manifest.clone());
+            extensions.insert(control_manifest);
 
             if let Some(ref handle) = self.copper_handle {
                 extensions.insert(handle.cmd_tx());
@@ -1078,6 +1079,7 @@ impl LocalRuntime {
                 reason.clone(),
                 Some("world_state_ready".into()),
             );
+            drop(runtime);
             return Err(RuntimeError::ModeTransitionBlocked(reason));
         }
         let spatial: Box<dyn WorldStateProvider> = if let Some(context) = primed_spatial_context.clone() {
@@ -1104,14 +1106,14 @@ impl LocalRuntime {
 
         let turn_input = TurnInput {
             user_message: user_message.to_string(),
-            cognition_mode: mode.into(),
+            cognition_mode: mode,
             custom_context: Vec::new(),
             volatile_blocks: Vec::new(),
         };
 
         let turn_output = {
             let mut runtime = self.session_runtime.lock().await;
-            runtime.sync_cognition_mode(mode.into());
+            runtime.sync_cognition_mode(mode);
             runtime.sync_prompt_surface(constitution, tool_schemas, project_context);
             runtime.sync_world_state_with_note(primed_spatial_context, world_state_note);
             runtime
@@ -1144,6 +1146,7 @@ impl LocalRuntime {
     }
 
     /// The non-streaming `run_turn()` is unchanged — `exec` mode continues to use it.
+    #[allow(clippy::too_many_lines)]
     pub async fn run_turn_streaming(&mut self, user_message: &str) -> Result<TurnHandle, RuntimeError> {
         let model = (self.model_factory)().map_err(RuntimeError::Model)?;
         let assessment = self.assess_mode_transition();
@@ -1179,6 +1182,7 @@ impl LocalRuntime {
                 reason.clone(),
                 Some("world_state_ready".into()),
             );
+            drop(runtime);
             return Err(RuntimeError::ModeTransitionBlocked(reason));
         }
         let spatial: Box<dyn WorldStateProvider> = if let Some(context) = primed_spatial_context.clone() {
@@ -1191,7 +1195,7 @@ impl LocalRuntime {
         let project_context: Vec<String> = prepare_prompt.get(1..).unwrap_or_default().to_vec();
         let turn_input = TurnInput {
             user_message: user_message.to_string(),
-            cognition_mode: mode.into(),
+            cognition_mode: mode,
             custom_context: Vec::new(),
             volatile_blocks: Vec::new(),
         };
@@ -1227,7 +1231,7 @@ impl LocalRuntime {
             project_dir: self.project_dir.clone(),
             session_id: self.session_id.clone(),
             cancel: cancel.clone(),
-            output_slot: output_slot.clone(),
+            output_slot,
             stream_chunks_to: Some(chunk_tx),
             stream_presence_to: Some(presence_tx),
         };
@@ -1237,7 +1241,7 @@ impl LocalRuntime {
         let join = tokio::spawn(async move {
             let result = {
                 let mut runtime = session_runtime.lock().await;
-                runtime.sync_cognition_mode(mode.into());
+                runtime.sync_cognition_mode(mode);
                 runtime.sync_prompt_surface(constitution, tool_schemas, project_context);
                 runtime.sync_world_state_with_note(primed_spatial_context, world_state_note);
                 runtime.run_turn_streaming(turn_input, None, &mut executor).await
@@ -1561,7 +1565,7 @@ name = "llama3.1"
     #[test]
     fn mode_assessment_requires_embodiment_backing() {
         let assessment =
-            assess_embodied_mode_readiness(true, false, true, true, None, &high_trust(), FreshnessState::Fresh);
+            assess_embodied_mode_readiness(true, false, true, true, None, &high_trust(), &FreshnessState::Fresh);
         assert_eq!(assessment.mode, AgentLoopMode::React);
         assert!(
             assessment
@@ -1582,11 +1586,11 @@ name = "llama3.1"
             true,
             None,
             &TrustPosture::default(),
-            FreshnessState::Unknown,
+            &FreshnessState::Unknown,
         );
         assert_eq!(blocked.mode, AgentLoopMode::React);
 
-        let ready = assess_embodied_mode_readiness(true, true, true, true, None, &high_trust(), FreshnessState::Fresh);
+        let ready = assess_embodied_mode_readiness(true, true, true, true, None, &high_trust(), &FreshnessState::Fresh);
         assert_eq!(ready.mode, AgentLoopMode::OodaReAct);
     }
 
@@ -1599,7 +1603,7 @@ name = "llama3.1"
             true,
             Some("watchdog tripped"),
             &high_trust(),
-            FreshnessState::Fresh,
+            &FreshnessState::Fresh,
         );
         assert_eq!(blocked.mode, AgentLoopMode::React);
         assert!(

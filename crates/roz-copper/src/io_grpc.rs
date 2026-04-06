@@ -5,6 +5,8 @@
 //! stub that will forward joint commands once the bridge exposes a
 //! `SendJointCommand` RPC.
 
+#![allow(clippy::missing_const_for_fn)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -165,7 +167,7 @@ impl GrpcActuatorSink {
         format!("copper-{}", uuid::Uuid::new_v4())
     }
 
-    fn is_actuator_channel(interface_type: &CommandInterfaceType) -> bool {
+    const fn is_actuator_channel(interface_type: &CommandInterfaceType) -> bool {
         matches!(
             interface_type,
             CommandInterfaceType::JointPosition
@@ -203,7 +205,7 @@ impl GrpcActuatorSink {
             })
     }
 
-    fn is_actuator_binding(binding_type: &BindingType) -> bool {
+    const fn is_actuator_binding(binding_type: &BindingType) -> bool {
         matches!(
             binding_type,
             BindingType::JointPosition
@@ -251,8 +253,7 @@ impl GrpcActuatorSink {
                         usize::try_from(binding.channel_index).ok() == Some(index)
                             && Self::is_actuator_binding(&binding.binding_type)
                     })
-                    .map(|binding| binding.physical_name.as_str())
-                    .unwrap_or(channel.name.as_str());
+                    .map_or(channel.name.as_str(), |binding| binding.physical_name.as_str());
                 Self::normalize_bridge_joint_name(robot_class, bound_name)
             })
             .collect()
@@ -373,13 +374,13 @@ impl ActuatorSink for GrpcActuatorSink {
             match client.send_joint_command(request).await {
                 Ok(response) => {
                     let inner = response.into_inner();
-                    if !inner.success {
+                    if inner.success {
+                        *error_message.lock() = None;
+                    } else {
                         tracing::warn!(error = inner.error, "SendJointCommand returned error");
                         control_acquired.store(false, Ordering::Relaxed);
                         error_flag.store(true, Ordering::Relaxed);
                         *error_message.lock() = Some(inner.error);
-                    } else {
-                        *error_message.lock() = None;
                     }
                 }
                 Err(e) => {

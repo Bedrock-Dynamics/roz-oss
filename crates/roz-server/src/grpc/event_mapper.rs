@@ -9,6 +9,8 @@
 //!    into `SessionResponse::SessionEvent`. Canonical envelopes are the default
 //!    gRPC transport for all session lifecycle and turn events.
 
+#![allow(clippy::too_many_lines, clippy::unnecessary_wraps)]
+
 use chrono::Utc;
 use roz_core::session::event::{
     CanonicalSessionEventEnvelope, CorrelationId, EventEnvelope, EventId, SessionEvent, SessionPermissionRule,
@@ -54,7 +56,7 @@ fn json_struct_proto<T: serde::Serialize>(value: &T) -> prost_types::Struct {
     super::convert::value_to_struct(value)
 }
 
-fn verifier_verdict_kind(verdict: &roz_core::controller::verification::VerifierVerdict) -> &'static str {
+const fn verifier_verdict_kind(verdict: &roz_core::controller::verification::VerifierVerdict) -> &'static str {
     match verdict {
         roz_core::controller::verification::VerifierVerdict::Pass { .. } => "pass",
         roz_core::controller::verification::VerifierVerdict::Fail { .. } => "fail",
@@ -129,10 +131,10 @@ fn typed_event_proto(event: &SessionEvent) -> Option<roz_v1::session_event_envel
             message_id,
         } => Some(roz_v1::session_event_envelope::TypedEvent::TurnFinished(
             roz_v1::TurnFinishedPayload {
-                input_tokens: u32::try_from(*input_tokens).unwrap_or(u32::MAX),
-                output_tokens: u32::try_from(*output_tokens).unwrap_or(u32::MAX),
-                cache_creation_tokens: u32::try_from(*cache_creation_tokens).unwrap_or(u32::MAX),
-                cache_read_tokens: u32::try_from(*cache_read_tokens).unwrap_or(u32::MAX),
+                input_tokens: *input_tokens,
+                output_tokens: *output_tokens,
+                cache_creation_tokens: *cache_creation_tokens,
+                cache_read_tokens: *cache_read_tokens,
                 stop_reason: stop_reason.clone(),
                 message_id: Some(message_id.clone()),
             },

@@ -1,5 +1,7 @@
 //! Session state types for `SessionRuntime`.
 
+#![allow(clippy::map_unwrap_or, clippy::missing_const_for_fn)]
+
 use chrono::{DateTime, Utc};
 use roz_core::blueprint::RuntimeBlueprint;
 use roz_core::edge_health::EdgeTransportHealth;

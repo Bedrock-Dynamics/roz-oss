@@ -28,7 +28,7 @@ impl DelegationScope {
     ///
     /// This intentionally fails closed: no allowed tools and no trust inheritance.
     #[must_use]
-    pub fn fail_closed() -> Self {
+    pub const fn fail_closed() -> Self {
         let untrusted = TrustPosture {
             workspace_trust: TrustLevel::Untrusted,
             host_trust: TrustLevel::Untrusted,

@@ -51,7 +51,7 @@ pub async fn publish_team_event(
         seq,
         timestamp_ns: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos() as u64)
+            .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
             .unwrap_or(0),
         event: event.clone(),
     })

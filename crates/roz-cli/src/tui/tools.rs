@@ -12,7 +12,7 @@ use roz_core::manifest::EmbodimentManifest;
 use roz_core::tools::{ToolCategory, ToolResult, ToolSchema};
 use serde_json::{Value, json};
 
-fn is_actuator_channel(interface_type: &CommandInterfaceType) -> bool {
+const fn is_actuator_channel(interface_type: &CommandInterfaceType) -> bool {
     matches!(
         interface_type,
         CommandInterfaceType::JointPosition
@@ -89,78 +89,79 @@ pub fn build_all_tools_with_copper(project_dir: &Path) -> AllTools {
     let mut copper_handle = None;
     let evidence_archive = EvidenceArchive::new(project_dir);
 
-    if let Ok(manifest) = EmbodimentManifest::load_from_project_dir(project_dir) {
-        if let Some(control_manifest) = manifest.control_interface_manifest() {
-            let replay_tool = roz_local::tools::replay_controller::ReplayControllerTool::new(&control_manifest);
-            dispatcher.register_with_category(Box::new(replay_tool), ToolCategory::Pure);
-            extensions.insert(evidence_archive);
-            extensions.insert(control_manifest.clone());
-            if let Some(embodiment_runtime) = manifest.authoritative_embodiment_runtime() {
-                extensions.insert(embodiment_runtime);
-            }
+    if let Ok(manifest) = EmbodimentManifest::load_from_project_dir(project_dir)
+        && let Some(control_manifest) = manifest.control_interface_manifest()
+    {
+        let replay_tool = roz_local::tools::replay_controller::ReplayControllerTool::new(&control_manifest);
+        dispatcher.register_with_category(Box::new(replay_tool), ToolCategory::Pure);
+        extensions.insert(evidence_archive);
+        extensions.insert(control_manifest.clone());
+        if let Some(embodiment_runtime) = manifest.authoritative_embodiment_runtime() {
+            extensions.insert(embodiment_runtime);
+        }
 
-            if let Some(ref daemon) = manifest.daemon
-                && let Some(ref ws_config) = daemon.websocket
-            {
-                // Build WS URL from daemon base_url + websocket path.
-                let ws_url = format!(
-                    "{}{}",
-                    daemon
-                        .base_url
-                        .replace("http://", "ws://")
-                        .replace("https://", "wss://"),
-                    ws_config.path,
-                );
-                let body_template = ws_config.set_target_body.clone().expect(
-                    "embodiment manifest [daemon.websocket] must have set_target_body when [channels] is present",
-                );
+        if let Some(ref daemon) = manifest.daemon
+            && let Some(ref ws_config) = daemon.websocket
+        {
+            // Build WS URL from daemon base_url + websocket path.
+            let ws_url = format!(
+                "{}{}",
+                daemon
+                    .base_url
+                    .replace("http://", "ws://")
+                    .replace("https://", "wss://"),
+                ws_config.path,
+            );
+            let body_template = ws_config
+                .set_target_body
+                .clone()
+                .expect("embodiment manifest [daemon.websocket] must have set_target_body when [channels] is present");
 
-                let bridge_config = roz_copper::io_ws::WsBridgeConfig {
-                    url: ws_url,
-                    set_target_type: ws_config.set_target_type.clone().unwrap_or_default(),
-                    body_template,
-                    channel_names: control_manifest
-                        .channels
-                        .iter()
-                        .filter(|channel| is_actuator_channel(&channel.interface_type))
-                        .map(|channel| channel.name.clone())
-                        .collect(),
-                    channel_defaults: control_manifest
-                        .channels
-                        .iter()
-                        .filter(|channel| is_actuator_channel(&channel.interface_type))
-                        .map(|_| 0.0)
-                        .collect(),
-                };
+            let bridge_config = roz_copper::io_ws::WsBridgeConfig {
+                url: ws_url,
+                set_target_type: ws_config.set_target_type.clone().unwrap_or_default(),
+                body_template,
+                channel_names: control_manifest
+                    .channels
+                    .iter()
+                    .filter(|channel| is_actuator_channel(&channel.interface_type))
+                    .map(|channel| channel.name.clone())
+                    .collect(),
+                channel_defaults: control_manifest
+                    .channels
+                    .iter()
+                    .filter(|channel| is_actuator_channel(&channel.interface_type))
+                    .map(|_| 0.0)
+                    .collect(),
+            };
 
-                // Create WS bridge on the current tokio runtime.
-                let rt = tokio::runtime::Handle::current();
-                let (actuator, sensor, _supervisor) = roz_copper::io_ws::create_ws_bridge(bridge_config, &rt);
+            // Create WS bridge on the current tokio runtime.
+            let rt = tokio::runtime::Handle::current();
+            let (actuator, sensor, _supervisor) = roz_copper::io_ws::create_ws_bridge(bridge_config, &rt);
 
-                // Spawn Copper with IO backends.
-                let handle = roz_copper::handle::CopperHandle::spawn_with_io(
-                    1.5,
-                    Some(actuator as Arc<dyn roz_copper::io::ActuatorSink>),
-                    Some(sensor as Box<dyn roz_copper::io::SensorSource>),
-                );
+            // Spawn Copper with IO backends.
+            let handle = roz_copper::handle::CopperHandle::spawn_with_io(
+                1.5,
+                Some(actuator as Arc<dyn roz_copper::io::ActuatorSink>),
+                Some(sensor as Box<dyn roz_copper::io::SensorSource>),
+            );
 
-                // Inject into Extensions for tool access.
-                extensions.insert(handle.cmd_tx());
-                extensions.insert(Arc::clone(handle.state()) as Arc<ArcSwap<roz_copper::channels::ControllerState>>);
+            // Inject into Extensions for tool access.
+            extensions.insert(handle.cmd_tx());
+            extensions.insert(Arc::clone(handle.state()) as Arc<ArcSwap<roz_copper::channels::ControllerState>>);
 
-                // Register controller tools.
-                dispatcher.register_with_category(
-                    Box::new(roz_local::tools::stop_controller::StopControllerTool),
-                    ToolCategory::Physical,
-                );
-                dispatcher.register_with_category(
-                    Box::new(roz_local::tools::controller_status::GetControllerStatusTool),
-                    ToolCategory::Pure,
-                );
+            // Register controller tools.
+            dispatcher.register_with_category(
+                Box::new(roz_local::tools::stop_controller::StopControllerTool),
+                ToolCategory::Physical,
+            );
+            dispatcher.register_with_category(
+                Box::new(roz_local::tools::controller_status::GetControllerStatusTool),
+                ToolCategory::Pure,
+            );
 
-                tracing::info!("copper WASM pipeline spawned with WS bridge");
-                copper_handle = Some(handle);
-            }
+            tracing::info!("copper WASM pipeline spawned with WS bridge");
+            copper_handle = Some(handle);
         }
     }
 

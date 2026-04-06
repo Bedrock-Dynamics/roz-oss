@@ -83,15 +83,12 @@ impl PromoteControllerTool {
         control_manifest: &roz_core::embodiment::binding::ControlInterfaceManifest,
         control_rate_hz: Option<f64>,
     ) -> Self {
-        let rate_text = control_rate_hz
-            .map(|hz| format!("{hz:.0} Hz"))
-            .unwrap_or_else(|| "the configured rate".to_string());
+        let rate_text = control_rate_hz.map_or_else(|| "the configured rate".to_string(), |hz| format!("{hz:.0} Hz"));
         let mut desc = format!(
-            "Promote a WASM controller through the lifecycle to the real-time Copper loop ({}). \
+            "Promote a WASM controller through the lifecycle to the real-time Copper loop ({rate_text}). \
              The submitted controller must already be a valid WebAssembly component for the \
              checked-in `live-controller` WIT world. Promotion verifies that exact component \
-             artifact for {VERIFY_TICK_COUNT} ticks and then registers it through deployment stages.\n\n",
-            rate_text
+             artifact for {VERIFY_TICK_COUNT} ticks and then registers it through deployment stages.\n\n"
         );
 
         desc.push_str("Command channels (write via TickOutput.command_values[index]):\n");
@@ -162,6 +159,7 @@ impl TypedToolExecutor for PromoteControllerTool {
         &self.description
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
         input: Self::Input,
@@ -320,7 +318,7 @@ fn run_lifecycle(
         &code_sha256,
         manifest_digest,
         embodiment_metadata,
-        verdict.clone(),
+        verdict,
     );
     artifact.evidence_bundle_id = Some(real_evidence.bundle_id.clone());
     let mut lifecycle = ControllerLifecycle::new();
@@ -407,6 +405,7 @@ fn summarize_events(events: &[SessionEvent]) -> Vec<String> {
 /// safety limits using the tick contract.
 ///
 /// Designed to run inside `spawn_blocking` because wasmtime is CPU-bound.
+#[allow(clippy::too_many_lines)]
 fn verify_wasm(
     controller_id: &str,
     code: &[u8],

@@ -1005,7 +1005,7 @@ struct TuiStreamingTurnExecutor<'a> {
 
 impl StreamingTurnExecutor for TuiStreamingTurnExecutor<'_> {
     fn execute_turn_streaming(&mut self, prepared: PreparedTurn) -> StreamingTurnHandle<'_> {
-        let prepared_agent_mode: AgentLoopMode = prepared.cognition_mode().into();
+        let prepared_agent_mode: AgentLoopMode = prepared.cognition_mode();
         debug_assert!(
             !prepared.system_blocks.is_empty(),
             "SessionRuntime should always provide system blocks"
@@ -1183,7 +1183,7 @@ impl LocalByokRuntimeSession {
             .await;
 
         match result {
-            Ok(StreamingTurnResult::Completed(_)) | Ok(StreamingTurnResult::Cancelled) => {
+            Ok(StreamingTurnResult::Completed(_) | StreamingTurnResult::Cancelled) => {
                 let _ = forwarder.await;
                 Ok(())
             }

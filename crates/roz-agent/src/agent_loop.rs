@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_lines)]
+
 use crate::context::ContextManager;
 use crate::dispatch::{ToolContext, ToolDispatcher};
 use crate::error::AgentError;
@@ -1384,7 +1386,7 @@ impl AgentLoop {
         }
     }
 
-    fn json_value_kind(value: &serde_json::Value) -> &'static str {
+    const fn json_value_kind(value: &serde_json::Value) -> &'static str {
         match value {
             serde_json::Value::Null => "null",
             serde_json::Value::Bool(_) => "bool",

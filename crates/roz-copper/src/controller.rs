@@ -8,6 +8,22 @@
 //! using the structured tick contract ([`TickInput`]/[`TickOutput`]),
 //! applies safety filtering, and publishes state via `ArcSwap`.
 
+#![allow(
+    clippy::assigning_clones,
+    clippy::collapsible_if,
+    clippy::map_unwrap_or,
+    clippy::missing_const_for_fn,
+    clippy::missing_fields_in_debug,
+    clippy::needless_pass_by_value,
+    clippy::redundant_clone,
+    clippy::redundant_closure_for_method_calls,
+    clippy::ref_option,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::unnecessary_to_owned,
+    clippy::useless_let_if_seq
+)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -1054,8 +1070,7 @@ fn tick_controller(
 
 fn fallback_limit_span(interface_type: &CommandInterfaceType) -> f64 {
     match interface_type {
-        CommandInterfaceType::JointVelocity => std::f64::consts::TAU,
-        CommandInterfaceType::JointPosition => std::f64::consts::TAU,
+        CommandInterfaceType::JointVelocity | CommandInterfaceType::JointPosition => std::f64::consts::TAU,
         CommandInterfaceType::JointTorque | CommandInterfaceType::GripperForce => 100.0,
         CommandInterfaceType::GripperPosition => 0.2,
         CommandInterfaceType::ForceTorqueSensor | CommandInterfaceType::ImuSensor => 2.0,

@@ -27,6 +27,7 @@ use roz_core::embodiment::{EmbodimentRuntime, binding::ControlInterfaceManifest}
 
 /// Commands from the agent to the Copper controller.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum ControllerCommand {
     /// Load a verified WASM controller artifact with its compiled bytecode.
     ///
@@ -110,6 +111,7 @@ impl ControllerCommand {
 /// Unlike [`ControllerCommand`], this can carry a fully prepared controller
 /// slot that has already been compiled and validated off the control thread.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum CopperRuntimeCommand {
     PreparedArtifact(crate::controller::PreparedController),
     PromoteActive,

@@ -7,6 +7,16 @@
 //!
 //! Messages use JSON envelopes for debuggability (not protobuf binary).
 
+#![allow(
+    clippy::collapsible_if,
+    clippy::match_same_arms,
+    clippy::needless_pass_by_value,
+    clippy::redundant_clone,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::type_complexity
+)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -93,7 +103,7 @@ struct EdgeSessionSpatialProvider {
 }
 
 impl EdgeSessionSpatialProvider {
-    fn new(camera_manager: Option<Arc<CameraManager>>) -> Self {
+    const fn new(camera_manager: Option<Arc<CameraManager>>) -> Self {
         Self { camera_manager }
     }
 
@@ -321,7 +331,7 @@ fn sync_edge_runtime_surface(
     let registered_tools = flatten_registered_edge_tools(registered_tool_sources);
     let (constitution_text, tool_schemas, session_permissions) =
         edge_turn_prompt_state(session_mode, camera_manager, &registered_tools);
-    session_runtime.sync_cognition_mode(session_mode.into());
+    session_runtime.sync_cognition_mode(session_mode);
     session_runtime.sync_prompt_surface(constitution_text, tool_schemas, session_project_context.to_vec());
     session_runtime.sync_permissions(session_permissions);
 }
@@ -446,7 +456,7 @@ impl StreamingTurnExecutor for EdgeTurnExecutor {
         let nats = self.nats.clone();
         let turn_cancel = self.turn_cancel.clone();
         let mut estop_rx = self.estop_rx.clone();
-        let mode: AgentLoopMode = prepared.cognition_mode().into();
+        let mode: AgentLoopMode = prepared.cognition_mode();
         let system_prompt = prepared.system_blocks.into_iter().map(|block| block.content).collect();
         let seed = AgentInputSeed::new(system_prompt, prepared.history, prepared.user_message);
 
@@ -637,11 +647,7 @@ async fn handle_edge_session(
 ) -> anyhow::Result<()> {
     let response_subject = Subjects::session_response(worker_id, session_id)?;
     let bootstrap = parse_runtime_bootstrap(session_id, &start_msg)?;
-    let session_mode = parse_edge_session_mode(
-        &start_msg,
-        bootstrap.cognition_mode().into(),
-        config.max_velocity.is_some(),
-    );
+    let session_mode = parse_edge_session_mode(&start_msg, bootstrap.cognition_mode(), config.max_velocity.is_some());
     let model_name = bootstrap
         .model_name
         .as_deref()
@@ -690,13 +696,13 @@ async fn handle_edge_session(
     let mut session_runtime = SessionRuntime::from_bootstrap(
         bootstrap,
         SessionRuntimeBootstrapImport {
-            cognition_mode_override: Some(session_mode.into()),
+            cognition_mode_override: Some(session_mode),
             constitution_text_override: Some(constitution_text.clone()),
             blueprint_version_override: None,
             tool_schemas_override: Some(tool_schemas.clone()),
         },
     );
-    session_runtime.sync_cognition_mode(session_mode.into());
+    session_runtime.sync_cognition_mode(session_mode);
     session_runtime.sync_prompt_surface(constitution_text, tool_schemas, session_project_context.clone());
     session_runtime.sync_permissions(session_permissions.clone());
     let prompt_staging = session_runtime.turn_prompt_staging();
@@ -820,7 +826,7 @@ async fn handle_edge_session(
                     let turn_future = session_runtime.run_turn_streaming(
                         roz_agent::session_runtime::TurnInput {
                             user_message: user_text,
-                            cognition_mode: session_mode.into(),
+                            cognition_mode: session_mode,
                             custom_context,
                             volatile_blocks,
                         },
@@ -919,7 +925,7 @@ async fn handle_edge_session(
                 };
 
                 match turn_result {
-                    Ok(StreamingTurnResult::Completed(_)) | Ok(StreamingTurnResult::Cancelled) => {
+                    Ok(StreamingTurnResult::Completed(_) | StreamingTurnResult::Cancelled) => {
                         if pending_surface_resync {
                             sync_edge_runtime_surface(
                                 &mut session_runtime,
@@ -1021,11 +1027,10 @@ async fn drain_runtime_events(
             Ok(envelope) => {
                 publish_event_envelope(nats, session_id, response_subject, &envelope).await?;
             }
-            Err(broadcast::error::TryRecvError::Empty) => return Ok(()),
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => return Ok(()),
             Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
                 tracing::warn!(session_id, skipped, "edge session event stream lagged");
             }
-            Err(broadcast::error::TryRecvError::Closed) => return Ok(()),
         }
     }
 }
@@ -1106,7 +1111,7 @@ fn apply_runtime_event_to_checkpoint(bootstrap: &mut SessionRuntimeBootstrap, ev
     }
 }
 
-fn approval_checkpoint_event(event: &SessionEvent) -> bool {
+const fn approval_checkpoint_event(event: &SessionEvent) -> bool {
     matches!(
         event,
         SessionEvent::ApprovalRequested { .. } | SessionEvent::ApprovalResolved { .. }

@@ -212,7 +212,7 @@ impl HostContext {
     }
 
     /// Set the runtime execution mode for the current tick.
-    pub fn set_execution_mode(&mut self, execution_mode: ExecutionMode) {
+    pub const fn set_execution_mode(&mut self, execution_mode: ExecutionMode) {
         self.execution_mode = execution_mode;
     }
 
@@ -271,7 +271,7 @@ impl HostContext {
     }
 }
 
-fn runtime_mode_to_wit(mode: ExecutionMode) -> live_controller::bedrock::controller::runtime::ExecutionMode {
+const fn runtime_mode_to_wit(mode: ExecutionMode) -> live_controller::bedrock::controller::runtime::ExecutionMode {
     match mode {
         ExecutionMode::Live => live_controller::bedrock::controller::runtime::ExecutionMode::Live,
         ExecutionMode::Replay => live_controller::bedrock::controller::runtime::ExecutionMode::Replay,

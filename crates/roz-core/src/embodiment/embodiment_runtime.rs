@@ -171,6 +171,7 @@ pub struct TickInputProjection {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct SensorReachability {
     pub sensor_id: String,
     pub actuated: bool,
@@ -444,7 +445,11 @@ impl EmbodimentRuntime {
                 .iter()
                 .map(|anchor| anchor.confidence.clamp(0.0, 1.0)),
         );
-        (!samples.is_empty()).then(|| samples.iter().sum::<f64>() / samples.len() as f64)
+        (!samples.is_empty()).then(|| {
+            let sample_count =
+                f64::from(u32::try_from(samples.len()).expect("observation sample count exceeds u32::MAX"));
+            samples.iter().sum::<f64>() / sample_count
+        })
     }
 
     fn link_frame_for_frame(&self, frame_id: &str) -> Option<String> {
@@ -560,7 +565,7 @@ impl EmbodimentRuntime {
         (transforms, validation_issues)
     }
 
-    fn overlay_snapshot_tree(&self, snapshot: &FrameGraphSnapshot) -> (FrameTree, Vec<String>) {
+    fn overlay_snapshot_tree(snapshot: &FrameGraphSnapshot) -> (FrameTree, Vec<String>) {
         let mut projection_tree = snapshot.frame_tree.clone();
         let mut validation_issues = Vec::new();
         for transform in &snapshot.dynamic_transforms {
@@ -729,7 +734,7 @@ impl EmbodimentRuntime {
     }
 
     #[must_use]
-    pub fn uses_legacy_watched_frame_inference(&self) -> bool {
+    pub const fn uses_legacy_watched_frame_inference(&self) -> bool {
         !self.model.has_declared_watched_frames() && !self.watched_frames.is_empty()
     }
 
@@ -912,6 +917,7 @@ impl EmbodimentRuntime {
         [q.w, q.i, q.j, q.k]
     }
 
+    #[allow(clippy::missing_const_for_fn)]
     fn vector3(value: [f64; 3]) -> Vector3<f64> {
         Vector3::new(value[0], value[1], value[2])
     }
@@ -1033,9 +1039,9 @@ impl EmbodimentRuntime {
         let blended_q = start_q.slerp(&end_q, alpha);
         Transform3D {
             translation: [
-                start.translation[0] + (end.translation[0] - start.translation[0]) * alpha,
-                start.translation[1] + (end.translation[1] - start.translation[1]) * alpha,
-                start.translation[2] + (end.translation[2] - start.translation[2]) * alpha,
+                (end.translation[0] - start.translation[0]).mul_add(alpha, start.translation[0]),
+                (end.translation[1] - start.translation[1]).mul_add(alpha, start.translation[1]),
+                (end.translation[2] - start.translation[2]).mul_add(alpha, start.translation[2]),
             ],
             rotation: Self::quaternion_array(&blended_q),
             timestamp_ns: end.timestamp_ns,
@@ -1060,16 +1066,14 @@ impl EmbodimentRuntime {
                 model.model_digest, model_digest
             ));
         }
-        model.model_digest = model_digest.clone();
+        model.model_digest.clone_from(&model_digest);
         let calibration_digest = calibration
             .as_ref()
             .filter(|overlay| overlay.is_valid_for_model(&model_digest))
-            .map(|overlay| overlay.calibration_digest.clone())
-            .unwrap_or_else(|| "none".to_string());
+            .map_or_else(|| "none".to_string(), |overlay| overlay.calibration_digest.clone());
         let safety_digest = safety_overlay
             .as_ref()
-            .map(|overlay| overlay.overlay_digest.clone())
-            .unwrap_or_else(|| "none".to_string());
+            .map_or_else(|| "none".to_string(), |overlay| overlay.overlay_digest.clone());
         let valid_calibration = calibration
             .as_ref()
             .filter(|overlay| overlay.is_valid_for_model(&model_digest));
@@ -1276,7 +1280,7 @@ impl EmbodimentRuntime {
 
     /// Whether the currently bound calibration is valid for this runtime.
     #[must_use]
-    pub fn calibration_valid(&self) -> bool {
+    pub const fn calibration_valid(&self) -> bool {
         self.calibration.is_none() || self.active_calibration_id.is_some()
     }
 
@@ -1317,7 +1321,7 @@ impl EmbodimentRuntime {
             .get(frame_id)
             .cloned()
             .unwrap_or(FreshnessState::Unknown);
-        let (projection_tree, validation_issues) = self.overlay_snapshot_tree(snapshot);
+        let (projection_tree, validation_issues) = Self::overlay_snapshot_tree(snapshot);
         if !projection_tree.frame_exists(frame_id) {
             return Err(format!("frame `{frame_id}` missing from snapshot frame tree"));
         }
@@ -1543,8 +1547,9 @@ impl EmbodimentRuntime {
         let min_margin_m = match (has_allowed_zone, allowed_margin, restricted_clearance) {
             (true, Some(allowed_margin), Some(restricted_clearance)) => Some(allowed_margin.min(restricted_clearance)),
             (true, Some(allowed_margin), None) => Some(allowed_margin),
-            (true, None, Some(restricted_clearance)) => Some(restricted_clearance),
-            (false, _, Some(restricted_clearance)) => Some(restricted_clearance),
+            (true, None, Some(restricted_clearance)) | (false, _, Some(restricted_clearance)) => {
+                Some(restricted_clearance)
+            }
             _ => None,
         };
 
@@ -1695,7 +1700,7 @@ impl EmbodimentRuntime {
             tcp_name: tcp.name.clone(),
             current_pose,
             target_pose,
-            workspace: workspace.clone(),
+            workspace,
             translation_error_m,
             orientation_error_rad,
             jacobian_rank,
@@ -1714,6 +1719,7 @@ impl EmbodimentRuntime {
     /// Uses a damped-least-squares Jacobian step, clamps the result to joint
     /// limits, and evaluates both the target and projected pose against the
     /// runtime workspace envelope.
+    #[allow(clippy::too_many_lines)]
     pub fn plan_tcp_step(
         &self,
         tcp_name: &str,
@@ -1808,10 +1814,11 @@ impl EmbodimentRuntime {
             1.0
         };
 
-        let mut proposed_joint_positions = current_joint_positions.clone();
+        let mut proposed_joint_positions = current_joint_positions;
         for (delta, joint_index) in delta_q.iter().zip(chain_indices.iter()) {
             let limits = &self.model.joints[*joint_index].limits;
-            proposed_joint_positions[*joint_index] = (proposed_joint_positions[*joint_index] + (*delta * scale))
+            proposed_joint_positions[*joint_index] = (*delta)
+                .mul_add(scale, proposed_joint_positions[*joint_index])
                 .clamp(limits.position_min, limits.position_max);
         }
 
@@ -1849,8 +1856,8 @@ impl EmbodimentRuntime {
             target_pose: target_pose_resolved,
             projected_pose,
             proposed_joint_positions,
-            target_workspace: target_workspace.clone(),
-            projected_workspace: projected_workspace.clone(),
+            target_workspace,
+            projected_workspace,
             remaining_translation_error_m,
             remaining_orientation_error_rad,
             jacobian_rank,
@@ -1864,6 +1871,7 @@ impl EmbodimentRuntime {
     }
 
     /// Iteratively solve toward a TCP target pose using bounded Jacobian steps.
+    #[allow(clippy::too_many_arguments)]
     pub fn solve_tcp_ik(
         &self,
         tcp_name: &str,
@@ -1894,7 +1902,7 @@ impl EmbodimentRuntime {
 
         for _ in 0..max_iterations {
             let plan = self.plan_tcp_step(tcp_name, &working_joints, target_pose, relative_to, max_joint_step)?;
-            working_joints = plan.proposed_joint_positions.clone();
+            working_joints.clone_from(&plan.proposed_joint_positions);
             alerts.extend(plan.alerts.iter().cloned());
             let converged = plan.remaining_translation_error_m <= translation_tolerance_m
                 && plan.remaining_orientation_error_rad <= orientation_tolerance_rad;
@@ -1959,7 +1967,7 @@ impl EmbodimentRuntime {
                 iterations: 0,
                 final_joint_positions: working_joints,
                 final_pose,
-                final_workspace: final_workspace.clone(),
+                final_workspace,
                 remaining_translation_error_m: Self::vector3(remaining_delta.translation).norm(),
                 remaining_orientation_error_rad: Self::scaled_axis(remaining_delta.rotation).norm(),
                 conditioning: Self::classify_conditioning(min_singular_value),
@@ -1972,6 +1980,7 @@ impl EmbodimentRuntime {
     }
 
     /// Plan a multi-waypoint TCP trajectory by solving incremental IK targets.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn plan_tcp_trajectory(
         &self,
         tcp_name: &str,
@@ -2015,7 +2024,8 @@ impl EmbodimentRuntime {
         let mut alerts = Vec::new();
 
         for index in 1..=waypoint_count {
-            let alpha = index as f64 / waypoint_count as f64;
+            let alpha = f64::from(u32::try_from(index).expect("waypoint index exceeds u32::MAX"))
+                / f64::from(u32::try_from(waypoint_count).expect("waypoint count exceeds u32::MAX"));
             let waypoint_pose = Self::interpolate_transform(&start_pose.transform, target_pose, alpha);
             let solution = self.solve_tcp_ik(
                 tcp_name,
@@ -2027,7 +2037,7 @@ impl EmbodimentRuntime {
                 translation_tolerance_m,
                 orientation_tolerance_rad,
             )?;
-            working_joints = solution.final_joint_positions.clone();
+            working_joints.clone_from(&solution.final_joint_positions);
             alerts.extend(solution.alerts.iter().cloned());
             waypoint_summaries.push(TrajectoryWaypointSummary {
                 waypoint_index: index,
@@ -2114,7 +2124,7 @@ impl EmbodimentRuntime {
         relative_to: Option<&str>,
     ) -> Result<WorkspaceFrameEvaluation, String> {
         let pose = self.resolve_frame_pose(snapshot, frame_id, relative_to)?;
-        let (projection_tree, _) = self.overlay_snapshot_tree(snapshot);
+        let (projection_tree, _) = Self::overlay_snapshot_tree(snapshot);
         let mut matches = Vec::new();
         for zone in self.workspace_envelope().zones {
             if !projection_tree.frame_exists(&zone.origin_frame) {
@@ -2232,8 +2242,9 @@ impl EmbodimentRuntime {
         let min_margin_m = match (has_allowed_zone, allowed_margin, restricted_clearance) {
             (true, Some(allowed_margin), Some(restricted_clearance)) => Some(allowed_margin.min(restricted_clearance)),
             (true, Some(allowed_margin), None) => Some(allowed_margin),
-            (true, None, Some(restricted_clearance)) => Some(restricted_clearance),
-            (false, _, Some(restricted_clearance)) => Some(restricted_clearance),
+            (true, None, Some(restricted_clearance)) | (false, _, Some(restricted_clearance)) => {
+                Some(restricted_clearance)
+            }
             _ => None,
         };
 
@@ -2347,8 +2358,9 @@ impl EmbodimentRuntime {
                     Some(allowed_margin.min(restricted_clearance))
                 }
                 (true, Some(allowed_margin), None) => Some(allowed_margin),
-                (true, None, Some(restricted_clearance)) => Some(restricted_clearance),
-                (false, _, Some(restricted_clearance)) => Some(restricted_clearance),
+                (true, None, Some(restricted_clearance)) | (false, _, Some(restricted_clearance)) => {
+                    Some(restricted_clearance)
+                }
                 _ => None,
             };
 
@@ -2382,6 +2394,7 @@ impl EmbodimentRuntime {
     /// This keeps snapshot materialization, watched-pose projection, and derived-feature
     /// computation inside `EmbodimentRuntime`. Surfaces that still own transport-specific
     /// tick contract types can adapt this projection at the final boundary.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_tick_input_projection(
         &self,
         tick: u64,
@@ -2478,7 +2491,7 @@ impl EmbodimentRuntime {
             );
         };
 
-        let (projection_tree, mut validation_issues) = self.overlay_snapshot_tree(snapshot);
+        let (projection_tree, mut validation_issues) = Self::overlay_snapshot_tree(snapshot);
 
         let watched_frames = if snapshot.watched_frames.is_empty() {
             &self.watched_frames

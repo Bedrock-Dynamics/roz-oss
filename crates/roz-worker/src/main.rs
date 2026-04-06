@@ -61,8 +61,7 @@ fn classify_terminal_status(
         let detail = output
             .as_ref()
             .err()
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "task timed out".to_string());
+            .map_or_else(|| "task timed out".to_string(), ToString::to_string);
         return (TaskTerminalStatus::TimedOut, Some(detail));
     }
 
@@ -152,7 +151,7 @@ fn agent_error_to_turn_execution_failure(error: AgentError) -> TurnExecutionFail
     }
 }
 
-fn session_runtime_error_to_agent_error(error: SessionRuntimeError, estop_active: bool) -> AgentError {
+fn session_runtime_error_to_agent_error(error: &SessionRuntimeError, estop_active: bool) -> AgentError {
     match error {
         SessionRuntimeError::SessionPaused => AgentError::Safety("session paused".into()),
         SessionRuntimeError::SessionCompleted => AgentError::Internal(anyhow::anyhow!("session already completed")),
@@ -279,7 +278,7 @@ async fn consume_team_approval_events(
 
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => break,
+            () = cancel.cancelled() => break,
             maybe_msg = messages.next() => {
                 let Some(message) = maybe_msg else { break; };
                 let msg = match message {
@@ -292,12 +291,9 @@ async fn consume_team_approval_events(
                 if let Err(error) = msg.ack().await {
                     tracing::warn!(%error, %approval_owner_task_id, task_id = %worker_task_id, "failed to ack team approval event");
                 }
-                let event = match decode_team_event_payload(&msg.payload) {
-                    Some(event) => event,
-                    None => {
-                        tracing::warn!(%approval_owner_task_id, task_id = %worker_task_id, "failed to decode team approval event");
-                        continue;
-                    }
+                let Some(event) = decode_team_event_payload(&msg.payload) else {
+                    tracing::warn!(%approval_owner_task_id, task_id = %worker_task_id, "failed to decode team approval event");
+                    continue;
                 };
                 if let TeamEvent::WorkerApprovalResolved {
                     worker_id,
@@ -646,7 +642,7 @@ async fn execute_task(
                 tracing::error!(task_id = %task_id, "E-STOP during task execution");
                 drop(copper_handle.take());
             }
-            Err(session_runtime_error_to_agent_error(error, *estop_rx.borrow()))
+            Err(session_runtime_error_to_agent_error(&error, *estop_rx.borrow()))
         }
         Err(_) => {
             timed_out = true;

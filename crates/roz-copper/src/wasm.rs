@@ -181,7 +181,7 @@ fn validate_module_contract(module: &Module) -> anyhow::Result<()> {
             }
             ("safety", "request_estop") => validate_import_signature(&func, &[], &[]),
             ("runtime", "execution_mode") => validate_import_signature(&func, &[], &[ValType::I32]),
-            ("math", "sin") | ("math", "cos") => validate_import_signature(&func, &[ValType::F64], &[ValType::F64]),
+            ("math", "sin" | "cos") => validate_import_signature(&func, &[ValType::F64], &[ValType::F64]),
             _ => anyhow::bail!("unsupported host import `{module_name}::{import_name}`"),
         };
 

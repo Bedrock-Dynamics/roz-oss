@@ -31,6 +31,7 @@ impl CopperSpatialProvider {
 
 #[async_trait]
 impl WorldStateProvider for CopperSpatialProvider {
+    #[allow(clippy::too_many_lines)]
     async fn snapshot(&self, _task_id: &str) -> WorldState {
         let current = self.state.load();
 

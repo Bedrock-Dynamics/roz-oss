@@ -232,7 +232,7 @@ impl EmbodimentModel {
 
     /// Whether the model explicitly declares a runtime-owned watched-frame set.
     #[must_use]
-    pub fn has_declared_watched_frames(&self) -> bool {
+    pub const fn has_declared_watched_frames(&self) -> bool {
         !self.watched_frames.is_empty()
     }
 

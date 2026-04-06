@@ -4,6 +4,8 @@
 //! counts, then finalizes into a [`ControllerEvidenceBundle`] suitable for
 //! promotion gating and audit trails.
 
+#![allow(clippy::too_many_arguments)]
+
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 

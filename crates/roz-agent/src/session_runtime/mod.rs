@@ -4,6 +4,13 @@
 //! instead of directly instantiating `AgentLoop`. The turn lifecycle
 //! (`run_turn`, `start_session`, etc.) drives `AgentLoop` execution.
 
+#![allow(
+    clippy::missing_const_for_fn,
+    clippy::single_match_else,
+    clippy::too_many_lines,
+    clippy::useless_conversion
+)]
+
 pub mod events;
 pub mod state;
 
@@ -1086,10 +1093,7 @@ impl SessionRuntime {
     }
 
     /// Run a single streaming turn and emit canonical streamed events from the runtime.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "streaming lifecycle owns several concurrent event channels"
-    )]
+    #[allow(clippy::too_many_lines)]
     pub async fn run_turn_streaming(
         &mut self,
         input: TurnInput,

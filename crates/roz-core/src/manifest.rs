@@ -424,11 +424,11 @@ impl EmbodimentManifest {
             .iter()
             .enumerate()
             .map(|(channel_index, (def, _, binding_type))| ChannelBinding {
-                physical_name: (*def).name.clone(),
-                channel_index: channel_index as u32,
+                physical_name: def.name.clone(),
+                channel_index: u32::try_from(channel_index).expect("control manifest channel count exceeds u32::MAX"),
                 binding_type: binding_type.clone(),
                 frame_id: def.frame_id.clone(),
-                units: (*def).unit.clone(),
+                units: def.unit.clone(),
                 semantic_role: None,
             })
             .collect();
@@ -506,10 +506,8 @@ impl EmbodimentManifest {
             .filter_map(|binding| {
                 let joint_type = match binding.binding_type {
                     BindingType::JointPosition => JointType::Revolute,
-                    BindingType::JointVelocity => JointType::Continuous,
-                    BindingType::Command => JointType::Continuous,
-                    BindingType::GripperPosition => JointType::Prismatic,
-                    BindingType::GripperForce => JointType::Prismatic,
+                    BindingType::JointVelocity | BindingType::Command => JointType::Continuous,
+                    BindingType::GripperPosition | BindingType::GripperForce => JointType::Prismatic,
                     BindingType::ForceTorque
                     | BindingType::ImuOrientation
                     | BindingType::ImuAngularVelocity

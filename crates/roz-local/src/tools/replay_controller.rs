@@ -77,16 +77,13 @@ impl ReplayControllerTool {
         control_manifest: &roz_core::embodiment::binding::ControlInterfaceManifest,
         control_rate_hz: Option<f64>,
     ) -> Self {
-        let rate_text = control_rate_hz
-            .map(|hz| format!("{hz:.0} Hz"))
-            .unwrap_or_else(|| "the configured rate".to_string());
+        let rate_text = control_rate_hz.map_or_else(|| "the configured rate".to_string(), |hz| format!("{hz:.0} Hz"));
         let mut desc = format!(
             "Replay a candidate controller offline against a recorded trace captured from the \
-             live controller contract ({}). This does not actuate hardware. It runs the \
+             live controller contract ({rate_text}). This does not actuate hardware. It runs the \
              controller on the provided replay trace, compares outputs according to the \
              selected replay mode, and archives the finalized replay evidence bundle when an \
-             evidence archive is configured.\n\n",
-            rate_text
+             evidence archive is configured.\n\n"
         );
 
         desc.push_str("Control channels (tick-output.command_values[index]):\n");
@@ -170,30 +167,29 @@ impl TypedToolExecutor for ReplayControllerTool {
         let runtime_digests = RuntimeDigests {
             controller_digest: hex::encode(Sha256::digest(&code_bytes)),
             wit_world_version: trace.verification_key.wit_world_version.clone(),
-            model_digest: embodiment_metadata
-                .as_ref()
-                .map(|metadata| metadata.model_digest.clone())
-                .unwrap_or_else(|| trace.verification_key.model_digest.clone()),
-            calibration_digest: embodiment_metadata
-                .as_ref()
-                .map(|metadata| metadata.calibration_digest.clone())
-                .unwrap_or_else(|| trace.verification_key.calibration_digest.clone()),
+            model_digest: embodiment_metadata.as_ref().map_or_else(
+                || trace.verification_key.model_digest.clone(),
+                |metadata| metadata.model_digest.clone(),
+            ),
+            calibration_digest: embodiment_metadata.as_ref().map_or_else(
+                || trace.verification_key.calibration_digest.clone(),
+                |metadata| metadata.calibration_digest.clone(),
+            ),
             manifest_digest,
             execution_mode: ExecutionMode::Replay,
             compiler_version: trace.verification_key.compiler_version.clone(),
         };
 
         let replay_mode = input.mode.unwrap_or(ReplayControllerMode::RegressionTest);
-        let engine = if let Some(archive) = ctx.extensions.get::<EvidenceArchive>().cloned() {
-            ReplayEngine::new(replay_mode.into()).with_evidence_archive(archive)
-        } else {
-            ReplayEngine::new(replay_mode.into())
-        };
+        let engine = ctx.extensions.get::<EvidenceArchive>().cloned().map_or_else(
+            || ReplayEngine::new(replay_mode.into()),
+            |archive| ReplayEngine::new(replay_mode.into()).with_evidence_archive(archive),
+        );
 
         let result = engine.replay_with(&trace, &runtime_digests, |tick_input| {
             task.host_context_mut().set_execution_mode(ExecutionMode::Replay);
             task.tick_with_contract(tick_input.tick, Some(tick_input))
-                .map(|output| output.unwrap_or_default())
+                .map(Option::unwrap_or_default)
                 .map_err(|error| error.to_string())
         });
         let evidence = result.evidence;
@@ -210,14 +206,14 @@ impl TypedToolExecutor for ReplayControllerTool {
             "mismatch_count": result.mismatches.len(),
             "verifier": {
                 "status": evidence.verifier_status.to_string(),
-                "reason": evidence.verifier_reason.clone(),
+                "reason": &evidence.verifier_reason,
             },
             "evidence": {
-                "bundle_id": evidence.bundle_id.clone(),
+                "bundle_id": &evidence.bundle_id,
                 "path": evidence_path,
                 "frame_snapshot_id": evidence.frame_snapshot_id,
-                "execution_mode": evidence.execution_mode.clone(),
-                "state_freshness": evidence.state_freshness.clone(),
+                "execution_mode": &evidence.execution_mode,
+                "state_freshness": &evidence.state_freshness,
             },
             "embodiment_family": embodiment_metadata.and_then(|metadata| metadata.embodiment_family),
         })))

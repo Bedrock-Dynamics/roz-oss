@@ -1,3 +1,5 @@
+#![allow(clippy::missing_const_for_fn, clippy::option_if_let_else)]
+
 use async_trait::async_trait;
 use roz_core::spatial::WorldState;
 use std::sync::{Arc, Mutex};
@@ -181,7 +183,8 @@ impl PrimedWorldStateProvider {
 #[async_trait]
 impl WorldStateProvider for PrimedWorldStateProvider {
     async fn snapshot(&self, task_id: &str) -> WorldState {
-        if let Some(context) = self.primed.lock().expect("primed spatial mutex poisoned").take() {
+        let primed = self.primed.lock().expect("primed spatial mutex poisoned").take();
+        if let Some(context) = primed {
             context
         } else {
             self.inner.snapshot(task_id).await
