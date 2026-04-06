@@ -510,7 +510,7 @@ impl Drop for GrpcActuatorSink {
                     return;
                 }
                 LeaseState::Owned => {
-                    *state = LeaseState::Idle;
+                    *state = LeaseState::DropRequested;
                 }
             }
         }
@@ -870,6 +870,19 @@ mod tests {
             !sink.had_error(),
             "local validation should fail before any background RPC"
         );
+    }
+
+    #[tokio::test]
+    async fn grpc_actuator_sink_drop_marks_owned_lease_for_release() {
+        let channel = tonic::transport::Channel::from_static("http://127.0.0.1:9999").connect_lazy();
+        let sink = GrpcActuatorSink::new(channel, vec!["j1".into()], tokio::runtime::Handle::current());
+        let lease_state = Arc::clone(&sink.lease_state);
+        *sink.lease_state.lock() = LeaseState::Owned;
+
+        drop(sink);
+        tokio::task::yield_now().await;
+
+        assert_eq!(*lease_state.lock(), LeaseState::DropRequested);
     }
 
     #[tokio::test]
