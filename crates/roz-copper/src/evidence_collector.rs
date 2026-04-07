@@ -324,6 +324,7 @@ impl EvidenceCollector {
             .collect();
 
         let steady_state_reached = self.steady_state_ticks >= STEADY_STATE_THRESHOLD;
+        let idle_output_stable = !self.command_oscillation_detected && steady_state_reached;
 
         ControllerEvidenceBundle {
             bundle_id: Uuid::new_v4().to_string(),
@@ -345,7 +346,7 @@ impl EvidenceCollector {
             tick_latency_p99: p99.into(),
             controller_stability_summary: StabilitySummary {
                 command_oscillation_detected: self.command_oscillation_detected,
-                idle_output_stable: !self.command_oscillation_detected,
+                idle_output_stable,
                 runtime_jitter_us: jitter_us,
                 missed_tick_count: self.missed_tick_count,
                 steady_state_reached,
@@ -514,6 +515,7 @@ mod tests {
 
         assert!(!bundle.controller_stability_summary.steady_state_reached);
         assert!(bundle.controller_stability_summary.command_oscillation_detected);
+        assert!(!bundle.controller_stability_summary.idle_output_stable);
     }
 
     #[test]
@@ -528,6 +530,7 @@ mod tests {
 
         assert!(bundle.controller_stability_summary.steady_state_reached);
         assert!(!bundle.controller_stability_summary.command_oscillation_detected);
+        assert!(bundle.controller_stability_summary.idle_output_stable);
     }
 
     #[test]
@@ -545,6 +548,7 @@ mod tests {
         let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
 
         assert!(!bundle.controller_stability_summary.steady_state_reached);
+        assert!(!bundle.controller_stability_summary.idle_output_stable);
     }
 
     #[test]
