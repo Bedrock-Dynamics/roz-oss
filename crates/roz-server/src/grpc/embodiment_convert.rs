@@ -656,3 +656,563 @@ impl From<roz_v1::CameraFrustum> for CameraFrustum {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- Geometry primitive tests --
+
+    #[test]
+    fn vec3_roundtrip() {
+        let domain = [1.5, -2.3, 0.0];
+        let proto = roz_v1::Vec3::from(&domain);
+        assert_eq!(proto.x, 1.5);
+        assert_eq!(proto.y, -2.3);
+        assert_eq!(proto.z, 0.0);
+        let back: [f64; 3] = proto.into();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn quaternion_identity_roundtrip() {
+        // WXYZ: [w=1, x=0, y=0, z=0]
+        let domain = [1.0, 0.0, 0.0, 0.0];
+        let proto = roz_v1::Quaternion::from(&domain);
+        // Proto should be XYZW: x=0, y=0, z=0, w=1
+        assert_eq!(proto.w, 1.0);
+        assert_eq!(proto.x, 0.0);
+        assert_eq!(proto.y, 0.0);
+        assert_eq!(proto.z, 0.0);
+        let back: [f64; 4] = proto.into();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn quaternion_nontrivial_roundtrip() {
+        // 45-degree rotation around Z: w=cos(pi/4), x=0, y=0, z=sin(pi/4)
+        let c = std::f64::consts::FRAC_PI_4.cos();
+        let s = std::f64::consts::FRAC_PI_4.sin();
+        let domain = [c, 0.0, 0.0, s]; // WXYZ
+        let proto = roz_v1::Quaternion::from(&domain);
+        // Proto x should NOT be 1.0 (would indicate wrong index mapping)
+        assert!(proto.x.abs() < f64::EPSILON, "proto.x should be 0, got {}", proto.x);
+        assert!((proto.w - c).abs() < f64::EPSILON);
+        assert!((proto.z - s).abs() < f64::EPSILON);
+        let back: [f64; 4] = proto.into();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn transform3d_roundtrip_identity() {
+        let domain = Transform3D::identity();
+        let proto = roz_v1::Transform3D::from(&domain);
+        let back = Transform3D::try_from(proto).unwrap();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn transform3d_roundtrip_nontrivial() {
+        let domain = Transform3D {
+            translation: [1.0, 2.0, 3.0],
+            rotation: [0.707, 0.0, 0.707, 0.0],
+            timestamp_ns: 42,
+        };
+        let proto = roz_v1::Transform3D::from(&domain);
+        let back = Transform3D::try_from(proto).unwrap();
+        assert_eq!(back.translation, domain.translation);
+        assert_eq!(back.rotation, domain.rotation);
+        assert_eq!(back.timestamp_ns, domain.timestamp_ns);
+    }
+
+    #[test]
+    fn transform3d_missing_translation_errors() {
+        let proto = roz_v1::Transform3D {
+            translation: None,
+            rotation: Some(roz_v1::Quaternion {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                w: 1.0,
+            }),
+            timestamp_ns: 0,
+        };
+        let err = Transform3D::try_from(proto).unwrap_err();
+        assert!(err.to_string().contains("missing required field"));
+        assert!(err.to_string().contains("translation"));
+    }
+
+    #[test]
+    fn transform3d_missing_rotation_errors() {
+        let proto = roz_v1::Transform3D {
+            translation: Some(roz_v1::Vec3 { x: 0.0, y: 0.0, z: 0.0 }),
+            rotation: None,
+            timestamp_ns: 0,
+        };
+        let err = Transform3D::try_from(proto).unwrap_err();
+        assert!(err.to_string().contains("missing required field"));
+        assert!(err.to_string().contains("rotation"));
+    }
+
+    #[test]
+    fn inertial_roundtrip() {
+        let domain = Inertial {
+            mass: 5.0,
+            center_of_mass: [0.1, -0.2, 0.15],
+        };
+        let proto = roz_v1::Inertial::from(&domain);
+        let back = Inertial::try_from(proto).unwrap();
+        assert_eq!(back.mass, domain.mass);
+        assert_eq!(back.center_of_mass, domain.center_of_mass);
+    }
+
+    #[test]
+    fn inertial_missing_center_of_mass_errors() {
+        let proto = roz_v1::Inertial {
+            mass: 5.0,
+            center_of_mass: None,
+        };
+        let err = Inertial::try_from(proto).unwrap_err();
+        assert!(err.to_string().contains("missing required field"));
+        assert!(err.to_string().contains("center_of_mass"));
+    }
+
+    // -- Enum tests --
+
+    #[test]
+    fn joint_type_all_variants_roundtrip() {
+        let cases = [
+            JointType::Revolute,
+            JointType::Prismatic,
+            JointType::Fixed,
+            JointType::Continuous,
+        ];
+        for jt in &cases {
+            let proto = domain_joint_type_to_proto(jt);
+            let back = proto_to_domain_joint_type(proto).unwrap();
+            assert_eq!(&back, jt);
+        }
+    }
+
+    #[test]
+    fn joint_type_unspecified_rejected() {
+        let result = proto_to_domain_joint_type(0);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("invalid enum value"));
+        assert!(err.to_string().contains("JointType"));
+    }
+
+    #[test]
+    fn tcp_type_all_variants_roundtrip() {
+        let cases = [TcpType::Gripper, TcpType::Tool, TcpType::Sensor, TcpType::Custom];
+        for tt in &cases {
+            let proto = domain_tcp_type_to_proto(tt);
+            let back = proto_to_domain_tcp_type(proto).unwrap();
+            assert_eq!(&back, tt);
+        }
+    }
+
+    #[test]
+    fn sensor_type_all_variants_roundtrip() {
+        let cases = [
+            SensorType::JointState,
+            SensorType::ForceTorque,
+            SensorType::Imu,
+            SensorType::Camera,
+            SensorType::PointCloud,
+            SensorType::Other,
+        ];
+        for st in &cases {
+            let proto = domain_sensor_type_to_proto(st);
+            let back = proto_to_domain_sensor_type(proto).unwrap();
+            assert_eq!(&back, st);
+        }
+    }
+
+    #[test]
+    fn zone_type_all_variants_roundtrip() {
+        let cases = [ZoneType::Allowed, ZoneType::Restricted, ZoneType::HumanPresence];
+        for zt in &cases {
+            let proto = domain_zone_type_to_proto(zt);
+            let back = proto_to_domain_zone_type(proto).unwrap();
+            assert_eq!(&back, zt);
+        }
+    }
+
+    #[test]
+    fn frame_source_all_variants_roundtrip() {
+        let cases = [FrameSource::Static, FrameSource::Dynamic, FrameSource::Computed];
+        for fs in &cases {
+            let proto = domain_frame_source_to_proto(fs);
+            let back = proto_to_domain_frame_source(proto).unwrap();
+            assert_eq!(&back, fs);
+        }
+    }
+
+    #[test]
+    fn binding_type_all_variants_roundtrip() {
+        let cases = [
+            BindingType::JointPosition,
+            BindingType::JointVelocity,
+            BindingType::ForceTorque,
+            BindingType::Command,
+            BindingType::GripperPosition,
+            BindingType::GripperForce,
+            BindingType::ImuOrientation,
+            BindingType::ImuAngularVelocity,
+            BindingType::ImuLinearAcceleration,
+        ];
+        for bt in &cases {
+            let proto = domain_binding_type_to_proto(bt);
+            let back = proto_to_domain_binding_type(proto).unwrap();
+            assert_eq!(&back, bt);
+        }
+    }
+
+    #[test]
+    fn command_interface_type_all_variants_roundtrip() {
+        let cases = [
+            CommandInterfaceType::JointVelocity,
+            CommandInterfaceType::JointPosition,
+            CommandInterfaceType::JointTorque,
+            CommandInterfaceType::GripperPosition,
+            CommandInterfaceType::GripperForce,
+            CommandInterfaceType::ForceTorqueSensor,
+            CommandInterfaceType::ImuSensor,
+        ];
+        for ct in &cases {
+            let proto = domain_command_interface_type_to_proto(ct);
+            let back = proto_to_domain_command_interface_type(proto).unwrap();
+            assert_eq!(&back, ct);
+        }
+    }
+
+    // -- Oneof tests --
+
+    #[test]
+    fn geometry_box_roundtrip() {
+        let domain = Geometry::Box {
+            half_extents: [0.5, 1.0, 1.5],
+        };
+        let proto = roz_v1::Geometry::from(&domain);
+        let back = Geometry::try_from(proto).unwrap();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn geometry_sphere_roundtrip() {
+        let domain = Geometry::Sphere { radius: 0.42 };
+        let proto = roz_v1::Geometry::from(&domain);
+        let back = Geometry::try_from(proto).unwrap();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn geometry_cylinder_roundtrip() {
+        let domain = Geometry::Cylinder {
+            radius: 0.1,
+            length: 0.5,
+        };
+        let proto = roz_v1::Geometry::from(&domain);
+        let back = Geometry::try_from(proto).unwrap();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn geometry_mesh_roundtrip_with_scale() {
+        let domain = Geometry::Mesh {
+            path: "meshes/arm.stl".into(),
+            scale: Some([0.001, 0.001, 0.001]),
+        };
+        let proto = roz_v1::Geometry::from(&domain);
+        let back = Geometry::try_from(proto).unwrap();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn geometry_mesh_roundtrip_no_scale() {
+        let domain = Geometry::Mesh {
+            path: "meshes/arm.stl".into(),
+            scale: None,
+        };
+        let proto = roz_v1::Geometry::from(&domain);
+        let back = Geometry::try_from(proto).unwrap();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn geometry_missing_shape_errors() {
+        let proto = roz_v1::Geometry { shape: None };
+        let err = Geometry::try_from(proto).unwrap_err();
+        assert!(err.to_string().contains("missing oneof variant"));
+        assert!(err.to_string().contains("Geometry.shape"));
+    }
+
+    #[test]
+    fn workspace_shape_all_variants_roundtrip() {
+        let cases = [
+            WorkspaceShape::Box {
+                half_extents: [1.0, 2.0, 3.0],
+            },
+            WorkspaceShape::Sphere { radius: 1.5 },
+            WorkspaceShape::Cylinder {
+                radius: 0.5,
+                half_height: 1.0,
+            },
+        ];
+        for ws in &cases {
+            let proto = roz_v1::WorkspaceShape::from(ws);
+            let back = WorkspaceShape::try_from(proto).unwrap();
+            assert_eq!(&back, ws);
+        }
+    }
+
+    #[test]
+    fn workspace_shape_missing_shape_errors() {
+        let proto = roz_v1::WorkspaceShape { shape: None };
+        let err = WorkspaceShape::try_from(proto).unwrap_err();
+        assert!(err.to_string().contains("missing oneof variant"));
+        assert!(err.to_string().contains("WorkspaceShape.shape"));
+    }
+
+    #[test]
+    fn semantic_role_manipulator_joint_roundtrip() {
+        let domain = SemanticRole::PrimaryManipulatorJoint { index: 3 };
+        let proto = roz_v1::SemanticRole::from(&domain);
+        let back = SemanticRole::try_from(proto).unwrap();
+        assert_eq!(back, domain);
+
+        let domain2 = SemanticRole::SecondaryManipulatorJoint { index: 1 };
+        let proto2 = roz_v1::SemanticRole::from(&domain2);
+        let back2 = SemanticRole::try_from(proto2).unwrap();
+        assert_eq!(back2, domain2);
+    }
+
+    #[test]
+    fn semantic_role_empty_variants_roundtrip() {
+        let cases = [
+            SemanticRole::PrimaryGripper,
+            SemanticRole::SecondaryGripper,
+            SemanticRole::BaseTranslation,
+            SemanticRole::BaseRotation,
+            SemanticRole::HeadPan,
+            SemanticRole::HeadTilt,
+            SemanticRole::PrimaryCamera,
+            SemanticRole::WristCamera,
+            SemanticRole::ForceTorqueSensor,
+        ];
+        for sr in &cases {
+            let proto = roz_v1::SemanticRole::from(sr);
+            let back = SemanticRole::try_from(proto).unwrap();
+            assert_eq!(&back, sr);
+        }
+    }
+
+    #[test]
+    fn semantic_role_custom_roundtrip() {
+        let domain = SemanticRole::Custom {
+            role: "my_custom_role".into(),
+        };
+        let proto = roz_v1::SemanticRole::from(&domain);
+        let back = SemanticRole::try_from(proto).unwrap();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn semantic_role_missing_role_errors() {
+        let proto = roz_v1::SemanticRole { role: None };
+        let err = SemanticRole::try_from(proto).unwrap_err();
+        assert!(err.to_string().contains("missing oneof variant"));
+        assert!(err.to_string().contains("SemanticRole.role"));
+    }
+
+    // -- Scalar wrapper tests --
+
+    #[test]
+    fn joint_safety_limits_roundtrip_with_torque() {
+        let domain = JointSafetyLimits {
+            joint_name: "shoulder_pitch".into(),
+            max_velocity: 2.0,
+            max_acceleration: 5.0,
+            max_jerk: 50.0,
+            position_min: -3.14,
+            position_max: 3.14,
+            max_torque: Some(40.0),
+        };
+        let proto = roz_v1::JointSafetyLimits::from(&domain);
+        let back = JointSafetyLimits::from(proto);
+        assert_eq!(back.joint_name, domain.joint_name);
+        assert_eq!(back.max_velocity, domain.max_velocity);
+        assert_eq!(back.max_acceleration, domain.max_acceleration);
+        assert_eq!(back.max_jerk, domain.max_jerk);
+        assert_eq!(back.position_min, domain.position_min);
+        assert_eq!(back.position_max, domain.position_max);
+        assert_eq!(back.max_torque, Some(40.0));
+    }
+
+    #[test]
+    fn joint_safety_limits_roundtrip_no_torque() {
+        let domain = JointSafetyLimits {
+            joint_name: "wrist".into(),
+            max_velocity: 3.0,
+            max_acceleration: 10.0,
+            max_jerk: 100.0,
+            position_min: -1.57,
+            position_max: 1.57,
+            max_torque: None,
+        };
+        let proto = roz_v1::JointSafetyLimits::from(&domain);
+        let back = JointSafetyLimits::from(proto);
+        assert_eq!(back.max_torque, None);
+    }
+
+    #[test]
+    fn joint_safety_limits_zero_torque_preserved() {
+        // Critical CONV-03 test: Some(0.0) must NOT become None.
+        let domain = JointSafetyLimits {
+            joint_name: "passive".into(),
+            max_velocity: 1.0,
+            max_acceleration: 2.0,
+            max_jerk: 10.0,
+            position_min: 0.0,
+            position_max: 0.0,
+            max_torque: Some(0.0),
+        };
+        let proto = roz_v1::JointSafetyLimits::from(&domain);
+        assert_eq!(proto.max_torque, Some(0.0));
+        let back = JointSafetyLimits::from(proto);
+        assert_eq!(
+            back.max_torque,
+            Some(0.0),
+            "Some(0.0) must survive roundtrip, not become None"
+        );
+    }
+
+    #[test]
+    fn force_safety_limits_roundtrip() {
+        let domain = ForceSafetyLimits {
+            max_contact_force_n: 80.0,
+            max_contact_torque_nm: 10.0,
+            force_rate_limit: 200.0,
+        };
+        let proto = roz_v1::ForceSafetyLimits::from(&domain);
+        let back = ForceSafetyLimits::from(proto);
+        assert_eq!(back.max_contact_force_n, domain.max_contact_force_n);
+        assert_eq!(back.max_contact_torque_nm, domain.max_contact_torque_nm);
+        assert_eq!(back.force_rate_limit, domain.force_rate_limit);
+    }
+
+    #[test]
+    fn contact_force_envelope_roundtrip() {
+        let domain = ContactForceEnvelope {
+            link_name: "gripper_finger_left".into(),
+            max_normal_force_n: 20.0,
+            max_shear_force_n: 5.0,
+            max_force_rate_n_per_s: 100.0,
+        };
+        let proto = roz_v1::ContactForceEnvelope::from(&domain);
+        let back = ContactForceEnvelope::from(proto);
+        assert_eq!(back.link_name, domain.link_name);
+        assert_eq!(back.max_normal_force_n, domain.max_normal_force_n);
+        assert_eq!(back.max_shear_force_n, domain.max_shear_force_n);
+        assert_eq!(back.max_force_rate_n_per_s, domain.max_force_rate_n_per_s);
+    }
+
+    #[test]
+    fn embodiment_family_roundtrip() {
+        let domain = EmbodimentFamily {
+            family_id: "single_arm_manipulator".into(),
+            description: "Single-arm tabletop manipulator with gripper".into(),
+        };
+        let proto = roz_v1::EmbodimentFamily::from(&domain);
+        let back = EmbodimentFamily::from(proto);
+        assert_eq!(back.family_id, domain.family_id);
+        assert_eq!(back.description, domain.description);
+    }
+
+    #[test]
+    fn collision_pair_roundtrip() {
+        let domain = ("link_a".to_string(), "link_b".to_string());
+        let proto = roz_v1::CollisionPair::from(&domain);
+        assert_eq!(proto.link_a, "link_a");
+        assert_eq!(proto.link_b, "link_b");
+        let back: (String, String) = proto.into();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn camera_frustum_roundtrip_with_resolution() {
+        let domain = CameraFrustum {
+            fov_horizontal_deg: 69.0,
+            fov_vertical_deg: 42.0,
+            near_clip_m: 0.01,
+            far_clip_m: 10.0,
+            resolution: Some((640, 480)),
+        };
+        let proto = roz_v1::CameraFrustum::from(&domain);
+        assert!(proto.resolution.is_some());
+        let back = CameraFrustum::from(proto);
+        assert_eq!(back.fov_horizontal_deg, domain.fov_horizontal_deg);
+        assert_eq!(back.fov_vertical_deg, domain.fov_vertical_deg);
+        assert_eq!(back.near_clip_m, domain.near_clip_m);
+        assert_eq!(back.far_clip_m, domain.far_clip_m);
+        assert_eq!(back.resolution, Some((640, 480)));
+    }
+
+    #[test]
+    fn camera_frustum_roundtrip_no_resolution() {
+        let domain = CameraFrustum {
+            fov_horizontal_deg: 90.0,
+            fov_vertical_deg: 60.0,
+            near_clip_m: 0.1,
+            far_clip_m: 50.0,
+            resolution: None,
+        };
+        let proto = roz_v1::CameraFrustum::from(&domain);
+        assert!(proto.resolution.is_none());
+        let back = CameraFrustum::from(proto);
+        assert_eq!(back.resolution, None);
+    }
+
+    // -- Timestamp helper tests --
+
+    #[test]
+    fn datetime_proto_roundtrip() {
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-01-15T10:30:00.123456789Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let proto = datetime_to_proto(ts);
+        let back = proto_to_datetime(proto).unwrap();
+        assert_eq!(back.timestamp(), ts.timestamp());
+        assert_eq!(back.timestamp_subsec_nanos(), ts.timestamp_subsec_nanos());
+    }
+
+    // -- Error variant tests --
+
+    #[test]
+    fn error_display_messages() {
+        let e1 = EmbodimentConvertError::MissingField("test_field".into());
+        assert!(e1.to_string().contains("missing required field"));
+        assert!(e1.to_string().contains("test_field"));
+
+        let e2 = EmbodimentConvertError::InvalidEnum {
+            type_name: "TestEnum",
+            value: 99,
+        };
+        assert!(e2.to_string().contains("invalid enum value"));
+        assert!(e2.to_string().contains("TestEnum"));
+        assert!(e2.to_string().contains("99"));
+
+        let e3 = EmbodimentConvertError::MissingOneOf("TestField.variant".into());
+        assert!(e3.to_string().contains("missing oneof variant"));
+        assert!(e3.to_string().contains("TestField.variant"));
+
+        let e4 = EmbodimentConvertError::InvalidTimestamp;
+        assert!(e4.to_string().contains("invalid timestamp"));
+    }
+}
