@@ -446,8 +446,8 @@ impl HotPathSafetyFilter {
                 // 4. Position limit check (if current positions available)
                 if let Some(positions) = current_positions
                     && let Some(&pos) = positions.get(i)
-                    && ((pos <= limits.position_min && result_commands[i] < 0.0)
-                        || (pos >= limits.position_max && result_commands[i] > 0.0))
+                    && ((pos <= limits.position_min + POSITION_LIMIT_MARGIN && result_commands[i] < 0.0)
+                        || (pos >= limits.position_max - POSITION_LIMIT_MARGIN && result_commands[i] > 0.0))
                 {
                     interventions.push(SafetyIntervention {
                         channel: limits.joint_name.clone(),
@@ -1035,8 +1035,8 @@ mod tests {
     #[test]
     fn hotpath_position_limit_stop() {
         let mut filter = HotPathSafetyFilter::new(vec![sample_limits("j0")], None, 0.01).unwrap();
-        // Position at max (3.14) + positive velocity → should be zeroed
-        let positions = [3.14];
+        // Position near max within margin + positive velocity → should be zeroed
+        let positions = [3.14 - 0.01];
         let result = filter.filter(&[1.0], Some(&positions), None);
         assert_eq!(result.commands, vec![0.0]);
         assert_eq!(result.interventions.len(), 1);

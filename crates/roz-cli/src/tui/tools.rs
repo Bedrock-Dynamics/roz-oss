@@ -156,7 +156,19 @@ pub fn build_all_tools_with_copper(project_dir: &Path) -> AllTools {
             };
 
             // Create WS bridge on the current tokio runtime.
-            let rt = tokio::runtime::Handle::current();
+            let Ok(rt) = tokio::runtime::Handle::try_current() else {
+                tracing::error!(
+                    manifest_path = %manifest_path.display(),
+                    "no Tokio runtime available for WS bridge; skipping Copper startup"
+                );
+                let schemas = dispatcher.schemas_with_categories();
+                return AllTools {
+                    dispatcher,
+                    schemas,
+                    copper_handle,
+                    extensions,
+                };
+            };
             let (actuator, sensor, _supervisor) = roz_copper::io_ws::create_ws_bridge(bridge_config, &rt);
 
             // Spawn Copper with IO backends.
@@ -730,6 +742,53 @@ path = "/ws/sdk"
         assert!(all.copper_handle.is_none());
         // Only CLI built-ins.
         assert_eq!(all.schemas.len(), 6);
+    }
+
+    #[test]
+    fn copper_skips_websocket_bridge_without_tokio_runtime() {
+        let dir = TempDir::new().unwrap();
+        let toml = r#"
+[robot]
+name = "copper-test"
+description = "test"
+
+[channels]
+robot_id = "test"
+robot_class = "expressive"
+control_rate_hz = 50
+
+[[channels.commands]]
+name = "head_pitch"
+type = "position"
+unit = "rad"
+limits = [-0.35, 0.17]
+
+[[channels.states]]
+name = "head_pitch"
+type = "position"
+unit = "rad"
+limits = [-0.35, 0.17]
+
+[daemon]
+base_url = "http://localhost:19999"
+
+[daemon.websocket]
+path = "/ws/sdk"
+set_target_type = "set_target"
+set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
+"#;
+        write_embodiment_manifest(&dir, toml);
+
+        let all = build_all_tools_with_copper(dir.path());
+
+        assert!(
+            all.copper_handle.is_none(),
+            "missing Tokio runtime should skip Copper startup instead of panicking"
+        );
+        let names: Vec<&str> = all.schemas.iter().map(|(s, _)| s.name.as_str()).collect();
+        assert!(names.contains(&"replay_controller"));
+        assert!(!names.contains(&"stop_controller"));
+        assert!(!names.contains(&"get_controller_status"));
     }
 
     /// Full copper path: websocket + channels -> spawns Copper, registers controller tools.

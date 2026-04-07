@@ -251,7 +251,7 @@ impl EvidenceCollector {
 
         let steady_state_reached = self.steady_state_ticks >= STEADY_STATE_THRESHOLD;
 
-        let mut evidence = ControllerEvidenceBundle {
+        ControllerEvidenceBundle {
             bundle_id: Uuid::new_v4().to_string(),
             controller_id: self.controller_id,
             ticks_run: self.tick_count,
@@ -287,9 +287,7 @@ impl EvidenceCollector {
             compiler_version: compiler_version.to_string(),
             created_at: Utc::now(),
             state_freshness: context.state_freshness.clone(),
-        };
-        evidence.set_verifier_status(VerifierStatus::Pending);
-        evidence
+        }
     }
 }
 

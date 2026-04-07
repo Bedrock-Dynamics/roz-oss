@@ -58,13 +58,32 @@ impl ModeTransitionGuard {
         }
 
         let tokens = Self::alert_tokens(alert);
-        Self::has_keyword(&tokens, "heartbeat")
-            && Self::has_any_keyword(
-                &tokens,
-                &[
-                    "degraded", "lost", "timeout", "timed", "missing", "stale", "offline", "failed",
-                ],
-            )
+        if !Self::has_keyword(&tokens, "heartbeat") {
+            return false;
+        }
+
+        let recovery_signal = Self::has_any_keyword(
+            &tokens,
+            &[
+                "restore",
+                "restored",
+                "restoring",
+                "recovered",
+                "recovery",
+                "healthy",
+                "resolved",
+                "ok",
+            ],
+        );
+        let degraded_signal = Self::has_any_keyword(
+            &tokens,
+            &[
+                "degraded", "lost", "timeout", "timed", "missing", "stale", "offline", "failed",
+            ],
+        );
+        let blocking_context = Self::has_any_keyword(&tokens, &["not", "still", "pending", "error", "failed"]);
+
+        degraded_signal && (!recovery_signal || blocking_context)
     }
 
     fn is_blocking_estop_alert(alert: &Alert) -> bool {
@@ -77,7 +96,12 @@ impl ModeTransitionGuard {
             return false;
         }
 
-        let clear_signal = Self::has_any_keyword(&tokens, &["cleared", "restored", "inactive", "released", "resolved"]);
+        let clear_signal = Self::has_any_keyword(&tokens, &["cleared", "restored", "inactive", "released", "resolved"])
+            || (Self::has_keyword(&tokens, "reset")
+                && Self::has_any_keyword(
+                    &tokens,
+                    &["complete", "completed", "success", "successful", "succeeded"],
+                ));
         let blocking_context = Self::has_any_keyword(
             &tokens,
             &[
@@ -305,12 +329,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn allows_ooda_when_heartbeat_restored_after_timeout() {
+        let guard = ModeTransitionGuard::new(AgentLoopMode::OodaReAct);
+        let mut state = context_with_entities();
+        state.alerts.push(Alert {
+            severity: AlertSeverity::Warning,
+            message: "Observation heartbeat restored after timeout".into(),
+            source: "edge_heartbeat".into(),
+        });
+
+        let result = guard.check(&make_action(), &state).await;
+
+        assert_eq!(result, SafetyVerdict::Allow);
+    }
+
+    #[tokio::test]
     async fn allows_ooda_when_estop_cleared_alert_present() {
         let guard = ModeTransitionGuard::new(AgentLoopMode::OodaReAct);
         let mut state = context_with_entities();
         state.alerts.push(Alert {
             severity: AlertSeverity::Warning,
             message: "E-stop cleared by operator".into(),
+            source: "safety_monitor".into(),
+        });
+
+        let result = guard.check(&make_action(), &state).await;
+
+        assert_eq!(result, SafetyVerdict::Allow);
+    }
+
+    #[tokio::test]
+    async fn allows_ooda_when_estop_reset_successful_alert_present() {
+        let guard = ModeTransitionGuard::new(AgentLoopMode::OodaReAct);
+        let mut state = context_with_entities();
+        state.alerts.push(Alert {
+            severity: AlertSeverity::Warning,
+            message: "E-stop reset successful".into(),
             source: "safety_monitor".into(),
         });
 
