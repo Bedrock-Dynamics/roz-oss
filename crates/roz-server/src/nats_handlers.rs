@@ -8,8 +8,10 @@
 
 use async_nats::Client as NatsClient;
 use futures::StreamExt as _;
+use roz_core::phases::PhaseMode;
 use roz_core::safety::SafetyLevel;
 use roz_core::tasks::{SpawnReply, SpawnRequest};
+use roz_nats::dispatch::{INTERNAL_TASK_STATUS_SUBJECT_PREFIX, TaskStatusEvent};
 use sqlx::PgPool;
 
 /// Subscribe to all internal NATS subjects and spawn handler loops.
@@ -17,7 +19,13 @@ use sqlx::PgPool;
 /// This is called once at startup. Each subject gets its own `tokio::spawn` task that
 /// loops until the NATS connection is dropped.
 pub fn spawn_all(nats: NatsClient, pool: PgPool, restate_ingress_url: String, http_client: reqwest::Client) {
-    tokio::spawn(spawn_task_handler(nats, pool, restate_ingress_url, http_client));
+    tokio::spawn(spawn_task_handler(
+        nats.clone(),
+        pool.clone(),
+        restate_ingress_url,
+        http_client,
+    ));
+    tokio::spawn(spawn_task_status_handler(nats, pool));
 }
 
 /// Send an error string as the NATS reply so the caller does not time out.
@@ -25,6 +33,55 @@ async fn send_error(nats: &NatsClient, reply_subject: &str, message: &str) {
     let payload = format!("{{\"error\":{message:?}}}");
     if let Err(e) = nats.publish(reply_subject.to_owned(), payload.into()).await {
         tracing::error!(error = %e, "failed to send NATS error reply");
+    }
+}
+
+fn mode_from_phases(phases: &[roz_core::phases::PhaseSpec]) -> roz_nats::dispatch::ExecutionMode {
+    match phases.first().map(|phase| phase.mode) {
+        Some(PhaseMode::OodaReAct) => roz_nats::dispatch::ExecutionMode::OodaReAct,
+        Some(PhaseMode::React) | None => roz_nats::dispatch::ExecutionMode::React,
+    }
+}
+
+const fn validate_child_task_delegation_scope(req: &SpawnRequest) -> Result<(), &'static str> {
+    if req.delegation_scope.is_none() {
+        return Err("child tasks require delegation_scope");
+    }
+    Ok(())
+}
+
+fn is_terminal_task_status(status: &str) -> bool {
+    matches!(
+        status,
+        "succeeded" | "failed" | "timed_out" | "cancelled" | "safety_stop"
+    )
+}
+
+async fn apply_task_status_event(pool: &PgPool, event: &TaskStatusEvent) {
+    if let Some(host_id) = event.host_id
+        && let Err(error) = roz_db::tasks::assign_host(pool, event.task_id, host_id).await
+    {
+        tracing::warn!(%error, task_id = %event.task_id, "failed to assign host from task status event");
+    }
+
+    if event.status == "running" {
+        if let Err(error) = roz_db::tasks::ensure_active_run(pool, event.task_id, event.host_id).await {
+            tracing::warn!(%error, task_id = %event.task_id, "failed to ensure active task run");
+        }
+    } else if is_terminal_task_status(&event.status) {
+        if matches!(roz_db::tasks::active_run_for_task(pool, event.task_id).await, Ok(None)) {
+            let _ = roz_db::tasks::ensure_active_run(pool, event.task_id, event.host_id).await;
+        }
+        if let Err(error) =
+            roz_db::tasks::complete_active_run_for_task(pool, event.task_id, &event.status, event.detail.as_deref())
+                .await
+        {
+            tracing::warn!(%error, task_id = %event.task_id, "failed to complete active task run");
+        }
+    }
+
+    if let Err(error) = roz_db::tasks::update_status(pool, event.task_id, &event.status).await {
+        tracing::warn!(%error, task_id = %event.task_id, status = %event.status, "failed to update task status");
     }
 }
 
@@ -59,6 +116,12 @@ async fn spawn_task_handler(nats: NatsClient, pool: PgPool, restate_ingress_url:
                 continue;
             }
         };
+
+        if let Err(message) = validate_child_task_delegation_scope(&req) {
+            tracing::warn!(parent_task_id = %req.parent_task_id, "rejecting child task without delegation scope");
+            send_error(&nats, &reply_subject, message).await;
+            continue;
+        }
 
         let phases_json = match serde_json::to_value(&req.phases) {
             Ok(v) => v,
@@ -146,11 +209,13 @@ async fn spawn_task_handler(nats: NatsClient, pool: PgPool, restate_ingress_url:
             safety_policy_id: None,
             host_id: host_uuid,
             timeout_secs: 300,
-            mode: roz_nats::dispatch::ExecutionMode::React,
+            mode: mode_from_phases(&req.phases),
             parent_task_id: Some(req.parent_task_id),
             restate_url: restate_ingress_url.clone(),
             traceparent: roz_nats::dispatch::current_traceparent(),
             phases: req.phases.clone(),
+            control_interface_manifest: req.control_interface_manifest.clone(),
+            delegation_scope: req.delegation_scope.clone(),
         };
         let invoke_subject = format!("invoke.{host_name}.{}", task.id);
         if let Ok(payload) = serde_json::to_vec(&invocation)
@@ -174,4 +239,70 @@ async fn spawn_task_handler(nats: NatsClient, pool: PgPool, restate_ingress_url:
     }
 
     tracing::info!(%subject, "internal NATS handler exiting");
+}
+
+async fn spawn_task_status_handler(nats: NatsClient, pool: PgPool) {
+    let subject = format!("{INTERNAL_TASK_STATUS_SUBJECT_PREFIX}.*");
+    let mut sub = match nats.subscribe(subject.clone()).await {
+        Ok(sub) => sub,
+        Err(error) => {
+            tracing::error!(%error, %subject, "failed to subscribe to task status updates");
+            return;
+        }
+    };
+
+    tracing::info!(%subject, "task status handler ready");
+
+    while let Some(msg) = sub.next().await {
+        match serde_json::from_slice::<TaskStatusEvent>(&msg.payload) {
+            Ok(event) => apply_task_status_event(&pool, &event).await,
+            Err(error) => tracing::warn!(%error, "failed to decode task status event"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use roz_core::tasks::SpawnRequest;
+    use uuid::Uuid;
+
+    fn spawn_request() -> SpawnRequest {
+        SpawnRequest {
+            tenant_id: Uuid::nil(),
+            parent_task_id: Uuid::new_v4(),
+            host_id: Uuid::new_v4().to_string(),
+            environment_id: Uuid::new_v4(),
+            prompt: "delegate this".to_string(),
+            phases: Vec::new(),
+            control_interface_manifest: None,
+            delegation_scope: None,
+        }
+    }
+
+    #[test]
+    fn child_tasks_require_delegation_scope() {
+        let req = spawn_request();
+        assert_eq!(
+            validate_child_task_delegation_scope(&req),
+            Err("child tasks require delegation_scope")
+        );
+    }
+
+    #[test]
+    fn child_tasks_with_delegation_scope_are_allowed() {
+        let mut req = spawn_request();
+        req.delegation_scope = Some(roz_core::tasks::DelegationScope::fail_closed());
+        validate_child_task_delegation_scope(&req).expect("scope should satisfy validation");
+    }
+
+    #[test]
+    fn terminal_task_statuses_match_runtime_contract() {
+        assert!(is_terminal_task_status("succeeded"));
+        assert!(is_terminal_task_status("failed"));
+        assert!(is_terminal_task_status("timed_out"));
+        assert!(is_terminal_task_status("cancelled"));
+        assert!(is_terminal_task_status("safety_stop"));
+        assert!(!is_terminal_task_status("queued"));
+    }
 }

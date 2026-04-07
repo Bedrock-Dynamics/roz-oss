@@ -63,7 +63,7 @@ pub struct GlobalOpts {
     #[arg(long, global = true)]
     pub task: Option<String>,
 
-    /// Target a specific robot host by name
+    /// Target a specific robot host by name or UUID. If names collide, use the UUID.
     #[arg(long)]
     pub host: Option<String>,
 

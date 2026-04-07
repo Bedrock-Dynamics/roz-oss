@@ -7,6 +7,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
+roz-core = { path = "../roz-core" }
+chrono = { workspace = true }
 testcontainers = { workspace = true, features = ["http_wait"] }
 testcontainers-modules = { workspace = true }
 tokio = { workspace = true }

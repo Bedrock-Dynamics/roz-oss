@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use roz_core::safety::SafetyVerdict;
-use roz_core::spatial::SpatialContext;
+use roz_core::spatial::WorldState;
 use roz_core::tools::ToolCall;
 
 use crate::safety::SafetyGuard;
@@ -31,7 +31,7 @@ impl SafetyGuard for BatteryGuard {
         "battery"
     }
 
-    async fn check(&self, _action: &ToolCall, state: &SpatialContext) -> SafetyVerdict {
+    async fn check(&self, _action: &ToolCall, state: &WorldState) -> SafetyVerdict {
         // Find battery_pct in any entity's properties
         let battery_pct = state
             .entities
@@ -74,10 +74,10 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
 
-    fn context_with_battery(pct: f64) -> SpatialContext {
+    fn context_with_battery(pct: f64) -> WorldState {
         let mut properties = HashMap::new();
         properties.insert("battery_pct".to_string(), json!(pct));
-        SpatialContext {
+        WorldState {
             entities: vec![EntityState {
                 id: "drone_1".to_string(),
                 kind: "drone".to_string(),
@@ -86,7 +86,8 @@ mod tests {
                 velocity: None,
                 properties,
                 timestamp_ns: None,
-                frame_id: None,
+                frame_id: "world".into(),
+                ..Default::default()
             }],
             ..Default::default()
         }
@@ -136,7 +137,7 @@ mod tests {
     #[tokio::test]
     async fn no_battery_data_allows() {
         let guard = BatteryGuard::new(30.0, 15.0);
-        let ctx = SpatialContext::default();
+        let ctx = WorldState::default();
         let result = guard.check(&make_action(), &ctx).await;
         assert_eq!(result, SafetyVerdict::Allow);
     }

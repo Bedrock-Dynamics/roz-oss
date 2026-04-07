@@ -6,9 +6,15 @@
 use crate::config::WorkerConfig;
 
 /// Build the agent model from worker config, wrapping in `FallbackModel` when configured.
-pub fn build_model(config: &WorkerConfig) -> anyhow::Result<Box<dyn roz_agent::model::Model>> {
+pub fn build_model(
+    config: &WorkerConfig,
+    model_name_override: Option<&str>,
+) -> anyhow::Result<Box<dyn roz_agent::model::Model>> {
+    let primary_model_name = model_name_override
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(&config.model_name);
     let primary = roz_agent::model::create_model(
-        &config.model_name,
+        primary_model_name,
         &config.gateway_url,
         &config.gateway_api_key,
         config.model_timeout_secs,

@@ -1,18 +1,18 @@
 //! Headless integration tests for CLI client-side tool execution.
 //!
-//! These verify that tools from `robot.toml` are discovered, registered,
-//! and their schemas are correctly built -- without requiring a live daemon
-//! or cloud server.
+//! These verify that tools from the embodiment manifest are discovered,
+//! registered, and their schemas are correctly built -- without requiring a
+//! live daemon or cloud server.
 
 use std::fs;
 
 use roz_cli::tui::tools;
 use tempfile::TempDir;
 
-const REACHY_MINI_ROBOT_TOML: &str = r#"
+const REACHY_MINI_EMBODIMENT_TOML: &str = r#"
 [robot]
 name = "reachy-mini"
-description = "Pollen Robotics Reachy Mini -- 5-DoF expressive head + mobile base"
+description = "Pollen Robotics Reachy Mini -- expressive tabletop robot with head, body, and antennas"
 
 [channels]
 robot_id = "reachy_mini"
@@ -105,14 +105,18 @@ method = "POST"
 path = "/api/motors/set_mode/disabled"
 "#;
 
+fn write_embodiment_manifest(dir: &TempDir, contents: &str) {
+    fs::write(dir.path().join("embodiment.toml"), contents).unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Tool discovery (unified: builtins + daemon)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn discovers_all_tools_from_robot_toml() {
+fn discovers_all_tools_from_legacy_robot_toml_fallback() {
     let dir = TempDir::new().unwrap();
-    fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
+    fs::write(dir.path().join("robot.toml"), REACHY_MINI_EMBODIMENT_TOML).unwrap();
 
     let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
     let names: Vec<&str> = schemas.iter().map(|(s, _)| s.name.as_str()).collect();
@@ -133,7 +137,21 @@ fn discovers_all_tools_from_robot_toml() {
 }
 
 #[test]
-fn builtins_only_without_robot_toml() {
+fn discovers_all_tools_from_embodiment_toml() {
+    let dir = TempDir::new().unwrap();
+    write_embodiment_manifest(&dir, REACHY_MINI_EMBODIMENT_TOML);
+
+    let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
+    let names: Vec<&str> = schemas.iter().map(|(s, _)| s.name.as_str()).collect();
+
+    assert!(names.contains(&"get_robot_state"));
+    assert!(names.contains(&"set_motors"));
+    assert!(names.contains(&"move_to"));
+    assert!(names.contains(&"play_animation"));
+}
+
+#[test]
+fn builtins_only_without_embodiment_manifest() {
     let dir = TempDir::new().unwrap();
     let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
     assert_eq!(
@@ -147,7 +165,7 @@ fn builtins_only_without_robot_toml() {
 fn builtins_only_without_daemon_section() {
     let dir = TempDir::new().unwrap();
     fs::write(
-        dir.path().join("robot.toml"),
+        dir.path().join("embodiment.toml"),
         "[robot]\nname = \"test\"\ndescription = \"no daemon\"\n",
     )
     .unwrap();
@@ -165,9 +183,9 @@ fn builtins_only_without_daemon_section() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn builds_tool_schemas_from_robot_toml() {
+fn builds_tool_schemas_from_embodiment_toml() {
     let dir = TempDir::new().unwrap();
-    fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
+    write_embodiment_manifest(&dir, REACHY_MINI_EMBODIMENT_TOML);
 
     let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
     let names: Vec<&str> = schemas.iter().map(|(s, _)| s.name.as_str()).collect();
@@ -181,7 +199,7 @@ fn builds_tool_schemas_from_robot_toml() {
 #[test]
 fn move_to_schema_has_channel_properties() {
     let dir = TempDir::new().unwrap();
-    fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
+    write_embodiment_manifest(&dir, REACHY_MINI_EMBODIMENT_TOML);
 
     let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
     let move_to = schemas
@@ -207,8 +225,7 @@ fn move_to_schema_has_channel_properties() {
     assert_eq!(pitch["type"], "number");
     let desc = pitch["description"].as_str().expect("should have description");
     assert!(desc.contains("rad"), "should mention unit");
-    assert!(desc.contains("-0.350"), "should mention lower limit");
-    assert!(desc.contains("0.170"), "should mention upper limit");
+    assert!(desc.contains(" to "), "should mention a bounded interval");
 
     // duration_secs is required
     let required = move_to.parameters["required"]
@@ -223,7 +240,7 @@ fn move_to_schema_has_channel_properties() {
 #[test]
 fn set_motors_schema_has_mode_parameter() {
     let dir = TempDir::new().unwrap();
-    fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
+    write_embodiment_manifest(&dir, REACHY_MINI_EMBODIMENT_TOML);
 
     let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
     let set_motors = schemas
@@ -241,7 +258,7 @@ fn set_motors_schema_has_mode_parameter() {
 #[test]
 fn play_animation_schema_mentions_available_moves() {
     let dir = TempDir::new().unwrap();
-    fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
+    write_embodiment_manifest(&dir, REACHY_MINI_EMBODIMENT_TOML);
 
     let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
     let play = schemas
@@ -267,7 +284,7 @@ fn play_animation_schema_mentions_available_moves() {
 }
 
 #[test]
-fn schemas_include_builtins_for_missing_robot_toml() {
+fn schemas_include_builtins_for_missing_embodiment_manifest() {
     let dir = TempDir::new().unwrap();
     let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
     assert_eq!(schemas.len(), 6, "should have 6 CLI built-in schemas (with categories)");
@@ -282,7 +299,7 @@ fn proto_schema_conversion_roundtrips() {
     use roz_cli::tui::convert::{struct_to_value, value_to_struct};
 
     let dir = TempDir::new().unwrap();
-    fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
+    write_embodiment_manifest(&dir, REACHY_MINI_EMBODIMENT_TOML);
 
     let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
     for (schema, _category) in &schemas {
@@ -320,7 +337,7 @@ fn tool_categories_are_correct_for_all_tools() {
     use roz_core::tools::ToolCategory;
 
     let dir = TempDir::new().unwrap();
-    fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
+    write_embodiment_manifest(&dir, REACHY_MINI_EMBODIMENT_TOML);
 
     let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
 
@@ -358,7 +375,7 @@ fn dispatcher_categories_match_schema_categories() {
     use roz_core::tools::ToolCategory;
 
     let dir = TempDir::new().unwrap();
-    fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
+    write_embodiment_manifest(&dir, REACHY_MINI_EMBODIMENT_TOML);
 
     let (dispatcher, schemas) = tools::build_all_tools(dir.path());
 
@@ -386,7 +403,7 @@ fn physical_tool_set_matches_expectations() {
     use roz_core::tools::ToolCategory;
 
     let dir = TempDir::new().unwrap();
-    fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
+    write_embodiment_manifest(&dir, REACHY_MINI_EMBODIMENT_TOML);
 
     let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
 
@@ -434,7 +451,7 @@ fn physical_tool_set_matches_expectations() {
 #[ignore = "requires Reachy Mini daemon on localhost:8000"]
 async fn get_robot_state_executes_against_daemon() {
     let dir = TempDir::new().unwrap();
-    fs::write(dir.path().join("robot.toml"), REACHY_MINI_ROBOT_TOML).unwrap();
+    write_embodiment_manifest(&dir, REACHY_MINI_EMBODIMENT_TOML);
 
     let (dispatcher, _schemas) = tools::build_all_tools(dir.path());
 

@@ -3,98 +3,85 @@
   roz
 </h1>
 
-<h4 align="center">the robotics claw</h4>
-
 <p align="center">
-  An open-source physical AI agent runtime. An LLM agent that writes WASM code to control real robots at 100Hz.
+  Open-source runtime and tooling for embodied AI agents.
 </p>
 
-> **Research Preview** — This is an early release for research and experimentation. APIs, interfaces, and safety guarantees are under active development and may change. Not recommended for production deployment on physical hardware without additional safety validation.
+> **Research Preview** — Roz is still evolving quickly. Interfaces, manifests, and safety behavior may change between releases.
+
+## What Roz Is
+
+Roz lets an agent work through two complementary control paths:
+
+- High-level embodied tools through MCP and daemon-backed actions
+- Low-level WebAssembly controllers executed through Copper at control-loop rate
+
+The OSS repo is focused on local development, simulation, and the shared runtime crates behind those flows.
 
 ## Quick Start
 
 ```bash
-cargo install roz-cli
-roz sim start manipulator    # Requires Docker
-roz                          # Interactive mode
-> wave the arm back and forth
+cargo install --path crates/roz-cli
+roz sim start manipulator
+roz
 ```
 
-## How It Works
+Inside a project, Roz reads:
 
-1. You describe what the robot should do
-2. The agent reasons about the task (Claude, GPT-4, Gemini, or local Ollama)
-3. For simple moves: calls MCP tools (move_to_pose, navigate_to, takeoff)
-4. For complex control: writes WASM code that runs at 100Hz in a safety sandbox
-5. Safety filter clamps all outputs (velocity, acceleration, position limits)
-6. Sensor feedback streams back for closed-loop control
+- `roz.toml` for project/model config
+- `embodiment.toml` for robot or simulator embodiment config
+- `AGENTS.md` for project-specific operating guidance
 
-## Two Control Paths
+`robot.toml` is still accepted as a legacy fallback, but `embodiment.toml` is the canonical filename.
 
-**Path A — High-level MCP tools (1-3Hz)**
-The agent calls tools like `move_to_pose`, `navigate_to`, `takeoff` via MCP. Each Docker sim container bundles its own MCP server with robot-specific tools.
-
-**Path B — WASM controllers (100Hz)**
-The agent writes WAT code that runs in a wasmtime sandbox at 100Hz. The WASM controller reads sensor state and writes motor commands through a robot-agnostic channel interface.
-
-## Supported Robots
-
-| Type | Sim Container | MCP Tools | WASM Channels |
-|------|--------------|-----------|---------------|
-| Manipulator (UR5) | `ros2-manipulator` | move_to_pose, get_joint_state, stop_arm | 6 joint velocities |
-| Drone (PX4) | `px4-gazebo-humble` | takeoff, land, go_to | 4 body velocities |
-| Drone (ArduPilot) | `ardupilot-gazebo` | arm, takeoff, go_to | 4 body velocities |
-| Mobile (Nav2) | `ros2-nav2` | navigate_to, follow_waypoints | 2 twist components |
-
-## Architecture
-
-```
-User -> roz CLI -> Agent (LLM)
-                      |--> MCP tools -> Docker sim -> MoveIt2/Nav2/MAVLink
-                      `--> WASM code -> Copper 100Hz -> Safety filter -> Bridge -> Gazebo
-```
-
-## Crate Map
+## Repo Layout
 
 | Crate | Purpose |
-|-------|---------|
-| `roz-core` | Domain types, channel manifests, no IO |
-| `roz-agent` | Agent loop, safety guards, tool dispatch, model abstraction |
-| `roz-copper` | WASM sandbox, 100Hz controller loop, IO traits, safety filter |
-| `roz-local` | Docker launcher, MCP client, skill registry, local runtime |
-| `roz-cli` | Interactive TUI, sim commands |
-| `roz-safety` | Safety daemon (heartbeat monitoring, e-stop) |
-| `roz-nats` | NATS client wrappers |
-| `roz-zenoh` | Zenoh transport layer |
+|------|---------|
+| `roz-core` | Shared domain types, manifests, embodiment/runtime primitives |
+| `roz-agent` | Agent loop, prompt assembly, safety stack, model abstraction |
+| `roz-copper` | WebAssembly controller runtime, safety filter, transport adapters |
+| `roz-local` | Local runtime, Docker sim launcher, MCP integration |
+| `roz-cli` | CLI and interactive TUI |
+| `roz-server` | OSS REST and gRPC server surfaces |
+| `roz-worker` | NATS worker runtime |
+| `roz-db` | SQLx migrations and queries |
+| `roz-nats` | Typed NATS subjects and payloads |
 
-## Development
+## Running Tests
+
+Standard development checks:
 
 ```bash
-# Build
 cargo build --workspace
-
-# Test
 cargo test --workspace
-
-# Integration tests (require Docker sim containers)
-cargo test --workspace -- --ignored --nocapture
 ```
+
+Opt-in live and container-backed suites live under `crates/*/tests` and are marked `#[ignore]`. They require the relevant local infrastructure, credentials, or Docker images.
+
+For the current live container matrix:
+
+```bash
+scripts/run_live_e2e_matrix.sh --help
+```
+
+## Examples
+
+Examples under `examples/` show the expected project shape. In particular:
+
+- `examples/reachy-mini/embodiment.toml` is the canonical Reachy Mini manifest
+- `examples/reachy-mini/AGENTS.md` shows the expected embodied tool guidance shape
 
 ## Status
 
-This is a **research preview**. The following are proven end-to-end with real infrastructure:
+The OSS repo is aimed at:
 
-- LLM writes WASM, deploys to 100Hz loop, UR5 arm moves at commanded velocity
-- LLM writes WASM, deploys, PX4 drone takes off and flies at commanded velocity
-- Multi-turn conversations with real sensor feedback
-- Safety filter clamps velocity, acceleration, and position limits
-- Agent delegates spatial reasoning to vision models
+- local runtime development
+- shared embodied/runtime abstractions
+- simulation and integration testing
+- contributor-facing tooling
 
-Known limitations:
-
-- Safety guarantees are simulation-validated only — additional validation required for physical hardware
-- WASM channel interface covers manipulators and drones; legged robots not yet supported
-- Cloud features (multi-tenant API, team coordination) are available separately
+Private cloud deployment and operator workflow live outside this README.
 
 ## License
 

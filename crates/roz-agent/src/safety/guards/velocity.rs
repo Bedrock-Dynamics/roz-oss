@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use roz_core::safety::SafetyVerdict;
-use roz_core::spatial::SpatialContext;
+use roz_core::spatial::WorldState;
 use roz_core::tools::ToolCall;
 use serde_json::Value;
 
@@ -49,7 +49,7 @@ impl SafetyGuard for VelocityLimiter {
         "velocity_limiter"
     }
 
-    async fn check(&self, action: &ToolCall, _state: &SpatialContext) -> SafetyVerdict {
+    async fn check(&self, action: &ToolCall, _state: &WorldState) -> SafetyVerdict {
         let mut clamped = action.clone();
 
         // --- scalar velocity check (multiple param names) ---
@@ -102,8 +102,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn empty_state() -> SpatialContext {
-        SpatialContext::default()
+    fn empty_state() -> WorldState {
+        WorldState::default()
     }
 
     #[tokio::test]

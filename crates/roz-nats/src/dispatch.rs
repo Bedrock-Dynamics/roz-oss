@@ -7,6 +7,34 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Internal NATS subject prefix used to route approval responses back to a task worker.
+pub const INTERNAL_APPROVAL_SUBJECT_PREFIX: &str = "roz.internal.tasks.approval";
+/// Internal NATS subject prefix used to report task lifecycle transitions back to the server.
+pub const INTERNAL_TASK_STATUS_SUBJECT_PREFIX: &str = "roz.internal.tasks.status";
+
+/// Subject carrying approval responses for a specific task.
+#[must_use]
+pub fn approval_subject(task_id: Uuid) -> String {
+    format!("{INTERNAL_APPROVAL_SUBJECT_PREFIX}.{task_id}")
+}
+
+/// Subject carrying task lifecycle events for a specific task.
+#[must_use]
+pub fn task_status_subject(task_id: Uuid) -> String {
+    format!("{INTERNAL_TASK_STATUS_SUBJECT_PREFIX}.{task_id}")
+}
+
+/// Wire event published by workers as task execution progresses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskStatusEvent {
+    pub task_id: Uuid,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<Uuid>,
+}
+
 /// Extract a W3C traceparent string from the current tracing span's `OTel` context.
 ///
 /// Returns `None` if no valid trace context is active (e.g., in tests or when `OTel` is not configured).
@@ -28,11 +56,12 @@ pub fn current_traceparent() -> Option<String> {
 
 /// How the agent loop should execute a task.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum ExecutionMode {
     /// Pure LLM reasoning + tools (no spatial context).
+    #[serde(rename = "react")]
     React,
     /// Spatial context injected into model messages + safety guards.
+    #[serde(rename = "ooda_react", alias = "ooda_re_act")]
     OodaReAct,
 }
 
@@ -56,6 +85,12 @@ pub struct TaskInvocation {
     /// Ordered phase specs for the agent loop. Empty = single React phase (default).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub phases: Vec<roz_core::phases::PhaseSpec>,
+    /// Optional control-interface contract propagated from the spawning session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_interface_manifest: Option<roz_core::embodiment::binding::ControlInterfaceManifest>,
+    /// Optional inherited worker delegation scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_scope: Option<roz_core::tasks::DelegationScope>,
 }
 
 /// Token counts for a completed task.
@@ -69,12 +104,42 @@ pub struct TokenUsage {
     pub cache_creation_tokens: u32,
 }
 
+/// Canonical terminal status reported by a worker once task execution ends.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskTerminalStatus {
+    Succeeded,
+    Failed,
+    TimedOut,
+    Cancelled,
+    SafetyStop,
+}
+
+impl TaskTerminalStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+            Self::SafetyStop => "safety_stop",
+        }
+    }
+}
+
+impl std::fmt::Display for TaskTerminalStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Sent from worker back to Restate when a task completes.
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TaskResult {
     pub task_id: Uuid,
-    pub success: bool,
+    pub status: TaskTerminalStatus,
     pub output: Option<serde_json::Value>,
     pub error: Option<String>,
     pub cycles: u32,
@@ -120,6 +185,8 @@ mod tests {
             restate_url: "http://localhost:8080".to_string(),
             traceparent: None,
             phases: vec![],
+            control_interface_manifest: None,
+            delegation_scope: None,
         };
 
         let bytes = serde_json::to_vec(&invocation).expect("serialize");
@@ -131,7 +198,7 @@ mod tests {
     fn task_result_roundtrip() {
         let result = TaskResult {
             task_id: Uuid::new_v4(),
-            success: true,
+            status: TaskTerminalStatus::Succeeded,
             output: Some(serde_json::json!({"picked_up": true})),
             error: None,
             cycles: 5,
@@ -167,16 +234,20 @@ mod tests {
         let react_json = serde_json::to_value(ExecutionMode::React).expect("serialize react");
         assert_eq!(react_json, serde_json::json!("react"));
 
-        let ooda_json = serde_json::to_value(ExecutionMode::OodaReAct).expect("serialize ooda_re_act");
-        assert_eq!(ooda_json, serde_json::json!("ooda_re_act"));
+        let ooda_json = serde_json::to_value(ExecutionMode::OodaReAct).expect("serialize ooda_react");
+        assert_eq!(ooda_json, serde_json::json!("ooda_react"));
 
         // Roundtrip from string
         let react: ExecutionMode = serde_json::from_value(serde_json::json!("react")).expect("deserialize react");
         assert_eq!(react, ExecutionMode::React);
 
         let ooda: ExecutionMode =
-            serde_json::from_value(serde_json::json!("ooda_re_act")).expect("deserialize ooda_re_act");
+            serde_json::from_value(serde_json::json!("ooda_react")).expect("deserialize ooda_react");
         assert_eq!(ooda, ExecutionMode::OodaReAct);
+
+        let legacy: ExecutionMode =
+            serde_json::from_value(serde_json::json!("ooda_re_act")).expect("deserialize ooda_re_act");
+        assert_eq!(legacy, ExecutionMode::OodaReAct);
     }
 
     #[test]
@@ -184,7 +255,7 @@ mod tests {
         let task_id = Uuid::new_v4();
         let result = TaskResult {
             task_id,
-            success: false,
+            status: TaskTerminalStatus::TimedOut,
             output: None,
             error: Some("timeout".to_string()),
             cycles: 0,
@@ -193,7 +264,7 @@ mod tests {
 
         // Verify the wire format shape for failure results.
         let json = serde_json::to_value(&result).expect("serialize");
-        assert_eq!(json["success"], false);
+        assert_eq!(json["status"], "timed_out");
         assert_eq!(json["error"], "timeout");
         assert!(json["output"].is_null());
         assert_eq!(json["cycles"], 0);
@@ -204,6 +275,35 @@ mod tests {
         let bytes = serde_json::to_vec(&result).expect("serialize to bytes");
         let deserialized: TaskResult = serde_json::from_slice(&bytes).expect("deserialize");
         assert_eq!(result, deserialized);
+    }
+
+    #[test]
+    fn task_terminal_status_strings_are_canonical() {
+        assert_eq!(TaskTerminalStatus::Succeeded.as_str(), "succeeded");
+        assert_eq!(TaskTerminalStatus::Failed.as_str(), "failed");
+        assert_eq!(TaskTerminalStatus::TimedOut.as_str(), "timed_out");
+        assert_eq!(TaskTerminalStatus::Cancelled.as_str(), "cancelled");
+        assert_eq!(TaskTerminalStatus::SafetyStop.as_str(), "safety_stop");
+    }
+
+    #[test]
+    fn task_status_event_roundtrip() {
+        let task_id = Uuid::new_v4();
+        let host_id = Uuid::new_v4();
+        let event = TaskStatusEvent {
+            task_id,
+            status: "running".into(),
+            detail: Some("worker accepted invocation".into()),
+            host_id: Some(host_id),
+        };
+
+        let bytes = serde_json::to_vec(&event).expect("serialize");
+        let deserialized: TaskStatusEvent = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(deserialized, event);
+        assert_eq!(
+            task_status_subject(task_id),
+            format!("{INTERNAL_TASK_STATUS_SUBJECT_PREFIX}.{task_id}")
+        );
     }
 
     #[test]
@@ -273,6 +373,8 @@ mod tests {
                     trigger: PhaseTrigger::OnToolSignal,
                 },
             ],
+            control_interface_manifest: None,
+            delegation_scope: None,
         };
         let json = serde_json::to_string(&inv).unwrap();
         let back: TaskInvocation = serde_json::from_str(&json).unwrap();
@@ -302,6 +404,8 @@ mod tests {
             restate_url: "http://localhost:9070".to_string(),
             traceparent: None,
             phases: vec![],
+            control_interface_manifest: None,
+            delegation_scope: None,
         };
 
         // Verify optional fields serialize as null in the wire format.
@@ -314,5 +418,14 @@ mod tests {
         let bytes = serde_json::to_vec(&invocation).expect("serialize to bytes");
         let deserialized: TaskInvocation = serde_json::from_slice(&bytes).expect("deserialize");
         assert_eq!(invocation, deserialized);
+    }
+
+    #[test]
+    fn approval_subject_formats_with_task_id() {
+        let task_id = Uuid::nil();
+        assert_eq!(
+            approval_subject(task_id),
+            format!("{INTERNAL_APPROVAL_SUBJECT_PREFIX}.{task_id}")
+        );
     }
 }

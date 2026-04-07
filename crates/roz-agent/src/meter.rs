@@ -75,7 +75,7 @@ impl UsageMeter for NoOpMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_loop::{AgentInput, AgentLoop, AgentLoopMode};
+    use crate::agent_loop::{AgentInput, AgentInputSeed, AgentLoop, AgentLoopMode};
     use crate::dispatch::ToolDispatcher;
     use crate::model::types::*;
     use crate::safety::SafetyStack;
@@ -139,8 +139,11 @@ mod tests {
             task_id: "test-meter-1".to_string(),
             tenant_id: "tenant-abc".to_string(),
             model_name: "mock-model".to_string(),
-            system_prompt: vec!["You are a test agent.".to_string()],
-            user_message: user_message.to_string(),
+            seed: AgentInputSeed::new(
+                vec!["You are a test agent.".to_string()],
+                Vec::new(),
+                user_message.to_string(),
+            ),
             max_cycles: 10,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -149,7 +152,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         }

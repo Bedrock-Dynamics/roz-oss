@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use roz_core::safety::SafetyVerdict;
-use roz_core::spatial::SpatialContext;
+use roz_core::spatial::WorldState;
 use roz_core::tools::ToolCall;
 
 use crate::safety::SafetyGuard;
@@ -28,7 +28,7 @@ impl SafetyGuard for SensorHealthGuard {
         "sensor_health"
     }
 
-    async fn check(&self, _action: &ToolCall, state: &SpatialContext) -> SafetyVerdict {
+    async fn check(&self, _action: &ToolCall, state: &WorldState) -> SafetyVerdict {
         let timestamps: Vec<u64> = state.entities.iter().filter_map(|e| e.timestamp_ns).collect();
 
         // If no timestamps present, allow (backward compat).
@@ -83,8 +83,8 @@ mod tests {
             .unwrap_or(0)
     }
 
-    fn context_with_timestamps(timestamps: &[Option<u64>]) -> SpatialContext {
-        SpatialContext {
+    fn context_with_timestamps(timestamps: &[Option<u64>]) -> WorldState {
+        WorldState {
             entities: timestamps
                 .iter()
                 .enumerate()
@@ -96,7 +96,8 @@ mod tests {
                     velocity: None,
                     properties: Default::default(),
                     timestamp_ns: *ts,
-                    frame_id: None,
+                    frame_id: "world".into(),
+                    ..Default::default()
                 })
                 .collect(),
             ..Default::default()
@@ -144,7 +145,7 @@ mod tests {
     #[tokio::test]
     async fn allows_empty_context() {
         let guard = SensorHealthGuard::new(100_000_000);
-        let ctx = SpatialContext::default();
+        let ctx = WorldState::default();
 
         let result = guard.check(&make_action(), &ctx).await;
         assert_eq!(result, SafetyVerdict::Allow);

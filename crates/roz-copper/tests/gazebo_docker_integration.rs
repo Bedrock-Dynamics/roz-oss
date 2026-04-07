@@ -179,11 +179,9 @@ async fn subscribe_poses_and_publish_commands() {
 
     for entity in &entities {
         assert_eq!(
-            entity.frame_id.as_deref(),
-            Some("world"),
+            entity.frame_id, "world",
             "entity '{}' has unexpected frame_id: {:?}",
-            entity.id,
-            entity.frame_id,
+            entity.id, entity.frame_id,
         );
 
         let pos = entity

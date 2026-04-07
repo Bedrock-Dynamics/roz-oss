@@ -37,6 +37,14 @@ pub struct TaskRunRow {
     pub error_message: Option<String>,
 }
 
+#[cfg(test)]
+fn is_terminal_status(status: &str) -> bool {
+    matches!(
+        status,
+        "succeeded" | "failed" | "timed_out" | "cancelled" | "safety_stop"
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Task CRUD
 // ---------------------------------------------------------------------------
@@ -147,6 +155,28 @@ pub async fn create_run(pool: &PgPool, task_id: Uuid, host_id: Option<Uuid>) -> 
     .ok_or(sqlx::Error::RowNotFound)
 }
 
+/// Fetch the most recent unfinished run for a task, if any.
+pub async fn active_run_for_task(pool: &PgPool, task_id: Uuid) -> Result<Option<TaskRunRow>, sqlx::Error> {
+    sqlx::query_as::<_, TaskRunRow>(
+        "SELECT * FROM roz_task_runs \
+         WHERE task_id = $1 AND completed_at IS NULL \
+         ORDER BY started_at DESC \
+         LIMIT 1",
+    )
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Ensure a task has an active run record once execution actually starts.
+pub async fn ensure_active_run(pool: &PgPool, task_id: Uuid, host_id: Option<Uuid>) -> Result<TaskRunRow, sqlx::Error> {
+    if let Some(run) = active_run_for_task(pool, task_id).await? {
+        return Ok(run);
+    }
+
+    create_run(pool, task_id, host_id).await
+}
+
 /// Mark a run complete with final status and optional error message.
 /// Sets `completed_at = now()`. Returns `None` when the run does not exist.
 pub async fn complete_run(
@@ -164,6 +194,31 @@ pub async fn complete_run(
          RETURNING *",
     )
     .bind(run_id)
+    .bind(status)
+    .bind(error_message)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Complete the most recent unfinished run for a task.
+pub async fn complete_active_run_for_task(
+    pool: &PgPool,
+    task_id: Uuid,
+    status: &str,
+    error_message: Option<&str>,
+) -> Result<Option<TaskRunRow>, sqlx::Error> {
+    sqlx::query_as::<_, TaskRunRow>(
+        "UPDATE roz_task_runs \
+         SET status = $2, completed_at = now(), error_message = $3 \
+         WHERE id = (
+             SELECT id FROM roz_task_runs
+             WHERE task_id = $1 AND completed_at IS NULL
+             ORDER BY started_at DESC
+             LIMIT 1
+         ) \
+         RETURNING *",
+    )
+    .bind(task_id)
     .bind(status)
     .bind(error_message)
     .fetch_optional(pool)
@@ -407,6 +462,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_active_run_reuses_open_run() {
+        let pool = setup().await;
+        let tenant_id = create_test_tenant(&pool).await;
+        let env_id = create_test_environment(&pool, tenant_id).await;
+        let host_id = create_test_host(&pool, tenant_id).await;
+
+        let task = create(
+            &pool,
+            tenant_id,
+            "active-run",
+            env_id,
+            None,
+            serde_json::json!([]),
+            None,
+        )
+        .await
+        .expect("Failed to create task");
+
+        let first = ensure_active_run(&pool, task.id, Some(host_id))
+            .await
+            .expect("first run");
+        let second = ensure_active_run(&pool, task.id, Some(host_id))
+            .await
+            .expect("reuse run");
+        assert_eq!(first.id, second.id);
+    }
+
+    #[tokio::test]
+    async fn complete_active_run_for_task_marks_terminal_status() {
+        let pool = setup().await;
+        let tenant_id = create_test_tenant(&pool).await;
+        let env_id = create_test_environment(&pool, tenant_id).await;
+        let host_id = create_test_host(&pool, tenant_id).await;
+
+        let task = create(
+            &pool,
+            tenant_id,
+            "timed-out-run",
+            env_id,
+            None,
+            serde_json::json!([]),
+            None,
+        )
+        .await
+        .expect("Failed to create task");
+        let run = ensure_active_run(&pool, task.id, Some(host_id))
+            .await
+            .expect("create run");
+
+        let completed = complete_active_run_for_task(&pool, task.id, "timed_out", Some("timed out"))
+            .await
+            .expect("complete active run")
+            .expect("run should exist");
+        assert_eq!(completed.id, run.id);
+        assert_eq!(completed.status, "timed_out");
+        assert_eq!(completed.error_message.as_deref(), Some("timed out"));
+        assert!(completed.completed_at.is_some());
+    }
+
+    #[test]
+    fn terminal_status_classification_matches_runtime_states() {
+        assert!(is_terminal_status("succeeded"));
+        assert!(is_terminal_status("failed"));
+        assert!(is_terminal_status("timed_out"));
+        assert!(is_terminal_status("cancelled"));
+        assert!(is_terminal_status("safety_stop"));
+        assert!(!is_terminal_status("running"));
+    }
+
+    #[tokio::test]
     async fn rls_tenant_isolation() {
         let pool = setup().await;
         let tenant_a = create_test_tenant(&pool).await;
@@ -437,8 +562,7 @@ mod tests {
             .execute(&pool)
             .await
             .expect("Failed to create test role");
-        sqlx::query(&format!("GRANT USAGE ON SCHEMA public TO {test_role}"))
-            .execute(&pool)
+        crate::grant_public_schema_usage_for_test_role(&pool, &test_role)
             .await
             .expect("Failed to grant schema usage");
         sqlx::query(&format!("GRANT SELECT ON roz_tasks TO {test_role}"))

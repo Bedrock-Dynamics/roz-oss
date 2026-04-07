@@ -1,3 +1,4 @@
+pub mod contract_tests;
 mod nats;
 mod pg;
 mod restate;

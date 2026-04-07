@@ -185,6 +185,94 @@ where
     collected
 }
 
+fn is_session_started_response(response: &session_response::Response) -> bool {
+    matches!(response, session_response::Response::SessionEvent(event) if event.event_type == "session_started")
+}
+
+fn session_started_from_response(response: &session_response::Response) -> Option<(String, String)> {
+    match response {
+        session_response::Response::SessionEvent(event) => match event.typed_event.as_ref()? {
+            roz_v1::session_event_envelope::TypedEvent::SessionStarted(payload) => Some((
+                payload.session_id.clone(),
+                payload.model_name.clone().unwrap_or_default(),
+            )),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn is_tool_request_response(response: &session_response::Response) -> bool {
+    matches!(response, session_response::Response::SessionEvent(event) if event.event_type == "tool_call_requested")
+}
+
+fn tool_request_from_response(response: &session_response::Response) -> Option<(String, String)> {
+    match response {
+        session_response::Response::SessionEvent(event) => match event.typed_event.as_ref()? {
+            roz_v1::session_event_envelope::TypedEvent::ToolCallRequested(payload) => {
+                Some((payload.call_id.clone(), payload.tool_name.clone()))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn is_text_delta_response(response: &session_response::Response) -> bool {
+    matches!(response, session_response::Response::SessionEvent(event) if event.event_type == "text_delta")
+}
+
+fn turn_finish_from_response(response: &session_response::Response) -> Option<(String, String)> {
+    match response {
+        session_response::Response::SessionEvent(event) => match event.typed_event.as_ref()? {
+            roz_v1::session_event_envelope::TypedEvent::TurnFinished(payload) => Some((
+                payload.message_id.clone().unwrap_or_default(),
+                payload.stop_reason.clone(),
+            )),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn response_error_message(response: &session_response::Response) -> Option<String> {
+    match response {
+        session_response::Response::SessionEvent(event) => match event.typed_event.as_ref()? {
+            roz_v1::session_event_envelope::TypedEvent::SessionRejected(payload) => Some(payload.message.clone()),
+            roz_v1::session_event_envelope::TypedEvent::SessionFailed(payload) => {
+                Some(format!("session failed: {}", payload.failure))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn request_tool_names(request: &serde_json::Value) -> Vec<String> {
+    request["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn request_system_text(request: &serde_json::Value) -> String {
+    request["system"]
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|block| block["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+        .unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------
 // Main test
 // ---------------------------------------------------------------------------
@@ -306,25 +394,14 @@ async fn full_agent_session_lifecycle() {
         .expect("send StartSession");
 
     // Receive SessionStarted.
-    let started_msgs = collect_until(
-        &mut resp_stream,
-        |r| matches!(r, session_response::Response::SessionStarted(_)),
-        Duration::from_secs(10),
-    )
-    .await;
-    let session_started = started_msgs
+    let started_msgs = collect_until(&mut resp_stream, is_session_started_response, Duration::from_secs(10)).await;
+    let (session_id_raw, session_model) = started_msgs
         .iter()
-        .find_map(|r| match r {
-            session_response::Response::SessionStarted(s) => Some(s),
-            _ => None,
-        })
+        .find_map(session_started_from_response)
         .expect("expected SessionStarted");
-    assert!(!session_started.session_id.is_empty(), "session_id should not be empty");
-    let session_id: uuid::Uuid = session_started
-        .session_id
-        .parse()
-        .expect("session_id should be a valid UUID");
-    assert_eq!(session_started.model, "claude-sonnet-4-6");
+    assert!(!session_id_raw.is_empty(), "session_id should not be empty");
+    let session_id: uuid::Uuid = session_id_raw.parse().expect("session_id should be a valid UUID");
+    assert_eq!(session_model, "claude-sonnet-4-6");
 
     // -----------------------------------------------------------------------
     // Step 8: Send UserMessage "read /foo.rs" -> expect ToolRequest
@@ -344,21 +421,13 @@ async fn full_agent_session_lifecycle() {
         .expect("send UserMessage 1");
 
     // Collect until we see a ToolRequest.
-    let tool_msgs = collect_until(
-        &mut resp_stream,
-        |r| matches!(r, session_response::Response::ToolRequest(_)),
-        Duration::from_secs(15),
-    )
-    .await;
-    let tool_req = tool_msgs
+    let tool_msgs = collect_until(&mut resp_stream, is_tool_request_response, Duration::from_secs(15)).await;
+    let (tool_call_id, tool_name) = tool_msgs
         .iter()
-        .find_map(|r| match r {
-            session_response::Response::ToolRequest(tr) => Some(tr),
-            _ => None,
-        })
+        .find_map(tool_request_from_response)
         .expect("expected ToolRequest");
-    assert_eq!(tool_req.tool_call_id, "toolu_test_1");
-    assert_eq!(tool_req.tool_name, "read_file");
+    assert_eq!(tool_call_id, "toolu_test_1");
+    assert_eq!(tool_name, "read_file");
 
     // -----------------------------------------------------------------------
     // Step 9: Send ToolResult -> expect TextDelta + TurnComplete
@@ -381,26 +450,21 @@ async fn full_agent_session_lifecycle() {
     // then emit TurnComplete.
     let turn1_msgs = collect_until(
         &mut resp_stream,
-        |r| matches!(r, session_response::Response::TurnComplete(_)),
+        |r| turn_finish_from_response(r).is_some(),
         Duration::from_secs(15),
     )
     .await;
 
     // Verify we received at least one TextDelta in this turn.
-    let has_text_delta = turn1_msgs
-        .iter()
-        .any(|r| matches!(r, session_response::Response::TextDelta(_)));
+    let has_text_delta = turn1_msgs.iter().any(is_text_delta_response);
     assert!(has_text_delta, "expected at least one TextDelta in turn 1");
 
-    let turn1_complete = turn1_msgs
+    let (turn1_message_id, turn1_stop_reason) = turn1_msgs
         .iter()
-        .find_map(|r| match r {
-            session_response::Response::TurnComplete(tc) => Some(tc),
-            _ => None,
-        })
+        .find_map(turn_finish_from_response)
         .expect("expected TurnComplete for turn 1");
-    assert!(!turn1_complete.message_id.is_empty());
-    assert_eq!(turn1_complete.stop_reason, "end_turn");
+    assert!(!turn1_message_id.is_empty());
+    assert_eq!(turn1_stop_reason, "end_turn");
 
     // -----------------------------------------------------------------------
     // Step 10: Ping -> Pong
@@ -444,24 +508,19 @@ async fn full_agent_session_lifecycle() {
 
     let turn2_msgs = collect_until(
         &mut resp_stream,
-        |r| matches!(r, session_response::Response::TurnComplete(_)),
+        |r| turn_finish_from_response(r).is_some(),
         Duration::from_secs(15),
     )
     .await;
 
-    let has_text_delta_2 = turn2_msgs
-        .iter()
-        .any(|r| matches!(r, session_response::Response::TextDelta(_)));
+    let has_text_delta_2 = turn2_msgs.iter().any(is_text_delta_response);
     assert!(has_text_delta_2, "expected at least one TextDelta in turn 2");
 
-    let turn2_complete = turn2_msgs
+    let (_turn2_message_id, turn2_stop_reason) = turn2_msgs
         .iter()
-        .find_map(|r| match r {
-            session_response::Response::TurnComplete(tc) => Some(tc),
-            _ => None,
-        })
+        .find_map(turn_finish_from_response)
         .expect("expected TurnComplete for turn 2");
-    assert_eq!(turn2_complete.stop_reason, "end_turn");
+    assert_eq!(turn2_stop_reason, "end_turn");
 
     // -----------------------------------------------------------------------
     // Step 12: CancelSession -> stream should end
@@ -504,8 +563,8 @@ async fn full_agent_session_lifecycle() {
 
     // Verify remaining responses do not contain unexpected errors.
     for resp in &remaining {
-        if let session_response::Response::Error(e) = resp {
-            panic!("unexpected error in remaining responses: {e:?}");
+        if let Some(message) = response_error_message(resp) {
+            panic!("unexpected error in remaining responses: {message}");
         }
     }
 }
@@ -513,6 +572,269 @@ async fn full_agent_session_lifecycle() {
 // ---------------------------------------------------------------------------
 // Test: project_context flows into the model's system prompt
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires Docker for testcontainers"]
+async fn register_tools_hot_swap_updates_subsequent_model_requests() {
+    let pg_url = roz_test::pg_url().await;
+    let pool = roz_db::create_pool(pg_url).await.expect("create pool");
+    roz_db::run_migrations(&pool).await.expect("run migrations");
+
+    let slug = format!("register-tools-test-{}", uuid::Uuid::new_v4());
+    let tenant = roz_db::tenant::create_tenant(&pool, "Register Tools Test Tenant", &slug, "personal")
+        .await
+        .expect("create tenant");
+    let env = roz_db::environments::create(
+        &pool,
+        tenant.id,
+        "register-tools-env",
+        "simulation",
+        &serde_json::json!({}),
+    )
+    .await
+    .expect("create env");
+    let api_key_result =
+        roz_db::api_keys::create_api_key(&pool, tenant.id, "register-tools-key", &["admin".into()], "test")
+            .await
+            .expect("create api key");
+
+    let responses = Arc::new(Mutex::new(vec![
+        text_sse("turn one"),
+        text_sse("turn two"),
+        text_sse("turn three"),
+        text_sse("turn four"),
+    ]));
+    let captured: CapturedRequests = Arc::new(Mutex::new(vec![]));
+    let gateway_url = mock_gateway_capturing(responses, captured.clone()).await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind grpc");
+    let addr = listener.local_addr().expect("addr");
+    let agent_svc = AgentServiceImpl::new(
+        pool.clone(),
+        reqwest::Client::new(),
+        "http://localhost:9080".into(),
+        None,
+        Arc::new(TestAuth),
+        "claude-sonnet-4-6".into(),
+        gateway_url,
+        "test-api-key".into(),
+        30,
+        "anthropic".into(),
+        None,
+        None,
+        Arc::new(roz_agent::meter::NoOpMeter),
+    );
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(AgentServiceServer::new(agent_svc))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .expect("grpc server");
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+        .expect("channel")
+        .connect()
+        .await
+        .expect("connect");
+    let mut client = AgentServiceClient::new(channel);
+
+    let (req_tx, req_rx) = tokio::sync::mpsc::channel::<SessionRequest>(16);
+    let stream = tokio_stream::wrappers::ReceiverStream::new(req_rx);
+    let mut request = tonic::Request::new(stream);
+    request.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {}", api_key_result.full_key).parse().expect("auth"),
+    );
+    let response = client.stream_session(request).await.expect("stream");
+    let mut resp_stream = response.into_inner();
+
+    req_tx
+        .send(SessionRequest {
+            request: Some(session_request::Request::Start(roz_v1::StartSession {
+                environment_id: env.id.to_string(),
+                host_id: None,
+                model: Some("claude-sonnet-4-6".into()),
+                tools: vec![],
+                history: vec![],
+                project_context: vec![],
+                max_context_tokens: None,
+                agent_placement: None,
+                camera_ids: vec![],
+                enable_video: false,
+            })),
+        })
+        .await
+        .expect("send StartSession");
+    collect_until(&mut resp_stream, is_session_started_response, Duration::from_secs(10)).await;
+
+    req_tx
+        .send(SessionRequest {
+            request: Some(session_request::Request::UserMessage(roz_v1::UserMessage {
+                content: "hello turn one".into(),
+                context: vec![],
+                ai_mode: None,
+                message_id: None,
+                tools: vec![],
+                system_context: None,
+            })),
+        })
+        .await
+        .expect("send UserMessage turn 1");
+    collect_until(
+        &mut resp_stream,
+        |r| turn_finish_from_response(r).is_some(),
+        Duration::from_secs(15),
+    )
+    .await;
+
+    let tool_schema = roz_v1::ToolSchema {
+        name: "sim-123__move_to".into(),
+        description: "Move the simulated arm".into(),
+        parameters_schema: Some(value_to_struct(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "target": { "type": "string" }
+            },
+            "required": ["target"]
+        }))),
+        timeout_ms: 30_000,
+        ..Default::default()
+    };
+
+    req_tx
+        .send(SessionRequest {
+            request: Some(session_request::Request::RegisterTools(roz_v1::RegisterTools {
+                source: Some("sim-123".into()),
+                tools: vec![tool_schema],
+                system_context: Some("Use the sim-123 tools for movement requests.".into()),
+            })),
+        })
+        .await
+        .expect("send RegisterTools");
+
+    req_tx
+        .send(SessionRequest {
+            request: Some(session_request::Request::UserMessage(roz_v1::UserMessage {
+                content: "hello turn two".into(),
+                context: vec![],
+                ai_mode: None,
+                message_id: None,
+                tools: vec![],
+                system_context: None,
+            })),
+        })
+        .await
+        .expect("send UserMessage turn 2");
+    collect_until(
+        &mut resp_stream,
+        |r| turn_finish_from_response(r).is_some(),
+        Duration::from_secs(15),
+    )
+    .await;
+
+    req_tx
+        .send(SessionRequest {
+            request: Some(session_request::Request::UserMessage(roz_v1::UserMessage {
+                content: "hello turn three".into(),
+                context: vec![],
+                ai_mode: None,
+                message_id: None,
+                tools: vec![],
+                system_context: None,
+            })),
+        })
+        .await
+        .expect("send UserMessage turn 3");
+    collect_until(
+        &mut resp_stream,
+        |r| turn_finish_from_response(r).is_some(),
+        Duration::from_secs(15),
+    )
+    .await;
+
+    req_tx
+        .send(SessionRequest {
+            request: Some(session_request::Request::RegisterTools(roz_v1::RegisterTools {
+                source: Some("sim-123".into()),
+                tools: vec![],
+                system_context: None,
+            })),
+        })
+        .await
+        .expect("send RegisterTools unregister");
+
+    req_tx
+        .send(SessionRequest {
+            request: Some(session_request::Request::UserMessage(roz_v1::UserMessage {
+                content: "hello turn four".into(),
+                context: vec![],
+                ai_mode: None,
+                message_id: None,
+                tools: vec![],
+                system_context: None,
+            })),
+        })
+        .await
+        .expect("send UserMessage turn 4");
+    collect_until(
+        &mut resp_stream,
+        |r| turn_finish_from_response(r).is_some(),
+        Duration::from_secs(15),
+    )
+    .await;
+
+    let requests = captured.lock().expect("captured");
+    assert_eq!(requests.len(), 4, "expected one model request per turn");
+
+    let turn1_tools = request_tool_names(&requests[0]);
+    assert!(
+        turn1_tools.is_empty(),
+        "turn 1 should not expose any tools before RegisterTools: {turn1_tools:?}"
+    );
+
+    let turn2_tools = request_tool_names(&requests[1]);
+    assert!(
+        turn2_tools.iter().any(|name| name == "sim-123__move_to"),
+        "turn 2 should include the hot-swapped tool: {turn2_tools:?}"
+    );
+    let turn2_system = request_system_text(&requests[1]);
+    assert!(
+        turn2_system.contains("Use the sim-123 tools for movement requests."),
+        "turn 2 should include RegisterTools.system_context: {turn2_system}"
+    );
+
+    let turn3_tools = request_tool_names(&requests[2]);
+    assert!(
+        turn3_tools.iter().any(|name| name == "sim-123__move_to"),
+        "turn 3 should retain the hot-swapped tool until it is explicitly unregistered: {turn3_tools:?}"
+    );
+    let turn3_system = request_system_text(&requests[2]);
+    assert!(
+        !turn3_system.contains("Use the sim-123 tools for movement requests."),
+        "turn 3 should consume RegisterTools.system_context after one turn while keeping durable tools: {turn3_system}"
+    );
+
+    let turn4_tools = request_tool_names(&requests[3]);
+    assert!(
+        !turn4_tools.iter().any(|name| name == "sim-123__move_to"),
+        "turn 4 should remove the unregistered tool source: {turn4_tools:?}"
+    );
+    let turn4_system = request_system_text(&requests[3]);
+    assert!(
+        !turn4_system.contains("Use the sim-123 tools for movement requests."),
+        "turn 4 should not retain removed workflow context: {turn4_system}"
+    );
+
+    let _ = req_tx
+        .send(SessionRequest {
+            request: Some(session_request::Request::CancelSession(roz_v1::CancelSession {
+                reason: "test done".into(),
+            })),
+        })
+        .await;
+}
 
 #[tokio::test]
 #[ignore = "requires Docker for testcontainers"]
@@ -606,12 +928,7 @@ async fn project_context_included_in_system_prompt() {
         .await
         .expect("send StartSession");
 
-    collect_until(
-        &mut resp_stream,
-        |r| matches!(r, session_response::Response::SessionStarted(_)),
-        Duration::from_secs(10),
-    )
-    .await;
+    collect_until(&mut resp_stream, is_session_started_response, Duration::from_secs(10)).await;
 
     // 7. Send UserMessage with per-message context.
     req_tx
@@ -634,7 +951,7 @@ async fn project_context_included_in_system_prompt() {
     // Wait for TurnComplete.
     collect_until(
         &mut resp_stream,
-        |r| matches!(r, session_response::Response::TurnComplete(_)),
+        |r| turn_finish_from_response(r).is_some(),
         Duration::from_secs(15),
     )
     .await;
@@ -820,24 +1137,13 @@ async fn start_session_with_host_id_stores_in_session() {
         .expect("send StartSession");
 
     // 7. Receive SessionStarted.
-    let started_msgs = collect_until(
-        &mut resp_stream,
-        |r| matches!(r, session_response::Response::SessionStarted(_)),
-        Duration::from_secs(10),
-    )
-    .await;
-    let session_started = started_msgs
+    let started_msgs = collect_until(&mut resp_stream, is_session_started_response, Duration::from_secs(10)).await;
+    let (session_id_raw, _session_model) = started_msgs
         .iter()
-        .find_map(|r| match r {
-            session_response::Response::SessionStarted(s) => Some(s),
-            _ => None,
-        })
+        .find_map(session_started_from_response)
         .expect("expected SessionStarted");
-    assert!(!session_started.session_id.is_empty(), "session_id should not be empty");
-    let session_id: uuid::Uuid = session_started
-        .session_id
-        .parse()
-        .expect("session_id should be a valid UUID");
+    assert!(!session_id_raw.is_empty(), "session_id should not be empty");
+    let session_id: uuid::Uuid = session_id_raw.parse().expect("session_id should be a valid UUID");
 
     // 8. Verify the session row exists in Postgres.
     // host_id is stored in the in-memory Session struct, not in the DB schema.
@@ -953,21 +1259,13 @@ async fn model_tier_names_resolve_to_actual_models() {
         .await
         .expect("send StartSession");
 
-    let started_msgs = collect_until(
-        &mut resp_stream,
-        |r| matches!(r, session_response::Response::SessionStarted(_)),
-        Duration::from_secs(10),
-    )
-    .await;
-    let session_started = started_msgs
+    let started_msgs = collect_until(&mut resp_stream, is_session_started_response, Duration::from_secs(10)).await;
+    let (_session_id_raw, session_model) = started_msgs
         .iter()
-        .find_map(|r| match r {
-            session_response::Response::SessionStarted(s) => Some(s),
-            _ => None,
-        })
+        .find_map(session_started_from_response)
         .expect("expected SessionStarted");
     assert_eq!(
-        session_started.model, "claude-haiku-4-5",
+        session_model, "claude-haiku-4-5",
         "\"fast\" tier should resolve to claude-haiku-4-5"
     );
 
@@ -1091,16 +1389,9 @@ async fn session_with_host_receives_telemetry() {
         .expect("send StartSession");
 
     // Wait for SessionStarted.
-    let started_msgs = collect_until(
-        &mut resp_stream,
-        |r| matches!(r, session_response::Response::SessionStarted(_)),
-        Duration::from_secs(10),
-    )
-    .await;
+    let started_msgs = collect_until(&mut resp_stream, is_session_started_response, Duration::from_secs(10)).await;
     assert!(
-        started_msgs
-            .iter()
-            .any(|r| matches!(r, session_response::Response::SessionStarted(_))),
+        started_msgs.iter().any(is_session_started_response),
         "expected SessionStarted"
     );
 

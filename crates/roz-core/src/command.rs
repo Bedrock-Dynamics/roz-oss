@@ -155,12 +155,12 @@ pub struct Command {
 
 /// Robot-agnostic command frame: flat vector of channel values.
 ///
-/// Channel semantics are defined by the [`crate::channels::ChannelManifest`] for the robot.
+/// Channel semantics are defined by the legacy runtime channel manifest for the robot.
 /// The index in `values` corresponds 1-to-1 with the index in
-/// [`crate::channels::ChannelManifest::commands`].
+/// that manifest's command list.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CommandFrame {
-    /// Per-channel command values; length must equal `ChannelManifest::command_count()`.
+    /// Per-channel command values; length must equal the legacy manifest command count.
     pub values: Vec<f64>,
 }
 
@@ -174,7 +174,7 @@ impl CommandFrame {
     ///
     /// Use this for safe-stop instead of `zero()` on position-controlled robots,
     /// where zero means "go to mechanical origin" rather than "stop."
-    pub fn from_defaults(manifest: &crate::channels::ChannelManifest) -> Self {
+    pub fn from_defaults(manifest: &crate::channels::LegacyRuntimeManifest) -> Self {
         Self {
             values: manifest.commands.iter().map(|c| c.default).collect(),
         }
@@ -474,9 +474,9 @@ mod tests {
 
     #[test]
     fn command_frame_from_defaults_uses_manifest() {
-        use crate::channels::{ChannelDescriptor, ChannelManifest, InterfaceType};
+        use crate::channels::{ChannelDescriptor, InterfaceType, LegacyRuntimeManifest};
 
-        let manifest = ChannelManifest {
+        let manifest = LegacyRuntimeManifest {
             robot_id: "test".into(),
             robot_class: "test".into(),
             control_rate_hz: 50,
@@ -518,7 +518,7 @@ mod tests {
 
     #[test]
     fn command_frame_from_defaults_empty_manifest() {
-        let manifest = crate::channels::ChannelManifest::default();
+        let manifest = crate::channels::LegacyRuntimeManifest::default();
         let frame = CommandFrame::from_defaults(&manifest);
         assert!(frame.values.is_empty());
     }

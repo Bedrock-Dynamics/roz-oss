@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,12 +6,49 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use roz_agent::dispatch::{Extensions, ToolContext, ToolDispatcher, ToolExecutor};
 use roz_agent::tools::execute_code::ExecuteCodeTool;
-use roz_core::manifest::RobotManifest;
+use roz_copper::evidence_archive::EvidenceArchive;
+use roz_core::embodiment::binding::CommandInterfaceType;
+use roz_core::manifest::EmbodimentManifest;
 use roz_core::tools::{ToolCategory, ToolResult, ToolSchema};
 use serde_json::{Value, json};
 
+const fn is_actuator_channel(interface_type: &CommandInterfaceType) -> bool {
+    matches!(
+        interface_type,
+        CommandInterfaceType::JointPosition
+            | CommandInterfaceType::JointVelocity
+            | CommandInterfaceType::JointTorque
+            | CommandInterfaceType::GripperPosition
+            | CommandInterfaceType::GripperForce
+    )
+}
+
+fn load_project_embodiment_manifest(
+    project_dir: &Path,
+    surface: &'static str,
+) -> Option<(EmbodimentManifest, PathBuf)> {
+    let path = EmbodimentManifest::project_manifest_path(project_dir)?;
+
+    match EmbodimentManifest::load(&path) {
+        Ok(manifest) => Some((manifest, path)),
+        Err(error) => {
+            tracing::error!(surface, manifest_path = %path.display(), %error, "failed to load embodiment manifest");
+            None
+        }
+    }
+}
+
+fn websocket_url(base_url: &str, path: &str) -> String {
+    let base = base_url
+        .trim_end_matches('/')
+        .replace("http://", "ws://")
+        .replace("https://", "wss://");
+    let path = path.trim_start_matches('/');
+    format!("{base}/{path}")
+}
+
 /// Build a `ToolDispatcher` with **all** tools for CLI sessions:
-/// 6 built-in tools + daemon tools from `robot.toml` (if present).
+/// 6 built-in tools + daemon tools from the embodiment manifest (if present).
 ///
 /// Returns the dispatcher and the combined schema vec paired with categories
 /// (used for cloud `RegisterTools` with correct `ToolCategoryHint` and for
@@ -29,13 +66,15 @@ pub fn build_all_tools(project_dir: &Path) -> (ToolDispatcher, Vec<(ToolSchema, 
     dispatcher.register_with_category(Box::new(ListFilesTool), ToolCategory::Pure);
     dispatcher.register_with_category(Box::new(SearchTool), ToolCategory::Pure);
 
-    // Daemon tools from robot.toml (if present)
-    let robot_toml = project_dir.join("robot.toml");
-    if let Ok(manifest) = RobotManifest::load(&robot_toml)
+    // Daemon tools from embodiment.toml (legacy robot.toml fallback accepted)
+    if let Some((manifest, _manifest_path)) = load_project_embodiment_manifest(project_dir, "build_all_tools")
         && let Some(daemon) = manifest.daemon.as_ref()
     {
-        let channels = manifest.channel_manifest();
-        for (tool, category) in roz_local::tools::daemon::daemon_tools(daemon, channels.as_ref()) {
+        let control_manifest = manifest.control_interface_manifest();
+        let embodiment_runtime = manifest.authoritative_embodiment_runtime();
+        for (tool, category) in
+            roz_local::tools::daemon::daemon_tools(daemon, control_manifest.as_ref(), embodiment_runtime.as_ref())
+        {
             dispatcher.register_with_category(tool, category);
         }
     }
@@ -53,85 +92,111 @@ pub struct AllTools {
     pub schemas: Vec<(ToolSchema, ToolCategory)>,
     /// Kept alive to prevent the controller thread from halting on drop.
     pub copper_handle: Option<roz_copper::handle::CopperHandle>,
-    /// Shared extensions containing `cmd_tx`, `ChannelManifest`, and
+    /// Shared extensions containing `cmd_tx`, canonical control metadata, and
     /// `Arc<ArcSwap<ControllerState>>` when Copper is active.
     pub extensions: Extensions,
 }
 
 /// Build tools and optionally spawn the Copper WASM pipeline with a WS bridge.
 ///
-/// When `robot.toml` has both `[daemon.websocket]` and `[channels]`, this:
+/// When the embodiment manifest has both `[daemon.websocket]` and `[channels]`, this:
 /// 1. Creates a WebSocket bridge (`WsActuatorSink` + `WsSensorSource`)
 /// 2. Spawns `CopperHandle::spawn_with_io()` with the bridge
-/// 3. Registers `deploy_controller`, `stop_controller`, `get_controller_status`
-/// 4. Injects `cmd_tx`, `ChannelManifest`, and `ControllerState` into Extensions
+/// 3. Registers `replay_controller`, `stop_controller`, and
+///    `get_controller_status` when Copper is active
+/// 4. Injects `EvidenceArchive`, `ControlInterfaceManifest`, and any live Copper handles into Extensions
 ///
 /// Falls back to the plain `build_all_tools` tool set when conditions aren't met.
 pub fn build_all_tools_with_copper(project_dir: &Path) -> AllTools {
     let (mut dispatcher, _) = build_all_tools(project_dir);
     let mut extensions = Extensions::default();
     let mut copper_handle = None;
+    let evidence_archive = EvidenceArchive::new(project_dir);
 
-    let robot_toml = project_dir.join("robot.toml");
-    if let Ok(manifest) = RobotManifest::load(&robot_toml)
-        && let Some(ref daemon) = manifest.daemon
-        && let Some(ref ws_config) = daemon.websocket
-        && let Some(channel_manifest) = manifest.channel_manifest()
+    if let Some((manifest, manifest_path)) =
+        load_project_embodiment_manifest(project_dir, "build_all_tools_with_copper")
+        && let Some(control_manifest) = manifest.control_interface_manifest()
     {
-        // Build WS URL from daemon base_url + websocket path.
-        let ws_url = format!(
-            "{}{}",
-            daemon
-                .base_url
-                .replace("http://", "ws://")
-                .replace("https://", "wss://"),
-            ws_config.path,
-        );
-        let body_template = ws_config
-            .set_target_body
-            .clone()
-            .expect("robot.toml [daemon.websocket] must have set_target_body when [channels] is present");
+        let replay_tool = roz_local::tools::replay_controller::ReplayControllerTool::new(&control_manifest);
+        dispatcher.register_with_category(Box::new(replay_tool), ToolCategory::Pure);
+        extensions.insert(evidence_archive);
+        extensions.insert(control_manifest.clone());
+        if let Some(embodiment_runtime) = manifest.authoritative_embodiment_runtime() {
+            extensions.insert(embodiment_runtime);
+        }
 
-        let bridge_config = roz_copper::io_ws::WsBridgeConfig {
-            url: ws_url,
-            set_target_type: ws_config.set_target_type.clone().unwrap_or_default(),
-            body_template,
-            channel_names: channel_manifest.commands.iter().map(|c| c.name.clone()).collect(),
-            channel_defaults: channel_manifest.commands.iter().map(|c| c.default).collect(),
-        };
+        if let Some(ref daemon) = manifest.daemon
+            && let Some(ref ws_config) = daemon.websocket
+        {
+            // Build WS URL from daemon base_url + websocket path.
+            let ws_url = websocket_url(&daemon.base_url, &ws_config.path);
+            let Some(body_template) = ws_config.set_target_body.clone() else {
+                tracing::error!(
+                    manifest_path = %manifest_path.display(),
+                    "embodiment manifest [daemon.websocket] must set set_target_body when [channels] are present"
+                );
+                let schemas = dispatcher.schemas_with_categories();
+                return AllTools {
+                    dispatcher,
+                    schemas,
+                    copper_handle,
+                    extensions,
+                };
+            };
 
-        // Create WS bridge on the current tokio runtime.
-        let rt = tokio::runtime::Handle::current();
-        let (actuator, sensor, _supervisor) = roz_copper::io_ws::create_ws_bridge(bridge_config, &rt);
+            let bridge_config = roz_copper::io_ws::WsBridgeConfig {
+                url: ws_url,
+                set_target_type: ws_config.set_target_type.clone().unwrap_or_default(),
+                body_template,
+                channel_names: control_manifest
+                    .channels
+                    .iter()
+                    .filter(|channel| is_actuator_channel(&channel.interface_type))
+                    .map(|channel| channel.name.clone())
+                    .collect(),
+                channel_defaults: Vec::new(),
+            };
 
-        // Spawn Copper with IO backends.
-        let handle = roz_copper::handle::CopperHandle::spawn_with_io(
-            1.5,
-            Some(actuator as Arc<dyn roz_copper::io::ActuatorSink>),
-            Some(sensor as Box<dyn roz_copper::io::SensorSource>),
-        );
+            // Create WS bridge on the current tokio runtime.
+            let Ok(rt) = tokio::runtime::Handle::try_current() else {
+                tracing::error!(
+                    manifest_path = %manifest_path.display(),
+                    "no Tokio runtime available for WS bridge; skipping Copper startup"
+                );
+                let schemas = dispatcher.schemas_with_categories();
+                return AllTools {
+                    dispatcher,
+                    schemas,
+                    copper_handle,
+                    extensions,
+                };
+            };
+            let (actuator, sensor, _supervisor) = roz_copper::io_ws::create_ws_bridge(bridge_config, &rt);
 
-        // Build deploy_controller tool before moving manifest into Extensions.
-        let deploy_tool = roz_local::tools::deploy_controller::DeployControllerTool::new(&channel_manifest);
+            // Spawn Copper with IO backends.
+            let handle = roz_copper::handle::CopperHandle::spawn_with_io(
+                1.5,
+                Some(actuator as Arc<dyn roz_copper::io::ActuatorSink>),
+                Some(sensor as Box<dyn roz_copper::io::SensorSource>),
+            );
 
-        // Inject into Extensions for tool access.
-        extensions.insert(handle.cmd_tx());
-        extensions.insert(channel_manifest);
-        extensions.insert(Arc::clone(handle.state()) as Arc<ArcSwap<roz_copper::channels::ControllerState>>);
+            // Inject into Extensions for tool access.
+            extensions.insert(handle.cmd_tx());
+            extensions.insert(Arc::clone(handle.state()) as Arc<ArcSwap<roz_copper::channels::ControllerState>>);
 
-        // Register controller tools.
-        dispatcher.register_with_category(Box::new(deploy_tool), ToolCategory::Physical);
-        dispatcher.register_with_category(
-            Box::new(roz_local::tools::stop_controller::StopControllerTool),
-            ToolCategory::Physical,
-        );
-        dispatcher.register_with_category(
-            Box::new(roz_local::tools::controller_status::GetControllerStatusTool),
-            ToolCategory::Pure,
-        );
+            // Register controller tools.
+            dispatcher.register_with_category(
+                Box::new(roz_local::tools::stop_controller::StopControllerTool),
+                ToolCategory::Physical,
+            );
+            dispatcher.register_with_category(
+                Box::new(roz_local::tools::controller_status::GetControllerStatusTool),
+                ToolCategory::Pure,
+            );
 
-        tracing::info!("copper WASM pipeline spawned with WS bridge");
-        copper_handle = Some(handle);
+            tracing::info!("copper WASM pipeline spawned with WS bridge");
+            copper_handle = Some(handle);
+        }
     }
 
     let schemas = dispatcher.schemas_with_categories();
@@ -143,17 +208,16 @@ pub fn build_all_tools_with_copper(project_dir: &Path) -> AllTools {
     }
 }
 
-/// Build system prompt blocks: constitution + robot.toml + project context.
+/// Build system prompt blocks: constitution + embodiment manifest + project context.
 ///
 /// Reuses `context::load_project_context_from()` for AGENTS.md/ROBOT.md,
-/// prepends the constitution, and adds robot.toml system prompt if present.
+/// prepends the constitution, and adds the embodiment manifest system prompt if present.
 pub fn build_system_prompt(project_dir: &Path, tool_names: &[&str]) -> Vec<String> {
     let mode = roz_agent::agent_loop::AgentLoopMode::React;
     let mut blocks = vec![roz_agent::constitution::build_constitution(mode, tool_names)];
 
-    // Robot system prompt from robot.toml
-    let robot_toml = project_dir.join("robot.toml");
-    if let Ok(manifest) = RobotManifest::load(&robot_toml) {
+    // Embodiment system prompt from embodiment.toml (legacy robot.toml fallback accepted)
+    if let Some((manifest, _manifest_path)) = load_project_embodiment_manifest(project_dir, "build_system_prompt") {
         let prompt = manifest.to_system_prompt();
         if !prompt.is_empty() {
             blocks.push(prompt);
@@ -181,7 +245,7 @@ pub fn default_context() -> ToolContext {
 /// `ToolContext` for local execution with pre-populated Extensions.
 ///
 /// Used by the cloud provider path to inject Copper handles (cmd\_tx,
-/// `ChannelManifest`, `ControllerState`) into tool execution context.
+/// canonical control metadata, `ControllerState`) into tool execution context.
 pub fn default_context_with(extensions: Extensions) -> ToolContext {
     ToolContext {
         task_id: "local".into(),
@@ -430,7 +494,7 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    const MINIMAL_ROBOT_TOML: &str = r#"
+    const MINIMAL_EMBODIMENT_TOML: &str = r#"
 [robot]
 name = "test-bot"
 description = "A test robot"
@@ -452,7 +516,15 @@ path_prefix = "/api/move/play"
 available_moves = ["wake_up", "goto_sleep"]
 "#;
 
-    const ROBOT_TOML_WITH_CHANNELS: &str = r#"
+    fn write_embodiment_manifest(dir: &TempDir, contents: &str) {
+        fs::write(dir.path().join("embodiment.toml"), contents).unwrap();
+    }
+
+    fn write_invalid_embodiment_manifest(dir: &TempDir, contents: &str) {
+        fs::write(dir.path().join("embodiment.toml"), contents).unwrap();
+    }
+
+    const EMBODIMENT_TOML_WITH_CHANNELS: &str = r#"
 [robot]
 name = "test-bot"
 description = "A test robot"
@@ -497,7 +569,7 @@ available_moves = ["wake_up", "goto_sleep"]
 "#;
 
     #[test]
-    fn build_all_tools_includes_builtins_without_robot_toml() {
+    fn build_all_tools_includes_builtins_without_embodiment_manifest() {
         let dir = TempDir::new().unwrap();
         let (dispatcher, schemas) = build_all_tools(dir.path());
         // 6 CLI built-ins: bash, read_file, write_file, list_files, search, execute_code
@@ -513,9 +585,9 @@ available_moves = ["wake_up", "goto_sleep"]
     }
 
     #[test]
-    fn build_all_tools_includes_daemon_tools_when_robot_toml_present() {
+    fn build_all_tools_includes_daemon_tools_when_embodiment_manifest_present() {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("robot.toml"), MINIMAL_ROBOT_TOML).unwrap();
+        write_embodiment_manifest(&dir, MINIMAL_EMBODIMENT_TOML);
         let (_dispatcher, schemas) = build_all_tools(dir.path());
         // 6 CLI built-ins + 3 daemon tools (get_robot_state, set_motors, play_animation)
         assert_eq!(schemas.len(), 9);
@@ -529,7 +601,7 @@ available_moves = ["wake_up", "goto_sleep"]
     #[test]
     fn build_all_tools_includes_move_to_with_channels() {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("robot.toml"), ROBOT_TOML_WITH_CHANNELS).unwrap();
+        write_embodiment_manifest(&dir, EMBODIMENT_TOML_WITH_CHANNELS);
         let (_dispatcher, schemas) = build_all_tools(dir.path());
         // 6 built-ins + 4 daemon tools (get_robot_state, set_motors, move_to, play_animation)
         assert_eq!(schemas.len(), 10);
@@ -545,14 +617,25 @@ available_moves = ["wake_up", "goto_sleep"]
     #[test]
     fn build_all_tools_no_daemon_when_no_daemon_section() {
         let dir = TempDir::new().unwrap();
-        fs::write(
-            dir.path().join("robot.toml"),
-            "[robot]\nname = \"test\"\ndescription = \"test\"\n",
-        )
-        .unwrap();
+        write_embodiment_manifest(&dir, "[robot]\nname = \"test\"\ndescription = \"test\"\n");
         let (_dispatcher, schemas) = build_all_tools(dir.path());
         // Only CLI built-ins
         assert_eq!(schemas.len(), 6);
+    }
+
+    #[test]
+    fn malformed_embodiment_manifest_keeps_builtin_tools_available() {
+        let dir = TempDir::new().unwrap();
+        write_invalid_embodiment_manifest(&dir, "[robot\nname = \"broken\"");
+
+        let (dispatcher, schemas) = build_all_tools(dir.path());
+
+        assert_eq!(dispatcher.schemas().len(), 6);
+        assert_eq!(schemas.len(), 6);
+        let names: Vec<&str> = schemas.iter().map(|(s, _)| s.name.as_str()).collect();
+        assert!(names.contains(&"bash"));
+        assert!(names.contains(&"read_file"));
+        assert!(names.contains(&"execute_code"));
     }
 
     #[test]
@@ -574,12 +657,12 @@ available_moves = ["wake_up", "goto_sleep"]
     #[test]
     fn copper_tools_not_registered_without_websocket() {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("robot.toml"), MINIMAL_ROBOT_TOML).unwrap();
+        write_embodiment_manifest(&dir, MINIMAL_EMBODIMENT_TOML);
         let all = build_all_tools_with_copper(dir.path());
         // No websocket section -> no copper handle, no controller tools.
         assert!(all.copper_handle.is_none());
         let names: Vec<&str> = all.schemas.iter().map(|(s, _)| s.name.as_str()).collect();
-        assert!(!names.contains(&"deploy_controller"));
+        assert!(!names.contains(&"promote_controller"));
         assert!(!names.contains(&"stop_controller"));
         assert!(!names.contains(&"get_controller_status"));
     }
@@ -599,20 +682,131 @@ base_url = "http://localhost:8000"
 [daemon.websocket]
 path = "/ws/sdk"
 "#;
-        fs::write(dir.path().join("robot.toml"), toml).unwrap();
+        write_embodiment_manifest(&dir, toml);
         let all = build_all_tools_with_copper(dir.path());
         assert!(all.copper_handle.is_none());
         let names: Vec<&str> = all.schemas.iter().map(|(s, _)| s.name.as_str()).collect();
-        assert!(!names.contains(&"deploy_controller"));
+        assert!(!names.contains(&"promote_controller"));
+    }
+
+    #[tokio::test]
+    async fn copper_tools_not_registered_when_websocket_body_missing() {
+        let dir = TempDir::new().unwrap();
+        let toml = r#"
+[robot]
+name = "copper-test"
+description = "test"
+
+[channels]
+robot_id = "test"
+robot_class = "expressive"
+control_rate_hz = 50
+
+[[channels.commands]]
+name = "head_pitch"
+type = "position"
+unit = "rad"
+limits = [-0.35, 0.17]
+
+[[channels.states]]
+name = "head_pitch"
+type = "position"
+unit = "rad"
+limits = [-0.35, 0.17]
+
+[daemon]
+base_url = "http://localhost:19999"
+
+[daemon.websocket]
+path = "/ws/sdk"
+"#;
+        write_embodiment_manifest(&dir, toml);
+
+        let all = build_all_tools_with_copper(dir.path());
+
+        assert!(
+            all.copper_handle.is_none(),
+            "missing set_target_body should skip Copper startup"
+        );
+        let names: Vec<&str> = all.schemas.iter().map(|(s, _)| s.name.as_str()).collect();
+        assert!(!names.contains(&"stop_controller"));
+        assert!(!names.contains(&"get_controller_status"));
+        assert!(
+            names.contains(&"replay_controller"),
+            "control-manifest tooling should still load"
+        );
     }
 
     #[test]
-    fn copper_tools_not_registered_without_robot_toml() {
+    fn copper_tools_not_registered_without_embodiment_manifest() {
         let dir = TempDir::new().unwrap();
         let all = build_all_tools_with_copper(dir.path());
         assert!(all.copper_handle.is_none());
         // Only CLI built-ins.
         assert_eq!(all.schemas.len(), 6);
+    }
+
+    #[test]
+    fn copper_skips_websocket_bridge_without_tokio_runtime() {
+        let dir = TempDir::new().unwrap();
+        let toml = r#"
+[robot]
+name = "copper-test"
+description = "test"
+
+[channels]
+robot_id = "test"
+robot_class = "expressive"
+control_rate_hz = 50
+
+[[channels.commands]]
+name = "head_pitch"
+type = "position"
+unit = "rad"
+limits = [-0.35, 0.17]
+
+[[channels.states]]
+name = "head_pitch"
+type = "position"
+unit = "rad"
+limits = [-0.35, 0.17]
+
+[daemon]
+base_url = "http://localhost:19999"
+
+[daemon.websocket]
+path = "/ws/sdk"
+set_target_type = "set_target"
+set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
+"#;
+        write_embodiment_manifest(&dir, toml);
+
+        let all = build_all_tools_with_copper(dir.path());
+
+        assert!(
+            all.copper_handle.is_none(),
+            "missing Tokio runtime should skip Copper startup instead of panicking"
+        );
+        let names: Vec<&str> = all.schemas.iter().map(|(s, _)| s.name.as_str()).collect();
+        assert!(names.contains(&"replay_controller"));
+        assert!(!names.contains(&"stop_controller"));
+        assert!(!names.contains(&"get_controller_status"));
+    }
+
+    #[test]
+    fn websocket_url_normalizes_path_join() {
+        assert_eq!(
+            websocket_url("http://localhost:8080/", "/ws/sdk"),
+            "ws://localhost:8080/ws/sdk"
+        );
+        assert_eq!(
+            websocket_url("http://localhost:8080", "ws/sdk"),
+            "ws://localhost:8080/ws/sdk"
+        );
+        assert_eq!(
+            websocket_url("https://localhost:8080/", "ws/sdk"),
+            "wss://localhost:8080/ws/sdk"
+        );
     }
 
     /// Full copper path: websocket + channels -> spawns Copper, registers controller tools.
@@ -653,7 +847,7 @@ path = "/ws/sdk"
 set_target_type = "set_target"
 set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
 "#;
-        fs::write(dir.path().join("robot.toml"), toml).unwrap();
+        write_embodiment_manifest(&dir, toml);
         let all = build_all_tools_with_copper(dir.path());
 
         // Copper handle should be present.
@@ -661,7 +855,10 @@ set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
 
         // Controller tools registered.
         let names: Vec<&str> = all.schemas.iter().map(|(s, _)| s.name.as_str()).collect();
-        assert!(names.contains(&"deploy_controller"), "missing deploy_controller");
+        assert!(
+            !names.contains(&"promote_controller"),
+            "promote_controller should remain external-authority only"
+        );
         assert!(names.contains(&"stop_controller"), "missing stop_controller");
         assert!(
             names.contains(&"get_controller_status"),
@@ -676,8 +873,10 @@ set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
             "extensions should contain cmd_tx"
         );
         assert!(
-            all.extensions.get::<roz_core::channels::ChannelManifest>().is_some(),
-            "extensions should contain ChannelManifest"
+            all.extensions
+                .get::<roz_core::embodiment::binding::ControlInterfaceManifest>()
+                .is_some(),
+            "extensions should contain ControlInterfaceManifest"
         );
         assert!(
             all.extensions
@@ -687,13 +886,6 @@ set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
         );
 
         // Verify categories.
-        let deploy_cat = all
-            .schemas
-            .iter()
-            .find(|(s, _)| s.name == "deploy_controller")
-            .map(|(_, c)| c);
-        assert_eq!(deploy_cat, Some(&ToolCategory::Physical));
-
         let status_cat = all
             .schemas
             .iter()
@@ -702,8 +894,8 @@ set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
         assert_eq!(status_cat, Some(&ToolCategory::Pure));
 
         // Existing daemon tools should also be present (from [daemon] section).
-        // No get_state/set_motors/etc in this toml -> only CLI builtins + 3 controller tools.
-        // CLI builtins(6) + controller tools(3) = 9
+        // No get_state/set_motors/etc in this toml -> CLI builtins + replay + 2 controller tools.
+        // CLI builtins(6) + replay(1) + controller tools(2) = 9
         assert_eq!(all.schemas.len(), 9);
 
         // Clean shutdown.
@@ -724,15 +916,11 @@ set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
     }
 
     #[test]
-    fn build_system_prompt_includes_robot_toml() {
+    fn build_system_prompt_includes_embodiment_manifest() {
         let dir = TempDir::new().unwrap();
-        fs::write(
-            dir.path().join("robot.toml"),
-            "[robot]\nname = \"test-bot\"\ndescription = \"A test robot\"\n",
-        )
-        .unwrap();
+        write_embodiment_manifest(&dir, "[robot]\nname = \"test-bot\"\ndescription = \"A test robot\"\n");
         let prompt = build_system_prompt(dir.path(), &[]);
-        assert!(prompt.len() >= 2, "should have constitution + robot prompt");
+        assert!(prompt.len() >= 2, "should have constitution + embodiment prompt");
         assert!(prompt[1].contains("test-bot"));
     }
 
@@ -748,14 +936,10 @@ set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
     #[test]
     fn build_system_prompt_all_blocks() {
         let dir = TempDir::new().unwrap();
-        fs::write(
-            dir.path().join("robot.toml"),
-            "[robot]\nname = \"all-bot\"\ndescription = \"Full test\"\n",
-        )
-        .unwrap();
+        write_embodiment_manifest(&dir, "[robot]\nname = \"all-bot\"\ndescription = \"Full test\"\n");
         fs::write(dir.path().join("AGENTS.md"), "Agent instructions.").unwrap();
         let prompt = build_system_prompt(dir.path(), &["bash"]);
-        // constitution + robot.toml + AGENTS.md = 3 blocks
+        // constitution + embodiment.toml + AGENTS.md = 3 blocks
         assert_eq!(prompt.len(), 3);
         assert!(prompt[0].contains("SAFETY-CRITICAL"));
         assert!(prompt[1].contains("all-bot"));

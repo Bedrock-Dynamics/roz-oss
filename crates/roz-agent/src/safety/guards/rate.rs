@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use roz_core::safety::SafetyVerdict;
-use roz_core::spatial::SpatialContext;
+use roz_core::spatial::WorldState;
 use roz_core::tools::ToolCall;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -34,7 +34,7 @@ impl SafetyGuard for RateGuard {
         "rate_limiter"
     }
 
-    async fn check(&self, _action: &ToolCall, _state: &SpatialContext) -> SafetyVerdict {
+    async fn check(&self, _action: &ToolCall, _state: &WorldState) -> SafetyVerdict {
         let now = Instant::now();
         let mut history = self.history.lock();
 
@@ -66,8 +66,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn empty_state() -> SpatialContext {
-        SpatialContext::default()
+    fn empty_state() -> WorldState {
+        WorldState::default()
     }
 
     fn make_action() -> ToolCall {

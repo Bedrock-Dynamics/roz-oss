@@ -83,11 +83,9 @@ fn read_project_name(dir: &Path) -> Option<String> {
         .map(String::from)
 }
 
-/// Read the robot name from `robot.toml` if present in the project directory.
+/// Read the embodiment name from the project manifest if present.
 pub fn read_robot_name(project_dir: &Path) -> Option<String> {
-    let robot_toml = project_dir.join("robot.toml");
-    let contents = std::fs::read_to_string(robot_toml).ok()?;
-    let manifest: roz_core::manifest::RobotManifest = toml::from_str(&contents).ok()?;
+    let manifest = roz_core::manifest::EmbodimentManifest::load_from_project_dir(project_dir).ok()?;
     Some(manifest.robot.name)
 }
 
@@ -187,10 +185,10 @@ mod tests {
     }
 
     #[test]
-    fn reads_robot_name_from_robot_toml() {
+    fn reads_robot_name_from_embodiment_toml() {
         let dir = TempDir::new().unwrap();
         fs::write(
-            dir.path().join("robot.toml"),
+            dir.path().join("embodiment.toml"),
             "[robot]\nname = \"reachy-mini\"\ndescription = \"A small robot\"\n",
         )
         .unwrap();
@@ -198,15 +196,15 @@ mod tests {
     }
 
     #[test]
-    fn robot_name_none_when_no_robot_toml() {
+    fn robot_name_none_when_no_manifest() {
         let dir = TempDir::new().unwrap();
         assert!(read_robot_name(dir.path()).is_none());
     }
 
     #[test]
-    fn robot_name_none_when_invalid_toml() {
+    fn robot_name_none_when_invalid_manifest() {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("robot.toml"), "not valid toml {{{").unwrap();
+        fs::write(dir.path().join("embodiment.toml"), "not valid toml {{{").unwrap();
         assert!(read_robot_name(dir.path()).is_none());
     }
 }

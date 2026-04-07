@@ -15,6 +15,12 @@ pub mod channels;
 #[cfg(feature = "copper-runtime")]
 pub mod ci;
 pub mod controller;
+pub mod controller_adapter;
+pub mod controller_lifecycle;
+#[doc(hidden)]
+pub mod deployment_manager;
+pub mod evidence_archive;
+pub mod evidence_collector;
 #[cfg(feature = "gazebo")]
 pub mod gazebo_cmd;
 #[cfg(feature = "gazebo")]
@@ -26,8 +32,13 @@ pub mod io_log;
 pub mod io_ws;
 pub mod manifest;
 pub mod mcap_export;
+pub mod replay;
 pub mod safety_filter;
 pub mod state_injector;
 pub mod tasks;
+pub mod tick_builder;
+pub mod tick_contract;
+pub mod tick_dispatch;
 pub mod wasm;
+pub mod wit_bindings;
 pub mod wit_host;

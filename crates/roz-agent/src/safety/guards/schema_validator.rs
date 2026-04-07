@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use roz_core::safety::SafetyVerdict;
-use roz_core::spatial::SpatialContext;
+use roz_core::spatial::WorldState;
 use roz_core::tools::ToolCall;
 use serde_json::Value;
 
@@ -62,7 +62,7 @@ impl SafetyGuard for SchemaValidator {
         "schema_validator"
     }
 
-    async fn check(&self, action: &ToolCall, _state: &SpatialContext) -> SafetyVerdict {
+    async fn check(&self, action: &ToolCall, _state: &WorldState) -> SafetyVerdict {
         self.validate(&action.tool, &action.params)
             .map_or(SafetyVerdict::Allow, |error| SafetyVerdict::Block { reason: error })
     }
@@ -73,8 +73,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn empty_state() -> SpatialContext {
-        SpatialContext::default()
+    fn empty_state() -> WorldState {
+        WorldState::default()
     }
 
     #[tokio::test]

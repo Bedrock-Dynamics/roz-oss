@@ -9,6 +9,8 @@
 //! forwarding streaming deltas to the client. `ToolResult` messages resolve pending
 //! remote tool calls. `CancelTurn` / `CancelSession` handle lifecycle cleanup.
 
+#![allow(clippy::significant_drop_tightening)]
+
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -16,24 +18,30 @@ use std::time::Duration;
 
 use futures::Stream;
 use sqlx::PgPool;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
-use roz_agent::agent_loop::{AgentInput, AgentLoop, AgentLoopMode};
+use roz_agent::agent_loop::{AgentInput, AgentInputSeed, AgentLoop, AgentLoopMode};
 use roz_agent::constitution::build_constitution;
 use roz_agent::dispatch::ToolDispatcher;
-use roz_agent::dispatch::remote::{
-    PendingApprovals, PendingResults, RemoteToolCall, RemoteToolExecutor, resolve_approval, resolve_pending,
-};
+use roz_agent::dispatch::remote::{PendingResults, RemoteToolCall, RemoteToolExecutor, resolve_pending};
 use roz_agent::model::types::StreamChunk;
 use roz_agent::safety::SafetyStack;
-use roz_agent::spatial_provider::NullSpatialContextProvider;
+use roz_agent::session_runtime::{
+    SessionRuntime, StreamingTurnExecutor, StreamingTurnHandle, StreamingTurnResult, TurnExecutionFailure, TurnOutput,
+};
+use roz_agent::spatial_provider::{
+    NullWorldStateProvider, bootstrap_runtime_world_state_provider, format_runtime_world_state_bootstrap_note,
+};
 use roz_core::auth::AuthIdentity;
+use roz_core::edge_health::EdgeTransportHealth;
+use roz_core::session::event::SessionPermissionRule;
+use roz_core::session::event::{CanonicalSessionEventEnvelope, CorrelationId, EventEnvelope, SessionEvent};
 use roz_core::tools::ToolCategory;
 
-use roz_core::team::{TeamEvent as CoreTeamEvent, WorkerFailReason};
+use roz_core::team::{SequencedTeamEvent, TeamEvent as CoreTeamEvent, WorkerFailReason};
 use roz_nats::subjects::Subjects;
 use roz_nats::team::{TEAM_STREAM, team_subject_pattern};
 
@@ -76,36 +84,76 @@ struct Session {
     tools: Vec<roz_core::tools::ToolSchema>,
     /// Proto-declared categories per tool (for dispatcher registration).
     tool_categories: HashMap<String, ToolCategory>,
-    messages: Vec<roz_agent::model::types::Message>,
     /// Client-provided project context (AGENTS.md, .substrate/rules/*.md, etc.)
     /// sent once at session start. Included in the system prompt for every turn.
     project_context: Vec<String>,
     #[allow(dead_code)]
     cancel_token: tokio_util::sync::CancellationToken,
     #[allow(dead_code)]
-    base_permissions: Vec<roz_v1::PermissionRule>,
+    base_permissions: Vec<SessionPermissionRule>,
     #[allow(dead_code)]
-    active_permissions: Vec<roz_v1::PermissionRule>,
-    /// Workflow context injected on the next `UserMessage` turn (from `RegisterTools`).
-    pending_system_context: Option<String>,
+    active_permissions: Vec<SessionPermissionRule>,
     pub host_id: Option<String>,
     /// Resolved worker name (host.name) corresponding to `host_id`.
     /// Cached at session start to avoid repeated DB lookups per message.
     pub worker_name: Option<String>,
     /// Whether this session runs on the edge worker (true) or cloud server (false).
     is_edge: bool,
+    /// Canonical session lifecycle tracker for cloud sessions.
+    runtime: Option<Arc<AsyncMutex<SessionRuntime>>>,
+    /// Mirrored checkpoint cache for edge sessions.
+    ///
+    /// After handoff, the worker remains the active runtime authority. The
+    /// server keeps only the latest exported checkpoint state so it can relay
+    /// reconnects and expose session metadata without acting like a second
+    /// runtime owner.
+    edge_mirror: Option<Arc<AsyncMutex<EdgeSessionMirror>>>,
+    /// Subscription to the canonical runtime event stream for cloud forwarding.
+    event_rx: Option<broadcast::Receiver<EventEnvelope>>,
+}
+
+struct EdgeSessionMirror {
+    bootstrap: roz_agent::session_runtime::SessionRuntimeBootstrap,
+}
+
+impl EdgeSessionMirror {
+    const fn new(bootstrap: roz_agent::session_runtime::SessionRuntimeBootstrap) -> Self {
+        Self { bootstrap }
+    }
+
+    fn export_bootstrap(&self) -> roz_agent::session_runtime::SessionRuntimeBootstrap {
+        self.bootstrap.clone()
+    }
+
+    fn update_checkpoint(&mut self, bootstrap: roz_agent::session_runtime::SessionRuntimeBootstrap) {
+        self.bootstrap = bootstrap;
+    }
+
+    const fn history_len(&self) -> usize {
+        self.bootstrap.history.len()
+    }
+
+    fn model_name(&self) -> String {
+        self.bootstrap.model_name.clone().unwrap_or_default()
+    }
 }
 
 /// State for an active agent turn, shared between the session loop and relay tasks.
 struct ActiveTurn {
     /// Resolves pending remote tool calls when the client sends `ToolResult`.
     pending: PendingResults,
-    /// D2: Resolves Roz-authoritative approvals when the client sends `PermissionDecision`.
-    pending_approvals: PendingApprovals,
+    /// Canonical runtime authority for resolving approvals on the active turn.
+    runtime: Arc<AsyncMutex<SessionRuntime>>,
     /// Cancel token scoped to this turn.
     cancel_token: tokio_util::sync::CancellationToken,
     /// Handle to the spawned agent task (dropped on turn completion).
     _handle: tokio::task::JoinHandle<()>,
+}
+
+enum TurnCompletion {
+    Completed(TurnOutput),
+    Cancelled,
+    Failed(roz_core::session::activity::RuntimeFailureKind),
 }
 
 // ---------------------------------------------------------------------------
@@ -325,12 +373,9 @@ impl AgentService for AgentServiceImpl {
                             tracing::warn!(error = %e, "WatchTeam: failed to ack message");
                         }
 
-                        let core_event: CoreTeamEvent = match serde_json::from_slice(&msg.payload) {
-                            Ok(ev) => ev,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "WatchTeam: failed to decode TeamEvent, skipping");
-                                continue;
-                            }
+                        let Some(core_event) = decode_team_event_payload(&msg.payload) else {
+                            tracing::warn!("WatchTeam: failed to decode TeamEvent payload, skipping");
+                            continue;
                         };
 
                         let proto_event = core_team_event_to_proto(core_event);
@@ -369,6 +414,61 @@ struct ModelConfig {
     fallback_model_name: Option<String>,
 }
 
+struct ServerStreamingExecutor {
+    agent_loop: AgentLoop,
+    agent_input: AgentInput,
+    tool_request_rx: Option<mpsc::Receiver<RemoteToolCall>>,
+    cancellation: tokio_util::sync::CancellationToken,
+}
+
+impl StreamingTurnExecutor for ServerStreamingExecutor {
+    fn execute_turn_streaming(
+        &mut self,
+        prepared: roz_agent::session_runtime::PreparedTurn,
+    ) -> StreamingTurnHandle<'_> {
+        let prepared_agent_mode: AgentLoopMode = prepared.cognition_mode();
+        let (chunk_tx, chunk_rx) = mpsc::channel::<StreamChunk>(64);
+        let (presence_tx, presence_rx) = mpsc::channel::<roz_agent::agent_loop::PresenceSignal>(16);
+        let tool_call_rx = self.tool_request_rx.take();
+        let cancellation = self.cancellation.clone();
+        let system_prompt: Vec<String> = prepared.system_blocks.into_iter().map(|block| block.content).collect();
+        let seed = AgentInputSeed::new(system_prompt, prepared.history, prepared.user_message);
+        let mut agent_input = self.agent_input.clone();
+        agent_input.mode = prepared_agent_mode;
+
+        StreamingTurnHandle {
+            completion: Box::pin(async move {
+                let result = tokio::select! {
+                    res = self.agent_loop.run_streaming_seeded(agent_input, seed, chunk_tx, presence_tx) => res,
+                    () = cancellation.cancelled() => {
+                        Err(roz_agent::error::AgentError::Cancelled {
+                            partial_input_tokens: 0,
+                            partial_output_tokens: 0,
+                        })
+                    }
+                };
+
+                match result {
+                    Ok(output) => Ok(TurnOutput {
+                        assistant_message: output.final_response.unwrap_or_default(),
+                        tool_calls_made: output.cycles,
+                        input_tokens: u64::from(output.total_usage.input_tokens),
+                        output_tokens: u64::from(output.total_usage.output_tokens),
+                        cache_read_tokens: u64::from(output.total_usage.cache_read_tokens),
+                        cache_creation_tokens: u64::from(output.total_usage.cache_creation_tokens),
+                        messages: output.messages,
+                    }),
+                    Err(error) => Err(Box::new(agent_error_to_turn_execution_failure(error))
+                        as Box<dyn std::error::Error + Send + Sync>),
+                }
+            }),
+            chunk_rx,
+            presence_rx,
+            tool_call_rx,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Session message loop
 // ---------------------------------------------------------------------------
@@ -402,7 +502,7 @@ async fn run_session_loop(
     let mut active_turn: Option<ActiveTurn> = None;
     // When a turn completes, the agent task sends the output (or None on error)
     // so the session loop can update messages, run compaction, and allow the next turn.
-    let (turn_done_tx, mut turn_done_rx) = mpsc::channel::<Option<roz_agent::agent_loop::AgentOutput>>(1);
+    let (turn_done_tx, mut turn_done_rx) = mpsc::channel::<TurnCompletion>(1);
     // Cancellation token for telemetry and WebRTC signaling relay tasks.
     // Cancelled when the session loop exits to stop the infinite relay loops.
     let relay_cancel = tokio_util::sync::CancellationToken::new();
@@ -421,68 +521,79 @@ async fn run_session_loop(
                 }
             }
             turn_output = turn_done_rx.recv() => {
-                if let Some(Some(output)) = turn_output
+                if let Some(turn_output) = turn_output
                     && let Some(ref mut sess) = session
                 {
-                    // Update session messages with the turn output (move, not clone).
-                    tracing::info!(
-                        session_id = %sess.id,
-                        tenant_id = %sess.tenant_id,
-                        environment_id = %sess.environment_id,
-                        model = %sess.model_name,
-                        input_tokens = output.total_usage.input_tokens,
-                        output_tokens = output.total_usage.output_tokens,
-                        cycles = output.cycles,
-                        "agent_session.turn_complete"
-                    );
-                    // Persist token usage to DB for metering/audit.
-                    if let Err(e) = roz_db::agent_sessions::update_session_usage(
-                        pool,
-                        sess.tenant_id,
-                        sess.id,
-                        i64::from(output.total_usage.input_tokens),
-                        i64::from(output.total_usage.output_tokens),
-                        1, // one turn completed
-                    )
-                    .await
-                    {
-                        tracing::warn!(session_id = %sess.id, error = %e, "failed to update session usage");
-                    }
-
-                    sess.messages = output.messages;
-
-                    // Between-turn compaction (Level 1 + 2 only; no model for Level 3).
-                    // Budget matches typical model context windows (200k tokens for claude-sonnet-4).
-                    let ctx_mgr = roz_agent::context::ContextManager::new(sess.max_context_tokens);
-                    let events = ctx_mgr.compact_escalating(&mut sess.messages, None).await;
-                    for event in &events {
-                        let _ = tx
-                            .send(Ok(SessionResponse {
-                                response: Some(session_response::Response::ContextCompacted(
-                                    roz_v1::ContextCompacted {
-                                        level: match event.level {
-                                            roz_agent::context::CompactionLevel::ToolResults => {
-                                                "tool_results"
-                                            }
-                                            roz_agent::context::CompactionLevel::Thinking => {
-                                                "thinking"
-                                            }
-                                            roz_agent::context::CompactionLevel::Summary => {
-                                                "summary"
-                                            }
-                                        }
-                                        .into(),
-                                        messages_before: u32::try_from(event.messages_before)
-                                            .unwrap_or(u32::MAX),
-                                        messages_after: u32::try_from(event.messages_after)
-                                            .unwrap_or(u32::MAX),
-                                        tokens_before: event.tokens_before,
-                                        tokens_after: event.tokens_after,
-                                        summary: event.summary.clone(),
-                                    },
-                                )),
-                            }))
-                            .await;
+                    match turn_output {
+                        TurnCompletion::Completed(output) => {
+                            tracing::info!(
+                                session_id = %sess.id,
+                                tenant_id = %sess.tenant_id,
+                                environment_id = %sess.environment_id,
+                                model = %sess.model_name,
+                                input_tokens = output.input_tokens,
+                                output_tokens = output.output_tokens,
+                                tool_calls = output.tool_calls_made,
+                                "agent_session.turn_complete"
+                            );
+                            if let Err(e) = roz_db::agent_sessions::update_session_usage(
+                                pool,
+                                sess.tenant_id,
+                                sess.id,
+                                i64::try_from(output.input_tokens).unwrap_or(i64::MAX),
+                                i64::try_from(output.output_tokens).unwrap_or(i64::MAX),
+                                1,
+                            )
+                            .await
+                            {
+                                tracing::warn!(session_id = %sess.id, error = %e, "failed to update session usage");
+                            }
+                            let runtime = sess
+                                .runtime
+                                .as_ref()
+                                .expect("cloud sessions must retain runtime authority");
+                            sess.event_rx = Some({
+                                let runtime = runtime.lock().await;
+                                runtime.subscribe_events()
+                            });
+                            {
+                                let mut runtime = runtime.lock().await;
+                                runtime.compact_context(sess.max_context_tokens).await;
+                            }
+                            if !drain_cloud_runtime_events(
+                                tx,
+                                sess.event_rx
+                                    .as_mut()
+                                    .expect("cloud sessions must retain event stream"),
+                                &sess.model_name,
+                                &sess.active_permissions,
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                        }
+                        TurnCompletion::Cancelled => {
+                            let runtime = sess
+                                .runtime
+                                .as_ref()
+                                .expect("cloud sessions must retain runtime authority");
+                            sess.event_rx = Some({
+                                let runtime = runtime.lock().await;
+                                runtime.subscribe_events()
+                            });
+                        }
+                        TurnCompletion::Failed(failure) => {
+                            tracing::warn!(session_id = %sess.id, ?failure, "agent turn failed");
+                            let runtime = sess
+                                .runtime
+                                .as_ref()
+                                .expect("cloud sessions must retain runtime authority");
+                            sess.event_rx = Some({
+                                let runtime = runtime.lock().await;
+                                runtime.subscribe_events()
+                            });
+                        }
                     }
                 }
                 active_turn = None;
@@ -496,6 +607,20 @@ async fn run_session_loop(
                     break;
                 }
                 if let Some(ref sess) = session {
+                    let history_messages = {
+                        if let Some(runtime) = &sess.runtime {
+                            let runtime = runtime.lock().await;
+                            runtime.history().len()
+                        } else {
+                            match sess.edge_mirror.as_ref() {
+                                Some(mirror) => {
+                                    let mirror = mirror.lock().await;
+                                    mirror.history_len()
+                                }
+                                None => 0,
+                            }
+                        }
+                    };
                     tracing::Span::current().record("session_id", tracing::field::display(sess.id));
                     tracing::Span::current().record("tenant_id", tracing::field::display(sess.tenant_id));
                     tracing::Span::current().record("environment_id", tracing::field::display(sess.environment_id));
@@ -505,7 +630,7 @@ async fn run_session_loop(
                         environment_id = %sess.environment_id,
                         model = %sess.model_name,
                         tools_count = sess.tools.len(),
-                        history_messages = sess.messages.len(),
+                        history_messages,
                         project_context_count = sess.project_context.len(),
                         "agent_session.started"
                     );
@@ -546,8 +671,11 @@ async fn run_session_loop(
                                     host_name = %host.name,
                                     "routing session to edge worker"
                                 );
-                                run_edge_relay(tx, nats, &host.name, &sess.id.to_string(), &sess.model_name, inbound)
-                                    .await;
+                                let bootstrap = sess
+                                    .edge_mirror
+                                    .clone()
+                                    .expect("edge sessions must retain mirrored checkpoint state");
+                                run_edge_relay(tx, nats, &host.name, &sess.id.to_string(), bootstrap, inbound).await;
                                 relay_cancel.cancel();
                                 return; // session done
                             }
@@ -636,42 +764,53 @@ async fn run_session_loop(
                 };
 
                 // Set up remote tool channels.
-                let (tool_request_tx, mut tool_request_rx) = mpsc::channel::<RemoteToolCall>(16);
+                let (tool_request_tx, tool_request_rx) = mpsc::channel::<RemoteToolCall>(16);
                 let pending: PendingResults = Arc::new(Mutex::new(HashMap::new()));
-                // D2: Roz-authoritative approval map for this turn.
-                let pending_approvals: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
 
-                // Register remote tool executors for each client-declared tool.
-                // D3b: prefer per-turn tools from the message (industry-standard
-                // stateless pattern); fall back to session-accumulated tools for
-                // backward compatibility with older clients.
+                let turn_runtime = sess
+                    .runtime
+                    .clone()
+                    .expect("cloud sessions must retain runtime authority");
+                let current_mode = {
+                    let runtime = turn_runtime.lock().await;
+                    runtime.cognition_mode()
+                };
+                let tools_changed = if msg.tools.is_empty() {
+                    false
+                } else {
+                    sess.tool_categories = msg
+                        .tools
+                        .iter()
+                        .map(|tool| (tool.name.clone(), proto_tool_category(tool)))
+                        .collect();
+                    sess.tools = msg
+                        .tools
+                        .iter()
+                        .cloned()
+                        .map(roz_core::tools::ToolSchema::from)
+                        .collect();
+                    sess.active_permissions = derive_permissions(&sess.tools);
+                    true
+                };
+
+                let mode = resolved_user_message_mode(msg.ai_mode.as_deref(), current_mode);
+                let session_project_context = sess.project_context.clone();
+                let active_permissions = sess.active_permissions.clone();
+                if tools_changed || mode != current_mode {
+                    let mut runtime = turn_runtime.lock().await;
+                    sync_cloud_runtime_surface(
+                        &mut runtime,
+                        mode,
+                        &sess.tools,
+                        &session_project_context,
+                        &active_permissions,
+                    );
+                }
+
+                // Register remote tool executors for the current session-owned tool inventory.
                 let mut dispatcher = ToolDispatcher::new(DEFAULT_TOOL_TIMEOUT);
-                let (turn_tools, turn_categories): (Vec<roz_core::tools::ToolSchema>, HashMap<String, ToolCategory>) =
-                    if msg.tools.is_empty() {
-                        // Backward compat: old clients register via RegisterTools /
-                        // StartSession and send UserMessage with no tools field.
-                        let cats = sess.tool_categories.clone();
-                        (sess.tools.clone(), cats)
-                    } else {
-                        let cats = msg
-                            .tools
-                            .iter()
-                            .map(|t| {
-                                let cat = match t.category() {
-                                    roz_v1::ToolCategoryHint::ToolCategoryPure => ToolCategory::Pure,
-                                    _ => ToolCategory::Physical,
-                                };
-                                (t.name.clone(), cat)
-                            })
-                            .collect();
-                        let schemas = msg
-                            .tools
-                            .iter()
-                            .cloned()
-                            .map(roz_core::tools::ToolSchema::from)
-                            .collect();
-                        (schemas, cats)
-                    };
+                let turn_tools = sess.tools.clone();
+                let turn_categories = sess.tool_categories.clone();
                 for tool in &turn_tools {
                     let category = turn_categories
                         .get(&tool.name)
@@ -694,83 +833,63 @@ async fn run_session_loop(
                 // The agent loop will add the user message to its messages internally,
                 // and the returned AgentOutput.messages will include it.
                 let user_content = msg.content;
-
-                let mode = match msg.ai_mode.as_deref() {
-                    Some("ooda_react" | "ooda") => AgentLoopMode::OodaReAct,
-                    _ => AgentLoopMode::React,
+                let volatile_blocks = prompt_context_blocks(&msg.context);
+                let inline_system_context = msg.system_context.filter(|ctx| !ctx.trim().is_empty());
+                let approval_runtime = {
+                    let runtime = turn_runtime.lock().await;
+                    runtime.approval_handle()
                 };
 
-                // D3b: per-turn system_context takes priority over the
-                // stashed pending_system_context from a prior RegisterTools.
-                let pending_ctx = msg.system_context.or_else(|| sess.pending_system_context.take());
-                let system_prompt = build_system_prompt_blocks(mode, &sess.project_context, &msg.context, pending_ctx);
-
-                // Warn if system prompt consumes >30% of context budget.
-                if sess.max_context_tokens > 0 {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let system_chars: u32 = system_prompt
-                        .iter()
-                        .map(String::len)
-                        .sum::<usize>()
-                        .min(u32::MAX as usize) as u32;
-                    let estimated_tokens = f64::from(system_chars) / 4.0;
-                    let budget_fraction = estimated_tokens / f64::from(sess.max_context_tokens);
-                    if budget_fraction > 0.30 {
-                        tracing::warn!(
-                            session_id = %sess.id,
-                            estimated_system_tokens = system_chars / 4,
-                            max_context_tokens = sess.max_context_tokens,
-                            budget_pct = format!("{:.1}%", budget_fraction * 100.0),
-                            "system prompt consumes >30% of context budget"
-                        );
-                    }
-                }
-
-                let agent_input = AgentInput {
-                    task_id: sess.id.to_string(),
-                    tenant_id: sess.tenant_id.to_string(),
-                    model_name: sess.model_name.clone(),
-                    system_prompt,
-                    user_message: user_content,
-                    max_cycles: 200, // safety ceiling, not behavioral limit
-                    max_tokens: 8192,
-                    max_context_tokens: sess.max_context_tokens,
+                let agent_input = AgentInput::runtime_shell(
+                    sess.id.to_string(),
+                    sess.tenant_id.to_string(),
+                    sess.model_name.clone(),
                     mode,
-                    phases: vec![],
-                    tool_choice: None,
-                    response_schema: None,
-                    streaming: true,
-                    history: sess.messages.clone(), // pass accumulated history
-                    cancellation_token: None,
-                    control_mode: roz_core::safety::ControlMode::default(),
-                };
-
-                // Create the chunk channel for streaming.
-                let (chunk_tx, mut chunk_rx) = mpsc::channel::<StreamChunk>(64);
-
-                // Create the presence side-channel for UI presence hints.
-                let (presence_tx, mut presence_rx) = mpsc::channel::<roz_agent::agent_loop::PresenceSignal>(16);
-
-                // Oneshot so the agent task can wait for the chunk relay to drain
-                // before sending TurnComplete. Without this, TurnComplete can race
-                // ahead of the final TextDelta/ThinkingDelta messages on the gRPC
-                // stream because both the agent task and relay task send to the same
-                // mpsc channel independently.
-                let (relay_done_tx, relay_done_rx) = tokio::sync::oneshot::channel::<()>();
+                    200, // safety ceiling, not behavioral limit
+                    8192,
+                    sess.max_context_tokens,
+                    true,
+                    None,
+                    roz_core::safety::ControlMode::default(),
+                );
 
                 let safety = SafetyStack::new(vec![]);
-                let spatial = Box::new(NullSpatialContextProvider);
-                let mut agent_loop = AgentLoop::new(model, dispatcher, safety, spatial)
-                    .with_pending_approvals(pending_approvals.clone())
+                let spatial_bootstrap =
+                    bootstrap_runtime_world_state_provider(Box::new(NullWorldStateProvider), &sess.id.to_string())
+                        .await;
+                let runtime_spatial_note = {
+                    let base = format_runtime_world_state_bootstrap_note(
+                        "server_runtime",
+                        spatial_bootstrap.runtime_spatial_context(),
+                        "no server-side spatial provider is bound for this turn",
+                    );
+                    if matches!(mode, AgentLoopMode::React) {
+                        format!(
+                            "{base} Current turn mode is React, so the runtime did not bind spatial state as active observation."
+                        )
+                    } else {
+                        base
+                    }
+                };
+                let runtime_spatial_context = if matches!(mode, AgentLoopMode::OodaReAct) {
+                    spatial_bootstrap.runtime_spatial_context().cloned()
+                } else {
+                    None
+                };
+                let spatial = spatial_bootstrap.provider;
+                let agent_loop = AgentLoop::new(model, dispatcher, safety, spatial)
+                    .with_approval_runtime(approval_runtime.clone())
                     .with_meter(meter.clone());
 
                 let turn_cancel = tokio_util::sync::CancellationToken::new();
-
-                // Use client-provided message_id if present, else generate one.
                 let message_id = msg
                     .message_id
                     .filter(|id| !id.is_empty())
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let mut turn_event_rx = {
+                    let runtime = turn_runtime.lock().await;
+                    runtime.subscribe_events()
+                };
 
                 tracing::info!(
                     session_id = %sess.id,
@@ -778,161 +897,138 @@ async fn run_session_loop(
                     "agent_session.turn_started"
                 );
 
-                // Spawn agent loop task.
-                let agent_tx = tx.clone();
-                let turn_cancel_agent = turn_cancel.clone();
-                let message_id_agent = message_id.clone();
-                let turn_done = turn_done_tx.clone();
-                let handle = tokio::spawn(async move {
-                    let result = tokio::select! {
-                        res = agent_loop.run_streaming(agent_input, chunk_tx, presence_tx) => res,
-                        () = turn_cancel_agent.cancelled() => {
-                            Err(roz_agent::error::AgentError::Safety("turn cancelled".into()))
+                let relay_tx = tx.clone();
+                let relay_model_name = sess.model_name.clone();
+                let relay_permissions = sess.active_permissions.clone();
+                let turn_cancel_relay = turn_cancel.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            recv = turn_event_rx.recv() => {
+                                match recv {
+                                    Ok(envelope) => {
+                                        let terminal = matches!(
+                                            envelope.event,
+                                            SessionEvent::TurnFinished { .. } | SessionEvent::SessionFailed { .. }
+                                        );
+                                        let response = cloud_event_envelope_to_response(
+                                            &envelope,
+                                            &relay_model_name,
+                                            &relay_permissions,
+                                        );
+                                        if relay_tx
+                                            .send(Ok(SessionResponse { response: Some(response) }))
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                        if terminal {
+                                            break;
+                                        }
+                                    }
+                                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                        tracing::warn!(skipped, "cloud turn event stream lagged");
+                                    }
+                                    Err(broadcast::error::RecvError::Closed) => break,
+                                }
+                            }
+                            () = turn_cancel_relay.cancelled() => {
+                                loop {
+                                    match turn_event_rx.try_recv() {
+                                        Ok(envelope) => {
+                                            let response = cloud_event_envelope_to_response(
+                                                &envelope,
+                                                &relay_model_name,
+                                                &relay_permissions,
+                                            );
+                                            if relay_tx
+                                                .send(Ok(SessionResponse { response: Some(response) }))
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => break,
+                                        Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                                            tracing::warn!(skipped, "cloud turn event stream lagged");
+                                        }
+                                    }
+                                }
+                                break;
+                            }
                         }
+                    }
+                });
+
+                let mut executor = ServerStreamingExecutor {
+                    agent_loop,
+                    agent_input,
+                    tool_request_rx: Some(tool_request_rx),
+                    cancellation: turn_cancel.clone(),
+                };
+                let agent_tx = tx.clone();
+                let turn_done = turn_done_tx.clone();
+                let turn_cancel_task = turn_cancel.clone();
+                let runtime_for_turn = turn_runtime.clone();
+                let handle = tokio::spawn(async move {
+                    let result = {
+                        let mut runtime = runtime_for_turn.lock().await;
+                        let custom_context = runtime
+                            .turn_prompt_staging()
+                            .take_turn_custom_context(inline_system_context);
+                        runtime.sync_world_state_with_note(runtime_spatial_context, Some(runtime_spatial_note));
+                        let turn_input = roz_agent::session_runtime::TurnInput {
+                            user_message: user_content,
+                            cognition_mode: mode,
+                            custom_context,
+                            volatile_blocks,
+                        };
+                        runtime
+                            .run_turn_streaming(turn_input, Some(message_id), &mut executor)
+                            .await
                     };
-
-                    // Cancel keepalive regardless of outcome.
-                    turn_cancel_agent.cancel();
-
-                    // Wait for the chunk relay task to finish draining all buffered
-                    // chunks before sending TurnComplete/Error. This guarantees the
-                    // client sees every TextDelta before TurnComplete on the stream.
-                    // Timeout prevents a hung relay from blocking turn completion.
-                    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), relay_done_rx).await;
+                    turn_cancel_task.cancel();
 
                     match result {
-                        Ok(output) => {
-                            let _ = agent_tx
-                                .send(Ok(SessionResponse {
-                                    response: Some(session_response::Response::TurnComplete(roz_v1::TurnComplete {
-                                        message_id: message_id_agent,
-                                        usage: Some(roz_v1::TokenUsage {
-                                            input_tokens: output.total_usage.input_tokens,
-                                            output_tokens: output.total_usage.output_tokens,
-                                            cache_read_tokens: output.total_usage.cache_read_tokens,
-                                            cache_creation_tokens: output.total_usage.cache_creation_tokens,
-                                        }),
-                                        stop_reason: "end_turn".into(),
-                                    })),
-                                }))
-                                .await;
-                            // Send the output so the session loop can update messages and compact.
-                            let _ = turn_done.send(Some(output)).await;
+                        Ok(StreamingTurnResult::Completed(output)) => {
+                            let _ = turn_done.send(TurnCompletion::Completed(output)).await;
                         }
-                        Err(e) if e.to_string().contains("turn cancelled") => {
-                            // Cancellation is not an error — send TurnComplete with stop_reason
-                            // "cancelled" so clients can distinguish cancelled turns from failures.
-                            let _ = agent_tx
-                                .send(Ok(SessionResponse {
-                                    response: Some(session_response::Response::TurnComplete(roz_v1::TurnComplete {
-                                        message_id: message_id_agent,
-                                        usage: None,
-                                        stop_reason: "cancelled".into(),
-                                    })),
-                                }))
-                                .await;
-                            let _ = turn_done.send(None).await;
+                        Ok(StreamingTurnResult::Cancelled) => {
+                            let _ = turn_done.send(TurnCompletion::Cancelled).await;
                         }
-                        Err(e) => {
-                            tracing::error!(error = %e, retryable = e.is_retryable(), "agent turn failed");
-                            // Classify: surface actionable info without leaking internal URLs.
-                            let (client_code, client_message) = match &e {
-                                roz_agent::error::AgentError::Safety(_) => ("safety_violation".into(), e.to_string()),
-                                roz_agent::error::AgentError::BudgetExceeded { .. } => {
-                                    ("budget_exceeded".into(), e.to_string())
-                                }
-                                _ if e.is_retryable() => (
-                                    "rate_limited".into(),
-                                    "Rate limited by provider. Please try again shortly.".to_string(),
-                                ),
-                                _ => (
-                                    "agent_error".into(),
-                                    "Model request failed. Please try again.".to_string(),
-                                ),
-                            };
+                        Err(roz_agent::session_runtime::SessionRuntimeError::SessionFailed(failure)) => {
+                            let _ = turn_done.send(TurnCompletion::Failed(failure)).await;
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %error, "streaming turn rejected before execution");
                             let _ = agent_tx
                                 .send(Ok(SessionResponse {
-                                    response: Some(session_response::Response::Error(roz_v1::SessionError {
-                                        code: client_code,
-                                        message: client_message,
-                                        retryable: e.is_retryable(),
-                                    })),
+                                    response: Some(super::event_mapper::canonical_session_event_to_response(
+                                        SessionEvent::SessionRejected {
+                                            code: "turn_rejected".into(),
+                                            message: error.to_string(),
+                                            retryable: false,
+                                        },
+                                        CorrelationId::new(),
+                                    )),
                                 }))
                                 .await;
-                            let _ = turn_done.send(None).await;
+                            let _ = turn_done
+                                .send(TurnCompletion::Failed(
+                                    roz_core::session::activity::RuntimeFailureKind::ModelError,
+                                ))
+                                .await;
                         }
                     }
                 });
 
                 active_turn = Some(ActiveTurn {
                     pending: pending.clone(),
-                    pending_approvals: pending_approvals.clone(),
+                    runtime: turn_runtime.clone(),
                     cancel_token: turn_cancel.clone(),
                     _handle: handle,
-                });
-
-                // Spawn chunk relay task: reads from chunk_rx, maps to SessionResponse.
-                // Signals relay_done_tx when all chunks have been forwarded.
-                let relay_tx = tx.clone();
-                let message_id_relay = message_id.clone();
-                tokio::spawn(async move {
-                    while let Some(chunk) = chunk_rx.recv().await {
-                        let response = match chunk {
-                            StreamChunk::TextDelta(content) => {
-                                Some(session_response::Response::TextDelta(roz_v1::TextDelta {
-                                    message_id: message_id_relay.clone(),
-                                    content,
-                                }))
-                            }
-                            StreamChunk::ThinkingDelta(content) => {
-                                Some(session_response::Response::ThinkingDelta(roz_v1::ThinkingDelta {
-                                    message_id: message_id_relay.clone(),
-                                    content,
-                                }))
-                            }
-                            // ToolUseStart and ToolUseInputDelta are handled internally by
-                            // the agent loop; the client sees ToolRequest when RemoteToolExecutor
-                            // sends calls. Skip these intermediate chunks.
-                            StreamChunk::ToolUseStart { .. }
-                            | StreamChunk::ToolUseInputDelta(_)
-                            | StreamChunk::Usage(_)
-                            | StreamChunk::Done(_) => None,
-                        };
-
-                        if let Some(resp) = response
-                            && relay_tx
-                                .send(Ok(SessionResponse { response: Some(resp) }))
-                                .await
-                                .is_err()
-                        {
-                            break; // client disconnected
-                        }
-                    }
-                    // Signal the agent task that all chunks have been relayed.
-                    let _ = relay_done_tx.send(());
-                });
-
-                // Spawn tool relay task: reads from tool_request_rx, maps to ToolRequest.
-                let tool_relay_tx = tx.clone();
-                tokio::spawn(async move {
-                    while let Some(call) = tool_request_rx.recv().await {
-                        let response = session_response::Response::ToolRequest(roz_v1::ToolRequest {
-                            tool_call_id: call.id,
-                            tool_name: call.name,
-                            parameters: Some(value_to_struct(call.parameters)),
-                            timeout_ms: call.timeout_ms,
-                        });
-
-                        if tool_relay_tx
-                            .send(Ok(SessionResponse {
-                                response: Some(response),
-                            }))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
                 });
 
                 // Spawn keepalive task.
@@ -955,113 +1051,6 @@ async fn run_session_loop(
                                 }
                             }
                             () = keepalive_cancel.cancelled() => break,
-                        }
-                    }
-                });
-
-                // Spawn presence relay task: reads PresenceSignal from agent loop,
-                // maps to SessionResponse::PresenceHint / ActivityUpdate,
-                // writes analytics events to the DB (with timeout), and
-                // rate-limits gRPC sends to avoid flooding the client.
-                let presence_relay_tx = tx.clone();
-                let presence_pool = pool.clone();
-                let presence_session_id = sess.id;
-                let presence_tenant_id = sess.tenant_id;
-                tokio::spawn(async move {
-                    use roz_agent::agent_loop::PresenceSignal;
-                    use tokio::time::Instant;
-
-                    let mut last_sent = Instant::now() - Duration::from_secs(1);
-                    let min_interval = Duration::from_millis(250);
-
-                    while let Some(signal) = presence_rx.recv().await {
-                        // Truncate detail to 512 chars (matches DB CHECK constraint).
-                        let truncate = |s: &str| -> String { s.chars().take(512).collect() };
-
-                        let (response, evt_type, evt_state, evt_detail, evt_level, evt_reason, evt_progress) =
-                            match &signal {
-                                PresenceSignal::PresenceHint { level, reason } => {
-                                    let reason_t = truncate(reason);
-                                    (
-                                        session_response::Response::PresenceHint(roz_v1::PresenceHint {
-                                            level: level.as_str().to_string(),
-                                            reason: reason_t.clone(),
-                                        }),
-                                        "presence_hint",
-                                        None::<&str>,
-                                        None::<String>,
-                                        Some(level.as_str()),
-                                        Some(reason_t),
-                                        None,
-                                    )
-                                }
-                                PresenceSignal::ActivityUpdate {
-                                    state,
-                                    detail,
-                                    progress,
-                                } => {
-                                    let detail_t = truncate(detail);
-                                    (
-                                        session_response::Response::ActivityUpdate(roz_v1::ActivityUpdate {
-                                            state: state.as_str().to_string(),
-                                            detail: detail_t.clone(),
-                                            progress: *progress,
-                                        }),
-                                        "activity_update",
-                                        Some(state.as_str()),
-                                        Some(detail_t),
-                                        None,
-                                        None::<String>,
-                                        *progress,
-                                    )
-                                }
-                            };
-
-                        // Rate-limit client-facing gRPC sends (max ~4/sec) — happens first so
-                        // the client is never blocked waiting for analytics writes.
-                        let now = Instant::now();
-                        let should_break = if now.duration_since(last_sent) >= min_interval {
-                            last_sent = now;
-                            presence_relay_tx
-                                .send(Ok(SessionResponse {
-                                    response: Some(response),
-                                }))
-                                .await
-                                .is_err()
-                        } else {
-                            false
-                        };
-
-                        // Fire-and-forget analytics write — never blocks the presence relay.
-                        // Convert borrowed &str fields to owned Strings so signal can be dropped.
-                        let pool_clone = presence_pool.clone();
-                        let evt_state_owned = evt_state.map(str::to_owned);
-                        let evt_level_owned = evt_level.map(str::to_owned);
-                        tokio::spawn(async move {
-                            let db_result = tokio::time::timeout(
-                                Duration::from_secs(5),
-                                roz_db::activity_events::insert_activity_event(
-                                    &pool_clone,
-                                    presence_session_id,
-                                    presence_tenant_id,
-                                    evt_type,
-                                    evt_state_owned.as_deref(),
-                                    evt_detail.as_deref(),
-                                    evt_level_owned.as_deref(),
-                                    evt_reason.as_deref(),
-                                    evt_progress,
-                                ),
-                            )
-                            .await;
-                            match db_result {
-                                Ok(Err(e)) => tracing::warn!(error = %e, "failed to write activity event"),
-                                Err(_) => tracing::warn!("activity event DB write timed out (5s)"),
-                                Ok(Ok(())) => {}
-                            }
-                        });
-
-                        if should_break {
-                            break;
                         }
                     }
                 });
@@ -1169,17 +1158,21 @@ async fn run_session_loop(
             // D2: IDE sends user's Deny/Allow decision for a Roz-authoritative approval.
             Some(session_request::Request::PermissionDecision(decision)) => {
                 if let Some(ref turn) = active_turn {
-                    let resolved = resolve_approval(&turn.pending_approvals, &decision.tool_call_id, decision.approved);
+                    let modifier = decision.modifier.map(super::tasks::prost_struct_to_json);
+                    let resolved = {
+                        let runtime = turn.runtime.lock().await;
+                        runtime.resolve_approval(&decision.approval_id, decision.approved, modifier)
+                    };
                     if !resolved {
                         tracing::warn!(
-                            tool_call_id = %decision.tool_call_id,
+                            approval_id = %decision.approval_id,
                             approved = decision.approved,
-                            "PermissionDecision for unknown or already-resolved call"
+                            "PermissionDecision for unknown or already-resolved approval"
                         );
                     }
                 } else {
                     tracing::warn!(
-                        tool_call_id = %decision.tool_call_id,
+                        approval_id = %decision.approval_id,
                         "PermissionDecision received but no active turn"
                     );
                 }
@@ -1205,13 +1198,7 @@ async fn run_session_loop(
                 let new_categories: HashMap<String, ToolCategory> = reg
                     .tools
                     .iter()
-                    .map(|t| {
-                        let cat = match t.category() {
-                            roz_v1::ToolCategoryHint::ToolCategoryPure => ToolCategory::Pure,
-                            _ => ToolCategory::Physical,
-                        };
-                        (t.name.clone(), cat)
-                    })
+                    .map(|tool| (tool.name.clone(), proto_tool_category(tool)))
                     .collect();
 
                 // Append new tools (empty list = unregister only).
@@ -1221,17 +1208,34 @@ async fn run_session_loop(
                 let n_added = new_tools.len();
                 sess.tools.extend(new_tools);
                 sess.tool_categories.extend(new_categories);
+                sess.active_permissions = derive_permissions(&sess.tools);
 
-                // Stash workflow context for the next UserMessage.
-                if let Some(ctx) = reg.system_context {
-                    sess.pending_system_context = Some(ctx);
+                let runtime = sess.runtime.clone();
+                let session_id = sess.id;
+                let total_tools = sess.tools.len();
+                let session_project_context = sess.project_context.clone();
+                let active_permissions = sess.active_permissions.clone();
+
+                if let Some(runtime) = runtime {
+                    let mut runtime = runtime.lock().await;
+                    let mode: AgentLoopMode = runtime.cognition_mode();
+                    sync_cloud_runtime_surface(
+                        &mut runtime,
+                        mode,
+                        &sess.tools,
+                        &session_project_context,
+                        &active_permissions,
+                    );
+                    if let Some(ctx) = reg.system_context.clone().filter(|ctx| !ctx.trim().is_empty()) {
+                        runtime.turn_prompt_staging().stage_system_context(Some(ctx));
+                    }
                 }
 
                 tracing::info!(
-                    session_id = %sess.id,
+                    session_id = %session_id,
                     source = %source,
                     tools_added = n_added,
-                    total_tools = sess.tools.len(),
+                    total_tools = total_tools,
                     "agent_session.register_tools"
                 );
             }
@@ -1281,6 +1285,40 @@ async fn run_session_loop(
     // Cancel any in-flight turn.
     if let Some(ref turn) = active_turn {
         turn.cancel_token.cancel();
+    }
+
+    if let Some(ref mut s) = session {
+        let should_complete = if let Some(runtime) = &s.runtime {
+            let runtime = runtime.lock().await;
+            !runtime.has_failed() && !runtime.is_completed()
+        } else {
+            false
+        };
+        if should_complete {
+            let summary = if cancelled {
+                "cancelled by client"
+            } else {
+                "session completed"
+            };
+            let completed = {
+                let mut runtime = s
+                    .runtime
+                    .as_ref()
+                    .expect("cloud sessions must retain runtime authority")
+                    .lock()
+                    .await;
+                runtime.complete_session(summary).await.is_ok()
+            };
+            if completed {
+                let _ = drain_cloud_runtime_events(
+                    tx,
+                    s.event_rx.as_mut().expect("cloud sessions must retain event stream"),
+                    &s.model_name,
+                    &s.active_permissions,
+                )
+                .await;
+            }
+        }
     }
 
     // Cleanup: mark session with the appropriate terminal status.
@@ -1724,20 +1762,44 @@ async fn handle_start(
         None
     };
 
-    // Send SessionStarted acknowledgement only for cloud sessions.
-    // For edge sessions, the worker sends its own SessionStarted via the relay.
-    if !is_edge {
-        let started = SessionResponse {
-            response: Some(session_response::Response::SessionStarted(roz_v1::SessionStarted {
-                session_id: session_id.to_string(),
-                model: model_name.clone(),
-                permissions: base_permissions.clone(),
-            })),
-        };
-        if tx.send(Ok(started)).await.is_err() {
-            return false; // client disconnected
+    let session_config = roz_agent::session_runtime::SessionConfig {
+        session_id: session_id.to_string(),
+        tenant_id: tenant_id.to_string(),
+        mode: if is_edge {
+            roz_core::session::control::SessionMode::Edge
+        } else {
+            roz_core::session::control::SessionMode::Server
+        },
+        cognition_mode: roz_core::session::control::CognitionMode::React,
+        constitution_text: build_constitution_for_tools(AgentLoopMode::React, &tools),
+        blueprint_toml: String::new(),
+        model_name: Some(model_name.clone()),
+        permissions: base_permissions.clone(),
+        tool_schemas: prompt_tool_schemas(&tools),
+        project_context: start.project_context.clone(),
+        initial_history: messages,
+    };
+    let (runtime, edge_mirror, event_rx) = if is_edge {
+        (
+            None,
+            Some(Arc::new(AsyncMutex::new(EdgeSessionMirror::new(
+                roz_agent::session_runtime::SessionRuntimeBootstrap::from_config(&session_config),
+            )))),
+            None,
+        )
+    } else {
+        let mut session_rt = roz_agent::session_runtime::SessionRuntime::new(&session_config);
+        let mut event_rx = session_rt.subscribe_events();
+        if let Err(error) = session_rt.start_session().await {
+            tracing::error!(error = %error, "failed to start cloud session runtime");
+            send_error(tx, "internal", "failed to start session runtime", true).await;
+            return false;
         }
-    }
+        if !drain_cloud_runtime_events(tx, &mut event_rx, &model_name, &base_permissions).await {
+            return false;
+        }
+        (Some(Arc::new(AsyncMutex::new(session_rt))), None, Some(event_rx))
+    };
 
     *session = Some(Session {
         id: session_id,
@@ -1747,15 +1809,16 @@ async fn handle_start(
         max_context_tokens,
         tools,
         tool_categories,
-        messages,
         project_context: start.project_context,
         cancel_token: tokio_util::sync::CancellationToken::new(),
         base_permissions: base_permissions.clone(),
         active_permissions: base_permissions,
-        pending_system_context: None,
         host_id: start.host_id,
         worker_name,
         is_edge,
+        runtime,
+        edge_mirror,
+        event_rx,
     });
 
     true
@@ -1775,6 +1838,7 @@ async fn handle_start(
 /// 1. Project context — from `StartSession` (AGENTS.md, rules) (stable per-session)
 /// 2. Pending context — from the most recent `RegisterTools.system_context` (semi-stable)
 /// 3. Per-message context — from `UserMessage.context` (volatile per-turn)
+#[cfg_attr(not(test), allow(dead_code))]
 fn build_system_prompt_blocks(
     mode: AgentLoopMode,
     project_context: &[String],
@@ -1818,15 +1882,287 @@ fn build_system_prompt_blocks(
     blocks
 }
 
+fn prompt_tool_schemas(tools: &[roz_core::tools::ToolSchema]) -> Vec<roz_agent::prompt_assembler::ToolSchema> {
+    tools
+        .iter()
+        .map(|tool| roz_agent::prompt_assembler::ToolSchema {
+            name: tool.name.clone(),
+            description: tool.description.clone(),
+            parameters_json: serde_json::to_string(&tool.parameters).unwrap_or_else(|_| "{}".to_string()),
+        })
+        .collect()
+}
+
+fn proto_tool_category(tool: &roz_v1::ToolSchema) -> ToolCategory {
+    match tool.category() {
+        roz_v1::ToolCategoryHint::ToolCategoryPure => ToolCategory::Pure,
+        _ => ToolCategory::Physical,
+    }
+}
+
+fn build_constitution_for_tools(mode: AgentLoopMode, tools: &[roz_core::tools::ToolSchema]) -> String {
+    let tool_names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+    build_constitution(mode, &tool_names)
+}
+
+fn resolved_user_message_mode(ai_mode: Option<&str>, current_mode: AgentLoopMode) -> AgentLoopMode {
+    match ai_mode {
+        Some("react") => AgentLoopMode::React,
+        Some("ooda_react" | "ooda_re_act" | "ooda") => AgentLoopMode::OodaReAct,
+        _ => current_mode,
+    }
+}
+
+fn sync_cloud_runtime_surface(
+    runtime: &mut SessionRuntime,
+    mode: AgentLoopMode,
+    tools: &[roz_core::tools::ToolSchema],
+    project_context: &[String],
+    permissions: &[SessionPermissionRule],
+) {
+    runtime.sync_cognition_mode(mode);
+    runtime.sync_prompt_surface(
+        build_constitution_for_tools(mode, tools),
+        prompt_tool_schemas(tools),
+        project_context.to_vec(),
+    );
+    runtime.sync_permissions(permissions.to_vec());
+}
+
+fn prompt_context_blocks(blocks: &[roz_v1::ContentBlock]) -> Vec<String> {
+    blocks
+        .iter()
+        .filter_map(|block| {
+            let roz_v1::content_block::Block::Text(text) = block.block.as_ref()? else {
+                return None;
+            };
+            let label = block.label.as_deref().unwrap_or("Context");
+            Some(format!("[{label}]\n{text}"))
+        })
+        .collect()
+}
+
+fn edge_tool_category_name(tool: &roz_v1::ToolSchema) -> &'static str {
+    match tool.category() {
+        roz_v1::ToolCategoryHint::ToolCategoryPure => "pure",
+        _ => "physical",
+    }
+}
+
+fn build_edge_relay_user_message_envelope(message: &roz_v1::UserMessage) -> serde_json::Value {
+    serde_json::json!({
+        "type": "user_message",
+        "text": message.content,
+        "message_id": message.message_id,
+        "ai_mode": message.ai_mode,
+        "system_context": message.system_context,
+        "volatile_blocks": prompt_context_blocks(&message.context),
+        "tools": message.tools.iter().map(|tool| {
+            serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": super::tasks::prost_struct_to_json(tool.parameters_schema.clone().unwrap_or_default()),
+                "category": edge_tool_category_name(tool),
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn build_edge_relay_register_tools_envelope(register_tools: &roz_v1::RegisterTools) -> serde_json::Value {
+    serde_json::json!({
+        "type": "register_tools",
+        "source": register_tools.source,
+        "system_context": register_tools.system_context,
+        "tools": register_tools.tools.iter().map(|tool| {
+            serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": super::tasks::prost_struct_to_json(tool.parameters_schema.clone().unwrap_or_default()),
+                "category": edge_tool_category_name(tool),
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn build_edge_relay_start_envelope(
+    bootstrap: &roz_agent::session_runtime::SessionRuntimeBootstrap,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "start_session",
+        "model": bootstrap.model_name.clone(),
+        "bootstrap": bootstrap,
+    })
+}
+
+fn build_edge_relay_tool_result_envelope(result: &roz_v1::ToolResult) -> serde_json::Value {
+    serde_json::json!({
+        "type": "tool_result",
+        "tool_call_id": result.tool_call_id,
+        "success": result.success,
+        "result": result.result,
+        "exit_code": result.exit_code,
+        "truncated": result.truncated,
+        "duration_ms": result.duration_ms,
+    })
+}
+
+fn build_edge_relay_permission_decision_envelope(decision: &roz_v1::PermissionDecision) -> serde_json::Value {
+    serde_json::json!({
+        "type": "permission_decision",
+        "approval_id": decision.approval_id,
+        "approved": decision.approved,
+        "modifier": decision.modifier.clone().map(super::tasks::prost_struct_to_json),
+    })
+}
+
+fn agent_error_to_turn_execution_failure(error: roz_agent::error::AgentError) -> TurnExecutionFailure {
+    match error {
+        roz_agent::error::AgentError::Safety(message) => {
+            TurnExecutionFailure::new(roz_core::session::activity::RuntimeFailureKind::SafetyBlocked, message)
+                .with_client_error("safety_violation", false)
+        }
+        roz_agent::error::AgentError::ToolDispatch { message, .. } => {
+            TurnExecutionFailure::new(roz_core::session::activity::RuntimeFailureKind::ToolError, message)
+                .with_client_error("agent_error", false)
+        }
+        roz_agent::error::AgentError::CircuitBreakerTripped {
+            consecutive_error_turns,
+        } => TurnExecutionFailure::new(
+            roz_core::session::activity::RuntimeFailureKind::CircuitBreakerTripped,
+            format!("circuit breaker tripped after {consecutive_error_turns} consecutive all-error turns"),
+        )
+        .with_client_error("agent_error", false),
+        roz_agent::error::AgentError::Cancelled { .. } => TurnExecutionFailure::new(
+            roz_core::session::activity::RuntimeFailureKind::OperatorAbort,
+            "turn cancelled",
+        ),
+        roz_agent::error::AgentError::BudgetExceeded { plan, period_end } => TurnExecutionFailure::new(
+            roz_core::session::activity::RuntimeFailureKind::ModelError,
+            format!("usage limit reached on plan '{plan}', resets {period_end}"),
+        )
+        .with_client_error("budget_exceeded", false),
+        other => {
+            let retryable = other.is_retryable();
+            let message = if retryable {
+                "Rate limited by provider. Please try again shortly.".to_string()
+            } else {
+                "Model request failed. Please try again.".to_string()
+            };
+            TurnExecutionFailure::new(roz_core::session::activity::RuntimeFailureKind::ModelError, message)
+                .with_client_error(if retryable { "rate_limited" } else { "agent_error" }, retryable)
+        }
+    }
+}
+
+fn canonicalize_session_started_envelope(
+    envelope: &EventEnvelope,
+    model_name: &str,
+    permissions: &[SessionPermissionRule],
+) -> EventEnvelope {
+    let SessionEvent::SessionStarted {
+        session_id,
+        mode,
+        blueprint_version,
+        ..
+    } = &envelope.event
+    else {
+        return envelope.clone();
+    };
+
+    EventEnvelope {
+        event_id: envelope.event_id.clone(),
+        correlation_id: envelope.correlation_id.clone(),
+        parent_event_id: envelope.parent_event_id.clone(),
+        timestamp: envelope.timestamp,
+        event: SessionEvent::SessionStarted {
+            session_id: session_id.clone(),
+            mode: *mode,
+            blueprint_version: blueprint_version.clone(),
+            model_name: Some(model_name.to_string()),
+            permissions: permissions.to_vec(),
+        },
+    }
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn edge_event_envelope_to_response(envelope: &EventEnvelope, model_name: &str) -> Option<session_response::Response> {
+    let _ = model_name;
+    Some(super::event_mapper::canonical_event_envelope_to_session_response(
+        envelope,
+    ))
+}
+
+fn edge_canonical_json_envelope_to_response(
+    envelope: &CanonicalSessionEventEnvelope,
+    model_name: &str,
+) -> Option<session_response::Response> {
+    match envelope.clone().into_event_envelope() {
+        Ok(envelope) => edge_event_envelope_to_response(&envelope, model_name),
+        Err(error) => {
+            tracing::warn!(%error, event_type = %envelope.event_type, "failed to decode canonical edge session event payload");
+            Some(super::event_mapper::canonical_session_event_to_response(
+                SessionEvent::EdgeTransportDegraded {
+                    transport: "nats".to_string(),
+                    health: EdgeTransportHealth::Degraded {
+                        affected: vec!["session_event_decode".to_string()],
+                    },
+                    affected_capabilities: vec!["session_events".to_string()],
+                },
+                CorrelationId(envelope.correlation_id.clone()),
+            ))
+        }
+    }
+}
+
+fn cloud_event_envelope_to_response(
+    envelope: &EventEnvelope,
+    model_name: &str,
+    permissions: &[SessionPermissionRule],
+) -> session_response::Response {
+    let envelope = canonicalize_session_started_envelope(envelope, model_name, permissions);
+    super::event_mapper::canonical_event_envelope_to_session_response(&envelope)
+}
+
+async fn drain_cloud_runtime_events(
+    tx: &mpsc::Sender<Result<SessionResponse, Status>>,
+    event_rx: &mut broadcast::Receiver<EventEnvelope>,
+    model_name: &str,
+    permissions: &[SessionPermissionRule],
+) -> bool {
+    loop {
+        match event_rx.try_recv() {
+            Ok(envelope) => {
+                let response = cloud_event_envelope_to_response(&envelope, model_name, permissions);
+                if tx
+                    .send(Ok(SessionResponse {
+                        response: Some(response),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return false;
+                }
+            }
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => return true,
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                tracing::warn!(skipped, "cloud session event stream lagged");
+            }
+        }
+    }
+}
+
 /// Send a `SessionError` response on the outbound channel.
 async fn send_error(tx: &mpsc::Sender<Result<SessionResponse, Status>>, code: &str, message: &str, retryable: bool) {
     let _ = tx
         .send(Ok(SessionResponse {
-            response: Some(session_response::Response::Error(roz_v1::SessionError {
-                code: code.into(),
-                message: message.into(),
-                retryable,
-            })),
+            response: Some(super::event_mapper::canonical_session_event_to_response(
+                SessionEvent::SessionRejected {
+                    code: code.into(),
+                    message: message.into(),
+                    retryable,
+                },
+                CorrelationId::new(),
+            )),
         }))
         .await;
 }
@@ -1851,12 +2187,40 @@ fn core_team_event_to_proto(event: CoreTeamEvent) -> roz_v1::TeamEvent {
             phase,
             mode: match mode {
                 roz_core::phases::PhaseMode::React => "react".to_string(),
-                roz_core::phases::PhaseMode::OodaReAct => "ooda_re_act".to_string(),
+                roz_core::phases::PhaseMode::OodaReAct => "ooda_react".to_string(),
             },
         }),
         CoreTeamEvent::WorkerToolCall { worker_id, tool } => Event::WorkerToolCall(roz_v1::WorkerToolCall {
             worker_id: worker_id.to_string(),
             tool,
+        }),
+        CoreTeamEvent::WorkerApprovalRequested {
+            worker_id,
+            task_id,
+            approval_id,
+            tool_name,
+            reason,
+            timeout_secs,
+        } => Event::WorkerApprovalRequested(roz_v1::WorkerApprovalRequested {
+            worker_id: worker_id.to_string(),
+            task_id: task_id.to_string(),
+            approval_id,
+            tool_name,
+            reason,
+            timeout_secs,
+        }),
+        CoreTeamEvent::WorkerApprovalResolved {
+            worker_id,
+            task_id,
+            approval_id,
+            approved,
+            modifier,
+        } => Event::WorkerApprovalResolved(roz_v1::WorkerApprovalResolved {
+            worker_id: worker_id.to_string(),
+            task_id: task_id.to_string(),
+            approval_id,
+            approved,
+            modifier: modifier.map(value_to_struct),
         }),
         CoreTeamEvent::WorkerCompleted { worker_id, result } => Event::WorkerCompleted(roz_v1::WorkerCompleted {
             worker_id: worker_id.to_string(),
@@ -1883,6 +2247,14 @@ fn core_team_event_to_proto(event: CoreTeamEvent) -> roz_v1::TeamEvent {
     roz_v1::TeamEvent { event: Some(inner) }
 }
 
+fn decode_team_event_payload(payload: &[u8]) -> Option<CoreTeamEvent> {
+    if let Ok(sequenced) = serde_json::from_slice::<SequencedTeamEvent>(payload) {
+        return Some(sequenced.event);
+    }
+
+    serde_json::from_slice::<CoreTeamEvent>(payload).ok()
+}
+
 /// Substrings that indicate a tool is "pure" (read-only / observational).
 const PURE_VERBS: &[&str] = &["read", "get", "list", "search", "glob", "grep", "find"];
 
@@ -1890,17 +2262,17 @@ const PURE_VERBS: &[&str] = &["read", "get", "list", "search", "glob", "grep", "
 ///
 /// Physical tools default to `require_confirmation`; tools whose names contain
 /// read-like verbs (get, list, search, etc.) default to `allow`.
-fn derive_permissions(tools: &[roz_core::tools::ToolSchema]) -> Vec<roz_v1::PermissionRule> {
+fn derive_permissions(tools: &[roz_core::tools::ToolSchema]) -> Vec<SessionPermissionRule> {
     if tools.is_empty() {
         // Sensible defaults when no tools are declared.
         return vec![
-            roz_v1::PermissionRule {
+            SessionPermissionRule {
                 tool_pattern: "*".into(),
                 policy: "require_confirmation".into(),
                 category: Some("physical".into()),
                 reason: Some("default: physical tools require confirmation".into()),
             },
-            roz_v1::PermissionRule {
+            SessionPermissionRule {
                 tool_pattern: "*".into(),
                 policy: "allow".into(),
                 category: Some("pure".into()),
@@ -1914,7 +2286,7 @@ fn derive_permissions(tools: &[roz_core::tools::ToolSchema]) -> Vec<roz_v1::Perm
         .map(|tool| {
             let is_pure = PURE_VERBS.iter().any(|verb| tool.name.starts_with(verb));
 
-            roz_v1::PermissionRule {
+            SessionPermissionRule {
                 tool_pattern: tool.name.clone(),
                 policy: if is_pure {
                     "allow".into()
@@ -1931,11 +2303,11 @@ fn derive_permissions(tools: &[roz_core::tools::ToolSchema]) -> Vec<roz_v1::Perm
 /// Override permissions for plan mode: physical tools are blocked, pure tools
 /// remain allowed.
 #[allow(dead_code)]
-fn plan_mode_permissions(base: &[roz_v1::PermissionRule]) -> Vec<roz_v1::PermissionRule> {
+fn plan_mode_permissions(base: &[SessionPermissionRule]) -> Vec<SessionPermissionRule> {
     base.iter()
         .map(|rule| {
             if rule.category.as_deref() == Some("physical") {
-                roz_v1::PermissionRule {
+                SessionPermissionRule {
                     policy: "block".into(),
                     reason: Some("plan mode: observation only".into()),
                     ..rule.clone()
@@ -1965,7 +2337,7 @@ async fn run_edge_relay(
     nats: &async_nats::Client,
     worker_id: &str,
     session_id: &str,
-    model_name: &str,
+    edge_mirror: Arc<AsyncMutex<EdgeSessionMirror>>,
     stream: &mut Streaming<SessionRequest>,
 ) {
     let req_subject = match roz_nats::subjects::Subjects::session_request(worker_id, session_id) {
@@ -1994,7 +2366,10 @@ async fn run_edge_relay(
 
     // Publish StartSession to the worker, including the resolved model name
     // so the worker can use the client's model selection.
-    let start_envelope = serde_json::json!({"type": "start_session", "model": model_name});
+    let start_envelope = {
+        let bootstrap = edge_mirror.lock().await.export_bootstrap();
+        build_edge_relay_start_envelope(&bootstrap)
+    };
     if let Ok(payload) = serde_json::to_vec(&start_envelope)
         && let Err(e) = nats.publish(req_subject.clone(), payload.into()).await
     {
@@ -2006,6 +2381,8 @@ async fn run_edge_relay(
     // Timeout after 30s of silence from worker — handles worker crash.
     let tx_clone = tx.clone();
     let relay_session_id = session_id.to_string();
+    let relay_model_name = { edge_mirror.lock().await.model_name() };
+    let relay_edge_mirror = Arc::clone(&edge_mirror);
     let resp_relay = tokio::spawn(async move {
         loop {
             let msg = match tokio::time::timeout(Duration::from_secs(30), worker_resp.next()).await {
@@ -2015,77 +2392,66 @@ async fn run_edge_relay(
                     // 30s with no message from worker — assume worker crash.
                     tracing::error!(session_id = %relay_session_id, "edge relay timeout — no response from worker in 30s");
                     let err_resp = SessionResponse {
-                        response: Some(session_response::Response::Error(roz_v1::SessionError {
-                            code: "worker_timeout".to_string(),
-                            message: "No response from edge worker within 30 seconds — worker may have crashed"
-                                .to_string(),
-                            retryable: true,
-                        })),
+                        response: Some(super::event_mapper::canonical_session_event_to_response(
+                            SessionEvent::SessionRejected {
+                                code: "worker_timeout".to_string(),
+                                message: "No response from edge worker within 30 seconds — worker may have crashed"
+                                    .to_string(),
+                                retryable: true,
+                            },
+                            CorrelationId::new(),
+                        )),
                     };
                     let _ = tx_clone.send(Ok(err_resp)).await;
                     break;
                 }
             };
+            if let Ok(envelope) = serde_json::from_slice::<CanonicalSessionEventEnvelope>(&msg.payload) {
+                if let Some(response) = edge_canonical_json_envelope_to_response(&envelope, &relay_model_name) {
+                    let session_response = SessionResponse {
+                        response: Some(response),
+                    };
+                    if tx_clone.send(Ok(session_response)).await.is_err() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if let Ok(envelope) = serde_json::from_slice::<EventEnvelope>(&msg.payload) {
+                if let Some(response) = edge_event_envelope_to_response(&envelope, &relay_model_name) {
+                    let session_response = SessionResponse {
+                        response: Some(response),
+                    };
+                    if tx_clone.send(Ok(session_response)).await.is_err() {
+                        break;
+                    }
+                }
+                continue;
+            }
             let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(&msg.payload) else {
                 continue;
             };
 
             let msg_type = envelope["type"].as_str().unwrap_or("");
-            let response = match msg_type {
-                "keepalive" => {
-                    // Worker is alive but busy. Reset timeout by continuing the loop.
-                    continue;
+            if msg_type == "runtime_checkpoint" {
+                match serde_json::from_value::<roz_agent::session_runtime::SessionRuntimeBootstrap>(
+                    envelope.get("bootstrap").cloned().unwrap_or(serde_json::Value::Null),
+                ) {
+                    Ok(bootstrap) => {
+                        relay_edge_mirror.lock().await.update_checkpoint(bootstrap);
+                    }
+                    Err(error) => {
+                        tracing::warn!(session_id = %relay_session_id, %error, "failed to parse edge runtime checkpoint");
+                    }
                 }
-                "session_started" => {
-                    let sid = envelope["session_id"].as_str().unwrap_or("").to_string();
-                    let model = envelope["model"].as_str().unwrap_or("").to_string();
-                    Some(session_response::Response::SessionStarted(roz_v1::SessionStarted {
-                        session_id: sid,
-                        model,
-                        permissions: vec![],
-                    }))
-                }
-                "text_delta" => {
-                    let text = envelope["text"].as_str().unwrap_or("").to_string();
-                    Some(session_response::Response::TextDelta(roz_v1::TextDelta {
-                        message_id: String::new(),
-                        content: text,
-                    }))
-                }
-                "turn_complete" => {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let input_tokens = envelope["input_tokens"].as_u64().unwrap_or(0) as u32;
-                    #[allow(clippy::cast_possible_truncation)]
-                    let output_tokens = envelope["output_tokens"].as_u64().unwrap_or(0) as u32;
-                    let stop_reason = envelope["stop_reason"].as_str().unwrap_or("end_turn").to_string();
-                    Some(session_response::Response::TurnComplete(roz_v1::TurnComplete {
-                        message_id: String::new(),
-                        usage: Some(roz_v1::TokenUsage {
-                            input_tokens,
-                            output_tokens,
-                            cache_read_tokens: 0,
-                            cache_creation_tokens: 0,
-                        }),
-                        stop_reason,
-                    }))
-                }
-                "error" => {
-                    let message = envelope["message"].as_str().unwrap_or("unknown error").to_string();
-                    Some(session_response::Response::Error(roz_v1::SessionError {
-                        code: "agent_error".to_string(),
-                        message,
-                        retryable: false,
-                    }))
-                }
-                _ => None,
-            };
-
-            if let Some(resp) = response {
-                let sr = SessionResponse { response: Some(resp) };
-                if tx_clone.send(Ok(sr)).await.is_err() {
-                    break; // client disconnected
-                }
+                continue;
             }
+            if msg_type == "keepalive" {
+                // Worker is alive but busy. Reset timeout by continuing the loop.
+                continue;
+            }
+
+            tracing::warn!(msg_type, session_id = %relay_session_id, "ignoring unexpected legacy edge relay message");
         }
     });
 
@@ -2093,8 +2459,11 @@ async fn run_edge_relay(
     while let Ok(Some(req)) = stream.message().await {
         if let Some(request) = req.request {
             let envelope = match request {
-                session_request::Request::UserMessage(um) => {
-                    serde_json::json!({"type": "user_message", "text": um.content})
+                session_request::Request::UserMessage(um) => build_edge_relay_user_message_envelope(&um),
+                session_request::Request::RegisterTools(reg) => build_edge_relay_register_tools_envelope(&reg),
+                session_request::Request::ToolResult(result) => build_edge_relay_tool_result_envelope(&result),
+                session_request::Request::PermissionDecision(decision) => {
+                    build_edge_relay_permission_decision_envelope(&decision)
                 }
                 session_request::Request::CancelSession(_) => {
                     serde_json::json!({"type": "cancel_session"})
@@ -2122,6 +2491,9 @@ async fn run_edge_relay(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roz_core::edge_health::EdgeTransportHealth;
+    use roz_core::session::activity::RuntimeActivity;
+    use roz_core::session::control::SessionMode;
     use serde_json::json;
 
     #[test]
@@ -2183,6 +2555,380 @@ mod tests {
         assert_eq!(perms[3].tool_pattern, "gripper_close");
         assert_eq!(perms[3].policy, "require_confirmation");
         assert_eq!(perms[3].category.as_deref(), Some("physical"));
+    }
+
+    #[test]
+    fn resolved_user_message_mode_preserves_runtime_mode_when_shell_omits_it() {
+        assert_eq!(
+            resolved_user_message_mode(None, AgentLoopMode::OodaReAct),
+            AgentLoopMode::OodaReAct
+        );
+        assert_eq!(
+            resolved_user_message_mode(Some("react"), AgentLoopMode::OodaReAct),
+            AgentLoopMode::React
+        );
+        assert_eq!(
+            resolved_user_message_mode(Some("ooda"), AgentLoopMode::React),
+            AgentLoopMode::OodaReAct
+        );
+    }
+
+    #[test]
+    fn edge_event_envelope_maps_session_started() {
+        let envelope = EventEnvelope {
+            event_id: roz_core::session::event::EventId::new(),
+            correlation_id: roz_core::session::event::CorrelationId::new(),
+            parent_event_id: None,
+            timestamp: chrono::Utc::now(),
+            event: SessionEvent::SessionStarted {
+                session_id: "sess-edge-1".into(),
+                mode: SessionMode::Edge,
+                blueprint_version: "1.0".into(),
+                model_name: Some("claude-sonnet-4-6".into()),
+                permissions: vec![SessionPermissionRule {
+                    tool_pattern: "capture_frame".into(),
+                    policy: "allow".into(),
+                    category: Some("pure".into()),
+                    reason: None,
+                }],
+            },
+        };
+
+        let response =
+            edge_event_envelope_to_response(&envelope, "claude-sonnet-4-6").expect("session started should map");
+
+        match response {
+            session_response::Response::SessionEvent(event) => {
+                assert_eq!(event.event_type, "session_started");
+                match event.typed_event {
+                    Some(roz_v1::session_event_envelope::TypedEvent::SessionStarted(payload)) => {
+                        assert_eq!(payload.session_id, "sess-edge-1");
+                        assert_eq!(payload.model_name.as_deref(), Some("claude-sonnet-4-6"));
+                        assert_eq!(payload.permissions[0].tool_pattern, "capture_frame");
+                        assert_eq!(payload.permissions[0].policy, "allow");
+                    }
+                    other => panic!("expected typed session_started payload, got {other:?}"),
+                }
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn edge_event_envelope_prefers_canonical_runtime_event() {
+        let envelope = EventEnvelope {
+            event_id: roz_core::session::event::EventId::new(),
+            correlation_id: roz_core::session::event::CorrelationId::new(),
+            parent_event_id: None,
+            timestamp: chrono::Utc::now(),
+            event: SessionEvent::ActivityChanged {
+                state: RuntimeActivity::Planning,
+                reason: "turn 1 started".into(),
+                robot_safe: true,
+                unblock_event: None,
+            },
+        };
+
+        let response = edge_event_envelope_to_response(&envelope, "ignored").expect("activity event should map");
+
+        match response {
+            session_response::Response::SessionEvent(event) => {
+                assert_eq!(event.event_type, "activity_changed");
+                match event.typed_event {
+                    Some(roz_v1::session_event_envelope::TypedEvent::ActivityChanged(payload)) => {
+                        assert_eq!(payload.state, "planning");
+                        assert_eq!(payload.reason, "turn 1 started");
+                    }
+                    other => panic!("expected typed activity_changed payload, got {other:?}"),
+                }
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn edge_event_envelope_preserves_unmapped_runtime_event() {
+        let envelope = EventEnvelope {
+            event_id: roz_core::session::event::EventId("evt-1".into()),
+            correlation_id: roz_core::session::event::CorrelationId("corr-1".into()),
+            parent_event_id: None,
+            timestamp: chrono::Utc::now(),
+            event: SessionEvent::TurnStarted { turn_index: 3 },
+        };
+
+        let response = edge_event_envelope_to_response(&envelope, "ignored").expect("turn-started event should map");
+
+        match response {
+            session_response::Response::SessionEvent(event) => {
+                assert_eq!(event.event_id, "evt-1");
+                assert_eq!(event.correlation_id, "corr-1");
+                assert_eq!(event.event_type, "turn_started");
+                match event.typed_event {
+                    Some(roz_v1::session_event_envelope::TypedEvent::TurnStarted(payload)) => {
+                        assert_eq!(payload.turn_index, 3);
+                    }
+                    other => panic!("expected typed turn_started payload, got {other:?}"),
+                }
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_edge_canonical_json_becomes_typed_degradation_event() {
+        let envelope = CanonicalSessionEventEnvelope {
+            event_id: "evt-bad".into(),
+            correlation_id: "corr-bad".into(),
+            parent_event_id: None,
+            timestamp: chrono::Utc::now(),
+            event_type: "text_delta".into(),
+            event_payload: serde_json::json!({"not": "a tagged session event"}),
+        };
+
+        let response = edge_canonical_json_envelope_to_response(&envelope, "ignored")
+            .expect("decode failure should still map to a typed response");
+
+        match response {
+            session_response::Response::SessionEvent(event) => {
+                assert_eq!(event.event_type, "edge_degraded");
+                match event.typed_event {
+                    Some(roz_v1::session_event_envelope::TypedEvent::EdgeTransportDegraded(payload)) => {
+                        assert_eq!(payload.transport, "nats");
+                        assert_eq!(payload.affected_capabilities, vec!["session_events"]);
+                        let health = payload.health.expect("health should be present");
+                        let value = super::super::convert::struct_to_value(health);
+                        let parsed: EdgeTransportHealth = serde_json::from_value(value).unwrap();
+                        assert_eq!(
+                            parsed,
+                            EdgeTransportHealth::Degraded {
+                                affected: vec!["session_event_decode".into()]
+                            }
+                        );
+                    }
+                    other => panic!("expected typed edge degradation event, got {other:?}"),
+                }
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cloud_event_envelope_maps_session_started_with_permissions() {
+        let envelope = EventEnvelope {
+            event_id: roz_core::session::event::EventId::new(),
+            correlation_id: roz_core::session::event::CorrelationId::new(),
+            parent_event_id: None,
+            timestamp: chrono::Utc::now(),
+            event: SessionEvent::SessionStarted {
+                session_id: "sess-cloud-1".into(),
+                mode: SessionMode::Server,
+                blueprint_version: "1.0".into(),
+                model_name: None,
+                permissions: vec![],
+            },
+        };
+        let permissions = vec![SessionPermissionRule {
+            tool_pattern: "capture_frame".into(),
+            policy: "allow".into(),
+            category: Some("pure".into()),
+            reason: Some("observation only".into()),
+        }];
+
+        let response = cloud_event_envelope_to_response(&envelope, "claude-sonnet-4-6", &permissions);
+
+        match response {
+            session_response::Response::SessionEvent(event) => {
+                assert_eq!(event.event_type, "session_started");
+                match event.typed_event {
+                    Some(roz_v1::session_event_envelope::TypedEvent::SessionStarted(payload)) => {
+                        assert_eq!(payload.session_id, "sess-cloud-1");
+                        assert_eq!(payload.model_name.as_deref(), Some("claude-sonnet-4-6"));
+                        assert_eq!(payload.permissions[0].tool_pattern, "capture_frame");
+                        assert_eq!(payload.permissions[0].policy, "allow");
+                    }
+                    other => panic!("expected typed session_started payload, got {other:?}"),
+                }
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cloud_event_envelope_prefers_canonical_runtime_event() {
+        let envelope = EventEnvelope {
+            event_id: roz_core::session::event::EventId("evt-cloud-1".into()),
+            correlation_id: roz_core::session::event::CorrelationId("corr-cloud-1".into()),
+            parent_event_id: None,
+            timestamp: chrono::Utc::now(),
+            event: SessionEvent::ActivityChanged {
+                state: RuntimeActivity::Planning,
+                reason: "turn 1 started".into(),
+                robot_safe: true,
+                unblock_event: None,
+            },
+        };
+
+        let response = cloud_event_envelope_to_response(&envelope, "ignored", &[]);
+        match response {
+            session_response::Response::SessionEvent(event) => {
+                assert_eq!(event.event_id, "evt-cloud-1");
+                assert_eq!(event.correlation_id, "corr-cloud-1");
+                assert_eq!(event.event_type, "activity_changed");
+                match event.typed_event {
+                    Some(roz_v1::session_event_envelope::TypedEvent::ActivityChanged(payload)) => {
+                        assert_eq!(payload.state, "planning");
+                        assert_eq!(payload.reason, "turn 1 started");
+                    }
+                    other => panic!("expected typed activity_changed payload, got {other:?}"),
+                }
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_edge_relay_user_message_envelope_forwards_runtime_prompt_inputs() {
+        let envelope = build_edge_relay_user_message_envelope(&roz_v1::UserMessage {
+            content: "move to target".into(),
+            context: vec![roz_v1::ContentBlock {
+                label: Some("Editor".into()),
+                block: Some(roz_v1::content_block::Block::Text("fn main() {}".into())),
+            }],
+            ai_mode: Some("ooda_react".into()),
+            message_id: Some("msg-1".into()),
+            tools: vec![roz_v1::ToolSchema {
+                name: "scan_area".into(),
+                description: "Scan the area".into(),
+                parameters_schema: Some(crate::grpc::convert::value_to_struct(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "radius_m": { "type": "number" }
+                    }
+                }))),
+                timeout_ms: 1_500,
+                category: roz_v1::ToolCategoryHint::ToolCategoryPure as i32,
+            }],
+            system_context: Some("workflow context".into()),
+        });
+
+        assert_eq!(envelope["type"], "user_message");
+        assert_eq!(envelope["text"], "move to target");
+        assert_eq!(envelope["message_id"], "msg-1");
+        assert_eq!(envelope["ai_mode"], "ooda_react");
+        assert_eq!(envelope["system_context"], "workflow context");
+        assert_eq!(envelope["volatile_blocks"][0], "[Editor]\nfn main() {}");
+        assert_eq!(envelope["tools"][0]["name"], "scan_area");
+        assert_eq!(envelope["tools"][0]["category"], "pure");
+        assert_eq!(
+            envelope["tools"][0]["parameters"]["properties"]["radius_m"]["type"],
+            "number"
+        );
+    }
+
+    #[test]
+    fn build_edge_relay_register_tools_envelope_forwards_pending_system_context() {
+        let envelope = build_edge_relay_register_tools_envelope(&roz_v1::RegisterTools {
+            source: Some("sim".into()),
+            tools: vec![roz_v1::ToolSchema {
+                name: "scan_area".into(),
+                description: "Scan".into(),
+                parameters_schema: Some(crate::grpc::convert::value_to_struct(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "radius_m": { "type": "number" }
+                    }
+                }))),
+                timeout_ms: 30_000,
+                category: roz_v1::ToolCategoryHint::ToolCategoryPure as i32,
+            }],
+            system_context: Some("sim workflow".into()),
+        });
+
+        assert_eq!(envelope["type"], "register_tools");
+        assert_eq!(envelope["source"], "sim");
+        assert_eq!(envelope["system_context"], "sim workflow");
+        assert_eq!(envelope["tools"][0]["name"], "scan_area");
+        assert_eq!(envelope["tools"][0]["category"], "pure");
+    }
+
+    #[test]
+    fn build_edge_relay_start_envelope_carries_only_canonical_bootstrap() {
+        let bootstrap = roz_agent::session_runtime::SessionRuntimeBootstrap::from_config(
+            &roz_agent::session_runtime::SessionConfig {
+                session_id: "sess-edge-1".into(),
+                tenant_id: "tenant-edge".into(),
+                mode: SessionMode::Edge,
+                cognition_mode: roz_core::session::control::CognitionMode::React,
+                constitution_text: String::new(),
+                blueprint_toml: String::new(),
+                model_name: Some("claude-sonnet-4-6".into()),
+                permissions: vec![SessionPermissionRule {
+                    tool_pattern: "capture_frame".into(),
+                    policy: "allow".into(),
+                    category: Some("pure".into()),
+                    reason: None,
+                }],
+                tool_schemas: Vec::new(),
+                project_context: vec!["# AGENTS.md\nEdge bootstrap".into()],
+                initial_history: vec![roz_agent::model::types::Message::user("hello edge")],
+            },
+        );
+
+        let envelope = build_edge_relay_start_envelope(&bootstrap);
+
+        assert_eq!(envelope["type"], "start_session");
+        assert_eq!(envelope["model"], "claude-sonnet-4-6");
+        assert!(envelope.get("tenant_id").is_none());
+        assert!(envelope.get("project_context").is_none());
+        assert!(envelope.get("permissions").is_none());
+        assert!(envelope.get("history").is_none());
+        assert_eq!(envelope["bootstrap"]["session_id"], "sess-edge-1");
+        assert_eq!(envelope["bootstrap"]["tenant_id"], "tenant-edge");
+        assert_eq!(
+            envelope["bootstrap"]["project_context"][0],
+            "# AGENTS.md\nEdge bootstrap"
+        );
+        assert_eq!(envelope["bootstrap"]["permissions"][0]["tool_pattern"], "capture_frame");
+        let bootstrap_history: Vec<roz_agent::model::types::Message> =
+            serde_json::from_value(envelope["bootstrap"]["history"].clone())
+                .expect("bootstrap history should deserialize");
+        assert_eq!(bootstrap_history[0].text().as_deref(), Some("hello edge"));
+    }
+
+    #[test]
+    fn build_edge_relay_tool_result_envelope_forwards_structured_fields() {
+        let envelope = build_edge_relay_tool_result_envelope(&roz_v1::ToolResult {
+            tool_call_id: "toolu_123".into(),
+            success: true,
+            result: "{\"ok\":true}".into(),
+            exit_code: Some(0),
+            truncated: true,
+            duration_ms: Some(42),
+        });
+
+        assert_eq!(envelope["type"], "tool_result");
+        assert_eq!(envelope["tool_call_id"], "toolu_123");
+        assert_eq!(envelope["success"], true);
+        assert_eq!(envelope["result"], "{\"ok\":true}");
+        assert_eq!(envelope["exit_code"], 0);
+        assert_eq!(envelope["truncated"], true);
+        assert_eq!(envelope["duration_ms"], 42);
+    }
+
+    #[test]
+    fn build_edge_relay_permission_decision_envelope_forwards_modifier() {
+        let envelope = build_edge_relay_permission_decision_envelope(&roz_v1::PermissionDecision {
+            approval_id: "apr_approve".into(),
+            approved: true,
+            modifier: Some(crate::grpc::convert::value_to_struct(serde_json::json!({
+                "position": { "x": 1.0 }
+            }))),
+        });
+
+        assert_eq!(envelope["type"], "permission_decision");
+        assert_eq!(envelope["approval_id"], "apr_approve");
+        assert_eq!(envelope["approved"], true);
+        assert_eq!(envelope["modifier"]["position"]["x"], 1.0);
     }
 
     #[test]
@@ -2262,13 +3008,13 @@ mod tests {
     #[test]
     fn plan_mode_permissions_blocks_physical() {
         let base = vec![
-            roz_v1::PermissionRule {
+            SessionPermissionRule {
                 tool_pattern: "move_arm".into(),
                 policy: "require_confirmation".into(),
                 category: Some("physical".into()),
                 reason: None,
             },
-            roz_v1::PermissionRule {
+            SessionPermissionRule {
                 tool_pattern: "get_sensor".into(),
                 policy: "allow".into(),
                 category: Some("pure".into()),
@@ -2374,10 +3120,10 @@ mod tests {
         let proto = core_team_event_to_proto(ooda_event);
         match proto.event {
             Some(Event::WorkerPhase(wp)) => {
-                assert_eq!(wp.mode, "ooda_re_act");
+                assert_eq!(wp.mode, "ooda_react");
                 assert_eq!(wp.phase, 2);
             }
-            other => panic!("expected WorkerPhase(ooda_re_act), got {other:?}"),
+            other => panic!("expected WorkerPhase(ooda_react), got {other:?}"),
         }
     }
 
@@ -2422,6 +3168,108 @@ mod tests {
                 assert_eq!(wc.result, "task finished successfully");
             }
             other => panic!("expected WorkerCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn team_event_worker_approval_requested_to_proto() {
+        use roz_core::team::TeamEvent as CoreTeamEvent;
+        use roz_v1::team_event::Event;
+        use uuid::Uuid;
+
+        let worker_id = Uuid::nil();
+        let task_id = Uuid::max();
+        let event = CoreTeamEvent::WorkerApprovalRequested {
+            worker_id,
+            task_id,
+            approval_id: "apr-123".to_string(),
+            tool_name: "exec_command".to_string(),
+            reason: "requires human approval".to_string(),
+            timeout_secs: 45,
+        };
+
+        let proto = core_team_event_to_proto(event);
+        match proto.event {
+            Some(Event::WorkerApprovalRequested(requested)) => {
+                assert_eq!(requested.worker_id, worker_id.to_string());
+                assert_eq!(requested.task_id, task_id.to_string());
+                assert_eq!(requested.approval_id, "apr-123");
+                assert_eq!(requested.tool_name, "exec_command");
+                assert_eq!(requested.reason, "requires human approval");
+                assert_eq!(requested.timeout_secs, 45);
+            }
+            other => panic!("expected WorkerApprovalRequested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn team_event_worker_approval_resolved_to_proto() {
+        use roz_core::team::TeamEvent as CoreTeamEvent;
+        use roz_v1::team_event::Event;
+        use uuid::Uuid;
+
+        let worker_id = Uuid::nil();
+        let task_id = Uuid::max();
+        let event = CoreTeamEvent::WorkerApprovalResolved {
+            worker_id,
+            task_id,
+            approval_id: "apr-123".to_string(),
+            approved: true,
+            modifier: Some(serde_json::json!({"speed": 0.2})),
+        };
+
+        let proto = core_team_event_to_proto(event);
+        match proto.event {
+            Some(Event::WorkerApprovalResolved(resolved)) => {
+                assert_eq!(resolved.worker_id, worker_id.to_string());
+                assert_eq!(resolved.task_id, task_id.to_string());
+                assert_eq!(resolved.approval_id, "apr-123");
+                assert!(resolved.approved);
+                assert!(resolved.modifier.is_some());
+            }
+            other => panic!("expected WorkerApprovalResolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_team_event_payload_accepts_sequenced_wrapper() {
+        let worker_id = uuid::Uuid::new_v4();
+        let payload = serde_json::to_vec(&SequencedTeamEvent {
+            seq: 7,
+            timestamp_ns: 123_456,
+            event: CoreTeamEvent::WorkerToolCall {
+                worker_id,
+                tool: "move_arm".into(),
+            },
+        })
+        .unwrap();
+
+        let decoded = decode_team_event_payload(&payload).expect("sequenced payload should decode");
+        match decoded {
+            CoreTeamEvent::WorkerToolCall { worker_id: id, tool } => {
+                assert_eq!(id, worker_id);
+                assert_eq!(tool, "move_arm");
+            }
+            other => panic!("expected WorkerToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_team_event_payload_still_accepts_legacy_payload() {
+        let worker_id = uuid::Uuid::new_v4();
+        let payload = serde_json::to_vec(&CoreTeamEvent::WorkerStarted {
+            worker_id,
+            host_id: "host-1".into(),
+        })
+        .unwrap();
+
+        let decoded = decode_team_event_payload(&payload).expect("legacy payload should decode");
+        match decoded {
+            CoreTeamEvent::WorkerStarted { worker_id: id, host_id } => {
+                assert_eq!(id, worker_id);
+                assert_eq!(host_id, "host-1");
+            }
+            other => panic!("expected WorkerStarted, got {other:?}"),
         }
     }
 }

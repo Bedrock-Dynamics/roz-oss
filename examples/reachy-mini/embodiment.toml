@@ -1,0 +1,187 @@
+[robot]
+name = "reachy-mini"
+description = "Pollen Robotics Reachy Mini — expressive tabletop robot with head, body, and antennas"
+
+[safety]
+e_stop_behavior = "hold_position"
+watchdog_timeout_ms = 500
+
+[channels]
+robot_id = "reachy_mini"
+robot_class = "expressive"
+control_rate_hz = 50
+
+# 9 position command channels.
+# 40 deg = 0.6981317007977318
+# 160 deg = 2.792526803190927
+# 65 deg = 1.1344640137963142
+# 120 deg = 2.0943951023931953
+
+# Head position (indices 0-2)
+[[channels.commands]]
+name = "head_x"
+type = "position"
+unit = "m"
+limits = [-0.03, 0.03]
+position_state_index = 0
+
+[[channels.commands]]
+name = "head_y"
+type = "position"
+unit = "m"
+limits = [-0.03, 0.03]
+position_state_index = 1
+
+[[channels.commands]]
+name = "head_z"
+type = "position"
+unit = "m"
+limits = [-0.015, 0.015]
+position_state_index = 2
+
+# Head orientation (indices 3-5)
+[[channels.commands]]
+name = "head_roll"
+type = "position"
+unit = "rad"
+limits = [-0.6981317007977318, 0.6981317007977318]
+position_state_index = 3
+
+[[channels.commands]]
+name = "head_pitch"
+type = "position"
+unit = "rad"
+limits = [-0.6981317007977318, 0.6981317007977318]
+position_state_index = 4
+
+[[channels.commands]]
+name = "head_yaw"
+type = "position"
+unit = "rad"
+limits = [-3.141592653589793, 3.141592653589793]
+position_state_index = 5
+max_delta_from = [6, 1.1344640137963142]
+
+# Body yaw (index 6)
+[[channels.commands]]
+name = "body_yaw"
+type = "position"
+unit = "rad"
+limits = [-2.792526803190927, 2.792526803190927]
+position_state_index = 6
+
+# Antennas (indices 7-8)
+[[channels.commands]]
+name = "left_antenna"
+type = "position"
+unit = "rad"
+limits = [0.0, 2.0943951023931953]
+position_state_index = 7
+
+[[channels.commands]]
+name = "right_antenna"
+type = "position"
+unit = "rad"
+limits = [0.0, 2.0943951023931953]
+position_state_index = 8
+
+# 9 state channels — mirror commands.
+
+[[channels.states]]
+name = "head_x"
+type = "position"
+unit = "m"
+limits = [-0.03, 0.03]
+
+[[channels.states]]
+name = "head_y"
+type = "position"
+unit = "m"
+limits = [-0.03, 0.03]
+
+[[channels.states]]
+name = "head_z"
+type = "position"
+unit = "m"
+limits = [-0.015, 0.015]
+
+[[channels.states]]
+name = "head_roll"
+type = "position"
+unit = "rad"
+limits = [-0.6981317007977318, 0.6981317007977318]
+
+[[channels.states]]
+name = "head_pitch"
+type = "position"
+unit = "rad"
+limits = [-0.6981317007977318, 0.6981317007977318]
+
+[[channels.states]]
+name = "head_yaw"
+type = "position"
+unit = "rad"
+limits = [-3.141592653589793, 3.141592653589793]
+
+[[channels.states]]
+name = "body_yaw"
+type = "position"
+unit = "rad"
+limits = [-2.792526803190927, 2.792526803190927]
+
+[[channels.states]]
+name = "left_antenna"
+type = "position"
+unit = "rad"
+limits = [0.0, 2.0943951023931953]
+
+[[channels.states]]
+name = "right_antenna"
+type = "position"
+unit = "rad"
+limits = [0.0, 2.0943951023931953]
+
+[daemon]
+base_url = "http://localhost:8000"
+
+[daemon.websocket]
+path = "/api/move/ws/set_target"
+set_target_type = "set_target"
+set_target_body = '{"target_head_pose": {"x": {{head_x}}, "y": {{head_y}}, "z": {{head_z}}, "roll": {{head_roll}}, "pitch": {{head_pitch}}, "yaw": {{head_yaw}}}, "target_antennas": [{{right_antenna}}, {{left_antenna}}], "target_body_yaw": {{body_yaw}}}'
+
+[daemon.get_state]
+method = "GET"
+path = "/api/state/full"
+
+[daemon.set_motors]
+method = "POST"
+path = "/api/motors/set_mode/{{mode}}"
+
+[daemon.move_to]
+method = "POST"
+path = "/api/move/goto"
+body = '''
+{
+  "head_pose": {
+    "x": {{head_x}},
+    "y": {{head_y}},
+    "z": {{head_z}},
+    "roll": {{head_roll}},
+    "pitch": {{head_pitch}},
+    "yaw": {{head_yaw}}
+  },
+  "antennas": [{{right_antenna}}, {{left_antenna}}],
+  "body_yaw": {{body_yaw}},
+  "duration": {{duration}},
+  "interpolation": "minjerk"
+}
+'''
+
+[daemon.play_animation]
+method = "POST"
+path_prefix = "/api/move/play"
+available_moves = ["wake_up", "goto_sleep"]
+
+[daemon.stop_motion]
+method = "POST"
+path = "/api/motors/set_mode/disabled"

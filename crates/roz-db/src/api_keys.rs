@@ -76,8 +76,11 @@ pub async fn verify_api_key(pool: &PgPool, key: &str) -> Result<Option<ApiKey>, 
     let key_prefix = &key[..std::cmp::min(16, key.len())];
 
     sqlx::query_as::<_, ApiKey>(
-        "SELECT * FROM roz_api_keys WHERE key_prefix = $1 AND key_hash = $2 AND revoked_at IS NULL \
-         AND (expires_at IS NULL OR expires_at > now())",
+        "UPDATE roz_api_keys \
+         SET last_used_at = now() \
+         WHERE key_prefix = $1 AND key_hash = $2 AND revoked_at IS NULL \
+           AND (expires_at IS NULL OR expires_at > now()) \
+         RETURNING *",
     )
     .bind(key_prefix)
     .bind(key_hash)
@@ -173,7 +176,9 @@ mod tests {
             .await
             .expect("Failed to verify API key");
         assert!(verified.is_some());
-        assert_eq!(verified.unwrap().id, result.api_key.id);
+        let verified = verified.unwrap();
+        assert_eq!(verified.id, result.api_key.id);
+        assert!(verified.last_used_at.is_some(), "verify should update last_used_at");
     }
 
     #[tokio::test]

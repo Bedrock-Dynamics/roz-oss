@@ -41,7 +41,9 @@ fn pose_to_entity(pose: &gz_transport_rs::msgs::Pose) -> EntityState {
         velocity: None,
         properties: HashMap::new(),
         timestamp_ns: None,
-        frame_id: Some("world".to_owned()),
+        frame_id: "world".to_owned(),
+        last_observed_ns: None,
+        observation_confidence: 1.0,
     }
 }
 
@@ -104,20 +106,24 @@ mod tests {
         assert_eq!(arm.position, Some([1.0, 2.0, 3.0]));
         // roz convention: [w, x, y, z]
         assert_eq!(arm.orientation, Some([1.0, 0.0, 0.0, 0.0]));
-        assert_eq!(arm.frame_id.as_deref(), Some("world"));
+        assert_eq!(arm.frame_id, "world");
         assert!(arm.velocity.is_none());
         assert!(arm.properties.is_empty());
         assert!(arm.timestamp_ns.is_none());
+        assert!(arm.last_observed_ns.is_none());
+        assert_eq!(arm.observation_confidence, 1.0);
 
         let cam = &entities[1];
         assert_eq!(cam.id, "camera_mount");
         assert_eq!(cam.kind, "gazebo_model");
         assert_eq!(cam.position, Some([-0.5, 0.25, 1.8]));
         assert_eq!(cam.orientation, Some([0.927, 0.1, 0.2, 0.3]));
-        assert_eq!(cam.frame_id.as_deref(), Some("world"));
+        assert_eq!(cam.frame_id, "world");
         assert!(cam.velocity.is_none());
         assert!(cam.properties.is_empty());
         assert!(cam.timestamp_ns.is_none());
+        assert!(cam.last_observed_ns.is_none());
+        assert_eq!(cam.observation_confidence, 1.0);
     }
 
     #[test]
@@ -141,9 +147,11 @@ mod tests {
         assert_eq!(entity.kind, "gazebo_model");
         assert!(entity.position.is_none());
         assert!(entity.orientation.is_none());
-        assert_eq!(entity.frame_id.as_deref(), Some("world"));
+        assert_eq!(entity.frame_id, "world");
         assert!(entity.velocity.is_none());
         assert!(entity.properties.is_empty());
         assert!(entity.timestamp_ns.is_none());
+        assert!(entity.last_observed_ns.is_none());
+        assert_eq!(entity.observation_confidence, 1.0);
     }
 }

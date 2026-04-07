@@ -1,8 +1,8 @@
 //! Camera snapshot provider for the agent OODA perception path.
 //!
-//! Translates raw JPEG camera frames into `SpatialContext` screenshots that the
+//! Translates raw JPEG camera frames into `WorldState` screenshots that the
 //! agent loop can inject into its spatial observation step. Each camera's latest
-//! frame is cached and served on demand via the `SpatialContextProvider` trait.
+//! frame is cached and served on demand via the `WorldStateProvider` trait.
 
 use std::sync::Arc;
 
@@ -11,17 +11,17 @@ use base64::Engine;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use roz_agent::spatial_provider::SpatialContextProvider;
+use roz_agent::spatial_provider::WorldStateProvider;
 use roz_core::edge::vision::VisionConfig;
-use roz_core::spatial::{SimScreenshot, SpatialContext};
+use roz_core::spatial::{SimScreenshot, WorldState};
 
-/// Provides camera snapshots as `SpatialContext` for agent perception.
+/// Provides camera snapshots as `WorldState` for agent perception.
 ///
 /// Each camera's latest JPEG frame is stored as a base64-encoded screenshot.
-/// The `SpatialContextProvider` implementation returns all cached screenshots
+/// The `WorldStateProvider` implementation returns all cached screenshots
 /// when the agent loop requests a spatial observation.
 pub struct CameraSpatialProvider {
-    last_context: RwLock<SpatialContext>,
+    last_context: RwLock<WorldState>,
 }
 
 impl CameraSpatialProvider {
@@ -29,7 +29,7 @@ impl CameraSpatialProvider {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            last_context: RwLock::new(SpatialContext::default()),
+            last_context: RwLock::new(WorldState::default()),
         }
     }
 
@@ -68,8 +68,8 @@ impl Default for CameraSpatialProvider {
 }
 
 #[async_trait]
-impl SpatialContextProvider for CameraSpatialProvider {
-    async fn snapshot(&self, _task_id: &str) -> SpatialContext {
+impl WorldStateProvider for CameraSpatialProvider {
+    async fn snapshot(&self, _task_id: &str) -> WorldState {
         self.last_context.read().await.clone()
     }
 }

@@ -5,7 +5,7 @@
 //! acknowledging receipt — full integration with Copper's `CuBridge` trait
 //! is planned for a future phase.
 
-use roz_nats::dispatch::{TaskInvocation, TaskResult, TokenUsage};
+use roz_nats::dispatch::{TaskInvocation, TaskResult, TaskTerminalStatus, TokenUsage};
 
 /// Bridge connecting the NATS cloud dispatch layer to the local Copper runtime.
 ///
@@ -37,7 +37,7 @@ impl NatsCopperBridge {
     pub fn execute_task(&self, invocation: &TaskInvocation) -> TaskResult {
         TaskResult {
             task_id: invocation.task_id,
-            success: true,
+            status: TaskTerminalStatus::Succeeded,
             output: Some(serde_json::json!({
                 "status": "acknowledged",
                 "worker_id": self.worker_id,
@@ -81,12 +81,14 @@ mod tests {
             restate_url: "http://localhost:8080".to_owned(),
             traceparent: None,
             phases: vec![],
+            control_interface_manifest: None,
+            delegation_scope: None,
         };
 
         let result = bridge.execute_task(&invocation);
 
         assert_eq!(result.task_id, task_id);
-        assert!(result.success);
+        assert_eq!(result.status, TaskTerminalStatus::Succeeded);
         assert!(result.error.is_none());
         assert_eq!(result.cycles, 0);
         assert_eq!(result.token_usage, TokenUsage::default());

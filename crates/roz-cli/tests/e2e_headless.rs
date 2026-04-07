@@ -29,15 +29,29 @@ struct HeadlessResult {
 /// Uses a poll loop with `try_wait` since `Command::timeout()` is not
 /// stabilized in our pinned Rust 1.92.0.
 fn roz_headless(task: &str, timeout: Duration) -> HeadlessResult {
-    roz_headless_in(task, timeout, None)
+    roz_headless_in_with_env(task, timeout, None, &[])
 }
 
 /// Run `roz --non-interactive --task <task>` in a specific directory.
 fn roz_headless_in(task: &str, timeout: Duration, working_dir: Option<&std::path::Path>) -> HeadlessResult {
+    roz_headless_in_with_env(task, timeout, working_dir, &[])
+}
+
+/// Run `roz --non-interactive --task <task>` in a specific directory with
+/// explicit environment overrides.
+fn roz_headless_in_with_env(
+    task: &str,
+    timeout: Duration,
+    working_dir: Option<&std::path::Path>,
+    envs: &[(&str, &str)],
+) -> HeadlessResult {
     let mut cmd = Command::new(cargo_bin("roz"));
     cmd.args(["--non-interactive", "--task", task]);
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
+    }
+    for (key, value) in envs {
+        cmd.env(key, value);
     }
 
     let child = cmd
@@ -79,6 +93,47 @@ fn roz_headless_in(task: &str, timeout: Duration, working_dir: Option<&std::path
     }
 }
 
+/// Run `roz` against an explicitly provided cloud deployment using only env
+/// overrides, not any persisted local auth state.
+fn roz_headless_with_cloud_override(task: &str, timeout: Duration, api_url: &str, api_key: &str) -> HeadlessResult {
+    let home = tempfile::TempDir::new().expect("create temp HOME");
+    roz_headless_in_with_env(
+        task,
+        timeout,
+        None,
+        &[
+            ("HOME", home.path().to_str().expect("HOME path should be valid UTF-8")),
+            ("ROZ_API_URL", api_url),
+            ("ROZ_API_KEY", api_key),
+            ("ROZ_PROFILE", "dev-e2e-override"),
+        ],
+    )
+}
+
+/// Run `roz` in a specific project directory against an explicitly provided
+/// cloud deployment using only env overrides, not any persisted local auth
+/// state.
+fn roz_headless_in_with_cloud_override(
+    task: &str,
+    timeout: Duration,
+    working_dir: &std::path::Path,
+    api_url: &str,
+    api_key: &str,
+) -> HeadlessResult {
+    let home = tempfile::TempDir::new().expect("create temp HOME");
+    roz_headless_in_with_env(
+        task,
+        timeout,
+        Some(working_dir),
+        &[
+            ("HOME", home.path().to_str().expect("HOME path should be valid UTF-8")),
+            ("ROZ_API_URL", api_url),
+            ("ROZ_API_KEY", api_key),
+            ("ROZ_PROFILE", "dev-e2e-override"),
+        ],
+    )
+}
+
 /// Resolve the path to a cargo-built binary.
 ///
 /// Uses `CARGO_BIN_EXE_roz` (set by cargo for integration tests when a
@@ -97,6 +152,16 @@ fn cargo_bin(name: &str) -> PathBuf {
     path.push("debug");
     path.push(name);
     path
+}
+
+fn required_api_url() -> String {
+    std::env::var("ROZ_API_URL")
+        .or_else(|_| std::env::var("ROZ_SMOKE_URL"))
+        .expect("ROZ_API_URL or ROZ_SMOKE_URL must be set for this test")
+}
+
+fn required_api_key() -> String {
+    std::env::var("ROZ_API_KEY").expect("ROZ_API_KEY must be set for this test")
 }
 
 /// Parse the headless JSON output, returning the parsed value.
@@ -122,6 +187,25 @@ fn reachy_mini_dir() -> PathBuf {
     path.push("examples");
     path.push("reachy-mini");
     path
+}
+
+/// Build a temp project that exposes the Reachy daemon config only through the
+/// canonical `embodiment.toml` filename.
+fn canonical_reachy_mini_project() -> tempfile::TempDir {
+    let example_dir = reachy_mini_dir();
+    let project = tempfile::TempDir::new().expect("create temp embodiment project");
+    let embodiment_toml =
+        std::fs::read_to_string(example_dir.join("embodiment.toml")).expect("read reachy-mini embodiment.toml");
+    std::fs::write(project.path().join("embodiment.toml"), embodiment_toml).expect("write canonical embodiment.toml");
+
+    for extra in ["AGENTS.md", "ROBOT.md", "blueprint.toml"] {
+        let src = example_dir.join(extra);
+        if src.exists() {
+            std::fs::copy(&src, project.path().join(extra)).expect("copy project context file");
+        }
+    }
+
+    project
 }
 
 // ---------------------------------------------------------------------------
@@ -163,26 +247,141 @@ fn headless_basic_prompt() {
     assert!(!response.is_empty(), "response should contain text: {json}");
 }
 
+/// The headless CLI must honor `ROZ_API_URL` and `ROZ_API_KEY` environment
+/// overrides so it can be pointed at dev without relying on local auth state
+/// or the default production endpoint.
+#[test]
+#[ignore = "requires ROZ_API_URL + ROZ_API_KEY for a live cloud deployment"]
+fn headless_respects_api_url_override() {
+    let api_url = required_api_url();
+    let api_key = required_api_key();
+    let result = roz_headless_with_cloud_override(
+        "Say hello in exactly 3 words.",
+        Duration::from_secs(30),
+        &api_url,
+        &api_key,
+    );
+    assert!(
+        result.success,
+        "roz should exit successfully when pointed at an overridden cloud URL.\nstderr: {}",
+        result.stderr
+    );
+
+    let json = parse_output(&result);
+    assert_eq!(json["status"], "success", "status should be success: {json}");
+    assert!(
+        json["response"].as_str().is_some_and(|s| !s.is_empty()),
+        "response should contain text: {json}"
+    );
+}
+
+/// The dev cloud override should still permit client-side bash execution.
+#[test]
+#[ignore = "requires ROZ_API_URL + ROZ_API_KEY for a live cloud deployment"]
+fn headless_cloud_bash_tool_respects_api_url_override() {
+    let api_url = required_api_url();
+    let api_key = required_api_key();
+
+    let result = roz_headless_with_cloud_override(
+        "Use the bash tool to run 'echo roz_e2e_override_marker'. Report the exact output.",
+        Duration::from_secs(45),
+        &api_url,
+        &api_key,
+    );
+    assert!(result.success, "stderr: {}", result.stderr);
+
+    let json = parse_output(&result);
+    let response = json["response"].as_str().unwrap_or("").to_lowercase();
+    assert!(
+        response.contains("roz_e2e_override_marker"),
+        "agent should report the bash output containing our override marker.\nGot: {}",
+        json["response"]
+    );
+    let cycles = json["cycles"].as_u64().unwrap_or(0);
+    assert!(cycles >= 1, "expected at least one tool cycle, got {cycles}");
+}
+
+/// The dev cloud override should still permit client-side file reads with no
+/// dependence on persisted auth state.
+#[test]
+#[ignore = "requires ROZ_API_URL + ROZ_API_KEY for a live cloud deployment"]
+fn headless_cloud_read_file_respects_api_url_override() {
+    let api_url = required_api_url();
+    let api_key = required_api_key();
+
+    let dir = tempfile::TempDir::new().expect("create temp dir");
+    let test_file = dir.path().join("roz_override_test_file.txt");
+    std::fs::write(&test_file, "roz_override_file_content_67890").expect("write temp file");
+
+    let task = format!(
+        "Use the read_file tool to read the file at '{}' and tell me its exact contents.",
+        test_file.display()
+    );
+    let result = roz_headless_with_cloud_override(&task, Duration::from_secs(45), &api_url, &api_key);
+    assert!(result.success, "stderr: {}", result.stderr);
+
+    let json = parse_output(&result);
+    let response = json["response"].as_str().unwrap_or("");
+    assert!(
+        response.contains("roz_override_file_content_67890"),
+        "agent should report the file contents.\nGot: {}",
+        json["response"]
+    );
+}
+
+/// The dev cloud override should preserve multi-step cloud execution and return
+/// both requested outputs in a single headless session.
+#[test]
+#[ignore = "requires ROZ_API_URL + ROZ_API_KEY for a live cloud deployment"]
+fn headless_multi_step_bash_respects_api_url_override() {
+    let api_url = required_api_url();
+    let api_key = required_api_key();
+
+    let result = roz_headless_with_cloud_override(
+        "You must invoke the bash tool exactly twice. The first tool call may only run 'echo override_step1_done'. \
+         The second tool call may only run 'echo override_step2_done'. After the second tool call, report both outputs.",
+        Duration::from_secs(60),
+        &api_url,
+        &api_key,
+    );
+    assert!(result.success, "stderr: {}", result.stderr);
+
+    let json = parse_output(&result);
+    let response = json["response"].as_str().unwrap_or("").to_lowercase();
+    assert!(
+        response.contains("override_step1_done") && response.contains("override_step2_done"),
+        "agent should report both bash outputs.\nGot: {}",
+        json["response"]
+    );
+    let cycles = json["cycles"].as_u64().unwrap_or(0);
+    assert!(cycles >= 1, "expected at least one agent cycle, got {cycles}");
+}
+
 // ---------------------------------------------------------------------------
-// Tool discovery tests (no daemon needed, just robot.toml)
+// Tool discovery tests (no daemon needed, just embodiment.toml)
 // ---------------------------------------------------------------------------
 
-/// When run from a directory with robot.toml, the agent should discover and
-/// list the daemon tools registered from the manifest.
+/// When run from a directory with `embodiment.toml`, the agent should discover
+/// and list the daemon tools registered from the manifest.
 #[test]
-#[ignore = "requires authenticated roz CLI"]
-fn headless_discovers_robot_tools() {
-    let dir = reachy_mini_dir();
+#[ignore = "requires ROZ_API_URL + ROZ_API_KEY for a live cloud deployment"]
+fn headless_discovers_embodiment_tools() {
+    let api_url = required_api_url();
+    let api_key = required_api_key();
+    let project = canonical_reachy_mini_project();
+    let dir = project.path();
     assert!(
-        dir.join("robot.toml").exists(),
-        "reachy-mini/robot.toml should exist at {}",
+        dir.join("embodiment.toml").exists(),
+        "canonical embodiment.toml should exist at {}",
         dir.display()
     );
 
-    let result = roz_headless_in(
+    let result = roz_headless_in_with_cloud_override(
         "List all available tools you have. Just list their names, nothing else.",
         Duration::from_secs(45),
-        Some(&dir),
+        dir,
+        &api_url,
+        &api_key,
     );
     assert!(
         result.success,
@@ -193,13 +392,13 @@ fn headless_discovers_robot_tools() {
     let json = parse_output(&result);
     let response = json["response"].as_str().unwrap_or("").to_lowercase();
 
-    // The agent should mention at least some of the daemon tools from robot.toml.
+    // The agent should mention at least some of the daemon tools from embodiment.toml.
     assert!(
         response.contains("get_robot_state")
             || response.contains("move_to")
             || response.contains("play_animation")
             || response.contains("set_motors"),
-        "agent should list daemon tools from robot.toml.\n\
+        "agent should list daemon tools from embodiment.toml.\n\
          Expected one of: get_robot_state, move_to, play_animation, set_motors\n\
          Got response: {}",
         json["response"]
@@ -218,7 +417,8 @@ fn headless_discovers_robot_tools() {
 #[test]
 #[ignore = "requires authenticated roz CLI + Reachy Mini sim on localhost:8000"]
 fn headless_get_robot_state() {
-    let dir = reachy_mini_dir();
+    let project = canonical_reachy_mini_project();
+    let dir = project.path();
     let result = roz_headless_in(
         "Use the get_robot_state tool to check the robot state. Report the head pose values.",
         Duration::from_secs(60),
@@ -259,7 +459,8 @@ fn headless_get_robot_state() {
 #[test]
 #[ignore = "requires authenticated roz CLI + Reachy Mini sim on localhost:8000"]
 fn headless_move_to() {
-    let dir = reachy_mini_dir();
+    let project = canonical_reachy_mini_project();
+    let dir = project.path();
     let result = roz_headless_in(
         "Enable motors with set_motors, then use move_to to tilt the head pitch to 0.2 radians \
          over 1 second. Report what you did.",
@@ -291,7 +492,8 @@ fn headless_move_to() {
 #[test]
 #[ignore = "requires authenticated roz CLI + Reachy Mini sim on localhost:8000"]
 fn headless_play_animation() {
-    let dir = reachy_mini_dir();
+    let project = canonical_reachy_mini_project();
+    let dir = project.path();
     let result = roz_headless_in(
         "Play the wake_up animation using the play_animation tool.",
         Duration::from_secs(60),

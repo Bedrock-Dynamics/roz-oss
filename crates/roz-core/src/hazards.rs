@@ -15,7 +15,7 @@ pub enum HazardCategory {
 }
 
 /// Inject a simulated hazard into spatial context for testing.
-pub fn inject_hazard(category: HazardCategory, context: &mut crate::spatial::SpatialContext) {
+pub fn inject_hazard(category: HazardCategory, context: &mut crate::spatial::WorldState) {
     match category {
         HazardCategory::SensorSpoofing => {
             // Corrupt position data
@@ -58,9 +58,9 @@ pub fn inject_hazard(category: HazardCategory, context: &mut crate::spatial::Spa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spatial::{Alert, AlertSeverity, EntityState, SpatialContext};
+    use crate::spatial::{Alert, AlertSeverity, EntityState, WorldState};
 
-    fn make_context_with_entities(n: usize) -> SpatialContext {
+    fn make_context_with_entities(n: usize) -> WorldState {
         let entities = (0..n)
             .map(|i| EntityState {
                 id: format!("sensor_{i}"),
@@ -69,7 +69,7 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        SpatialContext {
+        WorldState {
             entities,
             ..Default::default()
         }
@@ -135,7 +135,7 @@ mod tests {
             HazardCategory::PayloadShift,
             HazardCategory::EnvironmentalChange,
         ] {
-            let mut ctx = SpatialContext::default();
+            let mut ctx = WorldState::default();
             inject_hazard(category, &mut ctx);
             assert_eq!(ctx.alerts.len(), 1, "expected 1 alert for {category:?}");
             assert_eq!(ctx.alerts[0].severity, AlertSeverity::Warning);
@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn inject_human_presence_preserves_existing_alerts() {
-        let mut ctx = SpatialContext {
+        let mut ctx = WorldState {
             alerts: vec![Alert {
                 severity: AlertSeverity::Info,
                 source: "monitor".to_string(),

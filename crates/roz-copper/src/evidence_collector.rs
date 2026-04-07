@@ -1,0 +1,791 @@
+//! Evidence collection during controller verification, shadow, and canary runs.
+//!
+//! [`EvidenceCollector`] accumulates per-tick telemetry and safety intervention
+//! counts, then finalizes into a [`ControllerEvidenceBundle`] suitable for
+//! promotion gating and audit trails.
+
+#![allow(clippy::too_many_arguments)]
+
+use std::collections::{BTreeSet, VecDeque};
+use std::time::{Duration, Instant};
+
+use chrono::Utc;
+use roz_core::controller::artifact::ExecutionMode;
+use roz_core::controller::evidence::{ControllerEvidenceBundle, StabilitySummary};
+use roz_core::controller::intervention::{InterventionKind, SafetyIntervention};
+use roz_core::controller::verification::VerifierStatus;
+use roz_core::session::snapshot::FreshnessState;
+use uuid::Uuid;
+
+use crate::tick_contract::TickOutput;
+
+/// Collects evidence during controller verification/shadow/canary runs.
+///
+/// Create one per verification run, call [`record_tick`] on every tick, then
+/// call [`finalize`] to produce the evidence bundle.
+pub struct EvidenceCollector {
+    controller_id: String,
+    #[allow(dead_code)]
+    started_at: Instant,
+    tick_count: u64,
+    rejection_count: u32,
+    limit_clamp_count: u32,
+    rate_clamp_count: u32,
+    position_limit_stop_count: u32,
+    epoch_interrupt_count: u32,
+    trap_count: u32,
+    watchdog_near_miss_count: u32,
+    missed_tick_count: u32,
+    channels_touched: BTreeSet<String>,
+    unexpected_channels_touched: Vec<String>,
+    all_channels: Vec<String>,
+    config_reads: u32,
+    tick_latency_stats: TickLatencyStats,
+    command_oscillation_detected: bool,
+    previous_commands: Vec<f64>,
+    steady_state_ticks: u32,
+}
+
+/// Number of consecutive stable ticks required to declare steady state.
+const STEADY_STATE_THRESHOLD: u32 = 50;
+const STEADY_STATE_EPSILON: f64 = 0.005;
+const OSCILLATION_DELTA_THRESHOLD: f64 = 0.05;
+/// Number of tick latencies retained for bounded percentile calculation.
+const MAX_TICK_LATENCY_SAMPLES: usize = 2048;
+
+#[derive(Debug, Clone)]
+struct TickLatencyStats {
+    recent_samples_us: VecDeque<u64>,
+    sample_count: u64,
+    mean_us: f64,
+    m2_us: f64,
+}
+
+impl TickLatencyStats {
+    #[allow(clippy::cast_precision_loss)] // online jitter stats are approximate by design
+    fn record(&mut self, duration: Duration) {
+        let micros = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+        if self.recent_samples_us.len() == MAX_TICK_LATENCY_SAMPLES {
+            self.recent_samples_us.pop_front();
+        }
+        self.recent_samples_us.push_back(micros);
+
+        self.sample_count += 1;
+        let sample_count = self.sample_count as f64;
+        let value = micros as f64;
+        let delta = value - self.mean_us;
+        self.mean_us += delta / sample_count;
+        let delta2 = value - self.mean_us;
+        self.m2_us += delta * delta2;
+    }
+
+    fn percentiles(&self) -> (u64, u64, u64) {
+        let samples: Vec<u64> = self.recent_samples_us.iter().copied().collect();
+        compute_percentiles(&samples)
+    }
+
+    #[allow(clippy::cast_precision_loss)] // online jitter stats are approximate by design
+    fn jitter_us(&self) -> f64 {
+        if self.sample_count < 2 {
+            return 0.0;
+        }
+        (self.m2_us / (self.sample_count - 1) as f64).sqrt()
+    }
+}
+
+impl Default for TickLatencyStats {
+    fn default() -> Self {
+        Self {
+            recent_samples_us: VecDeque::with_capacity(MAX_TICK_LATENCY_SAMPLES),
+            sample_count: 0,
+            mean_us: 0.0,
+            m2_us: 0.0,
+        }
+    }
+}
+
+/// Extra replay/verification context that binds an evidence bundle to a concrete frame snapshot.
+#[derive(Debug, Clone)]
+pub struct EvidenceFinalizeContext {
+    pub frame_snapshot_id: u64,
+    pub state_freshness: FreshnessState,
+}
+
+impl Default for EvidenceFinalizeContext {
+    fn default() -> Self {
+        Self {
+            frame_snapshot_id: 0,
+            state_freshness: FreshnessState::Unknown,
+        }
+    }
+}
+
+impl EvidenceCollector {
+    /// Create a new collector for the given controller.
+    ///
+    /// `channel_names` is the set of all joint/channel names the controller is
+    /// expected to drive.
+    #[must_use]
+    pub fn new(controller_id: &str, channel_names: &[String]) -> Self {
+        Self {
+            controller_id: controller_id.to_string(),
+            started_at: Instant::now(),
+            tick_count: 0,
+            rejection_count: 0,
+            limit_clamp_count: 0,
+            rate_clamp_count: 0,
+            position_limit_stop_count: 0,
+            epoch_interrupt_count: 0,
+            trap_count: 0,
+            watchdog_near_miss_count: 0,
+            missed_tick_count: 0,
+            channels_touched: BTreeSet::new(),
+            unexpected_channels_touched: Vec::new(),
+            all_channels: channel_names.to_vec(),
+            config_reads: 0,
+            tick_latency_stats: TickLatencyStats::default(),
+            command_oscillation_detected: false,
+            previous_commands: Vec::new(),
+            steady_state_ticks: 0,
+        }
+    }
+
+    /// Record one tick's results.
+    ///
+    /// `duration` is wall-clock time the controller took to process this tick.
+    /// `output` is the raw controller output (before safety filtering).
+    /// `interventions` are the safety filter's actions on this tick.
+    pub fn record_tick(&mut self, duration: Duration, output: &TickOutput, interventions: &[SafetyIntervention]) {
+        self.tick_count += 1;
+        self.tick_latency_stats.record(duration);
+
+        // Track which channels the controller wrote to.
+        // ANY output (including zero) counts as "touched" — the controller
+        // explicitly produced command values.
+        if !output.command_values.is_empty() {
+            for (i, _) in output.command_values.iter().enumerate() {
+                if let Some(channel_name) = self.all_channels.get(i) {
+                    self.channels_touched.insert(channel_name.clone());
+                } else {
+                    self.record_unexpected_channel(format!("unexpected_output_{i}"));
+                }
+            }
+        }
+
+        // Count interventions by kind
+        for intervention in interventions {
+            match intervention.kind {
+                InterventionKind::AccelerationLimit => {
+                    self.rate_clamp_count += 1;
+                }
+                InterventionKind::PositionLimit => {
+                    self.position_limit_stop_count += 1;
+                }
+                InterventionKind::NanReject => {
+                    self.rejection_count += 1;
+                }
+                InterventionKind::TickOverrun => {
+                    self.missed_tick_count += 1;
+                }
+                InterventionKind::UnconfiguredJoint
+                | InterventionKind::VelocityClamp
+                | InterventionKind::JerkLimit
+                | InterventionKind::ForceLimit
+                | InterventionKind::TorqueLimit
+                | InterventionKind::WorkspaceBoundary
+                | InterventionKind::ContactForceExceeded
+                | InterventionKind::SlipDetected
+                | InterventionKind::TactileOverload => {
+                    self.limit_clamp_count += 1;
+                }
+            }
+        }
+
+        // Detect command oscillation and only declare steady state when outputs
+        // remain within a small idle epsilon across the full command vector.
+        if self.previous_commands.is_empty() {
+            self.steady_state_ticks = 1;
+        } else if self.previous_commands.len() != output.command_values.len() {
+            self.steady_state_ticks = 0;
+        } else {
+            let mut sign_changes = 0u32;
+            let mut all_within_idle_epsilon = true;
+            let mut exceeded_oscillation_threshold = false;
+            for (prev, curr) in self.previous_commands.iter().zip(&output.command_values) {
+                if prev.signum() != curr.signum() && *prev != 0.0 && *curr != 0.0 {
+                    sign_changes += 1;
+                }
+                let delta = (curr - prev).abs();
+                if delta > STEADY_STATE_EPSILON {
+                    all_within_idle_epsilon = false;
+                }
+                if delta > OSCILLATION_DELTA_THRESHOLD {
+                    exceeded_oscillation_threshold = true;
+                }
+            }
+
+            let majority_threshold = output.command_values.len().max(1) / 2;
+            if sign_changes as usize > majority_threshold || exceeded_oscillation_threshold {
+                self.command_oscillation_detected = true;
+                self.steady_state_ticks = 0;
+            } else if all_within_idle_epsilon {
+                self.steady_state_ticks += 1;
+            } else {
+                self.steady_state_ticks = 0;
+            }
+        }
+
+        self.previous_commands.clone_from(&output.command_values);
+    }
+
+    /// Record a WASM trap event.
+    pub const fn record_trap(&mut self) {
+        self.trap_count += 1;
+    }
+
+    /// Record an epoch interrupt.
+    pub const fn record_epoch_interrupt(&mut self) {
+        self.epoch_interrupt_count += 1;
+    }
+
+    /// Record a watchdog near-miss (tick completed but close to budget).
+    pub const fn record_watchdog_near_miss(&mut self) {
+        self.watchdog_near_miss_count += 1;
+    }
+
+    /// Record a config read by the controller.
+    pub const fn record_config_read(&mut self) {
+        self.config_reads += 1;
+    }
+
+    /// Record that a named channel was touched (non-zero command).
+    pub fn record_channel_touched(&mut self, channel: &str) {
+        if self.all_channels.iter().any(|known| known == channel) {
+            self.channels_touched.insert(channel.to_string());
+        } else {
+            self.record_unexpected_channel(channel.to_string());
+        }
+    }
+
+    /// Finalize into a [`ControllerEvidenceBundle`].
+    ///
+    /// Consumes the collector and computes aggregate statistics.
+    #[must_use]
+    pub fn finalize(
+        self,
+        controller_digest: &str,
+        model_digest: &str,
+        calibration_digest: &str,
+        manifest_digest: &str,
+        wit_world_version: &str,
+        execution_mode: ExecutionMode,
+        compiler_version: &str,
+    ) -> ControllerEvidenceBundle {
+        self.finalize_with_context(
+            controller_digest,
+            model_digest,
+            calibration_digest,
+            manifest_digest,
+            wit_world_version,
+            execution_mode,
+            compiler_version,
+            &EvidenceFinalizeContext::default(),
+        )
+    }
+
+    /// Finalize into a [`ControllerEvidenceBundle`] with explicit snapshot/freshness linkage.
+    #[must_use]
+    pub fn finalize_with_context(
+        self,
+        controller_digest: &str,
+        model_digest: &str,
+        calibration_digest: &str,
+        manifest_digest: &str,
+        wit_world_version: &str,
+        execution_mode: ExecutionMode,
+        compiler_version: &str,
+        context: &EvidenceFinalizeContext,
+    ) -> ControllerEvidenceBundle {
+        let (p50, p95, p99) = self.tick_latency_stats.percentiles();
+        let jitter_us = self.tick_latency_stats.jitter_us();
+
+        let mut channels_touched: Vec<String> = self
+            .all_channels
+            .iter()
+            .filter(|channel| self.channels_touched.contains(channel.as_str()))
+            .cloned()
+            .collect();
+        channels_touched.extend(self.unexpected_channels_touched.iter().cloned());
+        let channels_untouched: Vec<String> = self
+            .all_channels
+            .iter()
+            .filter(|channel| !self.channels_touched.contains(channel.as_str()))
+            .cloned()
+            .collect();
+
+        let steady_state_reached = self.steady_state_ticks >= STEADY_STATE_THRESHOLD;
+        let idle_output_stable = !self.command_oscillation_detected && steady_state_reached;
+
+        ControllerEvidenceBundle {
+            bundle_id: Uuid::new_v4().to_string(),
+            controller_id: self.controller_id,
+            ticks_run: self.tick_count,
+            rejection_count: self.rejection_count,
+            limit_clamp_count: self.limit_clamp_count,
+            rate_clamp_count: self.rate_clamp_count,
+            position_limit_stop_count: self.position_limit_stop_count,
+            epoch_interrupt_count: self.epoch_interrupt_count,
+            trap_count: self.trap_count,
+            watchdog_near_miss_count: self.watchdog_near_miss_count,
+            channels_touched,
+            channels_untouched,
+            unexpected_channels_touched: self.unexpected_channels_touched,
+            config_reads: self.config_reads,
+            tick_latency_p50: p50.into(),
+            tick_latency_p95: p95.into(),
+            tick_latency_p99: p99.into(),
+            controller_stability_summary: StabilitySummary {
+                command_oscillation_detected: self.command_oscillation_detected,
+                idle_output_stable,
+                runtime_jitter_us: jitter_us,
+                missed_tick_count: self.missed_tick_count,
+                steady_state_reached,
+            },
+            verifier_status: VerifierStatus::Pending,
+            verifier_reason: None,
+            controller_digest: controller_digest.to_string(),
+            model_digest: model_digest.to_string(),
+            calibration_digest: calibration_digest.to_string(),
+            frame_snapshot_id: context.frame_snapshot_id,
+            manifest_digest: manifest_digest.to_string(),
+            wit_world_version: wit_world_version.to_string(),
+            execution_mode,
+            compiler_version: compiler_version.to_string(),
+            created_at: Utc::now(),
+            state_freshness: context.state_freshness.clone(),
+        }
+    }
+
+    fn record_unexpected_channel(&mut self, channel: String) {
+        if !self.unexpected_channels_touched.contains(&channel) {
+            self.unexpected_channels_touched.push(channel);
+        }
+    }
+}
+
+/// Compute p50, p95, p99 latency percentiles in microseconds.
+///
+/// Returns `(0, 0, 0)` if the input is empty.
+#[allow(clippy::cast_possible_truncation)] // tick latencies won't exceed u64 microseconds
+fn compute_percentiles(latencies_us: &[u64]) -> (u64, u64, u64) {
+    if latencies_us.is_empty() {
+        return (0, 0, 0);
+    }
+
+    let mut sorted = latencies_us.to_vec();
+    sorted.sort_unstable();
+
+    let len = sorted.len();
+    let p50 = sorted[len * 50 / 100];
+    let p95 = sorted[(len * 95 / 100).min(len - 1)];
+    let p99 = sorted[(len * 99 / 100).min(len - 1)];
+
+    (p50, p95, p99)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tick_contract::TickOutput;
+    use roz_core::controller::intervention::{InterventionKind, SafetyIntervention};
+
+    fn make_output(commands: Vec<f64>) -> TickOutput {
+        TickOutput {
+            command_values: commands,
+            estop: false,
+            estop_reason: None,
+            metrics: vec![],
+        }
+    }
+
+    fn make_intervention(kind: InterventionKind, channel: &str) -> SafetyIntervention {
+        SafetyIntervention {
+            channel: channel.to_string(),
+            raw_value: 5.0,
+            clamped_value: 1.0,
+            kind,
+            reason: "test".into(),
+        }
+    }
+
+    #[test]
+    fn evidence_collector_basic() {
+        let channels: Vec<String> = (0..3).map(|i| format!("channel_{i}")).collect();
+        let mut collector = EvidenceCollector::new("ctrl-001", &channels);
+
+        for _ in 0..100 {
+            let output = make_output(vec![0.1, 0.2, 0.3]);
+            collector.record_tick(Duration::from_micros(500), &output, &[]);
+        }
+
+        let bundle = collector.finalize(
+            "ctrl_sha",
+            "model_sha",
+            "cal_sha",
+            "man_sha",
+            "1.0.0",
+            ExecutionMode::Verify,
+            "wasmtime-43",
+        );
+
+        assert_eq!(bundle.ticks_run, 100);
+        assert_eq!(bundle.rejection_count, 0);
+        assert_eq!(bundle.limit_clamp_count, 0);
+        assert_eq!(bundle.trap_count, 0);
+        assert_eq!(bundle.controller_id, "ctrl-001");
+        assert_eq!(bundle.model_digest, "model_sha");
+        assert_eq!(bundle.execution_mode, ExecutionMode::Verify);
+    }
+
+    #[test]
+    fn evidence_collector_tracks_interventions() {
+        let mut collector = EvidenceCollector::new("ctrl-002", &[]);
+
+        let interventions = vec![
+            make_intervention(InterventionKind::VelocityClamp, "joint_0"),
+            make_intervention(InterventionKind::AccelerationLimit, "joint_1"),
+            make_intervention(InterventionKind::PositionLimit, "joint_2"),
+            make_intervention(InterventionKind::NanReject, "joint_0"),
+        ];
+
+        let output = make_output(vec![0.1, 0.2, 0.3]);
+        collector.record_tick(Duration::from_micros(500), &output, &interventions);
+
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Shadow, "wt");
+
+        assert_eq!(bundle.limit_clamp_count, 1); // VelocityClamp
+        assert_eq!(bundle.rate_clamp_count, 1); // AccelerationLimit
+        assert_eq!(bundle.position_limit_stop_count, 1); // PositionLimit
+        assert_eq!(bundle.rejection_count, 1); // NanReject
+    }
+
+    #[test]
+    fn evidence_collector_tracks_tick_overruns_separately() {
+        let mut collector = EvidenceCollector::new("ctrl-overrun", &[]);
+        let interventions = vec![
+            make_intervention(InterventionKind::TickOverrun, "joint_0"),
+            make_intervention(InterventionKind::VelocityClamp, "joint_0"),
+        ];
+
+        collector.record_tick(Duration::from_micros(500), &make_output(vec![0.1]), &interventions);
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Shadow, "wt");
+
+        assert_eq!(bundle.controller_stability_summary.missed_tick_count, 1);
+        assert_eq!(bundle.limit_clamp_count, 1);
+    }
+
+    #[test]
+    fn evidence_collector_detects_oscillation() {
+        // Single-channel oscillation: sign flips every tick, and > half channels
+        // (1 channel, threshold = 0) means every sign change is detected.
+        let mut collector = EvidenceCollector::new("ctrl-003", &[]);
+
+        for i in 0..20 {
+            let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+            let output = make_output(vec![sign]);
+            collector.record_tick(Duration::from_micros(100), &output, &[]);
+        }
+
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+
+        assert!(bundle.controller_stability_summary.command_oscillation_detected);
+        // Because oscillation keeps resetting steady_state_ticks
+        assert!(!bundle.controller_stability_summary.steady_state_reached);
+    }
+
+    #[test]
+    fn evidence_collector_same_sign_drift_is_not_steady() {
+        let mut collector = EvidenceCollector::new("ctrl-drift", &[]);
+
+        for value in [0.1, 0.2, 0.4, 0.8, 1.0] {
+            collector.record_tick(Duration::from_micros(100), &make_output(vec![value]), &[]);
+        }
+
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+
+        assert!(!bundle.controller_stability_summary.steady_state_reached);
+        assert!(bundle.controller_stability_summary.command_oscillation_detected);
+        assert!(!bundle.controller_stability_summary.idle_output_stable);
+    }
+
+    #[test]
+    fn evidence_collector_constant_output_reaches_steady_state() {
+        let mut collector = EvidenceCollector::new("ctrl-steady", &[]);
+
+        for _ in 0..STEADY_STATE_THRESHOLD {
+            collector.record_tick(Duration::from_micros(100), &make_output(vec![0.25, -0.25]), &[]);
+        }
+
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+
+        assert!(bundle.controller_stability_summary.steady_state_reached);
+        assert!(!bundle.controller_stability_summary.command_oscillation_detected);
+        assert!(bundle.controller_stability_summary.idle_output_stable);
+    }
+
+    #[test]
+    fn evidence_collector_width_change_resets_steady_state() {
+        let mut collector = EvidenceCollector::new("ctrl-width", &[]);
+
+        for _ in 0..(STEADY_STATE_THRESHOLD - 1) {
+            collector.record_tick(Duration::from_micros(100), &make_output(vec![0.25]), &[]);
+        }
+        collector.record_tick(Duration::from_micros(100), &make_output(vec![0.25, 0.25]), &[]);
+        for _ in 0..(STEADY_STATE_THRESHOLD - 1) {
+            collector.record_tick(Duration::from_micros(100), &make_output(vec![0.25]), &[]);
+        }
+
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+
+        assert!(!bundle.controller_stability_summary.steady_state_reached);
+        assert!(!bundle.controller_stability_summary.idle_output_stable);
+    }
+
+    #[test]
+    fn evidence_collector_tracks_channels() {
+        let all_channels: Vec<String> = vec!["channel_0".into(), "channel_1".into(), "channel_2".into()];
+        let mut collector = EvidenceCollector::new("ctrl-004", &all_channels);
+
+        // Controller writes output with 3 command values (including zero).
+        // ALL channels with output count as "touched" — writing zero is an
+        // explicit command, not absence of a command.
+        let output = make_output(vec![0.5, 0.3, 0.0]);
+        collector.record_tick(Duration::from_micros(200), &output, &[]);
+
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Canary, "wt");
+
+        assert!(bundle.channels_touched.contains(&"channel_0".to_string()));
+        assert!(bundle.channels_touched.contains(&"channel_1".to_string()));
+        assert!(bundle.channels_touched.contains(&"channel_2".to_string()));
+        assert!(bundle.channels_untouched.is_empty(), "all channels should be touched");
+    }
+
+    #[test]
+    fn evidence_collector_preserves_manifest_channel_order() {
+        let all_channels: Vec<String> = vec!["joint_b".into(), "joint_a".into(), "joint_c".into()];
+        let mut collector = EvidenceCollector::new("ctrl-order", &all_channels);
+        let output = make_output(vec![0.5, 0.0]);
+        collector.record_tick(Duration::from_micros(150), &output, &[]);
+
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+
+        assert_eq!(
+            bundle.channels_touched,
+            vec!["joint_b".to_string(), "joint_a".to_string()]
+        );
+        assert_eq!(bundle.channels_untouched, vec!["joint_c".to_string()]);
+    }
+
+    #[test]
+    fn evidence_collector_preserves_unexpected_output_channels() {
+        let all_channels: Vec<String> = vec!["joint_a".into(), "joint_b".into()];
+        let mut collector = EvidenceCollector::new("ctrl-extra", &all_channels);
+        collector.record_tick(Duration::from_micros(150), &make_output(vec![0.5, 0.1, 0.8]), &[]);
+        collector.record_channel_touched("joint_c");
+
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+
+        assert_eq!(
+            bundle.channels_touched,
+            vec!["joint_a", "joint_b", "unexpected_output_2", "joint_c"]
+        );
+        assert_eq!(
+            bundle.unexpected_channels_touched,
+            vec!["unexpected_output_2".to_string(), "joint_c".to_string()]
+        );
+        assert!(bundle.has_safety_issues());
+    }
+
+    #[test]
+    fn evidence_collector_untouched_when_no_output() {
+        let all_channels: Vec<String> = vec!["ch_a".into(), "ch_b".into()];
+        let mut collector = EvidenceCollector::new("ctrl-005", &all_channels);
+
+        // Controller produces empty output — no channels touched.
+        let output = make_output(vec![]);
+        collector.record_tick(Duration::from_micros(100), &output, &[]);
+
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+        assert!(bundle.channels_touched.is_empty());
+        assert_eq!(bundle.channels_untouched.len(), 2);
+    }
+
+    #[test]
+    fn evidence_collector_latency_percentiles() {
+        let mut collector = EvidenceCollector::new("ctrl-005", &[]);
+
+        // 100 ticks with increasing latencies: 1us, 2us, ..., 100us
+        for i in 1..=100 {
+            let output = make_output(vec![0.1]);
+            collector.record_tick(Duration::from_micros(i), &output, &[]);
+        }
+
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+
+        // p50 = index 50 of sorted 1..100 = 51
+        assert_eq!(bundle.tick_latency_p50.as_micros(), 51);
+        // p95 = index 95 = 96
+        assert_eq!(bundle.tick_latency_p95.as_micros(), 96);
+        // p99 = index 99 = 100
+        assert_eq!(bundle.tick_latency_p99.as_micros(), 100);
+    }
+
+    #[test]
+    fn evidence_collector_bounds_latency_samples() {
+        let mut collector = EvidenceCollector::new("ctrl-latency", &[]);
+        let lower_bound = 11_u64;
+        let upper_bound = MAX_TICK_LATENCY_SAMPLES as u64 + 10;
+
+        for i in 1..=upper_bound {
+            collector.record_tick(Duration::from_micros(i), &make_output(vec![0.1]), &[]);
+        }
+
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+
+        let expected_p50 = lower_bound + (MAX_TICK_LATENCY_SAMPLES * 50 / 100) as u64;
+        let expected_p99 = lower_bound + (MAX_TICK_LATENCY_SAMPLES * 99 / 100) as u64;
+
+        assert_eq!(bundle.tick_latency_p50.as_micros(), expected_p50);
+        assert_eq!(bundle.tick_latency_p99.as_micros(), expected_p99);
+        assert!(bundle.controller_stability_summary.runtime_jitter_us > 0.0);
+    }
+
+    #[test]
+    fn evidence_collector_trap_count() {
+        let mut collector = EvidenceCollector::new("ctrl-006", &[]);
+
+        collector.record_trap();
+        collector.record_trap();
+        collector.record_trap();
+
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+
+        assert_eq!(bundle.trap_count, 3);
+        assert!(bundle.has_safety_issues());
+    }
+
+    #[test]
+    fn evidence_collector_finalize_digests() {
+        let mut collector = EvidenceCollector::new("ctrl-007", &[]);
+
+        let output = make_output(vec![0.1]);
+        collector.record_tick(Duration::from_micros(100), &output, &[]);
+
+        let bundle = collector.finalize(
+            "sha256:ctrl999",
+            "sha256:model123",
+            "sha256:cal456",
+            "sha256:man789",
+            "bedrock:controller@1.0.0",
+            ExecutionMode::Live,
+            "wasmtime-43.0.0",
+        );
+
+        assert_eq!(bundle.controller_digest, "sha256:ctrl999");
+        assert_eq!(bundle.model_digest, "sha256:model123");
+        assert_eq!(bundle.calibration_digest, "sha256:cal456");
+        assert_eq!(bundle.manifest_digest, "sha256:man789");
+        assert_eq!(bundle.wit_world_version, "bedrock:controller@1.0.0");
+        assert_eq!(bundle.compiler_version, "wasmtime-43.0.0");
+        assert_eq!(bundle.execution_mode, ExecutionMode::Live);
+    }
+
+    #[test]
+    fn evidence_collector_empty_finalize() {
+        let collector = EvidenceCollector::new("ctrl-empty", &[]);
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+
+        assert_eq!(bundle.ticks_run, 0);
+        assert_eq!(bundle.tick_latency_p50.as_micros(), 0);
+        assert_eq!(bundle.tick_latency_p95.as_micros(), 0);
+        assert_eq!(bundle.tick_latency_p99.as_micros(), 0);
+        assert!(!bundle.has_safety_issues());
+    }
+
+    #[test]
+    fn evidence_collector_finalize_with_context_binds_snapshot() {
+        let mut collector = EvidenceCollector::new("ctrl-ctx", &[]);
+        collector.record_tick(Duration::from_micros(42), &make_output(vec![0.1]), &[]);
+
+        let bundle = collector.finalize_with_context(
+            "ctrl",
+            "model",
+            "cal",
+            "manifest",
+            "1.0.0",
+            ExecutionMode::Replay,
+            "wt",
+            &EvidenceFinalizeContext {
+                frame_snapshot_id: 77,
+                state_freshness: FreshnessState::Fresh,
+            },
+        );
+
+        assert_eq!(bundle.frame_snapshot_id, 77);
+        assert_eq!(bundle.state_freshness, FreshnessState::Fresh);
+    }
+
+    #[test]
+    fn evidence_collector_watchdog_near_miss() {
+        let mut collector = EvidenceCollector::new("ctrl-008", &[]);
+        collector.record_watchdog_near_miss();
+        collector.record_watchdog_near_miss();
+
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+        assert_eq!(bundle.watchdog_near_miss_count, 2);
+    }
+
+    #[test]
+    fn evidence_collector_epoch_interrupt() {
+        let mut collector = EvidenceCollector::new("ctrl-009", &[]);
+        collector.record_epoch_interrupt();
+
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+        assert_eq!(bundle.epoch_interrupt_count, 1);
+        assert!(bundle.has_safety_issues());
+    }
+
+    #[test]
+    fn compute_percentiles_empty() {
+        let (p50, p95, p99) = compute_percentiles(&[]);
+        assert_eq!((p50, p95, p99), (0, 0, 0));
+    }
+
+    #[test]
+    fn compute_percentiles_single() {
+        let latencies = vec![42];
+        let (p50, p95, p99) = compute_percentiles(&latencies);
+        assert_eq!(p50, 42);
+        assert_eq!(p95, 42);
+        assert_eq!(p99, 42);
+    }
+
+    #[test]
+    fn compute_jitter_zero_for_constant() {
+        let mut stats = TickLatencyStats::default();
+        for _ in 0..10 {
+            stats.record(Duration::from_micros(100));
+        }
+        let jitter = stats.jitter_us();
+        assert!(jitter < f64::EPSILON);
+    }
+
+    #[test]
+    fn compute_jitter_nonzero_for_varying() {
+        let mut stats = TickLatencyStats::default();
+        stats.record(Duration::from_micros(100));
+        stats.record(Duration::from_micros(200));
+        let jitter = stats.jitter_us();
+        assert!(jitter > 0.0);
+    }
+}

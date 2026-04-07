@@ -20,8 +20,8 @@ use roz_core::bt::parser::parse_execution_skill;
 use roz_core::bt::status::BtStatus;
 use roz_core::device_trust::evaluator::{TrustPolicy, evaluate_trust};
 use roz_core::device_trust::verify::{verify_firmware_crc32, verify_firmware_sha256};
-use roz_core::device_trust::{DeviceTrust, FirmwareManifest, FlashPartition, TrustPosture};
-use roz_core::recording::{ChannelManifest, RecordingManifest, RecordingSource};
+use roz_core::device_trust::{DeviceTrust, DeviceTrustPosture, FirmwareManifest, FlashPartition};
+use roz_core::recording::{RecordingChannel, RecordingManifest, RecordingSource};
 use roz_core::sim2real::diagnosis::{DiagnosisContext, compute_channel_stats, generate_summary};
 use roz_core::sim2real::pipeline::{ChannelConfig, ComparisonConfig, compare};
 use roz_core::sim2real::report::{DiagnosisAction, MetricKind};
@@ -323,13 +323,13 @@ fn bt_execution_to_sim_real_diagnosis() {
         host_id,
         source: RecordingSource::Simulation,
         channels: vec![
-            ChannelManifest {
+            RecordingChannel {
                 name: "velocity".to_string(),
                 topic: "/joint/vel".to_string(),
                 schema_name: "Float64".to_string(),
                 message_count: 5,
             },
-            ChannelManifest {
+            RecordingChannel {
                 name: "force".to_string(),
                 topic: "/gripper/force".to_string(),
                 schema_name: "Float64".to_string(),
@@ -455,7 +455,7 @@ fn firmware_trust_gates_skill_execution() {
     let device = DeviceTrust {
         host_id: Uuid::new_v4(),
         tenant_id: "tenant-prod".to_string(),
-        posture: TrustPosture::Untrusted, // will be re-evaluated
+        posture: DeviceTrustPosture::Untrusted, // will be re-evaluated
         firmware: Some(FirmwareManifest {
             version: "2.0.0".to_string(),
             sha256: sha.clone(),
@@ -477,7 +477,11 @@ fn firmware_trust_gates_skill_execution() {
     };
 
     let posture = evaluate_trust(&device, &policy, now);
-    assert_eq!(posture, TrustPosture::Trusted, "verified firmware should yield Trusted");
+    assert_eq!(
+        posture,
+        DeviceTrustPosture::Trusted,
+        "verified firmware should yield Trusted"
+    );
 
     // Step 4: Gate skill execution on trust — trusted devices can run execution skills
     let skill_def = parse_execution_skill(
@@ -509,7 +513,7 @@ tree:
     );
 
     // Only run if trusted
-    if posture == TrustPosture::Trusted {
+    if posture == DeviceTrustPosture::Trusted {
         let root: Box<dyn BtNode> = Box::new(ActionNode::new(&skill_def.name, Box::new(MoveExecutor::new(1, 0.1))));
         let mut runner = SkillRunner::new(root, ConditionChecker::new(vec![], vec![], vec![]));
         let result = runner.run_to_completion(5);
@@ -529,7 +533,7 @@ tree:
     };
 
     let untrusted_posture = evaluate_trust(&untrusted_device, &policy, now);
-    assert_eq!(untrusted_posture, TrustPosture::Untrusted);
+    assert_eq!(untrusted_posture, DeviceTrustPosture::Untrusted);
     // Production code would refuse to run the skill here
 }
 
@@ -842,7 +846,7 @@ tree:
         environment_id: Uuid::new_v4(),
         host_id,
         source: RecordingSource::Simulation,
-        channels: vec![ChannelManifest {
+        channels: vec![RecordingChannel {
             name: "temperature".to_string(),
             topic: "/sensor/temp".to_string(),
             schema_name: "Float64".to_string(),
@@ -916,7 +920,7 @@ tree:
     let device = DeviceTrust {
         host_id,
         tenant_id: "tenant-lab".to_string(),
-        posture: TrustPosture::Untrusted,
+        posture: DeviceTrustPosture::Untrusted,
         firmware: Some(FirmwareManifest {
             version: "2.0.0".to_string(),
             sha256: sha,
@@ -942,7 +946,7 @@ tree:
 
     assert_eq!(
         posture,
-        TrustPosture::Trusted,
+        DeviceTrustPosture::Trusted,
         "host that ran the skill should be trusted"
     );
 

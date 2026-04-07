@@ -19,7 +19,7 @@ pub struct TaskArgs {
 /// Available task subcommands.
 #[derive(Debug, Subcommand)]
 pub enum TaskCommands {
-    /// Run a task from a spec file or inline definition.
+    /// Run a task from a spec file or inline definition. Use global `--host` or include `host_id` in the spec. If host names collide, pass the host UUID.
     Run {
         /// Path to the task spec or inline task definition.
         spec: String,
@@ -66,9 +66,9 @@ pub enum TaskCommands {
 }
 
 /// Execute a task subcommand.
-pub async fn execute(cmd: &TaskCommands, config: &CliConfig) -> anyhow::Result<()> {
+pub async fn execute(cmd: &TaskCommands, config: &CliConfig, host_flag: Option<&str>) -> anyhow::Result<()> {
     match cmd {
-        TaskCommands::Run { spec, follow, phases } => run(config, spec, *follow, phases.as_deref()).await,
+        TaskCommands::Run { spec, follow, phases } => run(config, spec, *follow, phases.as_deref(), host_flag).await,
         TaskCommands::List => list(config).await,
         TaskCommands::Status { id } => status(config, id).await,
         TaskCommands::Watch { id } => watch(config, id).await,
@@ -84,7 +84,55 @@ fn is_yaml_extension(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("yaml") || ext.eq_ignore_ascii_case("yml"))
 }
 
-async fn run(config: &CliConfig, spec: &str, follow: bool, phases: Option<&str>) -> anyhow::Result<()> {
+fn task_body_object_mut(
+    body: &mut serde_json::Value,
+) -> anyhow::Result<&mut serde_json::Map<String, serde_json::Value>> {
+    body.as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("task spec must deserialize to a JSON/YAML object"))
+}
+
+fn body_host_id(body: &serde_json::Value) -> Option<&str> {
+    body.get("host_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+}
+
+async fn ensure_task_host_id<F, Fut>(
+    body: &mut serde_json::Value,
+    host_flag: Option<&str>,
+    mut resolve_host_id: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<String>>,
+{
+    if body_host_id(body).is_some() {
+        return Ok(());
+    }
+
+    let host = host_flag.ok_or_else(|| {
+        anyhow::anyhow!("task creation requires a target host; pass global `--host <name-or-uuid>` or include `host_id` in the task spec")
+    })?;
+    let resolved = resolve_host_id(host.to_string()).await?;
+    task_body_object_mut(body)?.insert("host_id".to_string(), serde_json::Value::String(resolved));
+    Ok(())
+}
+
+fn task_status_from_response(resp: &serde_json::Value) -> Option<&str> {
+    resp.get("data")
+        .and_then(|data| data.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| resp.get("status").and_then(serde_json::Value::as_str))
+        .or_else(|| resp.get("state").and_then(serde_json::Value::as_str))
+}
+
+async fn run(
+    config: &CliConfig,
+    spec: &str,
+    follow: bool,
+    phases: Option<&str>,
+    host_flag: Option<&str>,
+) -> anyhow::Result<()> {
     let client = config.api_client()?;
     let spec_path = Path::new(spec);
 
@@ -104,8 +152,17 @@ async fn run(config: &CliConfig, spec: &str, follow: bool, phases: Option<&str>)
     if let Some(phases_json) = phases {
         let parsed: Vec<roz_core::phases::PhaseSpec> =
             serde_json::from_str(phases_json).map_err(|e| anyhow::anyhow!("invalid --phases JSON: {e}"))?;
-        body["phases"] = serde_json::to_value(&parsed)?;
+        task_body_object_mut(&mut body)?.insert("phases".to_string(), serde_json::to_value(&parsed)?);
     }
+
+    let resolve_client = client.clone();
+    let resolve_api_url = config.api_url.clone();
+    ensure_task_host_id(&mut body, host_flag, move |host| {
+        let client = resolve_client.clone();
+        let api_url = resolve_api_url.clone();
+        async move { super::estop::resolve_host_id(&client, &api_url, &host).await }
+    })
+    .await?;
 
     let resp: serde_json::Value = client
         .post(format!("{}/v1/tasks", config.api_url))
@@ -288,7 +345,7 @@ async fn watch(config: &CliConfig, task_id: &str) -> anyhow::Result<()> {
 }
 
 /// Terminal task states that indicate completion.
-const TERMINAL_STATES: &[&str] = &["completed", "failed", "cancelled", "error"];
+const TERMINAL_STATES: &[&str] = &["succeeded", "failed", "timed_out", "cancelled", "safety_stop"];
 
 async fn wait(config: &CliConfig, id: &str, timeout: Option<u64>) -> anyhow::Result<()> {
     let client = config.api_client()?;
@@ -308,12 +365,15 @@ async fn wait(config: &CliConfig, id: &str, timeout: Option<u64>) -> anyhow::Res
             .json()
             .await?;
 
-        if let Some(state) = resp["status"].as_str().or_else(|| resp["state"].as_str())
+        if let Some(state) = task_status_from_response(&resp)
             && TERMINAL_STATES.contains(&state)
         {
             spinner.finish_with_message(format!("Task {id}: {state}"));
             crate::output::render_json(&resp)?;
-            return Ok(());
+            if state == "succeeded" {
+                return Ok(());
+            }
+            anyhow::bail!("Task {id} reached terminal state: {state}");
         }
 
         if let Some(dl) = deadline
@@ -409,13 +469,363 @@ async fn logs(config: &CliConfig, id: &str, follow: bool) -> anyhow::Result<()> 
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
     use roz_core::phases::{PhaseMode, PhaseSpec, PhaseTrigger, ToolSetFilter};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedRequest {
+        method: String,
+        path: String,
+        body: String,
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> anyhow::Result<RecordedRequest> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+
+        let header_end = loop {
+            let bytes_read = stream.read(&mut chunk).await?;
+            anyhow::ensure!(bytes_read > 0, "connection closed before request headers were received");
+            buffer.extend_from_slice(&chunk[..bytes_read]);
+
+            if let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+
+        let headers = std::str::from_utf8(&buffer[..header_end])?;
+        let request_line = headers
+            .lines()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("request line missing"))?;
+        let mut request_parts = request_line.split_whitespace();
+        let method = request_parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("request method missing"))?
+            .to_string();
+        let path = request_parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("request path missing"))?
+            .to_string();
+
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+
+        while buffer.len() - header_end < content_length {
+            let bytes_read = stream.read(&mut chunk).await?;
+            anyhow::ensure!(
+                bytes_read > 0,
+                "connection closed before request body was fully received"
+            );
+            buffer.extend_from_slice(&chunk[..bytes_read]);
+        }
+
+        let body = String::from_utf8(buffer[header_end..header_end + content_length].to_vec())?;
+        Ok(RecordedRequest { method, path, body })
+    }
+
+    async fn spawn_task_api(
+        hosts_response: serde_json::Value,
+        task_response: serde_json::Value,
+    ) -> anyhow::Result<(
+        String,
+        Arc<Mutex<Vec<RecordedRequest>>>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded_requests = Arc::clone(&requests);
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    accept_result = listener.accept() => {
+                        let (mut stream, _) = match accept_result {
+                            Ok(pair) => pair,
+                            Err(_) => break,
+                        };
+
+                        let request = match read_http_request(&mut stream).await {
+                            Ok(request) => request,
+                            Err(_) => continue,
+                        };
+
+                        recorded_requests.lock().expect("request log mutex poisoned").push(request.clone());
+
+                        let (status_line, response_body) = if request.path.starts_with("/v1/hosts?") {
+                            ("200 OK", hosts_response.to_string())
+                        } else if request.method == "POST" && request.path == "/v1/tasks" {
+                            ("200 OK", task_response.to_string())
+                        } else {
+                            ("404 Not Found", serde_json::json!({"error": "not found"}).to_string())
+                        };
+
+                        let response = format!(
+                            "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                            response_body.as_bytes().len(),
+                            response_body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    }
+                }
+            }
+        });
+
+        Ok((format!("http://{address}"), requests, shutdown_tx, server))
+    }
+
+    fn test_cli_config(api_url: String) -> CliConfig {
+        CliConfig {
+            api_url,
+            profile: "default".to_string(),
+            access_token: None,
+        }
+    }
+
+    #[test]
+    fn task_status_from_response_prefers_nested_data_status() {
+        let resp = serde_json::json!({
+            "data": { "status": "succeeded" },
+            "status": "failed"
+        });
+        assert_eq!(task_status_from_response(&resp), Some("succeeded"));
+    }
+
+    #[test]
+    fn terminal_states_match_current_task_model() {
+        assert!(TERMINAL_STATES.contains(&"succeeded"));
+        assert!(TERMINAL_STATES.contains(&"timed_out"));
+        assert!(TERMINAL_STATES.contains(&"safety_stop"));
+        assert!(!TERMINAL_STATES.contains(&"completed"));
+    }
+
+    #[tokio::test]
+    async fn ensure_task_host_id_injects_resolved_host_when_missing() {
+        let mut body = serde_json::json!({
+            "prompt": "scan bay",
+            "environment_id": "env-1"
+        });
+        ensure_task_host_id(&mut body, Some("robot-alpha"), |host| async move {
+            assert_eq!(host, "robot-alpha");
+            Ok("00000000-0000-0000-0000-000000000123".to_string())
+        })
+        .await
+        .expect("host should resolve");
+        assert_eq!(
+            body.get("host_id").and_then(serde_json::Value::as_str),
+            Some("00000000-0000-0000-0000-000000000123")
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_task_host_id_preserves_explicit_host_id() {
+        let mut body = serde_json::json!({
+            "prompt": "scan bay",
+            "environment_id": "env-1",
+            "host_id": "existing-host-id"
+        });
+        ensure_task_host_id(&mut body, Some("robot-alpha"), |_host| async move {
+            anyhow::bail!("resolver should not be called when host_id is already present")
+        })
+        .await
+        .expect("existing host_id should win");
+        assert_eq!(
+            body.get("host_id").and_then(serde_json::Value::as_str),
+            Some("existing-host-id")
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_task_host_id_requires_host_target() {
+        let mut body = serde_json::json!({
+            "prompt": "scan bay",
+            "environment_id": "env-1"
+        });
+        let error = ensure_task_host_id(&mut body, None, |_host| async move { Ok(String::new()) })
+            .await
+            .expect_err("missing host target should fail");
+        assert!(error.to_string().contains("requires a target host"));
+    }
+
+    #[tokio::test]
+    async fn ensure_task_host_id_propagates_duplicate_host_errors() {
+        let mut body = serde_json::json!({
+            "prompt": "scan bay",
+            "environment_id": "env-1"
+        });
+        let error = ensure_task_host_id(&mut body, Some("reachy-dev"), |_host| async move {
+            anyhow::bail!("host name 'reachy-dev' is ambiguous")
+        })
+        .await
+        .expect_err("duplicate host names should fail locally");
+        assert!(error.to_string().contains("ambiguous"));
+        assert!(body.get("host_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn run_rejects_ambiguous_host_names_before_creating_task() {
+        let (api_url, requests, shutdown_tx, server) = spawn_task_api(
+            serde_json::json!({
+                "data": [
+                    {
+                        "id": "00000000-0000-0000-0000-000000000111",
+                        "name": "reachy-dev",
+                        "status": "online"
+                    },
+                    {
+                        "id": "00000000-0000-0000-0000-000000000222",
+                        "name": "reachy-dev",
+                        "status": "offline"
+                    }
+                ]
+            }),
+            serde_json::json!({"data": {"id": "task-1"}}),
+        )
+        .await
+        .expect("test API should start");
+
+        let config = test_cli_config(api_url);
+        let error = run(
+            &config,
+            r#"{"prompt":"scan bay","environment_id":"env-1"}"#,
+            false,
+            None,
+            Some("reachy-dev"),
+        )
+        .await
+        .expect_err("duplicate host names should fail before task creation");
+
+        let _ = shutdown_tx.send(());
+        server.await.expect("server task should stop cleanly");
+
+        assert!(error.to_string().contains("ambiguous"));
+        let requests = requests.lock().expect("request log mutex poisoned");
+        assert_eq!(
+            requests.len(),
+            1,
+            "ambiguous host resolution should stop before task creation"
+        );
+        assert_eq!(requests[0].method, "GET");
+        assert!(requests[0].path.starts_with("/v1/hosts?"));
+    }
+
+    #[tokio::test]
+    async fn run_injects_resolved_host_id_into_task_creation_request() {
+        let resolved_host_id = "00000000-0000-0000-0000-000000000123";
+        let (api_url, requests, shutdown_tx, server) = spawn_task_api(
+            serde_json::json!({
+                "data": [
+                    {
+                        "id": resolved_host_id,
+                        "name": "reachy-dev",
+                        "status": "online"
+                    }
+                ]
+            }),
+            serde_json::json!({"data": {"id": "task-1"}}),
+        )
+        .await
+        .expect("test API should start");
+
+        let config = test_cli_config(api_url);
+        run(
+            &config,
+            r#"{"prompt":"scan bay","environment_id":"env-1"}"#,
+            false,
+            None,
+            Some("reachy-dev"),
+        )
+        .await
+        .expect("task creation should succeed");
+
+        let _ = shutdown_tx.send(());
+        server.await.expect("server task should stop cleanly");
+
+        let requests = requests.lock().expect("request log mutex poisoned");
+        assert_eq!(
+            requests.len(),
+            2,
+            "unique host resolution should query hosts and then create the task"
+        );
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[1].method, "POST");
+        assert_eq!(requests[1].path, "/v1/tasks");
+
+        let posted_body: serde_json::Value =
+            serde_json::from_str(&requests[1].body).expect("task create request body should be valid JSON");
+        assert_eq!(
+            posted_body.get("host_id").and_then(serde_json::Value::as_str),
+            Some(resolved_host_id)
+        );
+        assert_eq!(
+            posted_body.get("prompt").and_then(serde_json::Value::as_str),
+            Some("scan bay")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_accepts_host_uuid_without_querying_host_list() {
+        let host_id = "00000000-0000-0000-0000-000000000123";
+        let (api_url, requests, shutdown_tx, server) = spawn_task_api(
+            serde_json::json!({"data": []}),
+            serde_json::json!({"data": {"id": "task-1"}}),
+        )
+        .await
+        .expect("test API should start");
+
+        let config = test_cli_config(api_url);
+        run(
+            &config,
+            r#"{"prompt":"scan bay","environment_id":"env-1"}"#,
+            false,
+            None,
+            Some(host_id),
+        )
+        .await
+        .expect("task creation should succeed");
+
+        let _ = shutdown_tx.send(());
+        server.await.expect("server task should stop cleanly");
+
+        let requests = requests.lock().expect("request log mutex poisoned");
+        assert_eq!(
+            requests.len(),
+            1,
+            "UUID host targets should bypass host list resolution"
+        );
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/v1/tasks");
+
+        let posted_body: serde_json::Value =
+            serde_json::from_str(&requests[0].body).expect("task create request body should be valid JSON");
+        assert_eq!(
+            posted_body.get("host_id").and_then(serde_json::Value::as_str),
+            Some(host_id)
+        );
+    }
 
     #[test]
     fn parse_phases_json() {
         let json = r#"[
             {"mode":"react","tools":"all","trigger":"immediate"},
-            {"mode":"ooda_re_act","tools":{"named":["goto"]},"trigger":{"after_cycles":5}}
+            {"mode":"ooda_react","tools":{"named":["goto"]},"trigger":{"after_cycles":5}}
         ]"#;
         let phases: Vec<PhaseSpec> = serde_json::from_str(json).unwrap();
         assert_eq!(phases.len(), 2);
@@ -436,7 +846,7 @@ mod tests {
 
     #[test]
     fn parse_phases_single_phase() {
-        let json = r#"[{"mode":"ooda_re_act","tools":"all","trigger":"immediate"}]"#;
+        let json = r#"[{"mode":"ooda_react","tools":"all","trigger":"immediate"}]"#;
         let phases: Vec<PhaseSpec> = serde_json::from_str(json).unwrap();
         assert_eq!(phases.len(), 1);
         assert!(matches!(phases[0].mode, PhaseMode::OodaReAct));

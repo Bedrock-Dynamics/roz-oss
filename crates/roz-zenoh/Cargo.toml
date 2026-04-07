@@ -7,6 +7,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+roz-core = { path = "../roz-core" }
 zenoh = "1"
 serde.workspace = true
 serde_json.workspace = true

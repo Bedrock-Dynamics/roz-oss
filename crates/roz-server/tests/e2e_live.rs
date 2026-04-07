@@ -11,7 +11,66 @@
 //! ```
 
 use reqwest::StatusCode;
+use roz_server::grpc::roz_v1::{self, session_response};
 use serde_json::{Value, json};
+
+struct CanonicalToolRequest {
+    tool_call_id: String,
+    tool_name: String,
+    parameters: serde_json::Value,
+    #[allow(dead_code)]
+    timeout_ms: u32,
+}
+
+fn response_text_delta(response: &Option<session_response::Response>) -> Option<String> {
+    match response {
+        Some(session_response::Response::SessionEvent(event)) => match event.typed_event.as_ref()? {
+            roz_v1::session_event_envelope::TypedEvent::TextDelta(payload) => Some(payload.content.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn response_turn_finished(response: &Option<session_response::Response>) -> bool {
+    matches!(response, Some(session_response::Response::SessionEvent(event)) if event.event_type == "turn_finished")
+}
+
+fn response_session_started(response: &Option<session_response::Response>) -> bool {
+    matches!(response, Some(session_response::Response::SessionEvent(event)) if event.event_type == "session_started")
+}
+
+fn response_tool_request(response: &Option<session_response::Response>) -> Option<CanonicalToolRequest> {
+    match response {
+        Some(session_response::Response::SessionEvent(event)) => match event.typed_event.as_ref()? {
+            roz_v1::session_event_envelope::TypedEvent::ToolCallRequested(payload) => Some(CanonicalToolRequest {
+                tool_call_id: payload.call_id.clone(),
+                tool_name: payload.tool_name.clone(),
+                parameters: payload
+                    .parameters
+                    .clone()
+                    .map(roz_server::grpc::convert::struct_to_value)
+                    .unwrap_or_else(|| json!({})),
+                timeout_ms: payload.timeout_ms,
+            }),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn response_error_message(response: &Option<session_response::Response>) -> Option<String> {
+    match response {
+        Some(session_response::Response::SessionEvent(event)) => match event.typed_event.as_ref()? {
+            roz_v1::session_event_envelope::TypedEvent::SessionRejected(payload) => Some(payload.message.clone()),
+            roz_v1::session_event_envelope::TypedEvent::SessionFailed(payload) => {
+                Some(format!("session failed: {}", payload.failure))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -247,12 +306,28 @@ async fn task_create_and_poll() {
         .expect("response should contain environment id")
         .to_owned();
 
-    // 2. Create task
+    // 2. Create prerequisite host
+    let (status, body) = post(
+        "/v1/hosts",
+        &json!({
+            "name": "e2e-task-host",
+            "host_type": "edge"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create host should return 201");
+    let host_id = body["data"]["id"]
+        .as_str()
+        .expect("response should contain host id")
+        .to_owned();
+
+    // 3. Create task
     let (status, body) = post(
         "/v1/tasks",
         &json!({
             "prompt": "Navigate to waypoint alpha",
             "environment_id": env_id,
+            "host_id": host_id,
             "timeout_secs": 300
         }),
     )
@@ -263,13 +338,13 @@ async fn task_create_and_poll() {
         .expect("response should contain task id")
         .to_owned();
 
-    // 3. GET task -- verify prompt and status
+    // 4. GET task -- verify prompt and status
     let (status, body) = get(&format!("/v1/tasks/{task_id}")).await;
     assert_eq!(status, StatusCode::OK, "get task should return 200");
     assert_eq!(body["data"]["prompt"].as_str(), Some("Navigate to waypoint alpha"));
-    assert_eq!(body["data"]["status"].as_str(), Some("pending"));
+    assert_ne!(body["data"]["status"].as_str(), Some("pending"));
 
-    // 4. List tasks -- verify task appears
+    // 5. List tasks -- verify task appears
     let (status, body) = get("/v1/tasks").await;
     assert_eq!(status, StatusCode::OK, "list tasks should return 200");
     let found = body["data"]
@@ -279,11 +354,17 @@ async fn task_create_and_poll() {
         .any(|t| t["id"].as_str() == Some(&task_id));
     assert!(found, "created task should appear in list");
 
-    // 5. Cancel task
+    // 6. Cancel task
     let status = delete(&format!("/v1/tasks/{task_id}")).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "cancel task should return 204");
 
-    // 6. Cleanup -- delete prerequisite environment
+    let (status, body) = get(&format!("/v1/tasks/{task_id}")).await;
+    assert_eq!(status, StatusCode::OK, "cancelled task should still be retrievable");
+    assert_eq!(body["data"]["status"].as_str(), Some("cancelled"));
+
+    // 7. Cleanup -- delete prerequisites
+    let status = delete(&format!("/v1/hosts/{host_id}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "cleanup host should return 204");
     let status = delete(&format!("/v1/environments/{env_id}")).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "cleanup environment should return 204");
 }
@@ -345,7 +426,7 @@ async fn safety_policy_crud_lifecycle() {
 async fn task_chain_starts_workflow() {
     // Tests the server-side of the task execution chain:
     // POST /v1/tasks with host_id → Restate workflow started + NATS publish attempted.
-    // No worker is deployed on Fly.io, so the task will stay pending/running —
+    // No worker is guaranteed to be deployed on Fly.io, so the task may stay queued or advance to running —
     // but the server-side wiring (DB insert, Restate workflow, NATS dispatch) is exercised.
 
     // 1. Create prerequisite environment
@@ -395,8 +476,7 @@ async fn task_chain_starts_workflow() {
         body["data"]["prompt"].as_str(),
         Some("e2e chain test — pick up the red block")
     );
-    // Status is "pending" in DB (Restate manages the workflow state separately)
-    assert_eq!(body["data"]["status"].as_str(), Some("pending"));
+    assert_ne!(body["data"]["status"].as_str(), Some("pending"));
 
     // 5. Cleanup
     let _ = delete(&format!("/v1/tasks/{task_id}")).await;
@@ -486,16 +566,32 @@ async fn task_create_with_phases() {
         .expect("response should contain environment id")
         .to_owned();
 
-    // 2. Create task with phases array
+    // 2. Create prerequisite host
+    let (status, body) = post(
+        "/v1/hosts",
+        &json!({
+            "name": "e2e-phases-host",
+            "host_type": "edge"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create host should return 201");
+    let host_id = body["data"]["id"]
+        .as_str()
+        .expect("response should contain host id")
+        .to_owned();
+
+    // 3. Create task with phases array
     let (status, body) = post(
         "/v1/tasks",
         &json!({
             "prompt": "Navigate to waypoint alpha with phases",
             "environment_id": env_id,
+            "host_id": host_id,
             "timeout_secs": 300,
             "phases": [
                 {"mode": "react", "tools": "all", "trigger": "on_tool_signal"},
-                {"mode": "ooda_re_act", "tools": "all", "trigger": "immediate"}
+                {"mode": "ooda_react", "tools": "all", "trigger": "immediate"}
             ]
         }),
     )
@@ -506,8 +602,9 @@ async fn task_create_with_phases() {
         .expect("response should contain task id")
         .to_owned();
 
-    // 3. Cleanup
+    // 4. Cleanup
     let _ = delete(&format!("/v1/tasks/{task_id}")).await;
+    let _ = delete(&format!("/v1/hosts/{host_id}")).await;
     let status = delete(&format!("/v1/environments/{env_id}")).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "cleanup environment should return 204");
 }
@@ -527,7 +624,7 @@ async fn grpc_session_returns_text_response() {
     use tonic::metadata::MetadataValue;
 
     use roz_server::grpc::roz_v1::agent_service_client::AgentServiceClient;
-    use roz_server::grpc::roz_v1::{StartSession, UserMessage, session_request, session_response};
+    use roz_server::grpc::roz_v1::{StartSession, UserMessage, session_request};
 
     // 1. Create a throw-away environment (required for StartSession).
     let (status, body) = post(
@@ -581,7 +678,7 @@ async fn grpc_session_returns_text_response() {
         let Some(msg) = resp.message().await.expect("stream error") else {
             panic!("stream ended before SessionStarted");
         };
-        if matches!(msg.response, Some(session_response::Response::SessionStarted(_))) {
+        if response_session_started(&msg.response) {
             break;
         }
     }
@@ -605,13 +702,15 @@ async fn grpc_session_returns_text_response() {
             .await
             .expect("stream error")
             .expect("stream ended before TurnComplete");
-        match msg.response {
-            Some(session_response::Response::TextDelta(d)) => received_text.push_str(&d.content),
-            Some(session_response::Response::TurnComplete(_)) => break,
-            Some(session_response::Response::Error(e)) => {
-                panic!("agent returned error: {}", e.message)
-            }
-            _ => {}
+        if let Some(text) = response_text_delta(&msg.response) {
+            received_text.push_str(&text);
+            continue;
+        }
+        if response_turn_finished(&msg.response) {
+            break;
+        }
+        if let Some(message) = response_error_message(&msg.response) {
+            panic!("agent returned error: {message}");
         }
     }
 
@@ -643,7 +742,7 @@ async fn grpc_session_executes_code_via_tool() {
     use tonic::metadata::MetadataValue;
 
     use roz_server::grpc::roz_v1::agent_service_client::AgentServiceClient;
-    use roz_server::grpc::roz_v1::{StartSession, ToolSchema, UserMessage, session_request, session_response};
+    use roz_server::grpc::roz_v1::{StartSession, ToolSchema, UserMessage, session_request};
 
     // 1. Create a throw-away environment (required for StartSession).
     let (status, body) = post(
@@ -734,7 +833,7 @@ Do NOT explain. Do NOT ask questions. Just call execute_code immediately with th
         let Some(msg) = resp.message().await.expect("stream error") else {
             panic!("stream ended before SessionStarted");
         };
-        if matches!(msg.response, Some(session_response::Response::SessionStarted(_))) {
+        if response_session_started(&msg.response) {
             break;
         }
     }
@@ -763,69 +862,68 @@ Do NOT explain. Do NOT ask questions. Just call execute_code immediately with th
             .expect("stream error")
             .expect("stream ended before TurnComplete");
 
-        match msg.response {
-            Some(session_response::Response::TextDelta(d)) => {
-                received_text.push_str(&d.content);
-            }
-            Some(session_response::Response::ToolRequest(tool_req)) => {
-                assert_eq!(tool_req.tool_name, "execute_code", "expected execute_code tool call");
-                tool_was_called = true;
+        if let Some(text) = response_text_delta(&msg.response) {
+            received_text.push_str(&text);
+            continue;
+        }
+        if let Some(tool_req) = response_tool_request(&msg.response) {
+            assert_eq!(tool_req.tool_name, "execute_code", "expected execute_code tool call");
+            tool_was_called = true;
 
-                // Extract the WAT code from the parameters.
-                let params_value = roz_server::grpc::convert::struct_to_value(
-                    tool_req.parameters.expect("tool request should have parameters"),
-                );
-                let code = params_value["code"]
-                    .as_str()
-                    .expect("execute_code parameters should contain 'code' string");
-                let verify_first = params_value
-                    .get("verify_first")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(true);
+            // Extract the WAT code from the parameters.
+            let params_value = tool_req.parameters.clone();
+            let code = params_value["code"]
+                .as_str()
+                .expect("execute_code parameters should contain 'code' string");
+            let verify_first = params_value
+                .get("verify_first")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
 
-                // Compile the WAT code via CuWasmTask.
-                let (success, result_text) = match CuWasmTask::from_source(code.as_bytes()) {
-                    Ok(mut task) => {
-                        if verify_first {
-                            // Tick 10 times to verify the module executes correctly.
-                            let mut tick_error = None;
-                            for tick in 0..10 {
-                                if let Err(e) = task.tick(tick) {
-                                    tick_error = Some(format!("tick {tick} failed: {e}"));
-                                    break;
-                                }
+            // Compile the WAT code via CuWasmTask.
+            let (success, result_text) = match CuWasmTask::from_source(code.as_bytes()) {
+                Ok(mut task) => {
+                    if verify_first {
+                        // Tick 10 times to verify the module executes correctly.
+                        let mut tick_error = None;
+                        for tick in 0..10 {
+                            if let Err(e) = task.tick_with_contract(tick, None) {
+                                tick_error = Some(format!("tick {tick} failed: {e}"));
+                                break;
                             }
-                            tick_error.map_or_else(
-                                || (true, "verified: compiled and ticked 10 times successfully".to_string()),
-                                |err| (false, err),
-                            )
-                        } else {
-                            (true, "compiled successfully".to_string())
                         }
+                        tick_error.map_or_else(
+                            || (true, "verified: compiled and ticked 10 times successfully".to_string()),
+                            |err| (false, err),
+                        )
+                    } else {
+                        (true, "compiled successfully".to_string())
                     }
-                    Err(e) => (false, format!("compilation failed: {e}")),
-                };
+                }
+                Err(e) => (false, format!("compilation failed: {e}")),
+            };
 
-                // Send ToolResult back to the server.
-                req_tx
-                    .send(roz_server::grpc::roz_v1::SessionRequest {
-                        request: Some(session_request::Request::ToolResult(
-                            roz_server::grpc::roz_v1::ToolResult {
-                                tool_call_id: tool_req.tool_call_id,
-                                success,
-                                result: result_text,
-                                ..Default::default()
-                            },
-                        )),
-                    })
-                    .await
-                    .unwrap();
-            }
-            Some(session_response::Response::TurnComplete(_)) => break,
-            Some(session_response::Response::Error(e)) => {
-                panic!("agent returned error: {}", e.message);
-            }
-            _ => {} // Keepalive, ThinkingDelta, ActivityUpdate, etc.
+            // Send ToolResult back to the server.
+            req_tx
+                .send(roz_server::grpc::roz_v1::SessionRequest {
+                    request: Some(session_request::Request::ToolResult(
+                        roz_server::grpc::roz_v1::ToolResult {
+                            tool_call_id: tool_req.tool_call_id,
+                            success,
+                            result: result_text,
+                            ..Default::default()
+                        },
+                    )),
+                })
+                .await
+                .unwrap();
+            continue;
+        }
+        if response_turn_finished(&msg.response) {
+            break;
+        }
+        if let Some(message) = response_error_message(&msg.response) {
+            panic!("agent returned error: {message}");
         }
     }
 
@@ -864,7 +962,7 @@ async fn grpc_session_multiturn_mcp() {
     use tonic::metadata::MetadataValue;
 
     use roz_server::grpc::roz_v1::agent_service_client::AgentServiceClient;
-    use roz_server::grpc::roz_v1::{StartSession, ToolSchema, UserMessage, session_request, session_response};
+    use roz_server::grpc::roz_v1::{StartSession, ToolSchema, UserMessage, session_request};
 
     // 1. Connect MCP to local Docker sim (arm controller on port 8094).
     let mcp = Arc::new(roz_local::mcp::McpManager::new());
@@ -961,7 +1059,7 @@ async fn grpc_session_multiturn_mcp() {
         let Some(msg) = resp.message().await.expect("stream error") else {
             panic!("stream ended before SessionStarted");
         };
-        if matches!(msg.response, Some(session_response::Response::SessionStarted(_))) {
+        if response_session_started(&msg.response) {
             break;
         }
     }
@@ -990,49 +1088,49 @@ async fn grpc_session_multiturn_mcp() {
                     .expect("stream error")
                     .expect("stream ended before TurnComplete");
 
-                match msg.response {
-                    Some(session_response::Response::TextDelta(d)) => turn_text.push_str(&d.content),
-                    Some(session_response::Response::ToolRequest(tool_req)) => {
-                        turn_tool_calls += 1;
-                        let server_name = &tool_req.tool_name;
+                if let Some(text) = response_text_delta(&msg.response) {
+                    turn_text.push_str(&text);
+                    continue;
+                }
+                if let Some(tool_req) = response_tool_request(&msg.response) {
+                    turn_tool_calls += 1;
+                    let server_name = &tool_req.tool_name;
 
-                        // Map un-namespaced name back to MCP namespaced name.
-                        let namespaced = name_to_namespaced.get(server_name).unwrap_or_else(|| {
-                            panic!("server requested unknown tool: {server_name}");
-                        });
+                    // Map un-namespaced name back to MCP namespaced name.
+                    let namespaced = name_to_namespaced.get(server_name).unwrap_or_else(|| {
+                        panic!("server requested unknown tool: {server_name}");
+                    });
 
-                        // Extract parameters as serde_json::Value.
-                        let params = tool_req
-                            .parameters
-                            .map(roz_server::grpc::convert::struct_to_value)
-                            .unwrap_or_else(|| serde_json::json!({}));
+                    // Extract parameters as serde_json::Value.
+                    let params = tool_req.parameters.clone();
 
-                        // Dispatch to MCP.
-                        let (success, result_text) = match mcp.call_tool(namespaced, params).await {
-                            Ok(output) => (true, output),
-                            Err(e) => (false, format!("MCP tool error: {e}")),
-                        };
+                    // Dispatch to MCP.
+                    let (success, result_text) = match mcp.call_tool(namespaced, params).await {
+                        Ok(output) => (true, output),
+                        Err(e) => (false, format!("MCP tool error: {e}")),
+                    };
 
-                        // Return ToolResult.
-                        req_tx
-                            .send(roz_server::grpc::roz_v1::SessionRequest {
-                                request: Some(session_request::Request::ToolResult(
-                                    roz_server::grpc::roz_v1::ToolResult {
-                                        tool_call_id: tool_req.tool_call_id,
-                                        success,
-                                        result: result_text,
-                                        ..Default::default()
-                                    },
-                                )),
-                            })
-                            .await
-                            .unwrap();
-                    }
-                    Some(session_response::Response::TurnComplete(_)) => break,
-                    Some(session_response::Response::Error(e)) => {
-                        panic!("agent returned error: {}", e.message);
-                    }
-                    _ => {} // Keepalive, ThinkingDelta, ActivityUpdate, etc.
+                    // Return ToolResult.
+                    req_tx
+                        .send(roz_server::grpc::roz_v1::SessionRequest {
+                            request: Some(session_request::Request::ToolResult(
+                                roz_server::grpc::roz_v1::ToolResult {
+                                    tool_call_id: tool_req.tool_call_id,
+                                    success,
+                                    result: result_text,
+                                    ..Default::default()
+                                },
+                            )),
+                        })
+                        .await
+                        .unwrap();
+                    continue;
+                }
+                if response_turn_finished(&msg.response) {
+                    break;
+                }
+                if let Some(message) = response_error_message(&msg.response) {
+                    panic!("agent returned error: {message}");
                 }
             }
 

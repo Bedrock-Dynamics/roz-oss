@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::{DeviceTrust, TrustPosture};
+use super::{DeviceTrust, DeviceTrustPosture};
 
 // ---------------------------------------------------------------------------
 // TrustPolicy
@@ -29,15 +29,15 @@ pub struct TrustPolicy {
 /// 5. Firmware version not in allowed list (when list non-empty) -> `Untrusted`
 /// 6. Otherwise -> `Trusted`
 #[must_use]
-pub fn evaluate_trust(device: &DeviceTrust, policy: &TrustPolicy, now: DateTime<Utc>) -> TrustPosture {
+pub fn evaluate_trust(device: &DeviceTrust, policy: &TrustPolicy, now: DateTime<Utc>) -> DeviceTrustPosture {
     // 1. No firmware manifest
     let Some(firmware) = &device.firmware else {
-        return TrustPosture::Untrusted;
+        return DeviceTrustPosture::Untrusted;
     };
 
     // 2. No last attestation
     let Some(last_attestation) = device.last_attestation else {
-        return TrustPosture::Untrusted;
+        return DeviceTrustPosture::Untrusted;
     };
 
     // 3. Stale attestation
@@ -45,21 +45,21 @@ pub fn evaluate_trust(device: &DeviceTrust, policy: &TrustPolicy, now: DateTime<
     let max_secs = i64::try_from(policy.max_attestation_age_secs).unwrap_or(i64::MAX);
     let max_age = chrono::TimeDelta::seconds(max_secs);
     if age > max_age {
-        return TrustPosture::Provisional;
+        return DeviceTrustPosture::Provisional;
     }
 
     // 4. Signature required but missing
     if policy.require_firmware_signature && firmware.ed25519_signature.is_none() {
-        return TrustPosture::Provisional;
+        return DeviceTrustPosture::Provisional;
     }
 
     // 5. Firmware version not in allowed list
     if !policy.allowed_firmware_versions.is_empty() && !policy.allowed_firmware_versions.contains(&firmware.version) {
-        return TrustPosture::Untrusted;
+        return DeviceTrustPosture::Untrusted;
     }
 
     // 6. All checks passed
-    TrustPosture::Trusted
+    DeviceTrustPosture::Trusted
 }
 
 // ===========================================================================
@@ -89,7 +89,7 @@ mod tests {
         DeviceTrust {
             host_id: Uuid::new_v4(),
             tenant_id: "tenant-001".to_string(),
-            posture: TrustPosture::Untrusted, // initial value; evaluator overrides
+            posture: DeviceTrustPosture::Untrusted, // initial value; evaluator overrides
             firmware: Some(FirmwareManifest {
                 version: "1.0.0".to_string(),
                 sha256: "abc123".to_string(),
@@ -113,7 +113,7 @@ mod tests {
         let now = Utc::now();
         let device = trusted_device(now);
         let policy = base_policy();
-        assert_eq!(evaluate_trust(&device, &policy, now), TrustPosture::Trusted);
+        assert_eq!(evaluate_trust(&device, &policy, now), DeviceTrustPosture::Trusted);
     }
 
     // -----------------------------------------------------------------------
@@ -126,7 +126,7 @@ mod tests {
         let mut device = trusted_device(now);
         device.firmware = None;
         let policy = base_policy();
-        assert_eq!(evaluate_trust(&device, &policy, now), TrustPosture::Untrusted);
+        assert_eq!(evaluate_trust(&device, &policy, now), DeviceTrustPosture::Untrusted);
     }
 
     // -----------------------------------------------------------------------
@@ -139,7 +139,7 @@ mod tests {
         let mut device = trusted_device(now);
         device.last_attestation = None;
         let policy = base_policy();
-        assert_eq!(evaluate_trust(&device, &policy, now), TrustPosture::Untrusted);
+        assert_eq!(evaluate_trust(&device, &policy, now), DeviceTrustPosture::Untrusted);
     }
 
     // -----------------------------------------------------------------------
@@ -153,7 +153,7 @@ mod tests {
         // Attestation 2 hours ago, policy allows 1 hour
         device.last_attestation = Some(now - TimeDelta::seconds(7200));
         let policy = base_policy(); // max_attestation_age_secs = 3600
-        assert_eq!(evaluate_trust(&device, &policy, now), TrustPosture::Provisional);
+        assert_eq!(evaluate_trust(&device, &policy, now), DeviceTrustPosture::Provisional);
     }
 
     // -----------------------------------------------------------------------
@@ -167,7 +167,7 @@ mod tests {
         device.firmware.as_mut().unwrap().ed25519_signature = None;
         let mut policy = base_policy();
         policy.require_firmware_signature = true;
-        assert_eq!(evaluate_trust(&device, &policy, now), TrustPosture::Provisional);
+        assert_eq!(evaluate_trust(&device, &policy, now), DeviceTrustPosture::Provisional);
     }
 
     // -----------------------------------------------------------------------
@@ -180,7 +180,7 @@ mod tests {
         let device = trusted_device(now); // version "1.0.0"
         let mut policy = base_policy();
         policy.allowed_firmware_versions = vec!["2.0.0".to_string(), "3.0.0".to_string()];
-        assert_eq!(evaluate_trust(&device, &policy, now), TrustPosture::Untrusted);
+        assert_eq!(evaluate_trust(&device, &policy, now), DeviceTrustPosture::Untrusted);
     }
 
     // -----------------------------------------------------------------------
@@ -192,7 +192,7 @@ mod tests {
         let now = Utc::now();
         let device = trusted_device(now);
         let policy = base_policy(); // allowed_firmware_versions is empty by default
-        assert_eq!(evaluate_trust(&device, &policy, now), TrustPosture::Trusted);
+        assert_eq!(evaluate_trust(&device, &policy, now), DeviceTrustPosture::Trusted);
     }
 
     // -----------------------------------------------------------------------
@@ -208,6 +208,6 @@ mod tests {
         let mut policy = base_policy();
         policy.require_firmware_signature = true;
         policy.allowed_firmware_versions = vec!["1.0.0".to_string()];
-        assert_eq!(evaluate_trust(&device, &policy, now), TrustPosture::Trusted);
+        assert_eq!(evaluate_trust(&device, &policy, now), DeviceTrustPosture::Trusted);
     }
 }

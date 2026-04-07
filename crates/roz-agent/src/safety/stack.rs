@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use roz_core::safety::SafetyVerdict;
-use roz_core::spatial::SpatialContext;
+use roz_core::spatial::WorldState;
 use roz_core::tools::ToolCall;
 
 /// A safety guard that checks a tool call against spatial context.
@@ -10,7 +10,7 @@ pub trait SafetyGuard: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Evaluate a tool call in the given spatial context.
-    async fn check(&self, action: &ToolCall, state: &SpatialContext) -> SafetyVerdict;
+    async fn check(&self, action: &ToolCall, state: &WorldState) -> SafetyVerdict;
 }
 
 /// The result of running a tool call through the full safety stack.
@@ -38,7 +38,7 @@ impl SafetyStack {
     /// Run the action through every guard in order.
     /// A `Block` or `RequireConfirmation` verdict short-circuits evaluation.
     /// A `Modify` verdict replaces the action for subsequent guards.
-    pub async fn evaluate(&self, action: &ToolCall, state: &SpatialContext) -> SafetyResult {
+    pub async fn evaluate(&self, action: &ToolCall, state: &WorldState) -> SafetyResult {
         let mut current = action.clone();
         for guard in &self.guards {
             match guard.check(&current, state).await {
@@ -77,7 +77,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "always_allow"
         }
-        async fn check(&self, _action: &ToolCall, _state: &SpatialContext) -> SafetyVerdict {
+        async fn check(&self, _action: &ToolCall, _state: &WorldState) -> SafetyVerdict {
             SafetyVerdict::Allow
         }
     }
@@ -91,7 +91,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "always_block"
         }
-        async fn check(&self, _action: &ToolCall, _state: &SpatialContext) -> SafetyVerdict {
+        async fn check(&self, _action: &ToolCall, _state: &WorldState) -> SafetyVerdict {
             SafetyVerdict::Block {
                 reason: self.reason.clone(),
             }
@@ -106,7 +106,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "double_velocity"
         }
-        async fn check(&self, action: &ToolCall, _state: &SpatialContext) -> SafetyVerdict {
+        async fn check(&self, action: &ToolCall, _state: &WorldState) -> SafetyVerdict {
             let mut clamped = action.clone();
             if let Some(v) = clamped.params.get("velocity_ms").and_then(|v| v.as_f64()) {
                 clamped.params["velocity_ms"] = json!(v * 2.0);
@@ -139,7 +139,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "record_velocity"
         }
-        async fn check(&self, action: &ToolCall, _state: &SpatialContext) -> SafetyVerdict {
+        async fn check(&self, action: &ToolCall, _state: &WorldState) -> SafetyVerdict {
             if let Some(v) = action.params.get("velocity_ms").and_then(|v| v.as_f64()) {
                 *self.seen.lock().unwrap() = Some(v);
             }
@@ -154,7 +154,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "require_confirm"
         }
-        async fn check(&self, _action: &ToolCall, _state: &SpatialContext) -> SafetyVerdict {
+        async fn check(&self, _action: &ToolCall, _state: &WorldState) -> SafetyVerdict {
             SafetyVerdict::RequireConfirmation {
                 reason: "needs human approval".to_string(),
                 timeout_secs: 30,
@@ -174,8 +174,8 @@ mod tests {
         }
     }
 
-    fn empty_state() -> SpatialContext {
-        SpatialContext::default()
+    fn empty_state() -> WorldState {
+        WorldState::default()
     }
 
     // -----------------------------------------------------------------------
@@ -227,7 +227,7 @@ mod tests {
             fn name(&self) -> &'static str {
                 self.0.name()
             }
-            async fn check(&self, action: &ToolCall, state: &SpatialContext) -> SafetyVerdict {
+            async fn check(&self, action: &ToolCall, state: &WorldState) -> SafetyVerdict {
                 self.0.check(action, state).await
             }
         }
@@ -259,7 +259,7 @@ mod tests {
             fn name(&self) -> &'static str {
                 self.0.name()
             }
-            async fn check(&self, action: &ToolCall, state: &SpatialContext) -> SafetyVerdict {
+            async fn check(&self, action: &ToolCall, state: &WorldState) -> SafetyVerdict {
                 self.0.check(action, state).await
             }
         }

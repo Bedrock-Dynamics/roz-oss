@@ -75,6 +75,7 @@ pub enum TaskStatus {
     Running,
     Succeeded,
     Failed,
+    TimedOut,
     Cancelled,
     SafetyStop,
     Retrying,
@@ -285,7 +286,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn task_status_all_nine_variants() {
+    fn task_status_all_ten_variants() {
         let variants = [
             (TaskStatus::Pending, "pending"),
             (TaskStatus::Queued, "queued"),
@@ -293,12 +294,13 @@ mod tests {
             (TaskStatus::Running, "running"),
             (TaskStatus::Succeeded, "succeeded"),
             (TaskStatus::Failed, "failed"),
+            (TaskStatus::TimedOut, "timed_out"),
             (TaskStatus::Cancelled, "cancelled"),
             (TaskStatus::SafetyStop, "safety_stop"),
             (TaskStatus::Retrying, "retrying"),
         ];
 
-        assert_eq!(variants.len(), 9, "TaskStatus must have exactly 9 variants");
+        assert_eq!(variants.len(), 10, "TaskStatus must have exactly 10 variants");
 
         for (variant, expected) in &variants {
             let serialized = serde_json::to_string(variant).unwrap();

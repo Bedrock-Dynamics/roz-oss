@@ -18,8 +18,22 @@ pub mod triggers;
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
+fn parse_database_max_connections(value: Option<&str>) -> u32 {
+    value
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(10)
+}
+
+fn database_max_connections() -> u32 {
+    parse_database_max_connections(std::env::var("ROZ_DB_MAX_CONNECTIONS").ok().as_deref())
+}
+
 pub async fn create_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
-    PgPoolOptions::new().max_connections(10).connect(database_url).await
+    PgPoolOptions::new()
+        .max_connections(database_max_connections())
+        .connect(database_url)
+        .await
 }
 
 pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
@@ -73,8 +87,58 @@ pub(crate) async fn shared_test_pool() -> PgPool {
 }
 
 #[cfg(test)]
+fn is_retryable_public_schema_grant_error(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Database(database_error) => {
+            database_error.code().as_deref() == Some("XX000")
+                && database_error.message().contains("tuple concurrently updated")
+        }
+        _ => false,
+    }
+}
+
+/// Grant `USAGE` on the `public` schema to a transient test role.
+///
+/// Parallel RLS tests occasionally race while Postgres updates the schema ACL,
+/// surfacing `XX000 tuple concurrently updated`. Retry that transient case so
+/// the isolation tests remain deterministic under workspace-wide concurrency.
+#[cfg(test)]
+pub(crate) async fn grant_public_schema_usage_for_test_role(pool: &PgPool, test_role: &str) -> Result<(), sqlx::Error> {
+    const MAX_ATTEMPTS: u32 = 5;
+    let statement = format!("GRANT USAGE ON SCHEMA public TO {test_role}");
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        match sqlx::query(&statement).execute(pool).await {
+            Ok(_) => return Ok(()),
+            Err(error) if attempt < MAX_ATTEMPTS && is_retryable_public_schema_grant_error(&error) => {
+                tokio::time::sleep(std::time::Duration::from_millis(u64::from(attempt) * 25)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("grant_public_schema_usage_for_test_role should return within retry loop");
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn database_max_connections_defaults_to_ten() {
+        assert_eq!(parse_database_max_connections(None), 10);
+    }
+
+    #[test]
+    fn database_max_connections_uses_env_override() {
+        assert_eq!(parse_database_max_connections(Some("24")), 24);
+    }
+
+    #[test]
+    fn database_max_connections_rejects_zero_and_invalid_values() {
+        assert_eq!(parse_database_max_connections(Some("0")), 10);
+        assert_eq!(parse_database_max_connections(Some("not-a-number")), 10);
+    }
 
     #[tokio::test]
     async fn pool_creation_and_migration() {

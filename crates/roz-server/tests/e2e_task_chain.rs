@@ -77,7 +77,8 @@ fn spawn_mini_worker(
 
         let mut agent = roz_agent::agent_loop::AgentLoop::new(model, dispatcher, safety, spatial);
         let output = agent.run(agent_input).await;
-        let result = roz_worker::dispatch::build_task_result(task_id, output);
+        let result =
+            roz_worker::dispatch::build_task_result(task_id, roz_nats::dispatch::TaskTerminalStatus::Succeeded, output);
 
         let http = reqwest::Client::new();
         roz_worker::dispatch::signal_result(&http, &restate_url, &task_id.to_string(), &result)
@@ -205,6 +206,8 @@ async fn task_chain_end_to_end() {
         restate_url: restate.url().to_string(),
         traceparent: None,
         phases: vec![],
+        control_interface_manifest: None,
+        delegation_scope: None,
     };
 
     let subject = format!("invoke.{worker_id}.{}", task.id);
@@ -224,7 +227,7 @@ async fn task_chain_end_to_end() {
 
     // 11. Assert the full chain resolved correctly
     match &outcome_value {
-        roz_server::restate::task_workflow::TaskOutcome::Success { result } => {
+        roz_server::restate::task_workflow::TaskOutcome::Succeeded { result } => {
             // `MockModel` returned "E2E test task completed successfully",
             // which `build_task_result` wraps as a JSON string value
             let result_str = result.as_str().expect("result should be a string");
@@ -233,7 +236,7 @@ async fn task_chain_end_to_end() {
                 "unexpected result: {result_str}"
             );
         }
-        other => panic!("expected TaskOutcome::Success, got: {other:?}"),
+        other => panic!("expected TaskOutcome::Succeeded, got: {other:?}"),
     }
 
     // Cleanup

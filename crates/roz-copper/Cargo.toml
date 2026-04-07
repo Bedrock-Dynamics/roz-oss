@@ -37,11 +37,18 @@ tokio = { workspace = true, features = ["full"] }
 tokio-tungstenite.workspace = true
 futures.workspace = true
 anyhow.workspace = true
+chrono.workspace = true
+hex.workspace = true
+sha2.workspace = true
 tracing.workspace = true
-wasmtime = "43"
+wasmtime = { version = "43", features = ["component-model"] }
+wat = "1.245.1"
+wit-component = { version = "0.244.0", features = ["dummy-module"] }
+wit-parser = "0.244.0"
 
 [dev-dependencies]
 tempfile = "3"
+wasmprinter = "0.245.1"
 
 [build-dependencies]
 tonic-build = { workspace = true }

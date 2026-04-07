@@ -80,7 +80,7 @@ mod tests {
 
     #[test]
     fn parse_simulation_yaml() {
-        let yaml = r#"
+        let yaml = r"
 name: sim-lab
 kind: simulation
 simulation:
@@ -91,7 +91,7 @@ simulation:
 streams:
   - lidar-front
   - camera-rgb
-"#;
+";
         let config = EnvironmentConfig::from_yaml(yaml).unwrap();
         assert_eq!(config.name, "sim-lab");
         assert_eq!(config.kind, EnvironmentKind::Simulation);
@@ -106,7 +106,7 @@ streams:
 
     #[test]
     fn parse_hardware_yaml() {
-        let yaml = r#"
+        let yaml = r"
 name: factory-floor
 kind: hardware
 hardware:
@@ -118,7 +118,7 @@ safety:
   policy: warehouse-default
   max_speed_mps: 1.5
   geofence: loading-dock
-"#;
+";
         let config = EnvironmentConfig::from_yaml(yaml).unwrap();
         assert_eq!(config.name, "factory-floor");
         assert_eq!(config.kind, EnvironmentKind::Hardware);
@@ -133,7 +133,7 @@ safety:
 
     #[test]
     fn parse_hybrid_yaml() {
-        let yaml = r#"
+        let yaml = r"
 name: mixed-env
 kind: hybrid
 simulation:
@@ -146,7 +146,7 @@ toolchain:
   packages:
     - nav2
     - slam_toolbox
-"#;
+";
         let config = EnvironmentConfig::from_yaml(yaml).unwrap();
         assert_eq!(config.name, "mixed-env");
         assert_eq!(config.kind, EnvironmentKind::Hybrid);
@@ -159,10 +159,10 @@ toolchain:
 
     #[test]
     fn invalid_kind_returns_error() {
-        let yaml = r#"
+        let yaml = r"
 name: bad
 kind: imaginary
-"#;
+";
         let result = EnvironmentConfig::from_yaml(yaml);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -171,9 +171,9 @@ kind: imaginary
 
     #[test]
     fn missing_name_returns_error() {
-        let yaml = r#"
+        let yaml = r"
 kind: simulation
-"#;
+";
         let result = EnvironmentConfig::from_yaml(yaml);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -182,9 +182,9 @@ kind: simulation
 
     #[test]
     fn missing_kind_returns_error() {
-        let yaml = r#"
+        let yaml = r"
 name: no-kind
-"#;
+";
         let result = EnvironmentConfig::from_yaml(yaml);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -193,10 +193,10 @@ name: no-kind
 
     #[test]
     fn defaults_empty_when_omitted() {
-        let yaml = r#"
+        let yaml = r"
 name: minimal
 kind: simulation
-"#;
+";
         let config = EnvironmentConfig::from_yaml(yaml).unwrap();
         assert!(config.simulation.is_none());
         assert!(config.hardware.is_none());
@@ -207,13 +207,13 @@ kind: simulation
 
     #[test]
     fn roundtrip_through_json() {
-        let yaml = r#"
+        let yaml = r"
 name: roundtrip
 kind: hardware
 hardware:
   required_capabilities:
     - lidar
-"#;
+";
         let config = EnvironmentConfig::from_yaml(yaml).unwrap();
         let json = serde_json::to_value(&config).unwrap();
         assert_eq!(json["name"], "roundtrip");

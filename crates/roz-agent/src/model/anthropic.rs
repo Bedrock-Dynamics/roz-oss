@@ -17,6 +17,9 @@ const fn is_false(v: &bool) -> bool {
     !*v
 }
 
+/// Anthropic accepts at most 4 cached system blocks per request.
+const MAX_CACHED_SYSTEM_BLOCKS: usize = 4;
+
 // ---------------------------------------------------------------------------
 // Request types
 // ---------------------------------------------------------------------------
@@ -441,8 +444,9 @@ impl AnthropicProvider {
     /// caching applied as follows:
     /// - Single block: `cache_control: ephemeral` is always set (the block is
     ///   the entire stable system prompt).
-    /// - Multi-block: `cache_control: ephemeral` is set on all blocks except
-    ///   the last, which is treated as volatile per-turn context.
+    /// - Multi-block: `cache_control: ephemeral` is set on the stable prefix,
+    ///   capped at Anthropic's hard limit of 4 cached blocks. The last block
+    ///   is treated as volatile per-turn context and never cached.
     ///
     /// User and assistant messages are converted to `AnthropicContent::Blocks`
     /// containing the appropriate `ContentBlock` variants.
@@ -483,9 +487,15 @@ impl AnthropicProvider {
             // One SystemBlock per text part. Cache control rules:
             // - Single block: always cache it (it is the entire stable system
             //   prompt; nothing volatile here).
-            // - Multi-block: cache all-but-last. The last block is typically
-            //   volatile per-message context that changes each turn.
+            // - Multi-block: cache the stable prefix, but never exceed the
+            //   Anthropic limit of 4 cached system blocks. The last block is
+            //   typically volatile per-message context that changes each turn.
             let len = system_texts.len();
+            let cached_prefix_len = if len == 1 {
+                1
+            } else {
+                (len - 1).min(MAX_CACHED_SYSTEM_BLOCKS)
+            };
             Some(
                 system_texts
                     .into_iter()
@@ -493,7 +503,7 @@ impl AnthropicProvider {
                     .map(|(i, text)| SystemBlock {
                         block_type: "text".to_string(),
                         text,
-                        cache_control: if len == 1 || i < len - 1 {
+                        cache_control: if i < cached_prefix_len {
                             Some(CacheControl {
                                 control_type: "ephemeral".to_string(),
                             })
@@ -686,14 +696,15 @@ impl Model for AnthropicProvider {
             metadata: None,
         };
 
-        let resp = self
-            .base_request()
-            .json(&api_req)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<AnthropicResponse>()
-            .await?;
+        let response = self.base_request().json(&api_req).send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            tracing::error!(status = %status, body = %body, "anthropic API error");
+            return Err(format!("Anthropic API error {status}: {body}").into());
+        }
+
+        let resp = response.json::<AnthropicResponse>().await?;
 
         Ok(Self::convert_response(&resp))
     }
@@ -1098,6 +1109,29 @@ mod tests {
         assert_eq!(system[1].text, "Second system prompt.");
         assert!(system[1].cache_control.is_none()); // last → no cache
         assert_eq!(api_messages.len(), 1);
+    }
+
+    #[test]
+    fn convert_messages_caps_cached_system_blocks_at_provider_limit() {
+        let messages = vec![
+            Message::system("Base prompt."),
+            Message::system("Capability summary."),
+            Message::system("Robot manifest."),
+            Message::system("Agents context."),
+            Message::system("World state note."),
+            Message::system("Volatile per-turn block."),
+            Message::user("Hello"),
+        ];
+
+        let (system, _) = AnthropicProvider::convert_messages(&messages);
+        let system = system.expect("system should be present");
+        assert_eq!(system.len(), 6);
+        assert!(system[0].cache_control.is_some());
+        assert!(system[1].cache_control.is_some());
+        assert!(system[2].cache_control.is_some());
+        assert!(system[3].cache_control.is_some());
+        assert!(system[4].cache_control.is_none());
+        assert!(system[5].cache_control.is_none());
     }
 
     #[test]

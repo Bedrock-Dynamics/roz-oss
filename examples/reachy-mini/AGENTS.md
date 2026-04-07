@@ -2,6 +2,8 @@
 
 Pollen Robotics Reachy Mini wireless — a tabletop expressive robot with a 6-DOF Stewart platform head, body rotation, and two antenna actuators.
 
+Use `embodiment.toml` in this example as the canonical embodiment manifest. `robot.toml` is kept only as a legacy fallback copy.
+
 ## Hardware
 - **Head**: 6-DOF Stewart platform (pitch/roll ±40°, yaw ±180°)
 - **Body**: 1-DOF rotation (yaw ±160°)

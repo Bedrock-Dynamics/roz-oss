@@ -30,23 +30,55 @@ pub type PendingResults = Arc<Mutex<HashMap<String, oneshot::Sender<ToolResult>>
 
 /// Map of pending tool call IDs to boolean approval oneshot senders.
 ///
-/// Used by the D2 Roz-authoritative approval flow:
-/// `agent_loop` inserts a sender when `SafetyResult::NeedsHuman` fires;
-/// `agent.rs` gRPC handler resolves it when `PermissionDecision` arrives.
-pub type PendingApprovals = Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>;
+/// Legacy compatibility map for tests and low-level runtime internals.
+/// Canonical surfaces should resolve approvals through `SessionRuntime`.
+#[doc(hidden)]
+pub type PendingApprovals = Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>;
+
+/// Approval decision returned by an external approver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalDecision {
+    /// Whether the tool call is approved to proceed.
+    pub approved: bool,
+    /// Optional constrained modifier to merge into the tool input before execution.
+    pub modifier: Option<Value>,
+}
+
+/// Notification emitted when a tool call is suspended awaiting external approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingApprovalRequest {
+    /// Parent task owning this approval.
+    pub task_id: String,
+    /// Tool call / tool-use id to resolve later.
+    pub tool_call_id: String,
+    /// Human-readable tool name.
+    pub tool_name: String,
+    /// Original JSON tool input.
+    pub tool_input: Value,
+    /// Reason supplied by the safety stack.
+    pub reason: String,
+    /// Timeout after which the approval auto-denies.
+    pub timeout_secs: u64,
+}
 
 /// Resolves a pending Roz-authoritative approval by sending the decision
 /// through the oneshot channel associated with `tool_call_id`.
 ///
 /// Returns `true` if a pending approval was found and resolved, `false`
 /// if no matching approval was pending (e.g., already timed out or unknown).
-pub fn resolve_approval(pending: &PendingApprovals, tool_call_id: &str, approved: bool) -> bool {
+#[doc(hidden)]
+pub fn resolve_approval(
+    pending: &PendingApprovals,
+    tool_call_id: &str,
+    approved: bool,
+    modifier: Option<Value>,
+) -> bool {
     let sender = {
         let mut map = pending.lock().expect("pending approvals mutex poisoned");
         map.remove(tool_call_id)
     };
     // The receiver may have been dropped (timeout), so ignore send errors.
-    sender.is_some_and(|tx| tx.send(approved).is_ok())
+    sender.is_some_and(|tx| tx.send(ApprovalDecision { approved, modifier }).is_ok())
 }
 
 /// Resolves a pending remote tool call by sending the result through
@@ -300,15 +332,17 @@ mod tests {
     #[tokio::test]
     async fn resolve_approval_returns_true_for_known_id_when_approved() {
         let pending: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
-        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
         pending.lock().unwrap().insert("tc-approve".into(), tx);
 
         // Concurrently receive and verify the approval value.
         let received = tokio::spawn(async move { rx.await.expect("sender must not drop") });
 
-        let resolved = resolve_approval(&pending, "tc-approve", true);
+        let resolved = resolve_approval(&pending, "tc-approve", true, None);
         assert!(resolved, "should return true when a pending approval is found");
-        assert!(received.await.unwrap(), "receiver should get true (approved)");
+        let decision = received.await.unwrap();
+        assert!(decision.approved, "receiver should get true (approved)");
+        assert!(decision.modifier.is_none());
 
         let map = pending.lock().unwrap();
         assert!(map.is_empty(), "pending map should be empty after resolution");
@@ -317,38 +351,55 @@ mod tests {
     #[tokio::test]
     async fn resolve_approval_returns_false_for_unknown_id() {
         let pending: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
-        let resolved = resolve_approval(&pending, "nonexistent", true);
+        let resolved = resolve_approval(&pending, "nonexistent", true, None);
         assert!(!resolved, "should return false for unknown tool call id");
     }
 
     #[tokio::test]
     async fn resolve_approval_sends_denial_correctly() {
         let pending: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
-        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
         pending.lock().unwrap().insert("tc-deny".into(), tx);
 
         let received = tokio::spawn(async move { rx.await.expect("sender must not drop") });
 
         // Passing `false` denies the approval.
-        let resolved = resolve_approval(&pending, "tc-deny", false);
+        let resolved = resolve_approval(&pending, "tc-deny", false, None);
         assert!(resolved, "should return true (sender was found), even for a denial");
-        assert!(!received.await.unwrap(), "receiver should get false (denied)");
+        let decision = received.await.unwrap();
+        assert!(!decision.approved, "receiver should get false (denied)");
     }
 
     #[tokio::test]
     async fn resolve_approval_receiver_dropped_returns_false() {
         let pending: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
-        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
         pending.lock().unwrap().insert("tc-dropped".into(), tx);
 
         // Simulate the waiting side having timed out and dropped its receiver.
         drop(rx);
 
-        let resolved = resolve_approval(&pending, "tc-dropped", true);
+        let resolved = resolve_approval(&pending, "tc-dropped", true, None);
         assert!(!resolved, "should return false when the receiver was already dropped");
         // Map entry is removed even when send fails.
         let map = pending.lock().unwrap();
         assert!(map.is_empty(), "pending map should be cleaned up after failed send");
+    }
+
+    #[tokio::test]
+    async fn resolve_approval_sends_modifier() {
+        let pending: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = tokio::sync::oneshot::channel::<ApprovalDecision>();
+        pending.lock().unwrap().insert("tc-modified".into(), tx);
+
+        let received = tokio::spawn(async move { rx.await.expect("sender must not drop") });
+
+        let modifier = json!({"max_speed": 0.5});
+        let resolved = resolve_approval(&pending, "tc-modified", true, Some(modifier.clone()));
+        assert!(resolved, "should return true when a pending approval is found");
+        let decision = received.await.unwrap();
+        assert!(decision.approved);
+        assert_eq!(decision.modifier, Some(modifier));
     }
 
     #[tokio::test]

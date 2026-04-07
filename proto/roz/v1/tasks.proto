@@ -16,8 +16,12 @@ service TaskService {
 message CreateTaskRequest {
   string prompt = 1;
   string environment_id = 2;
-  optional string host_id = 3;
+  string host_id = 3;
   optional uint32 timeout_secs = 4;
+  optional google.protobuf.Struct control_interface_manifest = 5;
+  optional google.protobuf.Struct delegation_scope = 6;
+  repeated google.protobuf.Struct phases = 7;
+  optional string parent_task_id = 8;
 }
 
 message GetTaskRequest {
@@ -41,7 +45,7 @@ message CancelTaskResponse {}
 
 message ApproveToolUseRequest {
   string task_id = 1;
-  string tool_call_id = 2;
+  string approval_id = 2;
   bool approved = 3;
   optional google.protobuf.Struct modifier = 4;
 }

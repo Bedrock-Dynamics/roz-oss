@@ -93,7 +93,7 @@ mod tests {
     #[test]
     fn telemetry_msg_serde_roundtrip() {
         let msg = TelemetryMsg {
-            ts: 1708617600.123,
+            ts: 1_708_617_600.123,
             stream: "imu.accel".to_string(),
             data: json!({"x": 0.1, "y": 9.8, "z": 0.0}),
         };

@@ -8,7 +8,7 @@
 //!
 //! Requires: PX4 container on port 9090
 //! ```bash
-//! docker run -d --name roz-test-px4 -p 9090:50051 -p 14540:14540/udp -p 14550:14550/udp \
+//! docker run -d --name roz-test-px4 -p 9090:9090 -p 14540:14540/udp -p 14550:14550/udp \
 //!     bedrockdynamics/substrate-sim:px4-gazebo-humble
 //! ```
 //!
@@ -17,6 +17,8 @@
 //! cargo test -p roz-copper --test drone_wasm_velocity -- --ignored --nocapture
 //! ```
 
+mod live_controller_support;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -24,30 +26,37 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 
 use roz_copper::channels::ControllerCommand;
+use roz_copper::deployment_manager::DeploymentManager;
 use roz_copper::io::ActuatorSink;
 use roz_copper::io_grpc::proto::control_service_client::ControlServiceClient;
 use roz_copper::io_grpc::proto::{FlightCommand, FlightCommandRequest};
 use roz_copper::io_grpc::{GrpcActuatorSink, GrpcSensorSource};
 use roz_copper::io_log::{LogActuatorSink, TeeActuatorSink};
-use roz_core::channels::ChannelManifest;
+use roz_core::embodiment::binding::ControlInterfaceManifest;
 
-fn load_quadcopter_manifest() -> ChannelManifest {
-    let toml_str = include_str!("../../../examples/quadcopter/robot.toml");
-    let robot: roz_copper::manifest::RobotManifest = toml::from_str(toml_str).unwrap();
-    robot.channel_manifest().unwrap()
+fn load_quadcopter_control_manifest() -> (ControlInterfaceManifest, String) {
+    let toml_str = include_str!("../../../examples/quadcopter/embodiment.toml");
+    let robot: roz_copper::manifest::EmbodimentManifest = toml::from_str(toml_str).unwrap();
+    (
+        robot.control_interface_manifest().unwrap(),
+        robot
+            .channels
+            .as_ref()
+            .map(|channels| channels.robot_class.clone())
+            .unwrap_or_else(|| "generic".into()),
+    )
 }
 
 const BRIDGE_URL: &str = "http://127.0.0.1:9090";
 
-/// WAT that sets command channel 2 (velocity_z) to 0.5 m/s on every tick.
-const DRONE_VZ_WAT: &str = r#"
-    (module
-        (import "command" "set" (func $cmd (param i32 f64) (result i32)))
-        (func (export "process") (param i64)
-            (drop (call $cmd (i32.const 2) (f64.const 0.5)))
-        )
-    )
-"#;
+/// Build live-controller WAT that sets channel 2 (velocity_z) to 0.5 m/s.
+fn drone_vz_wat(control_manifest: &ControlInterfaceManifest) -> String {
+    let mut values = vec![0.0_f64; control_manifest.channels.len()];
+    if values.len() > 2 {
+        values[2] = 0.5;
+    }
+    live_controller_support::constant_output_controller_wat(&values)
+}
 
 /// Send a flight command via gRPC. Returns true on success.
 async fn send_flight_cmd(channel: tonic::transport::Channel, cmd: FlightCommand, mode: &str) -> bool {
@@ -89,17 +98,21 @@ async fn drone_wasm_velocity_through_bridge() {
         }
     };
 
-    let manifest = load_quadcopter_manifest();
+    let (control_manifest, robot_class) = load_quadcopter_control_manifest();
     let grpc_channel = tonic::transport::Channel::from_shared(BRIDGE_URL.to_string())
         .expect("valid URI")
         .connect()
         .await
         .expect("gRPC channel to bridge");
-    let grpc_sink = Arc::new(GrpcActuatorSink::from_manifest(
-        grpc_channel.clone(),
-        &manifest,
-        tokio::runtime::Handle::current(),
-    ));
+    let grpc_sink = Arc::new(
+        GrpcActuatorSink::from_control_manifest(
+            grpc_channel.clone(),
+            &control_manifest,
+            robot_class,
+            tokio::runtime::Handle::current(),
+        )
+        .expect("valid PX4 actuator manifest"),
+    );
     let log_sink = Arc::new(LogActuatorSink::new());
     let tee_sink = Arc::new(TeeActuatorSink::new(
         Arc::clone(&grpc_sink) as Arc<dyn ActuatorSink>,
@@ -117,8 +130,9 @@ async fn drone_wasm_velocity_through_bridge() {
     let s = Arc::clone(&state);
     let sd = Arc::clone(&shutdown);
     let mut sensor_owned = sensor;
+    let deployment_manager = DeploymentManager::new(true, false, true);
     let ctrl_handle = std::thread::spawn(move || {
-        roz_copper::controller::run_controller_loop(
+        roz_copper::controller::run_controller_loop_with_policy(
             &rx,
             &s,
             5.0, // quadcopter max velocity (m/s)
@@ -128,6 +142,7 @@ async fn drone_wasm_velocity_through_bridge() {
             Duration::from_secs(60),
             Some(&emergency_rx),
             &estop_tx,
+            deployment_manager,
         );
     });
 
@@ -151,12 +166,29 @@ async fn drone_wasm_velocity_through_bridge() {
     println!("BEFORE (hovering) drone z: {before_z:?}");
 
     // 4. Start WASM velocity setpoints, then switch to OFFBOARD.
-    // Load WASM — starts producing velocity commands at 100Hz.
-    tx.send(ControllerCommand::LoadWasm(
-        DRONE_VZ_WAT.as_bytes().to_vec(),
-        load_quadcopter_manifest(),
-    ))
-    .expect("send LoadWasm");
+    // Load WASM via artifact — starts producing velocity commands at 100Hz.
+    let (control_manifest, _) = load_quadcopter_control_manifest();
+    let embodiment_runtime = live_controller_support::compile_test_embodiment_runtime(&control_manifest);
+    let drone_wat = drone_vz_wat(&control_manifest);
+    let (artifact, component_bytes) = live_controller_support::build_live_artifact(
+        "drone-vz",
+        drone_wat.as_bytes(),
+        &control_manifest,
+        &embodiment_runtime,
+    );
+    tx.send(
+        ControllerCommand::load_artifact_with_embodiment_runtime(
+            artifact,
+            component_bytes,
+            &control_manifest,
+            &embodiment_runtime,
+        )
+        .into_runtime()
+        .expect("prepare runtime command"),
+    )
+    .expect("send LoadArtifact");
+    tx.send(roz_copper::channels::CopperRuntimeCommand::PromoteActive)
+        .expect("send PromoteActive");
 
     // Wait for setpoints to stream before switching to OFFBOARD.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -171,7 +203,15 @@ async fn drone_wasm_velocity_through_bridge() {
 
     // 6. Check results.
     let current = state.load();
-    println!("Controller: tick={}, running={}", current.last_tick, current.running);
+    println!(
+        "Controller: tick={}, running={}, deployment_state={:?}, active={:?}, candidate={:?}, last_output={:?}",
+        current.last_tick,
+        current.running,
+        current.deployment_state,
+        current.active_controller_id,
+        current.candidate_controller_id,
+        current.last_output
+    );
     assert!(current.running, "controller should be running");
 
     let cmds = log_sink.commands();
@@ -186,6 +226,7 @@ async fn drone_wasm_velocity_through_bridge() {
     );
 
     // Verify no bridge errors.
+    println!("GrpcActuatorSink last error: {:?}", grpc_sink.last_error_message());
     assert!(
         !grpc_sink.had_error(),
         "GrpcActuatorSink should not report errors — commands must reach MAVLink sender"

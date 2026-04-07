@@ -24,6 +24,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use roz_core::command::CommandFrame;
+use roz_core::embodiment::FrameSnapshotInput;
 use roz_core::template::render_template;
 
 use crate::io::{ActuatorSink, SensorFrame, SensorSource};
@@ -57,7 +58,7 @@ pub struct WsBridgeConfig {
     pub body_template: String,
     /// Channel names in manifest order — indices match `CommandFrame.values`.
     pub channel_names: Vec<String>,
-    /// Default values per channel (used if frame has fewer values).
+    /// Legacy default values. Partial actuator frames are rejected before render.
     pub channel_defaults: Vec<f64>,
 }
 
@@ -110,6 +111,9 @@ impl SensorSource for WsSensorSource {
             joint_positions: current.joint_positions.clone(),
             joint_velocities: Vec::new(),
             sim_time_ns: 0,
+            wrench: None,
+            contact: None,
+            frame_snapshot_input: FrameSnapshotInput::default(),
         })
     }
 }
@@ -131,7 +135,7 @@ pub fn create_ws_bridge(
     assert!(
         !config.body_template.is_empty() || config.channel_names.is_empty(),
         "WsBridgeConfig has {} command channels but no body_template — \
-         commands will never reach the daemon. Add set_target_body to [daemon.websocket] in robot.toml",
+         commands will never reach the daemon. Add set_target_body to [daemon.websocket] in embodiment.toml (legacy robot.toml also accepted)",
         config.channel_names.len(),
     );
 
@@ -287,7 +291,13 @@ async fn ws_write_loop(
 
         match frame {
             Ok(frame) => {
-                let msg_text = render_frame(config, &frame);
+                let msg_text = match render_frame(config, &frame) {
+                    Ok(msg_text) => msg_text,
+                    Err(error) => {
+                        tracing::error!(%error, "dropping invalid partial WS actuator frame");
+                        continue;
+                    }
+                };
                 if let Err(e) = ws_write.send(Message::Text(msg_text.into())).await {
                     return Err((anyhow::anyhow!("WS write error: {e}"), rx));
                 }
@@ -312,20 +322,23 @@ async fn ws_write_loop(
 ///
 /// Builds a `HashMap` of `channel_name` -> value string, then calls
 /// `render_template` to substitute `{{channel_name}}` placeholders.
-pub fn render_frame(config: &WsBridgeConfig, frame: &CommandFrame) -> String {
+pub fn render_frame(config: &WsBridgeConfig, frame: &CommandFrame) -> anyhow::Result<String> {
+    if frame.values.len() != config.channel_names.len() {
+        anyhow::bail!(
+            "command frame width {} does not match WS actuator layout {}",
+            frame.values.len(),
+            config.channel_names.len()
+        );
+    }
+
     let mut values = HashMap::with_capacity(config.channel_names.len());
 
     for (i, name) in config.channel_names.iter().enumerate() {
-        let val = frame
-            .values
-            .get(i)
-            .copied()
-            .or_else(|| config.channel_defaults.get(i).copied())
-            .unwrap_or(0.0);
+        let val = frame.values[i];
         values.insert(name.clone(), val.to_string());
     }
 
-    render_template(&config.body_template, &values)
+    Ok(render_template(&config.body_template, &values))
 }
 
 // ---------------------------------------------------------------------------
@@ -340,8 +353,8 @@ pub fn render_frame(config: &WsBridgeConfig, frame: &CommandFrame) -> String {
 /// - `{"type": "head_pose", "head_pose": [[r00,r01,r02,r03],[r10,r11,r12,r13],[r20,r21,r22,r23],[r30,r31,r32,r33]]}`
 ///   -> extracts Euler angles (roll, pitch, yaw) from the 4x4 rotation matrix.
 ///
-/// This parsing is Reachy-specific for now. A generic parser driven by
-/// `robot.toml` configuration is a follow-up.
+/// This parsing is Reachy-specific for now. A generic parser driven by the
+/// embodiment manifest is a follow-up.
 fn parse_sensor_message(text: &str) -> Option<Vec<f64>> {
     let value: serde_json::Value = serde_json::from_str(text).ok()?;
     let obj = value.as_object()?;
@@ -479,13 +492,13 @@ mod tests {
             channel_defaults: vec![0.0, 0.0],
         };
         let frame = CommandFrame { values: vec![0.1, 0.2] };
-        let msg = render_frame(&config, &frame);
+        let msg = render_frame(&config, &frame).unwrap();
         assert!(msg.contains("0.1"), "should contain head_x value: {msg}");
         assert!(msg.contains("0.2"), "should contain head_y value: {msg}");
     }
 
     #[test]
-    fn render_frame_uses_defaults_for_missing_channels() {
+    fn render_frame_rejects_partial_channels() {
         let config = WsBridgeConfig {
             url: String::new(),
             set_target_type: "set_target".into(),
@@ -493,11 +506,9 @@ mod tests {
             channel_names: vec!["x".into(), "y".into()],
             channel_defaults: vec![0.0, 99.0],
         };
-        // Frame only has one value — y should use default
         let frame = CommandFrame { values: vec![1.5] };
-        let msg = render_frame(&config, &frame);
-        assert!(msg.contains("1.5"), "x should be 1.5: {msg}");
-        assert!(msg.contains("99"), "y should use default 99: {msg}");
+        let err = render_frame(&config, &frame).unwrap_err();
+        assert!(err.to_string().contains("width 1"), "unexpected error: {err}");
     }
 
     #[test]
@@ -560,7 +571,7 @@ mod tests {
         let frame = CommandFrame {
             values: vec![0.0, 0.0, 0.0, 0.0, 0.3, 0.0, 0.0, 0.0, 0.0],
         };
-        let msg = render_frame(&config, &frame);
+        let msg = render_frame(&config, &frame).unwrap();
 
         // Must be valid JSON
         let parsed: serde_json::Value = serde_json::from_str(&msg)
@@ -583,7 +594,7 @@ mod tests {
             channel_defaults: vec![],
         };
         let frame = CommandFrame { values: vec![] };
-        assert_eq!(render_frame(&config, &frame), "");
+        assert_eq!(render_frame(&config, &frame).unwrap(), "");
     }
 
     #[test]

@@ -65,6 +65,19 @@ pub async fn complete_device_code(
     Ok(result.rows_affected() > 0)
 }
 
+/// Best-effort cleanup for expired or completed device codes.
+pub async fn purge_stale_device_codes(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "DELETE FROM roz_device_codes \
+         WHERE expires_at < now() \
+            OR (completed_at IS NOT NULL AND completed_at < now() - interval '1 hour')",
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +170,20 @@ mod tests {
             .await
             .expect("Failed to attempt second complete");
         assert!(!again);
+    }
+
+    #[tokio::test]
+    async fn purge_stale_device_codes_removes_expired_rows() {
+        let pool = setup().await;
+        let device_code = format!("dc_{}", Uuid::new_v4());
+        let user_code = format!("EXP{}", &Uuid::new_v4().to_string()[..5]).to_uppercase();
+        let expires_at = chrono::Utc::now() - chrono::Duration::minutes(5);
+
+        create_device_code(&pool, &device_code, &user_code, expires_at)
+            .await
+            .expect("create expired code");
+        let purged = purge_stale_device_codes(&pool).await.expect("purge stale codes");
+        assert!(purged >= 1);
+        assert!(get_by_device_code(&pool, &device_code).await.expect("query").is_none());
     }
 }

@@ -75,16 +75,6 @@ pub fn build_router(state: AppState) -> Router {
                 .put(routes::streams::update)
                 .delete(routes::streams::delete),
         )
-        // Command routes + state transition
-        .route(
-            "/v1/commands",
-            get(routes::commands::list).post(routes::commands::create),
-        )
-        .route(
-            "/v1/commands/{id}",
-            get(routes::commands::get).delete(routes::commands::delete),
-        )
-        .route("/v1/commands/{id}/transition", post(routes::commands::transition))
         // Lease acquire/release
         .route("/v1/leases", get(routes::leases::list).post(routes::leases::create))
         .route("/v1/leases/{id}", get(routes::leases::get))

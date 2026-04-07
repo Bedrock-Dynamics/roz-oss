@@ -1,7 +1,11 @@
 /target/
 .worktrees/
 .env
+.env.*
 .env.test
+.roz/
+.paper/
+paper/
 *.swp
 .infisical.json
 .claude/

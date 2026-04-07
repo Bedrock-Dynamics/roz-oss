@@ -10,41 +10,12 @@
 //! - Container label: `roz.managed=true`
 
 use std::collections::HashMap;
-use std::net::{TcpListener, UdpSocket};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-
-// ---- Port management ----
-
-/// Check if a UDP port is available (`MAVLink` uses UDP).
-fn is_udp_port_available(port: u16) -> bool {
-    UdpSocket::bind(("0.0.0.0", port)).is_ok()
-}
-
-/// Check if a TCP port is available (gRPC bridge + MCP use TCP).
-fn is_tcp_port_available(port: u16) -> bool {
-    TcpListener::bind(("127.0.0.1", port)).is_ok()
-}
-
-/// Find the first available UDP port starting from `start`, checking up to
-/// `max_attempts` consecutive ports.
-fn find_available_udp_port(start: u16, max_attempts: u16) -> Option<u16> {
-    (0..max_attempts)
-        .map(|offset| start + offset)
-        .find(|&port| is_udp_port_available(port))
-}
-
-/// Find the first available TCP port starting from `start`, checking up to
-/// `max_attempts` consecutive ports.
-fn find_available_tcp_port(start: u16, max_attempts: u16) -> Option<u16> {
-    (0..max_attempts)
-        .map(|offset| start + offset)
-        .find(|&port| is_tcp_port_available(port))
-}
 
 // ---- Error type ----
 
@@ -175,6 +146,39 @@ fn cleanup_stale_containers() {
     }
 }
 
+/// Resolve the random host port Docker published for `container_port`.
+fn published_host_port(container_ref: &str, container_port: &str) -> Result<u16, DockerError> {
+    let output = docker_command()
+        .args(["port", container_ref, container_port])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| DockerError::LaunchFailed(format!("docker port failed: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(DockerError::LaunchFailed(format!(
+            "docker port {container_port} failed: {stderr}"
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| DockerError::LaunchFailed(format!("docker port {container_port} returned no mapping")))?;
+
+    let port = line
+        .trim()
+        .rsplit(':')
+        .next()
+        .ok_or_else(|| DockerError::LaunchFailed(format!("unexpected docker port output: {line}")))?
+        .parse::<u16>()
+        .map_err(|e| DockerError::LaunchFailed(format!("failed to parse docker port output '{line}': {e}")))?;
+
+    Ok(port)
+}
+
 // ---- DockerLauncher ----
 
 pub struct DockerLauncher {
@@ -246,21 +250,7 @@ impl DockerLauncher {
         };
         let instance_id = format!("roz-sim-{counter_val}");
 
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let container_name = format!("roz-sim-{timestamp}-{counter_val}");
-
-        // Allocate ports
-        let mavlink_port = find_available_udp_port(14540, 20)
-            .ok_or_else(|| DockerError::PortUnavailable("no available UDP ports in 14540-14559".into()))?;
-
-        let bridge_port = find_available_tcp_port(9090, 20)
-            .ok_or_else(|| DockerError::PortUnavailable("no available TCP ports in 9090-9109".into()))?;
-
-        let mcp_port = find_available_tcp_port(8090, 20)
-            .ok_or_else(|| DockerError::PortUnavailable("no available TCP ports in 8090-8109".into()))?;
+        let container_name = format!("roz-sim-{counter_val}-{}", uuid::Uuid::new_v4().simple());
 
         // Build docker run arguments
         let project_mount = format!("{}:/workspace:ro", project_dir.to_string_lossy());
@@ -277,11 +267,11 @@ impl DockerLauncher {
             "--label".into(),
             format!("roz.instance_id={instance_id}"),
             "-p".into(),
-            format!("{mavlink_port}:14540/udp"),
+            "127.0.0.1::14540/udp".into(),
             "-p".into(),
-            format!("{bridge_port}:9090"),
+            "127.0.0.1::9090".into(),
             "-p".into(),
-            format!("{mcp_port}:8090"),
+            "127.0.0.1::8090".into(),
             "-v".into(),
             project_mount,
             "-e".into(),
@@ -312,6 +302,9 @@ impl DockerLauncher {
         }
 
         let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let mavlink_port = published_host_port(&container_name, "14540/udp")?;
+        let bridge_port = published_host_port(&container_name, "9090/tcp")?;
+        let mcp_port = published_host_port(&container_name, "8090/tcp")?;
 
         let instance = ContainerInstance {
             id: instance_id.clone(),
@@ -416,36 +409,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tcp_port_check_detects_bound_port() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        assert!(!is_tcp_port_available(port));
-        drop(listener);
-        // Port release can be delayed on some systems; allow a brief retry
-        let mut available = false;
-        for _ in 0..10 {
-            if is_tcp_port_available(port) {
-                available = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        assert!(available, "port {port} should become available after drop");
+    fn published_host_port_parses_ipv4_output() {
+        let line = "127.0.0.1:32768";
+        let port = line.trim().rsplit(':').next().unwrap().parse::<u16>().unwrap();
+        assert_eq!(port, 32768);
     }
 
     #[test]
-    fn find_available_tcp_port_skips_bound() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let found = find_available_tcp_port(port, 5);
-        assert!(found.is_some());
-        assert_ne!(found.unwrap(), port);
-    }
-
-    #[test]
-    fn find_available_tcp_port_returns_start_when_free() {
-        let found = find_available_tcp_port(49_990, 5);
-        assert!(found.is_some());
+    fn published_host_port_parses_ipv6_output() {
+        let line = "[::1]:32769";
+        let port = line.trim().rsplit(':').next().unwrap().parse::<u16>().unwrap();
+        assert_eq!(port, 32769);
     }
 
     #[test]

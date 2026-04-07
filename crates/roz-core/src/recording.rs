@@ -16,12 +16,12 @@ pub enum RecordingSource {
 }
 
 // ---------------------------------------------------------------------------
-// ChannelManifest
+// RecordingChannel
 // ---------------------------------------------------------------------------
 
 /// Describes a single channel within an MCAP recording file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelManifest {
+pub struct RecordingChannel {
     pub name: String,
     pub topic: String,
     pub schema_name: String,
@@ -41,7 +41,7 @@ pub struct RecordingManifest {
     pub environment_id: Uuid,
     pub host_id: Uuid,
     pub source: RecordingSource,
-    pub channels: Vec<ChannelManifest>,
+    pub channels: Vec<RecordingChannel>,
     pub duration_secs: f64,
     pub created_at: DateTime<Utc>,
 }
@@ -60,8 +60,8 @@ mod tests {
     // Helpers
     // -----------------------------------------------------------------------
 
-    fn sample_channel(name: &str, topic: &str) -> ChannelManifest {
-        ChannelManifest {
+    fn sample_channel(name: &str, topic: &str) -> RecordingChannel {
+        RecordingChannel {
             name: name.to_string(),
             topic: topic.to_string(),
             schema_name: format!("{name}_schema"),
@@ -116,14 +116,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ChannelManifest serde
+    // RecordingChannel serde
     // -----------------------------------------------------------------------
 
     #[test]
     fn channel_manifest_serde_roundtrip() {
         let original = sample_channel("camera", "/sensors/camera");
         let json = serde_json::to_string(&original).unwrap();
-        let restored: ChannelManifest = serde_json::from_str(&json).unwrap();
+        let restored: RecordingChannel = serde_json::from_str(&json).unwrap();
 
         assert_eq!(original.name, restored.name);
         assert_eq!(original.topic, restored.topic);

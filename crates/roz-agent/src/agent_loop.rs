@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_lines)]
+
 use crate::context::ContextManager;
 use crate::dispatch::{ToolContext, ToolDispatcher};
 use crate::error::AgentError;
@@ -7,9 +9,9 @@ use crate::model::types::{
     StreamResponse, TokenUsage, ToolChoiceStrategy,
 };
 use crate::safety::{SafetyResult, SafetyStack};
-use crate::spatial_provider::SpatialContextProvider;
-use roz_core::spatial::SpatialContext;
-use serde::{Deserialize, Serialize};
+use crate::spatial_provider::WorldStateProvider;
+pub use roz_core::session::control::CognitionMode;
+use roz_core::spatial::WorldState;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -72,6 +74,18 @@ pub enum PresenceSignal {
         /// Optional progress (0.0–1.0).
         progress: Option<f32>,
     },
+    /// Canonical approval-request lifecycle signal.
+    ApprovalRequested {
+        approval_id: String,
+        action: String,
+        reason: String,
+        timeout_secs: u64,
+    },
+    /// Canonical approval-resolution lifecycle signal.
+    ApprovalResolved {
+        approval_id: String,
+        outcome: roz_core::session::feedback::ApprovalOutcome,
+    },
 }
 
 /// Number of consecutive all-error tool turns before the circuit breaker trips.
@@ -101,36 +115,10 @@ impl Default for RetryConfig {
     }
 }
 
-/// The execution mode for the agent loop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentLoopMode {
-    /// Pure LLM reasoning + tool use. No spatial observation.
-    /// Used for AI skills (chat, planning, code generation).
-    React,
-    /// Full OODA-ReAct: spatial context is observed each cycle,
-    /// injected into model messages, and passed to the safety stack.
-    /// Used for physical/execution skills (robot control, navigation).
-    OodaReAct,
-}
-
-impl From<roz_core::phases::PhaseMode> for AgentLoopMode {
-    fn from(m: roz_core::phases::PhaseMode) -> Self {
-        match m {
-            roz_core::phases::PhaseMode::React => Self::React,
-            roz_core::phases::PhaseMode::OodaReAct => Self::OodaReAct,
-        }
-    }
-}
-
-impl From<AgentLoopMode> for roz_core::phases::PhaseMode {
-    fn from(m: AgentLoopMode) -> Self {
-        match m {
-            AgentLoopMode::React => Self::React,
-            AgentLoopMode::OodaReAct => Self::OodaReAct,
-        }
-    }
-}
+/// Compatibility alias retained while downstream crates converge on
+/// cognition-mode terminology.
+#[doc(hidden)]
+pub type AgentLoopMode = CognitionMode;
 
 /// The name of the hidden tool injected when structured output is requested.
 pub const RESPOND_TOOL_NAME: &str = "__respond";
@@ -143,15 +131,19 @@ pub struct AgentInput {
     /// Model name used for this run (e.g. `"claude-sonnet-4-6"`).
     /// Included in `UsageRecord` for per-model billing breakdowns.
     pub model_name: String,
-    pub system_prompt: Vec<String>,
-    pub user_message: String,
+    /// Direct-caller prompt/history/current-turn seed.
+    ///
+    /// Runtime-driven surfaces should keep this empty and use
+    /// [`AgentInput::runtime_shell`] together with [`AgentInputSeed`] passed
+    /// into [`AgentLoop::run_seeded`] / [`AgentLoop::run_streaming_seeded`].
+    pub seed: AgentInputSeed,
     pub max_cycles: u32,
     pub max_tokens: u32,
     /// Total context window size used as the denominator for
     /// compaction thresholds. Distinct from `max_tokens` which is
     /// the per-call output generation budget.
     pub max_context_tokens: u32,
-    pub mode: AgentLoopMode,
+    pub mode: CognitionMode,
     /// Ordered phase specs. Empty = single phase using `mode` with all tools (default behaviour).
     pub phases: Vec<roz_core::phases::PhaseSpec>,
     /// Tool choice strategy for model calls. `None` means the provider
@@ -166,15 +158,83 @@ pub struct AgentInput {
     /// functionally identical to what `complete()` returns, but enables future
     /// early-dispatch optimisations and real-time SSE forwarding.
     pub streaming: bool,
-    /// Conversation history from prior turns. Inserted between the system
-    /// message and the new user message so the model sees the full context.
-    pub history: Vec<Message>,
     /// Cooperative cancellation token. When cancelled, the agent loop exits
     /// cleanly at the next cycle boundary with `AgentError::Cancelled`.
     pub cancellation_token: Option<tokio_util::sync::CancellationToken>,
     /// Control mode for this session. Supervised requires human monitoring
     /// for physical actions. Default: Autonomous.
     pub control_mode: roz_core::safety::ControlMode,
+}
+
+/// Runtime-owned compatibility seed for prompt/history/current-turn input.
+#[derive(Debug, Clone, Default)]
+pub struct AgentInputSeed {
+    pub system_prompt: Vec<String>,
+    pub history: Vec<Message>,
+    pub user_message: String,
+}
+
+impl AgentInputSeed {
+    #[must_use]
+    pub fn new(system_prompt: Vec<String>, history: Vec<Message>, user_message: impl Into<String>) -> Self {
+        Self {
+            system_prompt,
+            history,
+            user_message: user_message.into(),
+        }
+    }
+}
+
+impl AgentInput {
+    /// Build a runtime-driven shell input with compatibility fields intentionally empty.
+    #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "runtime-driven callers need to set execution limits explicitly"
+    )]
+    pub fn runtime_shell(
+        task_id: impl Into<String>,
+        tenant_id: impl Into<String>,
+        model_name: impl Into<String>,
+        mode: CognitionMode,
+        max_cycles: u32,
+        max_tokens: u32,
+        max_context_tokens: u32,
+        streaming: bool,
+        cancellation_token: Option<tokio_util::sync::CancellationToken>,
+        control_mode: roz_core::safety::ControlMode,
+    ) -> Self {
+        Self {
+            task_id: task_id.into(),
+            tenant_id: tenant_id.into(),
+            model_name: model_name.into(),
+            seed: AgentInputSeed::default(),
+            max_cycles,
+            max_tokens,
+            max_context_tokens,
+            mode,
+            phases: Vec::new(),
+            tool_choice: None,
+            response_schema: None,
+            streaming,
+            cancellation_token,
+            control_mode,
+        }
+    }
+}
+
+impl std::ops::Deref for AgentInput {
+    type Target = AgentInputSeed;
+
+    fn deref(&self) -> &Self::Target {
+        &self.seed
+    }
+}
+
+impl std::ops::DerefMut for AgentInput {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.seed
+    }
 }
 
 /// Output from a completed agent loop run.
@@ -200,12 +260,22 @@ pub struct AgentLoop {
     model: Box<dyn Model>,
     dispatcher: ToolDispatcher,
     safety: SafetyStack,
-    spatial: Box<dyn SpatialContextProvider>,
+    spatial: Box<dyn WorldStateProvider>,
     retry_config: RetryConfig,
-    /// D2: shared map for Roz-authoritative approval flow.
-    /// When `SafetyResult::NeedsHuman` fires, a oneshot sender is inserted here.
-    /// The gRPC session loop resolves it when `PermissionDecision` arrives.
-    pending_approvals: Option<crate::dispatch::remote::PendingApprovals>,
+    /// Runtime-owned system prompt seed for this run. When present, it overrides
+    /// `AgentInput.seed.system_prompt` so runtime-driven surfaces can keep prompt
+    /// authority out of the public input struct.
+    system_prompt_seed: Vec<String>,
+    /// Runtime-owned transcript seed for this run. When present, it overrides
+    /// `AgentInput.seed.history` so surfaces can keep transcript authority out of the
+    /// public input struct.
+    history_seed: Vec<Message>,
+    /// Runtime-owned user message for this run. When present, it overrides
+    /// `AgentInput.seed.user_message` so runtime-driven surfaces do not have to copy
+    /// the current turn input back into the public agent request.
+    user_message_seed: Option<String>,
+    /// Runtime-owned approval authority shared with the session runtime.
+    approval_runtime: Option<crate::session_runtime::ApprovalRuntimeHandle>,
     /// Runtime-injected handles (e.g. `CopperHandle` `cmd_tx`) passed to every `ToolContext`.
     extensions: crate::dispatch::Extensions,
     /// Usage metering — check budget before LLM calls, record usage after.
@@ -247,7 +317,7 @@ impl AgentLoop {
         model: Box<dyn Model>,
         mut dispatcher: ToolDispatcher,
         safety: SafetyStack,
-        spatial: Box<dyn SpatialContextProvider>,
+        spatial: Box<dyn WorldStateProvider>,
     ) -> Self {
         // Register once at construction time so repeated calls to `run` / `run_streaming`
         // on the same instance do not silently overwrite existing registration state.
@@ -258,7 +328,10 @@ impl AgentLoop {
             safety,
             spatial,
             retry_config: RetryConfig::default(),
-            pending_approvals: None,
+            system_prompt_seed: Vec::new(),
+            history_seed: Vec::new(),
+            user_message_seed: None,
+            approval_runtime: None,
             extensions: crate::dispatch::Extensions::default(),
             meter: std::sync::Arc::new(crate::meter::NoOpMeter),
         }
@@ -285,15 +358,100 @@ impl AgentLoop {
         self
     }
 
+    /// Wire the runtime-owned approval authority.
+    #[must_use]
+    pub fn with_approval_runtime(mut self, approval_runtime: crate::session_runtime::ApprovalRuntimeHandle) -> Self {
+        self.approval_runtime = Some(approval_runtime);
+        self
+    }
+
     /// Wire the D2 Roz-authoritative approval map.
     ///
-    /// When set, `SafetyResult::NeedsHuman` suspends the agent turn and
-    /// waits for an IDE `PermissionDecision` to resolve the approval instead
-    /// of auto-denying. The same map is held by the gRPC session loop.
+    /// Compatibility wrapper for legacy tests and call sites that still pass the
+    /// raw map directly instead of the runtime-owned handle.
+    #[cfg(test)]
     #[must_use]
     pub fn with_pending_approvals(mut self, map: crate::dispatch::remote::PendingApprovals) -> Self {
-        self.pending_approvals = Some(map);
+        if let Some(approval_runtime) = &mut self.approval_runtime {
+            approval_runtime.replace_pending_approvals(map);
+        } else {
+            self.approval_runtime = Some(crate::session_runtime::ApprovalRuntimeHandle::from_pending_approvals(
+                map,
+            ));
+        }
         self
+    }
+
+    /// Wire an external notification sink for `NeedsHuman` approvals.
+    #[must_use]
+    pub fn with_approval_notifications(
+        mut self,
+        tx: mpsc::Sender<crate::dispatch::remote::PendingApprovalRequest>,
+    ) -> Self {
+        self.approval_runtime
+            .get_or_insert_with(crate::session_runtime::ApprovalRuntimeHandle::default)
+            .set_approval_notifications(tx);
+        self
+    }
+
+    /// Seed the system prompt for the next run.
+    pub fn set_system_prompt_seed(&mut self, system_prompt: Vec<String>) {
+        self.system_prompt_seed = system_prompt;
+    }
+
+    /// Builder form of [`set_system_prompt_seed`](Self::set_system_prompt_seed).
+    #[must_use]
+    pub fn with_system_prompt_seed(mut self, system_prompt: Vec<String>) -> Self {
+        self.system_prompt_seed = system_prompt;
+        self
+    }
+
+    /// Seed the transcript history for the next run.
+    pub fn set_history_seed(&mut self, history: Vec<Message>) {
+        self.history_seed = history;
+    }
+
+    /// Builder form of [`set_history_seed`](Self::set_history_seed).
+    #[must_use]
+    pub fn with_history_seed(mut self, history: Vec<Message>) -> Self {
+        self.history_seed = history;
+        self
+    }
+
+    /// Seed the user message for the next run.
+    pub fn set_user_message_seed(&mut self, user_message: impl Into<String>) {
+        self.user_message_seed = Some(user_message.into());
+    }
+
+    /// Builder form of [`set_user_message_seed`](Self::set_user_message_seed).
+    #[must_use]
+    pub fn with_user_message_seed(mut self, user_message: impl Into<String>) -> Self {
+        self.user_message_seed = Some(user_message.into());
+        self
+    }
+
+    fn apply_input_seed(&mut self, seed: AgentInputSeed) {
+        self.system_prompt_seed = seed.system_prompt;
+        self.history_seed = seed.history;
+        self.user_message_seed = Some(seed.user_message);
+    }
+
+    /// Run with runtime-owned prompt/history/current-turn seeds.
+    pub async fn run_seeded(&mut self, input: AgentInput, seed: AgentInputSeed) -> Result<AgentOutput, AgentError> {
+        self.apply_input_seed(seed);
+        self.run(input).await
+    }
+
+    /// Streaming variant of [`run_seeded`](Self::run_seeded).
+    pub async fn run_streaming_seeded(
+        &mut self,
+        input: AgentInput,
+        seed: AgentInputSeed,
+        chunk_tx: mpsc::Sender<StreamChunk>,
+        presence_tx: mpsc::Sender<PresenceSignal>,
+    ) -> Result<AgentOutput, AgentError> {
+        self.apply_input_seed(seed);
+        self.run_streaming(input, chunk_tx, presence_tx).await
     }
 
     /// Build initial message list from system prompt blocks, history, and user message.
@@ -302,8 +460,13 @@ impl AgentLoop {
     /// is a system message (used later to strip it from the returned turn messages).
     fn build_messages(&self, input: &AgentInput) -> (Vec<Message>, bool) {
         let catalog = self.dispatcher.tool_catalog();
+        let system_prompt_blocks = if self.system_prompt_seed.is_empty() {
+            &input.seed.system_prompt
+        } else {
+            &self.system_prompt_seed
+        };
         let mut system_parts: Vec<ContentPart> = Vec::new();
-        for (i, block) in input.system_prompt.iter().enumerate() {
+        for (i, block) in system_prompt_blocks.iter().enumerate() {
             let text = if i == 0 && !catalog.is_empty() {
                 format!("{block}\n\n{catalog}")
             } else {
@@ -321,8 +484,13 @@ impl AgentLoop {
                 parts: system_parts,
             });
         }
-        messages.extend(input.history.clone());
-        messages.push(Message::user(input.user_message.clone()));
+        if self.history_seed.is_empty() {
+            messages.extend(input.seed.history.clone());
+        } else {
+            messages.extend(self.history_seed.clone());
+        }
+        let user_message = self.user_message_seed.as_deref().unwrap_or(&input.seed.user_message);
+        messages.push(Message::user(user_message.to_string()));
         (messages, has_system)
     }
 
@@ -622,6 +790,9 @@ impl AgentLoop {
 
         let ctx_mgr = ContextManager::new(input.max_context_tokens);
         let (mut messages, has_system) = self.build_messages(&input);
+        self.system_prompt_seed.clear();
+        self.history_seed.clear();
+        self.user_message_seed = None;
 
         let mut total_usage = TokenUsage::default();
         let mut cycles = 0u32;
@@ -789,8 +960,8 @@ impl AgentLoop {
 
             // Observe: get spatial context based on mode
             let spatial_ctx = match current_mode {
-                AgentLoopMode::React => SpatialContext::default(),
-                AgentLoopMode::OodaReAct => {
+                CognitionMode::React => WorldState::default(),
+                CognitionMode::OodaReAct => {
                     tracing::debug!("observing spatial context");
                     let ctx = self.spatial.snapshot(&input.task_id).await;
                     if ctx.entities.is_empty() && ctx.screenshots.is_empty() {
@@ -985,7 +1156,7 @@ impl AgentLoop {
         call: &roz_core::tools::ToolCall,
         reason: &str,
         timeout_secs: u64,
-        approvals: &crate::dispatch::remote::PendingApprovals,
+        approval_runtime: &crate::session_runtime::ApprovalRuntimeHandle,
         presence_tx: &mpsc::Sender<PresenceSignal>,
         tool_ctx: &ToolContext,
         cancellation_token: Option<&tokio_util::sync::CancellationToken>,
@@ -1004,60 +1175,296 @@ impl AgentLoop {
             })
             .await;
 
-        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-        {
-            let mut map = approvals.lock().expect("pending approvals mutex poisoned");
-            map.insert(call.id.clone(), tx);
-        }
+        let (tx, rx) = tokio::sync::oneshot::channel::<crate::dispatch::remote::ApprovalDecision>();
+        approval_runtime.register_pending_approval(call.id.clone(), tx);
+        approval_runtime
+            .notify_requested(crate::dispatch::remote::PendingApprovalRequest {
+                task_id: tool_ctx.task_id.clone(),
+                tool_call_id: call.id.clone(),
+                tool_name: call.tool.clone(),
+                tool_input: call.params.clone(),
+                reason: reason.to_string(),
+                timeout_secs,
+            })
+            .await;
+
+        let _ = presence_tx
+            .send(PresenceSignal::ApprovalRequested {
+                approval_id: call.id.clone(),
+                action: call.tool.clone(),
+                reason: reason.to_string(),
+                timeout_secs,
+            })
+            .await;
 
         let timed_rx = tokio::time::timeout(tokio::time::Duration::from_secs(timeout_secs), rx);
 
         // Race the approval wait against the session cancellation token so that
         // a cancelled session does not hang until the approval timeout expires.
-        let approved = if let Some(token) = cancellation_token {
+        let (decision, denial_reason) = if let Some(token) = cancellation_token {
             tokio::select! {
                 result = timed_rx => {
                     match result {
-                        Ok(Ok(v)) => v,
+                        Ok(Ok(v)) => {
+                            let denial_reason = if v.approved {
+                                None
+                            } else {
+                                Some("denied by user".to_string())
+                            };
+                            (v, denial_reason)
+                        }
                         Ok(Err(_)) => {
                             tracing::warn!(tool_call_id = %call.id, "approval channel closed unexpectedly");
-                            false
+                            (
+                                crate::dispatch::remote::ApprovalDecision { approved: false, modifier: None },
+                                Some("approval channel closed".to_string()),
+                            )
                         }
                         Err(_) => {
                             tracing::warn!(tool_call_id = %call.id, timeout_secs, "approval timed out");
-                            approvals.lock().expect("pending approvals mutex poisoned").remove(&call.id);
-                            false
+                            approval_runtime.remove_pending_approval(&call.id);
+                            (
+                                crate::dispatch::remote::ApprovalDecision { approved: false, modifier: None },
+                                Some("approval timed out".to_string()),
+                            )
                         }
                     }
                 }
                 () = token.cancelled() => {
                     tracing::info!(tool_call_id = %call.id, "approval wait cancelled by session");
-                    approvals.lock().expect("pending approvals mutex poisoned").remove(&call.id);
-                    false
+                    approval_runtime.remove_pending_approval(&call.id);
+                    (
+                        crate::dispatch::remote::ApprovalDecision { approved: false, modifier: None },
+                        Some("approval wait cancelled".to_string()),
+                    )
                 }
             }
         } else {
             match timed_rx.await {
-                Ok(Ok(v)) => v,
+                Ok(Ok(v)) => {
+                    let denial_reason = if v.approved {
+                        None
+                    } else {
+                        Some("denied by user".to_string())
+                    };
+                    (v, denial_reason)
+                }
                 Ok(Err(_)) => {
                     tracing::warn!(tool_call_id = %call.id, "approval channel closed unexpectedly");
-                    false
+                    (
+                        crate::dispatch::remote::ApprovalDecision {
+                            approved: false,
+                            modifier: None,
+                        },
+                        Some("approval channel closed".to_string()),
+                    )
                 }
                 Err(_) => {
                     tracing::warn!(tool_call_id = %call.id, timeout_secs, "approval timed out");
-                    approvals
-                        .lock()
-                        .expect("pending approvals mutex poisoned")
-                        .remove(&call.id);
-                    false
+                    approval_runtime.remove_pending_approval(&call.id);
+                    (
+                        crate::dispatch::remote::ApprovalDecision {
+                            approved: false,
+                            modifier: None,
+                        },
+                        Some("approval timed out".to_string()),
+                    )
                 }
             }
         };
 
-        if approved {
-            self.dispatcher.dispatch(call, tool_ctx).await
+        if decision.approved {
+            let effective_call = if let Some(modifier) = decision.modifier {
+                let mut modified = call.clone();
+                let approval_outcome = Self::approval_outcome_for_decision(
+                    &call.params,
+                    &crate::dispatch::remote::ApprovalDecision {
+                        approved: true,
+                        modifier: Some(modifier.clone()),
+                    },
+                    None,
+                );
+                let merged = match Self::merge_approval_modifier_into_value(call.params.clone(), modifier) {
+                    Ok(merged) => merged,
+                    Err(error) => {
+                        let _ = presence_tx
+                            .send(PresenceSignal::ApprovalResolved {
+                                approval_id: call.id.clone(),
+                                outcome: roz_core::session::feedback::ApprovalOutcome::Denied {
+                                    reason: Some(format!("invalid approval modifier: {error}")),
+                                    category: None,
+                                },
+                            })
+                            .await;
+                        return roz_core::tools::ToolResult::error(format!(
+                            "Invalid approval modifier for {}: {error}",
+                            call.tool
+                        ));
+                    }
+                };
+                let _ = presence_tx
+                    .send(PresenceSignal::ApprovalResolved {
+                        approval_id: call.id.clone(),
+                        outcome: approval_outcome,
+                    })
+                    .await;
+                modified.params = merged;
+                modified
+            } else {
+                let _ = presence_tx
+                    .send(PresenceSignal::ApprovalResolved {
+                        approval_id: call.id.clone(),
+                        outcome: roz_core::session::feedback::ApprovalOutcome::Approved,
+                    })
+                    .await;
+                call.clone()
+            };
+            self.dispatcher.dispatch(&effective_call, tool_ctx).await
         } else {
+            let approval_outcome = Self::approval_outcome_for_decision(&call.params, &decision, denial_reason);
+            let _ = presence_tx
+                .send(PresenceSignal::ApprovalResolved {
+                    approval_id: call.id.clone(),
+                    outcome: approval_outcome,
+                })
+                .await;
             roz_core::tools::ToolResult::error(format!("Permission denied by user for: {}", call.tool))
+        }
+    }
+
+    fn merge_approval_modifier_into_value(
+        base: serde_json::Value,
+        modifier: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        match (base, modifier) {
+            (serde_json::Value::Object(mut base_map), serde_json::Value::Object(modifier_map)) => {
+                for (key, value) in modifier_map {
+                    let Some(existing) = base_map.remove(&key) else {
+                        return Err(format!("modifier attempted to add unknown field '{key}'"));
+                    };
+                    let merged = Self::merge_approval_modifier_into_value(existing, value)?;
+                    base_map.insert(key, merged);
+                }
+                Ok(serde_json::Value::Object(base_map))
+            }
+            (serde_json::Value::Array(base_items), serde_json::Value::Array(modifier_items)) => {
+                if base_items.len() != modifier_items.len() {
+                    return Err(format!(
+                        "modifier cannot change array length from {} to {}",
+                        base_items.len(),
+                        modifier_items.len()
+                    ));
+                }
+                base_items
+                    .into_iter()
+                    .zip(modifier_items)
+                    .map(|(existing, value)| Self::merge_approval_modifier_into_value(existing, value))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(serde_json::Value::Array)
+            }
+            (serde_json::Value::Object(_), _) => {
+                Err("modifier cannot replace an object input with a non-object value".into())
+            }
+            (_, serde_json::Value::Object(_)) => {
+                Err("modifier cannot introduce a new object where the original input was not an object".into())
+            }
+            (serde_json::Value::Array(_), _) => {
+                Err("modifier cannot replace an array input with a non-array value".into())
+            }
+            (_, serde_json::Value::Array(_)) => {
+                Err("modifier cannot introduce a new array where the original input was not an array".into())
+            }
+            (serde_json::Value::Null, serde_json::Value::Null) => Ok(serde_json::Value::Null),
+            (serde_json::Value::Bool(_), serde_json::Value::Bool(value)) => Ok(serde_json::Value::Bool(value)),
+            (serde_json::Value::Number(_), serde_json::Value::Number(value)) => Ok(serde_json::Value::Number(value)),
+            (serde_json::Value::String(_), serde_json::Value::String(value)) => Ok(serde_json::Value::String(value)),
+            (base, modifier) => Err(format!(
+                "modifier cannot change value type from '{}' to '{}'",
+                Self::json_value_kind(&base),
+                Self::json_value_kind(&modifier)
+            )),
+        }
+    }
+
+    const fn json_value_kind(value: &serde_json::Value) -> &'static str {
+        match value {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "bool",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "object",
+        }
+    }
+
+    fn approval_outcome_for_decision(
+        base: &serde_json::Value,
+        decision: &crate::dispatch::remote::ApprovalDecision,
+        denial_reason: Option<String>,
+    ) -> roz_core::session::feedback::ApprovalOutcome {
+        if !decision.approved {
+            return roz_core::session::feedback::ApprovalOutcome::Denied {
+                reason: denial_reason,
+                category: None,
+            };
+        }
+
+        let Some(modifier) = decision.modifier.as_ref() else {
+            return roz_core::session::feedback::ApprovalOutcome::Approved;
+        };
+
+        let mut modifications = Vec::new();
+        Self::collect_modifier_changes(base, modifier, "", &mut modifications);
+        if modifications.is_empty() {
+            roz_core::session::feedback::ApprovalOutcome::Approved
+        } else {
+            roz_core::session::feedback::ApprovalOutcome::Modified { modifications }
+        }
+    }
+
+    fn collect_modifier_changes(
+        base: &serde_json::Value,
+        modifier: &serde_json::Value,
+        path: &str,
+        modifications: &mut Vec<roz_core::session::feedback::Modification>,
+    ) {
+        match (base, modifier) {
+            (serde_json::Value::Object(base_map), serde_json::Value::Object(modifier_map)) => {
+                for (key, value) in modifier_map {
+                    if let Some(existing) = base_map.get(key) {
+                        let next_path = if path.is_empty() {
+                            key.clone()
+                        } else {
+                            format!("{path}.{key}")
+                        };
+                        Self::collect_modifier_changes(existing, value, &next_path, modifications);
+                    }
+                }
+            }
+            (serde_json::Value::Array(base_items), serde_json::Value::Array(modifier_items)) => {
+                for (index, (existing, value)) in base_items.iter().zip(modifier_items.iter()).enumerate() {
+                    let next_path = if path.is_empty() {
+                        format!("[{index}]")
+                    } else {
+                        format!("{path}[{index}]")
+                    };
+                    Self::collect_modifier_changes(existing, value, &next_path, modifications);
+                }
+            }
+            _ => {
+                if base != modifier {
+                    modifications.push(roz_core::session::feedback::Modification {
+                        field: if path.is_empty() {
+                            "$".to_string()
+                        } else {
+                            path.to_string()
+                        },
+                        old_value: base.to_string(),
+                        new_value: modifier.to_string(),
+                        reason: None,
+                    });
+                }
+            }
         }
     }
 
@@ -1067,7 +1474,7 @@ impl AgentLoop {
     async fn dispatch_tool_calls(
         &self,
         tool_calls: &[roz_core::tools::ToolCall],
-        spatial_ctx: &SpatialContext,
+        spatial_ctx: &WorldState,
         tool_ctx: &ToolContext,
         messages: &mut Vec<Message>,
         presence_tx: &mpsc::Sender<PresenceSignal>,
@@ -1103,20 +1510,22 @@ impl AgentLoop {
                     roz_core::tools::ToolResult::error(format!("Blocked by {guard}: {reason}"))
                 }
                 SafetyResult::NeedsHuman { reason, timeout_secs } => {
-                    if let Some(ref approvals) = self.pending_approvals {
+                    if let Some(ref approval_runtime) = self.approval_runtime {
                         self.wait_for_human_approval(
                             call,
                             &reason,
                             timeout_secs,
-                            approvals,
+                            approval_runtime,
                             presence_tx,
                             tool_ctx,
                             cancellation_token,
                         )
                         .await
                     } else {
-                        // No approval map wired — fall back to auto-deny (legacy behavior).
-                        roz_core::tools::ToolResult::error(format!("Requires human approval: {reason}"))
+                        tracing::error!(tool = %call.tool, reason = %reason, "human approval required but no runtime approval authority is configured");
+                        roz_core::tools::ToolResult::error(format!(
+                            "Human approval required but no approval runtime is configured: {reason}"
+                        ))
                     }
                 }
             };
@@ -1229,6 +1638,9 @@ impl AgentLoop {
 
         let ctx_mgr = ContextManager::new(input.max_context_tokens);
         let (mut messages, has_system) = self.build_messages(&input);
+        self.system_prompt_seed.clear();
+        self.history_seed.clear();
+        self.user_message_seed = None;
 
         let mut total_usage = TokenUsage::default();
         let mut cycles = 0u32;
@@ -1374,8 +1786,8 @@ impl AgentLoop {
 
             // Observe: get spatial context based on mode
             let spatial_ctx = match current_mode {
-                AgentLoopMode::React => SpatialContext::default(),
-                AgentLoopMode::OodaReAct => {
+                CognitionMode::React => WorldState::default(),
+                CognitionMode::OodaReAct => {
                     tracing::debug!("observing spatial context");
                     let ctx = self.spatial.snapshot(&input.task_id).await;
                     if ctx.entities.is_empty() && ctx.screenshots.is_empty() {
@@ -1525,7 +1937,7 @@ impl AgentLoop {
 }
 
 /// Format spatial context as a human-readable string for injection into model messages.
-fn format_spatial_context(ctx: &SpatialContext) -> String {
+fn format_spatial_context(ctx: &WorldState) -> String {
     use std::fmt::Write;
 
     let mut lines = Vec::new();
@@ -1566,7 +1978,7 @@ fn format_spatial_context(ctx: &SpatialContext) -> String {
 /// When screenshots are present, returns a user message with both text and
 /// image content blocks (Anthropic requires images in user messages).
 /// Otherwise returns a system message with text-only observation.
-fn build_spatial_observation(ctx: &SpatialContext) -> Message {
+fn build_spatial_observation(ctx: &WorldState) -> Message {
     let formatted = format_spatial_context(ctx);
     let observation_text = format!("[Spatial Observation]\n{formatted}");
     if ctx.screenshots.is_empty() {
@@ -1649,8 +2061,11 @@ mod tests {
             task_id: "test-task".into(),
             tenant_id: "test-tenant".into(),
             model_name: String::new(),
-            system_prompt: vec!["You are a robot arm controller.".into()],
-            user_message: "Move the arm to x=1".into(),
+            seed: AgentInputSeed::new(
+                vec!["You are a robot arm controller.".into()],
+                vec![],
+                "Move the arm to x=1",
+            ),
             max_cycles: 10,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -1659,7 +2074,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -1708,8 +2122,7 @@ mod tests {
             task_id: "test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec![],
-            user_message: "Go".into(),
+            seed: AgentInputSeed::new(vec![], vec![], "Go"),
             max_cycles: 3,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -1718,7 +2131,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -1739,7 +2151,7 @@ mod tests {
             fn name(&self) -> &'static str {
                 "block_dangerous"
             }
-            async fn check(&self, action: &ToolCall, _state: &SpatialContext) -> SafetyVerdict {
+            async fn check(&self, action: &ToolCall, _state: &WorldState) -> SafetyVerdict {
                 if action.tool == "self_destruct" {
                     SafetyVerdict::Block {
                         reason: "self_destruct is forbidden".into(),
@@ -1808,8 +2220,7 @@ mod tests {
             task_id: "safety-test".into(),
             tenant_id: "test-tenant".into(),
             model_name: String::new(),
-            system_prompt: vec!["You are a safe robot.".into()],
-            user_message: "Do something".into(),
+            seed: AgentInputSeed::new(vec!["You are a safe robot.".into()], vec![], "Do something"),
             max_cycles: 10,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -1818,7 +2229,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -1879,8 +2289,7 @@ mod tests {
             task_id: "clamp-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec![],
-            user_message: "Move fast".into(),
+            seed: AgentInputSeed::new(vec![], vec![], "Move fast"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -1889,7 +2298,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -1928,8 +2336,7 @@ mod tests {
             task_id: "react-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["You are a helpful assistant.".into()],
-            user_message: "Say hello".into(),
+            seed: AgentInputSeed::new(vec!["You are a helpful assistant.".into()], vec![], "Say hello"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -1938,7 +2345,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -1993,7 +2399,7 @@ mod tests {
             requests: recorded_requests.clone(),
         };
 
-        let ctx = SpatialContext {
+        let ctx = WorldState {
             entities: vec![EntityState {
                 id: "arm_1".to_string(),
                 kind: "robot_arm".to_string(),
@@ -2002,7 +2408,8 @@ mod tests {
                 velocity: Some([0.1, 0.0, 0.0]),
                 properties: HashMap::new(),
                 timestamp_ns: None,
-                frame_id: None,
+                frame_id: "world".into(),
+                ..Default::default()
             }],
             relations: vec![],
             constraints: vec![],
@@ -2012,6 +2419,7 @@ mod tests {
                 source: "safety_monitor".to_string(),
             }],
             screenshots: vec![],
+            ..Default::default()
         };
 
         let spatial = Box::new(MockSpatialContextProvider::new(ctx));
@@ -2024,8 +2432,7 @@ mod tests {
             task_id: "spatial-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["You are a robot controller.".into()],
-            user_message: "Check the scene".into(),
+            seed: AgentInputSeed::new(vec!["You are a robot controller.".into()], vec![], "Check the scene"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -2034,7 +2441,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -2115,7 +2521,7 @@ mod tests {
             requests: recorded_requests.clone(),
         };
 
-        let ctx = SpatialContext {
+        let ctx = WorldState {
             entities: vec![EntityState {
                 id: "arm_1".to_string(),
                 kind: "robot_arm".to_string(),
@@ -2124,7 +2530,8 @@ mod tests {
                 velocity: None,
                 properties: HashMap::new(),
                 timestamp_ns: None,
-                frame_id: None,
+                frame_id: "world".into(),
+                ..Default::default()
             }],
             relations: vec![],
             constraints: vec![],
@@ -2135,6 +2542,7 @@ mod tests {
                 data: "iVBORw0KGgoAAAANSUhEUg==".to_string(),
                 depth_data: None,
             }],
+            ..Default::default()
         };
 
         let spatial = Box::new(MockSpatialContextProvider::new(ctx));
@@ -2147,8 +2555,7 @@ mod tests {
             task_id: "screenshot-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["You are a robot controller.".into()],
-            user_message: "Inspect the scene".into(),
+            seed: AgentInputSeed::new(vec!["You are a robot controller.".into()], vec![], "Inspect the scene"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -2157,7 +2564,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -2238,7 +2644,7 @@ mod tests {
         };
 
         // No screenshots
-        let ctx = SpatialContext {
+        let ctx = WorldState {
             entities: vec![EntityState {
                 id: "arm_1".to_string(),
                 kind: "robot_arm".to_string(),
@@ -2247,12 +2653,14 @@ mod tests {
                 velocity: None,
                 properties: HashMap::new(),
                 timestamp_ns: None,
-                frame_id: None,
+                frame_id: "world".into(),
+                ..Default::default()
             }],
             relations: vec![],
             constraints: vec![],
             alerts: vec![],
             screenshots: vec![],
+            ..Default::default()
         };
 
         let spatial = Box::new(MockSpatialContextProvider::new(ctx));
@@ -2265,8 +2673,7 @@ mod tests {
             task_id: "no-screenshot-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["You are a robot controller.".into()],
-            user_message: "Inspect the scene".into(),
+            seed: AgentInputSeed::new(vec!["You are a robot controller.".into()], vec![], "Inspect the scene"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -2275,7 +2682,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -2308,13 +2714,13 @@ mod tests {
 
     #[test]
     fn format_spatial_context_empty() {
-        let ctx = SpatialContext::default();
+        let ctx = WorldState::default();
         assert_eq!(format_spatial_context(&ctx), "No spatial observations.");
     }
 
     #[test]
     fn format_spatial_context_with_entities_and_alerts() {
-        let ctx = SpatialContext {
+        let ctx = WorldState {
             entities: vec![
                 EntityState {
                     id: "arm_1".to_string(),
@@ -2324,7 +2730,8 @@ mod tests {
                     velocity: Some([0.5, 0.0, 0.0]),
                     properties: HashMap::new(),
                     timestamp_ns: None,
-                    frame_id: None,
+                    frame_id: "world".into(),
+                    ..Default::default()
                 },
                 EntityState {
                     id: "sensor_1".to_string(),
@@ -2334,7 +2741,8 @@ mod tests {
                     velocity: None,
                     properties: HashMap::new(),
                     timestamp_ns: None,
-                    frame_id: None,
+                    frame_id: "world".into(),
+                    ..Default::default()
                 },
             ],
             relations: vec![],
@@ -2356,6 +2764,7 @@ mod tests {
                 source: "motor_driver".to_string(),
             }],
             screenshots: vec![],
+            ..Default::default()
         };
 
         let formatted = format_spatial_context(&ctx);
@@ -2381,16 +2790,16 @@ mod tests {
     }
 
     #[test]
-    fn agent_loop_mode_serde() {
-        let json = serde_json::to_string(&AgentLoopMode::React).unwrap();
+    fn cognition_mode_serde() {
+        let json = serde_json::to_string(&CognitionMode::React).unwrap();
         assert_eq!(json, "\"react\"");
-        let json = serde_json::to_string(&AgentLoopMode::OodaReAct).unwrap();
-        assert_eq!(json, "\"ooda_re_act\"");
+        let json = serde_json::to_string(&CognitionMode::OodaReAct).unwrap();
+        assert_eq!(json, "\"ooda_react\"");
 
-        let mode: AgentLoopMode = serde_json::from_str("\"react\"").unwrap();
-        assert_eq!(mode, AgentLoopMode::React);
-        let mode: AgentLoopMode = serde_json::from_str("\"ooda_re_act\"").unwrap();
-        assert_eq!(mode, AgentLoopMode::OodaReAct);
+        let mode: CognitionMode = serde_json::from_str("\"react\"").unwrap();
+        assert_eq!(mode, CognitionMode::React);
+        let mode: CognitionMode = serde_json::from_str("\"ooda_react\"").unwrap();
+        assert_eq!(mode, CognitionMode::OodaReAct);
     }
 
     // --- RetryConfig defaults ---
@@ -2505,8 +2914,7 @@ mod tests {
             task_id: "retry-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["System".into()],
-            user_message: "Hello".into(),
+            seed: AgentInputSeed::new(vec!["System".into()], vec![], "Hello"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -2515,7 +2923,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -2560,8 +2967,7 @@ mod tests {
             task_id: "fatal-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["System".into()],
-            user_message: "Hello".into(),
+            seed: AgentInputSeed::new(vec!["System".into()], vec![], "Hello"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -2570,7 +2976,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -2688,8 +3093,7 @@ mod tests {
             task_id: "compact-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec![big_system.clone()],
-            user_message: big_user,
+            seed: AgentInputSeed::new(vec![big_system.clone()], vec![], big_user),
             max_cycles: 5,
             // Small token budget so compaction triggers after cycle 1
             max_tokens: 200,
@@ -2699,7 +3103,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -2834,8 +3237,7 @@ mod tests {
             task_id: "tool-id-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["You have sensors.".into()],
-            user_message: "Read the lidar".into(),
+            seed: AgentInputSeed::new(vec!["You have sensors.".into()], vec![], "Read the lidar"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -2844,7 +3246,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -2988,8 +3389,7 @@ mod tests {
             task_id: "catalog-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["You are a robot controller.".into()],
-            user_message: "Move the arm".into(),
+            seed: AgentInputSeed::new(vec!["You are a robot controller.".into()], vec![], "Move the arm"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -2998,7 +3398,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -3077,8 +3476,7 @@ mod tests {
             task_id: "no-catalog-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["You are a helpful assistant.".into()],
-            user_message: "Hello".into(),
+            seed: AgentInputSeed::new(vec!["You are a helpful assistant.".into()], vec![], "Hello"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -3087,7 +3485,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -3157,8 +3554,7 @@ mod tests {
             task_id: "tool-choice-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["You are a test assistant.".into()],
-            user_message: "Test".into(),
+            seed: AgentInputSeed::new(vec!["You are a test assistant.".into()], vec![], "Test"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -3167,7 +3563,6 @@ mod tests {
             tool_choice: Some(ToolChoiceStrategy::Any),
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -3225,8 +3620,7 @@ mod tests {
             task_id: "tool-choice-none-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["You are a test assistant.".into()],
-            user_message: "Test".into(),
+            seed: AgentInputSeed::new(vec!["You are a test assistant.".into()], vec![], "Test"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -3235,7 +3629,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -3317,8 +3710,7 @@ mod tests {
             task_id: "respond-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["You are a test assistant.".into()],
-            user_message: "What is the answer?".into(),
+            seed: AgentInputSeed::new(vec!["You are a test assistant.".into()], vec![], "What is the answer?"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -3327,7 +3719,6 @@ mod tests {
             tool_choice: None,
             response_schema: Some(schema.clone()),
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -3377,7 +3768,7 @@ mod tests {
             fn name(&self) -> &'static str {
                 "panic_if_respond"
             }
-            async fn check(&self, action: &roz_core::tools::ToolCall, _state: &SpatialContext) -> SafetyVerdict {
+            async fn check(&self, action: &roz_core::tools::ToolCall, _state: &WorldState) -> SafetyVerdict {
                 if action.tool == RESPOND_TOOL_NAME {
                     panic!("__respond should never be sent to the safety stack!");
                 }
@@ -3420,8 +3811,7 @@ mod tests {
             task_id: "respond-dispatch-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["Return structured output.".into()],
-            user_message: "Give me results.".into(),
+            seed: AgentInputSeed::new(vec!["Return structured output.".into()], vec![], "Give me results."),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -3430,7 +3820,6 @@ mod tests {
             tool_choice: None,
             response_schema: Some(schema),
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -3496,8 +3885,7 @@ mod tests {
             task_id: "mixed-respond-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["Structured output test.".into()],
-            user_message: "Read and respond.".into(),
+            seed: AgentInputSeed::new(vec!["Structured output test.".into()], vec![], "Read and respond."),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -3506,7 +3894,6 @@ mod tests {
             tool_choice: None,
             response_schema: Some(schema),
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -3569,8 +3956,7 @@ mod tests {
             task_id: "no-schema-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["You are a test assistant.".into()],
-            user_message: "Hello".into(),
+            seed: AgentInputSeed::new(vec!["You are a test assistant.".into()], vec![], "Hello"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -3579,7 +3965,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -3636,8 +4021,7 @@ mod tests {
             task_id: "equiv-ns".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["You are a test assistant.".into()],
-            user_message: "Say hello".into(),
+            seed: AgentInputSeed::new(vec!["You are a test assistant.".into()], vec![], "Say hello"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -3646,7 +4030,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -3664,8 +4047,7 @@ mod tests {
             task_id: "equiv-s".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["You are a test assistant.".into()],
-            user_message: "Say hello".into(),
+            seed: AgentInputSeed::new(vec!["You are a test assistant.".into()], vec![], "Say hello"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -3674,7 +4056,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: true,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -3768,8 +4149,11 @@ mod tests {
             task_id: "stream-tools".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["You are a robot arm controller.".into()],
-            user_message: "Move the arm to x=1".into(),
+            seed: AgentInputSeed::new(
+                vec!["You are a robot arm controller.".into()],
+                vec![],
+                "Move the arm to x=1",
+            ),
             max_cycles: 10,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -3778,7 +4162,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: true,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -3852,8 +4235,7 @@ mod tests {
             task_id: "stream-assemble".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["Sensor controller.".into()],
-            user_message: "Read the lidar".into(),
+            seed: AgentInputSeed::new(vec!["Sensor controller.".into()], vec![], "Read the lidar"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -3862,7 +4244,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: true,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -3908,8 +4289,7 @@ mod tests {
             task_id: "stream-thinking".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["Think carefully.".into()],
-            user_message: "What is 6*7?".into(),
+            seed: AgentInputSeed::new(vec!["Think carefully.".into()], vec![], "What is 6*7?"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -3918,7 +4298,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: true,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -4083,8 +4462,7 @@ mod tests {
             task_id: "mixed-dispatch-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec![],
-            user_message: "Do three things".into(),
+            seed: AgentInputSeed::new(vec![], vec![], "Do three things"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -4093,7 +4471,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -4238,8 +4615,7 @@ mod tests {
             task_id: "order-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec![],
-            user_message: "Go".into(),
+            seed: AgentInputSeed::new(vec![], vec![], "Go"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -4248,7 +4624,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -4312,7 +4687,7 @@ mod tests {
             fn name(&self) -> &'static str {
                 "block_physical"
             }
-            async fn check(&self, action: &ToolCall, _state: &SpatialContext) -> SafetyVerdict {
+            async fn check(&self, action: &ToolCall, _state: &WorldState) -> SafetyVerdict {
                 if action.tool == "dangerous_arm" {
                     SafetyVerdict::Block {
                         reason: "arm movement blocked".into(),
@@ -4406,8 +4781,7 @@ mod tests {
             task_id: "safety-mixed".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec![],
-            user_message: "Go".into(),
+            seed: AgentInputSeed::new(vec![], vec![], "Go"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -4416,7 +4790,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -4482,7 +4855,7 @@ mod tests {
             fn name(&self) -> &'static str {
                 "block_all"
             }
-            async fn check(&self, _action: &ToolCall, _state: &SpatialContext) -> SafetyVerdict {
+            async fn check(&self, _action: &ToolCall, _state: &WorldState) -> SafetyVerdict {
                 SafetyVerdict::Block {
                     reason: "all tools blocked".into(),
                 }
@@ -4535,8 +4908,7 @@ mod tests {
             task_id: "pure-bypass".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec![],
-            user_message: "Calculate".into(),
+            seed: AgentInputSeed::new(vec![], vec![], "Calculate"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -4545,7 +4917,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -4620,8 +4991,7 @@ mod tests {
             task_id: "stream-test".into(),
             tenant_id: "test-tenant".into(),
             model_name: String::new(),
-            system_prompt: vec!["You are a robot controller.".into()],
-            user_message: "Move the arm.".into(),
+            seed: AgentInputSeed::new(vec!["You are a robot controller.".into()], vec![], "Move the arm."),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -4630,7 +5000,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: true,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -4690,8 +5059,7 @@ mod tests {
             task_id: "streaming-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["You are helpful.".into()],
-            user_message: "Say hello".into(),
+            seed: AgentInputSeed::new(vec!["You are helpful.".into()], vec![], "Say hello"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -4700,7 +5068,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: true,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -4774,8 +5141,7 @@ mod tests {
             task_id: "non-streaming-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["System".into()],
-            user_message: "Hello".into(),
+            seed: AgentInputSeed::new(vec!["System".into()], vec![], "Hello"),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -4784,7 +5150,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -4858,8 +5223,11 @@ mod tests {
             task_id: "history-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["You are a helpful assistant.".into()],
-            user_message: "Do you remember what I asked before?".into(),
+            seed: AgentInputSeed::new(
+                vec!["You are a helpful assistant.".into()],
+                history,
+                "Do you remember what I asked before?",
+            ),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -4868,7 +5236,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: true,
-            history,
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -4907,6 +5274,248 @@ mod tests {
             output.final_response.as_deref(),
             Some("I remember our previous conversation!")
         );
+    }
+
+    #[tokio::test]
+    async fn agent_loop_run_streaming_with_seeded_history() {
+        struct RecordingModel {
+            inner: MockModel,
+            requests: std::sync::Arc<parking_lot::Mutex<Vec<CompletionRequest>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Model for RecordingModel {
+            fn capabilities(&self) -> Vec<ModelCapability> {
+                self.inner.capabilities()
+            }
+
+            async fn complete(
+                &self,
+                req: &CompletionRequest,
+            ) -> Result<CompletionResponse, Box<dyn std::error::Error + Send + Sync>> {
+                self.requests.lock().push(req.clone());
+                self.inner.complete(req).await
+            }
+        }
+
+        let recorded_requests = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let responses = vec![CompletionResponse {
+            parts: vec![ContentPart::Text {
+                text: "I remember our previous conversation!".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage {
+                input_tokens: 30,
+                output_tokens: 10,
+                ..Default::default()
+            },
+        }];
+
+        let recording_model = RecordingModel {
+            inner: MockModel::new(vec![ModelCapability::TextReasoning], responses),
+            requests: recorded_requests.clone(),
+        };
+
+        let dispatcher = ToolDispatcher::new(Duration::from_secs(5));
+        let safety = SafetyStack::new(vec![]);
+        let spatial = Box::new(PanicSpatialProvider);
+        let history = vec![Message::user("What is 2+2?"), Message::assistant_text("4")];
+        let mut agent =
+            AgentLoop::new(Box::new(recording_model), dispatcher, safety, spatial).with_history_seed(history);
+
+        let (chunk_tx, _chunk_rx) = mpsc::channel::<StreamChunk>(64);
+        let input = AgentInput {
+            task_id: "seeded-history-test".into(),
+            tenant_id: "test".into(),
+            model_name: String::new(),
+            seed: AgentInputSeed::new(
+                vec!["You are a helpful assistant.".into()],
+                Vec::new(),
+                "Do you remember what I asked before?",
+            ),
+            max_cycles: 5,
+            max_tokens: 4096,
+            max_context_tokens: 200_000,
+            mode: AgentLoopMode::React,
+            phases: vec![],
+            tool_choice: None,
+            response_schema: None,
+            streaming: true,
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
+        };
+
+        let (presence_tx, _presence_rx) = mpsc::channel(16);
+        let output = agent.run_streaming(input, chunk_tx, presence_tx).await.unwrap();
+
+        let requests = recorded_requests.lock();
+        assert_eq!(requests.len(), 1, "expected exactly 1 model call");
+        let req = &requests[0];
+        assert!(req.messages.len() >= 4);
+        assert_eq!(req.messages[1].role, MessageRole::User);
+        assert_eq!(req.messages[2].role, MessageRole::Assistant);
+        assert_eq!(req.messages[3].role, MessageRole::User);
+
+        assert!(output.messages.len() >= 4);
+        assert_eq!(output.messages[0].role, MessageRole::User);
+        assert_eq!(output.messages[1].role, MessageRole::Assistant);
+        assert_eq!(output.messages[2].role, MessageRole::User);
+        assert_eq!(output.messages[3].role, MessageRole::Assistant);
+    }
+
+    #[tokio::test]
+    async fn agent_loop_run_streaming_with_seeded_system_prompt() {
+        struct RecordingModel {
+            inner: MockModel,
+            requests: std::sync::Arc<parking_lot::Mutex<Vec<CompletionRequest>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Model for RecordingModel {
+            fn capabilities(&self) -> Vec<ModelCapability> {
+                self.inner.capabilities()
+            }
+
+            async fn complete(
+                &self,
+                req: &CompletionRequest,
+            ) -> Result<CompletionResponse, Box<dyn std::error::Error + Send + Sync>> {
+                self.requests.lock().push(req.clone());
+                self.inner.complete(req).await
+            }
+        }
+
+        let recorded_requests = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let responses = vec![CompletionResponse {
+            parts: vec![ContentPart::Text {
+                text: "Seeded prompt used.".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage {
+                input_tokens: 15,
+                output_tokens: 5,
+                ..Default::default()
+            },
+        }];
+
+        let recording_model = RecordingModel {
+            inner: MockModel::new(vec![ModelCapability::TextReasoning], responses),
+            requests: recorded_requests.clone(),
+        };
+
+        let dispatcher = ToolDispatcher::new(Duration::from_secs(5));
+        let safety = SafetyStack::new(vec![]);
+        let spatial = Box::new(PanicSpatialProvider);
+        let mut agent = AgentLoop::new(Box::new(recording_model), dispatcher, safety, spatial)
+            .with_system_prompt_seed(vec!["SEEDED SYSTEM PROMPT".into()]);
+
+        let (chunk_tx, _chunk_rx) = mpsc::channel::<StreamChunk>(64);
+        let input = AgentInput {
+            task_id: "seeded-system-prompt-test".into(),
+            tenant_id: "test".into(),
+            model_name: String::new(),
+            seed: AgentInputSeed::new(Vec::new(), Vec::new(), "hello"),
+            max_cycles: 5,
+            max_tokens: 4096,
+            max_context_tokens: 200_000,
+            mode: AgentLoopMode::React,
+            phases: vec![],
+            tool_choice: None,
+            response_schema: None,
+            streaming: true,
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
+        };
+
+        let (presence_tx, _presence_rx) = mpsc::channel(16);
+        let _output = agent.run_streaming(input, chunk_tx, presence_tx).await.unwrap();
+
+        let requests = recorded_requests.lock();
+        assert_eq!(requests.len(), 1, "expected exactly 1 model call");
+        let req = &requests[0];
+        assert_eq!(req.messages[0].role, MessageRole::System);
+        assert!(
+            req.messages[0]
+                .text()
+                .as_deref()
+                .is_some_and(|text| text.contains("SEEDED SYSTEM PROMPT")),
+            "seeded system prompt should be present in the first message"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_loop_run_streaming_with_seeded_user_message() {
+        struct RecordingModel {
+            inner: MockModel,
+            requests: std::sync::Arc<parking_lot::Mutex<Vec<CompletionRequest>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Model for RecordingModel {
+            fn capabilities(&self) -> Vec<ModelCapability> {
+                self.inner.capabilities()
+            }
+
+            async fn complete(
+                &self,
+                req: &CompletionRequest,
+            ) -> Result<CompletionResponse, Box<dyn std::error::Error + Send + Sync>> {
+                self.requests.lock().push(req.clone());
+                self.inner.complete(req).await
+            }
+        }
+
+        let recorded_requests = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let responses = vec![CompletionResponse {
+            parts: vec![ContentPart::Text {
+                text: "Seeded user message used.".into(),
+            }],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage {
+                input_tokens: 15,
+                output_tokens: 5,
+                ..Default::default()
+            },
+        }];
+
+        let recording_model = RecordingModel {
+            inner: MockModel::new(vec![ModelCapability::TextReasoning], responses),
+            requests: recorded_requests.clone(),
+        };
+
+        let dispatcher = ToolDispatcher::new(Duration::from_secs(5));
+        let safety = SafetyStack::new(vec![]);
+        let spatial = Box::new(PanicSpatialProvider);
+        let mut agent = AgentLoop::new(Box::new(recording_model), dispatcher, safety, spatial)
+            .with_user_message_seed("SEEDED USER MESSAGE");
+
+        let (chunk_tx, _chunk_rx) = mpsc::channel::<StreamChunk>(64);
+        let input = AgentInput {
+            task_id: "seeded-user-message-test".into(),
+            tenant_id: "test".into(),
+            model_name: String::new(),
+            seed: AgentInputSeed::new(Vec::new(), Vec::new(), "IGNORED PLACEHOLDER"),
+            max_cycles: 5,
+            max_tokens: 4096,
+            max_context_tokens: 200_000,
+            mode: AgentLoopMode::React,
+            phases: vec![],
+            tool_choice: None,
+            response_schema: None,
+            streaming: true,
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
+        };
+
+        let (presence_tx, _presence_rx) = mpsc::channel(16);
+        let _output = agent.run_streaming(input, chunk_tx, presence_tx).await.unwrap();
+
+        let requests = recorded_requests.lock();
+        assert_eq!(requests.len(), 1, "expected exactly 1 model call");
+        let req = &requests[0];
+        let last = req.messages.last().expect("expected user message");
+        assert_eq!(last.role, MessageRole::User);
+        assert_eq!(last.text().as_deref(), Some("SEEDED USER MESSAGE"));
     }
 
     /// Regression test: when the model calls 2+ tools in one
@@ -4974,8 +5583,11 @@ mod tests {
             task_id: "multi-tool-batch".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["You are a robot controller.".into()],
-            user_message: "Move arm and read sensor".into(),
+            seed: AgentInputSeed::new(
+                vec!["You are a robot controller.".into()],
+                vec![],
+                "Move arm and read sensor",
+            ),
             max_cycles: 10,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -4984,7 +5596,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -5063,8 +5674,7 @@ mod tests {
             task_id: "presence-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec!["Be brief.".into()],
-            user_message: "Hi".into(),
+            seed: AgentInputSeed::new(vec!["Be brief.".into()], vec![], "Hi"),
             max_cycles: 3,
             max_tokens: 256,
             max_context_tokens: 200_000,
@@ -5073,7 +5683,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: true,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -5126,6 +5735,12 @@ mod tests {
                     level.as_str()
                 );
             }
+            PresenceSignal::ApprovalRequested { approval_id, .. } => {
+                panic!("final signal should not be ApprovalRequested({approval_id})");
+            }
+            PresenceSignal::ApprovalResolved { approval_id, .. } => {
+                panic!("final signal should not be ApprovalResolved({approval_id})");
+            }
         }
     }
 
@@ -5139,8 +5754,7 @@ mod tests {
             task_id: "cb-test".into(),
             tenant_id: "test".into(),
             model_name: String::new(),
-            system_prompt: vec![],
-            user_message: "Go".into(),
+            seed: AgentInputSeed::new(vec![], vec![], "Go"),
             max_cycles,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -5149,7 +5763,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         }
@@ -5435,7 +6048,7 @@ mod tests {
             fn name(&self) -> &'static str {
                 "require_human_approval"
             }
-            async fn check(&self, _action: &ToolCall, _state: &SpatialContext) -> SafetyVerdict {
+            async fn check(&self, _action: &ToolCall, _state: &WorldState) -> SafetyVerdict {
                 SafetyVerdict::RequireConfirmation {
                     reason: "sensitive operation".into(),
                     timeout_secs: 10,
@@ -5451,7 +6064,7 @@ mod tests {
             fn name(&self) -> &'static str {
                 "immediate_timeout"
             }
-            async fn check(&self, _action: &ToolCall, _state: &SpatialContext) -> SafetyVerdict {
+            async fn check(&self, _action: &ToolCall, _state: &WorldState) -> SafetyVerdict {
                 SafetyVerdict::RequireConfirmation {
                     reason: "needs approval".into(),
                     timeout_secs: 0, // zero duration → immediate timeout
@@ -5464,8 +6077,7 @@ mod tests {
                 task_id: "approval-test".into(),
                 tenant_id: "test-tenant".into(),
                 model_name: String::new(),
-                system_prompt: vec![],
-                user_message: "Run the sensitive op".into(),
+                seed: AgentInputSeed::new(vec![], vec![], "Run the sensitive op"),
                 max_cycles: 5,
                 max_tokens: 4096,
                 max_context_tokens: 200_000,
@@ -5474,10 +6086,33 @@ mod tests {
                 tool_choice: None,
                 response_schema: None,
                 streaming: false,
-                history: vec![],
                 cancellation_token: None,
                 control_mode: roz_core::safety::ControlMode::default(),
             }
+        }
+    }
+
+    struct RecordingModifierTool {
+        seen_params: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::dispatch::ToolExecutor for RecordingModifierTool {
+        fn schema(&self) -> roz_core::tools::ToolSchema {
+            roz_core::tools::ToolSchema {
+                name: "sensitive_op".into(),
+                description: "records approved params".into(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+
+        async fn execute(
+            &self,
+            params: serde_json::Value,
+            _ctx: &crate::dispatch::ToolContext,
+        ) -> Result<roz_core::tools::ToolResult, Box<dyn std::error::Error + Send + Sync>> {
+            *self.seen_params.lock().unwrap() = Some(params.clone());
+            Ok(roz_core::tools::ToolResult::success(params))
         }
     }
 
@@ -5535,7 +6170,7 @@ mod tests {
         let pa = pending.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            resolve_approval(&pa, "toolu_sensitive_1", true);
+            resolve_approval(&pa, "toolu_sensitive_1", true, None);
         });
 
         let output = agent.run(approval_input()).await.unwrap();
@@ -5604,7 +6239,7 @@ mod tests {
         let pa = pending.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            resolve_approval(&pa, "toolu_denied_1", false);
+            resolve_approval(&pa, "toolu_denied_1", false, None);
         });
 
         let output = agent.run(approval_input()).await.unwrap();
@@ -5622,11 +6257,363 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn needs_human_without_pending_approvals_auto_denies() {
+    async fn needs_human_approval_modifier_constrains_tool_params() {
+        use crate::dispatch::remote::{PendingApprovals, resolve_approval};
+        use approval_helpers::{RequireHumanApproval, approval_input};
+        use std::sync::Arc;
+
+        let responses = vec![
+            CompletionResponse {
+                parts: vec![ContentPart::ToolUse {
+                    id: "toolu_modified_1".into(),
+                    name: "sensitive_op".into(),
+                    input: json!({
+                        "target": {"x": 1.0, "y": 2.0},
+                        "speed": 1.0,
+                        "mode": "fast"
+                    }),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage {
+                    input_tokens: 20,
+                    output_tokens: 10,
+                    ..Default::default()
+                },
+            },
+            CompletionResponse {
+                parts: vec![ContentPart::Text {
+                    text: "Modified approval executed.".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage {
+                    input_tokens: 30,
+                    output_tokens: 12,
+                    ..Default::default()
+                },
+            },
+        ];
+
+        let model = Box::new(MockModel::new(vec![ModelCapability::TextReasoning], responses));
+        let mut dispatcher = ToolDispatcher::new(Duration::from_secs(5));
+        let seen_params = Arc::new(std::sync::Mutex::new(None));
+        dispatcher.register(Box::new(RecordingModifierTool {
+            seen_params: seen_params.clone(),
+        }));
+
+        let pending: PendingApprovals = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let mut agent = AgentLoop::new(
+            model,
+            dispatcher,
+            SafetyStack::new(vec![Box::new(RequireHumanApproval)]),
+            Box::new(MockSpatialContextProvider::empty()),
+        )
+        .with_pending_approvals(pending.clone());
+
+        let pa = pending.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            resolve_approval(
+                &pa,
+                "toolu_modified_1",
+                true,
+                Some(json!({
+                    "speed": 0.25,
+                    "target": {"y": 1.5},
+                    "mode": "safe"
+                })),
+            );
+        });
+
+        let output = agent.run(approval_input()).await.unwrap();
+        assert_eq!(output.final_response.as_deref(), Some("Modified approval executed."));
+        let seen = seen_params.lock().unwrap().clone().expect("tool should execute");
+        assert_eq!(
+            seen,
+            json!({
+                "target": {"x": 1.0, "y": 1.5},
+                "speed": 0.25,
+                "mode": "safe"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn needs_human_approval_modifier_cannot_add_new_fields() {
+        use crate::dispatch::remote::{PendingApprovals, resolve_approval};
+        use approval_helpers::{RequireHumanApproval, approval_input};
+        use std::sync::Arc;
+
+        let responses = vec![
+            CompletionResponse {
+                parts: vec![ContentPart::ToolUse {
+                    id: "toolu_modified_invalid".into(),
+                    name: "sensitive_op".into(),
+                    input: json!({
+                        "target": {"x": 1.0, "y": 2.0},
+                        "speed": 1.0
+                    }),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage {
+                    input_tokens: 20,
+                    output_tokens: 10,
+                    ..Default::default()
+                },
+            },
+            CompletionResponse {
+                parts: vec![ContentPart::Text {
+                    text: "Modifier rejected.".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage {
+                    input_tokens: 30,
+                    output_tokens: 12,
+                    ..Default::default()
+                },
+            },
+        ];
+
+        let model = Box::new(MockModel::new(vec![ModelCapability::TextReasoning], responses));
+        let mut dispatcher = ToolDispatcher::new(Duration::from_secs(5));
+        let seen_params = Arc::new(std::sync::Mutex::new(None));
+        dispatcher.register(Box::new(RecordingModifierTool {
+            seen_params: seen_params.clone(),
+        }));
+
+        let pending: PendingApprovals = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let mut agent = AgentLoop::new(
+            model,
+            dispatcher,
+            SafetyStack::new(vec![Box::new(RequireHumanApproval)]),
+            Box::new(MockSpatialContextProvider::empty()),
+        )
+        .with_pending_approvals(pending.clone());
+
+        let pa = pending.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            resolve_approval(
+                &pa,
+                "toolu_modified_invalid",
+                true,
+                Some(json!({
+                    "target": {"z": 9.0}
+                })),
+            );
+        });
+
+        let output = agent.run(approval_input()).await.unwrap();
+        assert_eq!(output.final_response.as_deref(), Some("Modifier rejected."));
+        let seen = seen_params.lock().unwrap().clone();
+        assert!(
+            seen.is_none(),
+            "tool should not execute when modifier expands input shape"
+        );
+    }
+
+    #[tokio::test]
+    async fn needs_human_approval_modifier_cannot_change_array_length() {
+        use crate::dispatch::remote::{PendingApprovals, resolve_approval};
+        use approval_helpers::{RequireHumanApproval, approval_input};
+        use std::sync::Arc;
+
+        let responses = vec![
+            CompletionResponse {
+                parts: vec![ContentPart::ToolUse {
+                    id: "toolu_modified_array_invalid".into(),
+                    name: "sensitive_op".into(),
+                    input: json!({
+                        "waypoints": [
+                            {"x": 1.0, "y": 2.0},
+                            {"x": 3.0, "y": 4.0}
+                        ]
+                    }),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage {
+                    input_tokens: 20,
+                    output_tokens: 10,
+                    ..Default::default()
+                },
+            },
+            CompletionResponse {
+                parts: vec![ContentPart::Text {
+                    text: "Array modifier rejected.".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage {
+                    input_tokens: 30,
+                    output_tokens: 12,
+                    ..Default::default()
+                },
+            },
+        ];
+
+        let model = Box::new(MockModel::new(vec![ModelCapability::TextReasoning], responses));
+        let mut dispatcher = ToolDispatcher::new(Duration::from_secs(5));
+        let seen_params = Arc::new(std::sync::Mutex::new(None));
+        dispatcher.register(Box::new(RecordingModifierTool {
+            seen_params: seen_params.clone(),
+        }));
+
+        let pending: PendingApprovals = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let mut agent = AgentLoop::new(
+            model,
+            dispatcher,
+            SafetyStack::new(vec![Box::new(RequireHumanApproval)]),
+            Box::new(MockSpatialContextProvider::empty()),
+        )
+        .with_pending_approvals(pending.clone());
+
+        let pa = pending.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            resolve_approval(
+                &pa,
+                "toolu_modified_array_invalid",
+                true,
+                Some(json!({
+                    "waypoints": [
+                        {"x": 1.5, "y": 2.5}
+                    ]
+                })),
+            );
+        });
+
+        let output = agent.run(approval_input()).await.unwrap();
+        assert_eq!(output.final_response.as_deref(), Some("Array modifier rejected."));
+        let seen = seen_params.lock().unwrap().clone();
+        assert!(
+            seen.is_none(),
+            "tool should not execute when modifier changes array length"
+        );
+    }
+
+    #[tokio::test]
+    async fn needs_human_approval_modifier_cannot_change_scalar_type() {
+        use crate::dispatch::remote::{PendingApprovals, resolve_approval};
+        use approval_helpers::{RequireHumanApproval, approval_input};
+        use std::sync::Arc;
+
+        let responses = vec![
+            CompletionResponse {
+                parts: vec![ContentPart::ToolUse {
+                    id: "toolu_modified_type_invalid".into(),
+                    name: "sensitive_op".into(),
+                    input: json!({
+                        "mode": "safe",
+                        "speed": 1.0
+                    }),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage {
+                    input_tokens: 20,
+                    output_tokens: 10,
+                    ..Default::default()
+                },
+            },
+            CompletionResponse {
+                parts: vec![ContentPart::Text {
+                    text: "Type modifier rejected.".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage {
+                    input_tokens: 30,
+                    output_tokens: 12,
+                    ..Default::default()
+                },
+            },
+        ];
+
+        let model = Box::new(MockModel::new(vec![ModelCapability::TextReasoning], responses));
+        let mut dispatcher = ToolDispatcher::new(Duration::from_secs(5));
+        let seen_params = Arc::new(std::sync::Mutex::new(None));
+        dispatcher.register(Box::new(RecordingModifierTool {
+            seen_params: seen_params.clone(),
+        }));
+
+        let pending: PendingApprovals = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let mut agent = AgentLoop::new(
+            model,
+            dispatcher,
+            SafetyStack::new(vec![Box::new(RequireHumanApproval)]),
+            Box::new(MockSpatialContextProvider::empty()),
+        )
+        .with_pending_approvals(pending.clone());
+
+        let pa = pending.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            resolve_approval(
+                &pa,
+                "toolu_modified_type_invalid",
+                true,
+                Some(json!({
+                    "mode": true
+                })),
+            );
+        });
+
+        let output = agent.run(approval_input()).await.unwrap();
+        assert_eq!(output.final_response.as_deref(), Some("Type modifier rejected."));
+        let seen = seen_params.lock().unwrap().clone();
+        assert!(
+            seen.is_none(),
+            "tool should not execute when modifier changes scalar type"
+        );
+    }
+
+    #[test]
+    fn collect_modifier_changes_reports_nested_paths() {
+        let base = json!({
+            "target": {"x": 1.0, "y": 2.0},
+            "waypoints": [
+                {"speed": 1.0},
+                {"speed": 0.5}
+            ],
+            "mode": "fast"
+        });
+        let modifier = json!({
+            "target": {"y": 1.5},
+            "waypoints": [
+                {"speed": 0.8},
+                {"speed": 0.4}
+            ],
+            "mode": "safe"
+        });
+
+        let mut modifications = Vec::new();
+        AgentLoop::collect_modifier_changes(&base, &modifier, "", &mut modifications);
+
+        assert_eq!(modifications.len(), 4);
+        assert!(
+            modifications
+                .iter()
+                .any(|m| m.field == "target.y" && m.old_value == "2.0" && m.new_value == "1.5")
+        );
+        assert!(
+            modifications
+                .iter()
+                .any(|m| m.field == "waypoints[0].speed" && m.old_value == "1.0" && m.new_value == "0.8")
+        );
+        assert!(
+            modifications
+                .iter()
+                .any(|m| m.field == "waypoints[1].speed" && m.old_value == "0.5" && m.new_value == "0.4")
+        );
+        assert!(
+            modifications
+                .iter()
+                .any(|m| m.field == "mode" && m.old_value == "\"fast\"" && m.new_value == "\"safe\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn needs_human_without_approval_runtime_returns_configuration_error() {
         use approval_helpers::{RequireHumanApproval, approval_input};
 
-        // Without `.with_pending_approvals()` the agent falls back to the legacy
-        // auto-deny path and returns an error immediately to the model.
+        // Without `.with_approval_runtime()` the agent surfaces a configuration
+        // error instead of fabricating approval authority.
         let responses = vec![
             CompletionResponse {
                 parts: vec![ContentPart::ToolUse {
@@ -5661,7 +6648,7 @@ mod tests {
             ToolResult::success(json!({"result": "should not run"})),
         )));
 
-        // No .with_pending_approvals() — legacy auto-deny.
+        // No .with_approval_runtime() — missing approval authority.
         let mut agent = AgentLoop::new(
             model,
             dispatcher,
@@ -5670,7 +6657,7 @@ mod tests {
         );
 
         let output = agent.run(approval_input()).await.unwrap();
-        // The agent completes in 2 cycles: tool call (auto-denied) + final turn.
+        // The agent completes in 2 cycles: tool call (configuration error) + final turn.
         assert_eq!(output.cycles, 2);
         assert_eq!(output.final_response.as_deref(), Some("Auto-denied, cannot proceed."));
     }
@@ -5880,8 +6867,7 @@ mod tests {
             task_id: "ap-test".into(),
             tenant_id: "test-tenant".into(),
             model_name: String::new(),
-            system_prompt: vec!["You are a test agent.".into()],
-            user_message: "Run phase test.".into(),
+            seed: AgentInputSeed::new(vec!["You are a test agent.".into()], vec![], "Run phase test."),
             max_cycles: 10,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -5901,7 +6887,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -5982,8 +6967,7 @@ mod tests {
             task_id: "ap-schema-test".into(),
             tenant_id: "test-tenant".into(),
             model_name: String::new(),
-            system_prompt: vec!["Test agent.".into()],
-            user_message: "Do nothing.".into(),
+            seed: AgentInputSeed::new(vec!["Test agent.".into()], vec![], "Do nothing."),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -5997,7 +6981,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -6069,8 +7052,7 @@ mod tests {
             task_id: "ap-schema-signal-test".into(),
             tenant_id: "test-tenant".into(),
             model_name: String::new(),
-            system_prompt: vec!["Test agent.".into()],
-            user_message: "Do nothing.".into(),
+            seed: AgentInputSeed::new(vec!["Test agent.".into()], vec![], "Do nothing."),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -6084,7 +7066,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -6188,8 +7169,7 @@ mod tests {
             task_id: "after-cycles-test".into(),
             tenant_id: "test-tenant".into(),
             model_name: String::new(),
-            system_prompt: vec!["Test agent.".into()],
-            user_message: "Run phase test.".into(),
+            seed: AgentInputSeed::new(vec!["Test agent.".into()], vec![], "Run phase test."),
             max_cycles: 10,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -6209,7 +7189,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -6310,8 +7289,7 @@ mod tests {
             task_id: "named-filter-test".into(),
             tenant_id: "test-tenant".into(),
             model_name: String::new(),
-            system_prompt: vec!["Test agent.".into()],
-            user_message: "Do something.".into(),
+            seed: AgentInputSeed::new(vec!["Test agent.".into()], vec![], "Do something."),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -6324,7 +7302,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -6417,8 +7394,7 @@ mod tests {
             task_id: "none-filter-test".into(),
             tenant_id: "test-tenant".into(),
             model_name: String::new(),
-            system_prompt: vec!["Test agent.".into()],
-            user_message: "Do nothing.".into(),
+            seed: AgentInputSeed::new(vec!["Test agent.".into()], vec![], "Do nothing."),
             max_cycles: 5,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -6431,7 +7407,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };
@@ -6524,8 +7499,7 @@ mod tests {
             task_id: "no-signal-test".into(),
             tenant_id: "test-tenant".into(),
             model_name: String::new(),
-            system_prompt: vec!["Test agent.".into()],
-            user_message: "Run without signalling.".into(),
+            seed: AgentInputSeed::new(vec!["Test agent.".into()], vec![], "Run without signalling."),
             max_cycles: 3,
             max_tokens: 4096,
             max_context_tokens: 200_000,
@@ -6545,7 +7519,6 @@ mod tests {
             tool_choice: None,
             response_schema: None,
             streaming: false,
-            history: vec![],
             cancellation_token: None,
             control_mode: roz_core::safety::ControlMode::default(),
         };

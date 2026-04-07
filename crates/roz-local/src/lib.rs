@@ -1,5 +1,6 @@
 pub mod builtin_skills;
 pub mod docker;
+pub mod event_renderer;
 pub mod manifest;
 pub mod mcp;
 pub mod registry;

@@ -50,7 +50,7 @@ async fn restate_ingress_accepts_requests() {
 /// 4. Submits a task via Restate ingress (`/TaskWorkflow/{id}/run/send`)
 /// 5. Signals the result via `deliver_result`
 /// 6. Polls the workflow output until completion
-/// 7. Asserts `TaskOutcome::Success`
+/// 7. Asserts `TaskOutcome::Succeeded`
 ///
 /// Requires Docker for testcontainers.
 #[tokio::test]
@@ -130,7 +130,7 @@ async fn task_lifecycle_through_restate() {
 
     let task_result = roz_nats::dispatch::TaskResult {
         task_id,
-        success: true,
+        status: roz_nats::dispatch::TaskTerminalStatus::Succeeded,
         output: Some(serde_json::json!({"result": "integration test complete"})),
         error: None,
         cycles: 1,
@@ -174,10 +174,10 @@ async fn task_lifecycle_through_restate() {
 
     // 7. Assert success
     match &outcome_value {
-        TaskOutcome::Success { result } => {
+        TaskOutcome::Succeeded { result } => {
             assert_eq!(result["result"], "integration test complete");
         }
-        other => panic!("expected TaskOutcome::Success, got: {other:?}"),
+        other => panic!("expected TaskOutcome::Succeeded, got: {other:?}"),
     }
 
     // Cleanup: shut down the Restate SDK HTTP server

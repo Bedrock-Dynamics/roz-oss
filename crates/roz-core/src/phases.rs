@@ -8,9 +8,10 @@ use serde::{Deserialize, Serialize};
 
 /// Execution mode for a task phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum PhaseMode {
+    #[serde(rename = "react")]
     React,
+    #[serde(rename = "ooda_react", alias = "ooda_re_act")]
     OodaReAct,
 }
 
@@ -115,5 +116,12 @@ mod tests {
         let json = serde_json::to_string(&spec).unwrap();
         let roundtripped: PhaseSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(spec, roundtripped);
+    }
+
+    #[test]
+    fn phase_mode_accepts_legacy_alias() {
+        let mode: PhaseMode = serde_json::from_str("\"ooda_react\"").unwrap();
+        assert_eq!(mode, PhaseMode::OodaReAct);
+        assert_eq!(serde_json::to_string(&PhaseMode::OodaReAct).unwrap(), "\"ooda_react\"");
     }
 }

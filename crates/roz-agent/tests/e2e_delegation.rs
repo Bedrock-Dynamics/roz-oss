@@ -20,7 +20,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use roz_agent::agent_loop::{AgentInput, AgentLoop, AgentLoopMode};
+use roz_agent::agent_loop::{AgentInput, AgentInputSeed, AgentLoop, AgentLoopMode};
 use roz_agent::delegation::DelegationTool;
 use roz_agent::dispatch::ToolDispatcher;
 use roz_agent::safety::SafetyStack;
@@ -64,16 +64,19 @@ async fn claude_delegates_spatial_to_gemini() {
         task_id: "e2e-delegation".to_string(),
         tenant_id: "test".to_string(),
         model_name: String::new(),
-        system_prompt: vec![
-            "You have a delegate_to_spatial tool. When asked for spatial or physical analysis, \
-             you MUST call delegate_to_spatial with a clear task description. \
-             Do not answer spatial questions directly — always delegate them."
-                .to_string(),
-        ],
-        user_message: "Describe the typical workspace layout of a UR5 robot arm — its reach \
+        seed: AgentInputSeed::new(
+            vec![
+                "You have a delegate_to_spatial tool. When asked for spatial or physical analysis, \
+                 you MUST call delegate_to_spatial with a clear task description. \
+                 Do not answer spatial questions directly — always delegate them."
+                    .to_string(),
+            ],
+            Vec::new(),
+            "Describe the typical workspace layout of a UR5 robot arm — its reach \
             envelope, joint limits, and typical mounting configuration. \
             Delegate this question to the spatial analysis model using your tool."
-            .to_string(),
+                .to_string(),
+        ),
         max_cycles: 5,
         max_tokens: 4096,
         max_context_tokens: 200_000,
@@ -82,7 +85,6 @@ async fn claude_delegates_spatial_to_gemini() {
         tool_choice: None,
         response_schema: None,
         streaming: false,
-        history: vec![],
         cancellation_token: None,
         control_mode: roz_core::safety::ControlMode::default(),
     };

@@ -10,6 +10,13 @@ pub struct CliConfig {
     pub access_token: Option<String>,
 }
 
+fn store_in_keyring(service: &str, account: &str, secret: &str) -> bool {
+    keyring::Entry::new(service, account)
+        .ok()
+        .and_then(|entry| entry.set_password(secret).ok())
+        .is_some()
+}
+
 impl CliConfig {
     /// Load configuration from environment variables, keyring, and config files.
     ///
@@ -108,6 +115,10 @@ impl CliConfig {
 
     /// Save an API key to `~/.roz/credentials.toml`.
     pub fn save_global_api_key(profile: &str, api_key: &str) -> anyhow::Result<()> {
+        if store_in_keyring("roz", profile, api_key) {
+            return Ok(());
+        }
+
         let config_dir = Self::config_dir()?;
         std::fs::create_dir_all(&config_dir)?;
         let cred_path = config_dir.join("credentials.toml");
@@ -144,6 +155,10 @@ impl CliConfig {
         refresh_token: Option<&str>,
         expires_in: Option<u64>,
     ) -> anyhow::Result<()> {
+        if refresh_token.is_none() && expires_in.is_none() && store_in_keyring("roz-provider", provider, access_token) {
+            return Ok(());
+        }
+
         let config_dir = Self::config_dir()?;
         std::fs::create_dir_all(&config_dir)?;
         let cred_path = config_dir.join("credentials.toml");

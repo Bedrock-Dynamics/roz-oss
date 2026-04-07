@@ -5621,6 +5621,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "toml 0.8.23",
  "tracing",
  "uuid",
 ]
@@ -5680,12 +5681,14 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "chrono",
  "cu29",
  "cu29-derive",
  "cu29-helpers",
  "cu29-unifiedlog",
  "futures",
  "gz-transport-rs",
+ "hex",
  "mcap",
  "parking_lot",
  "prost 0.13.5",
@@ -5693,6 +5696,7 @@ dependencies = [
  "roz-nats",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -5702,7 +5706,11 @@ dependencies = [
  "tonic-build",
  "tracing",
  "uuid",
+ "wasmprinter",
  "wasmtime",
+ "wat",
+ "wit-component",
+ "wit-parser 0.244.0",
 ]
 
 [[package]]
@@ -5721,6 +5729,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.18",
  "toml 0.8.23",
  "tracing",
@@ -5755,6 +5764,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "directories",
+ "hex",
  "parking_lot",
  "reqwest 0.12.28",
  "rmcp",
@@ -5764,6 +5774,7 @@ dependencies = [
  "schemars 1.2.1",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -5870,6 +5881,8 @@ dependencies = [
 name = "roz-test"
 version = "0.2.0"
 dependencies = [
+ "chrono",
+ "roz-core",
  "testcontainers",
  "testcontainers-modules",
  "tokio",
@@ -5924,6 +5937,7 @@ name = "roz-zenoh"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "roz-core",
  "serde",
  "serde_json",
  "tempfile",
@@ -9549,6 +9563,7 @@ dependencies = [
  "wasm-encoder 0.244.0",
  "wasm-metadata",
  "wasmparser 0.244.0",
+ "wat",
  "wit-parser 0.244.0",
 ]
 

@@ -65,6 +65,18 @@ fn compile_rust_to_wasm(_code: &str) -> Result<Vec<u8>, String> {
 /// and optionally verifies it by running ticks in the WASM sandbox.
 pub struct ExecuteCodeTool;
 
+fn control_manifest_from_ctx(
+    ctx: &ToolContext,
+) -> Result<roz_core::embodiment::binding::ControlInterfaceManifest, Box<dyn std::error::Error + Send + Sync>> {
+    ctx.extensions
+        .get::<roz_core::embodiment::binding::ControlInterfaceManifest>()
+        .cloned()
+        .ok_or_else(|| {
+            "no ControlInterfaceManifest in ToolContext — configure the canonical robot control interface before executing code"
+                .into()
+        })
+}
+
 #[async_trait]
 impl TypedToolExecutor for ExecuteCodeTool {
     type Input = ExecuteCodeInput;
@@ -101,16 +113,8 @@ impl TypedToolExecutor for ExecuteCodeTool {
         }
 
         // Read manifest from context — no UR5 fallback.
-        let manifest = ctx
-            .extensions
-            .get::<roz_core::channels::ChannelManifest>()
-            .cloned()
-            .ok_or_else(|| {
-                Box::<dyn std::error::Error + Send + Sync>::from(
-                    "no ChannelManifest in ToolContext — configure the robot type before executing code",
-                )
-            })?;
-        let host_ctx = roz_copper::wit_host::HostContext::with_manifest(manifest);
+        let control_manifest = control_manifest_from_ctx(ctx)?;
+        let host_ctx = roz_copper::wit_host::HostContext::with_control_manifest(&control_manifest);
         let wasm_result = roz_copper::wasm::CuWasmTask::from_source_with_host(input.code.as_bytes(), host_ctx);
         let mut task = match wasm_result {
             Ok(t) => t,
@@ -148,7 +152,7 @@ impl TypedToolExecutor for ExecuteCodeTool {
 
         if input.verify_first {
             for tick in 0..VERIFY_TICK_COUNT {
-                if let Err(e) = task.tick(tick) {
+                if let Err(e) = task.tick_with_contract(tick, None) {
                     let output = ExecuteCodeOutput {
                         status: "error".to_string(),
                         message: format!("Verification failed on tick {tick}: {e}"),
@@ -191,12 +195,37 @@ mod tests {
 
     use super::*;
 
+    fn compatible_control_manifest() -> roz_core::embodiment::binding::ControlInterfaceManifest {
+        let mut manifest = roz_core::embodiment::binding::ControlInterfaceManifest {
+            version: 1,
+            manifest_digest: String::new(),
+            channels: (0..6)
+                .map(|index| roz_core::embodiment::binding::ControlChannelDef {
+                    name: format!("joint{index}/velocity"),
+                    interface_type: roz_core::embodiment::binding::CommandInterfaceType::JointVelocity,
+                    units: "rad/s".into(),
+                    frame_id: format!("joint{index}_link"),
+                })
+                .collect(),
+            bindings: (0..6)
+                .map(|index| roz_core::embodiment::binding::ChannelBinding {
+                    physical_name: format!("joint{index}"),
+                    channel_index: index as u32,
+                    binding_type: roz_core::embodiment::binding::BindingType::JointVelocity,
+                    frame_id: format!("joint{index}_link"),
+                    units: "rad/s".into(),
+                    semantic_role: None,
+                })
+                .collect(),
+        };
+        manifest.stamp_digest();
+        manifest
+    }
+
     fn test_ctx() -> ToolContext {
         let mut ext = crate::dispatch::Extensions::new();
-        ext.insert(roz_core::channels::ChannelManifest::generic_velocity(
-            6,
-            std::f64::consts::PI,
-        ));
+        let control_manifest = compatible_control_manifest();
+        ext.insert(control_manifest);
         ToolContext {
             task_id: "test-task".to_string(),
             tenant_id: "test-tenant".to_string(),
@@ -317,7 +346,9 @@ mod tests {
     /// those commands rejected by the production safety limit (1.5 rad/s).
     /// Verification completes successfully but reports the rejections.
     #[tokio::test]
-    async fn verify_with_production_limits_rejects_excessive_velocity() {
+    async fn verify_with_production_limits_rejects_old_abi() {
+        // Old ABI modules that import motor::set_velocity should fail to compile
+        // (import cannot be satisfied with the tick contract host functions).
         let wat = r#"
             (module
                 (import "motor" "set_velocity" (func $sv (param f64) (result i32)))
@@ -332,24 +363,15 @@ mod tests {
             verify_first: true,
         };
         let result = TypedToolExecutor::execute(&tool, input, &test_ctx()).await.unwrap();
-        assert!(result.is_success(), "verification should succeed even with rejections");
-        let output_str = result.output.to_string();
-        assert!(
-            output_str.contains("Warning") && output_str.contains("rejected"),
-            "output should warn about rejected velocity commands, got: {output_str}"
-        );
+        assert!(result.is_error(), "old ABI imports should fail to link");
     }
 
-    /// A WASM module that calls `set_velocity(0.5)` should pass verification
-    /// under the production limit (1.5 rad/s) with no warnings.
+    /// A minimal tick-contract WASM module should pass verification.
     #[tokio::test]
-    async fn verify_with_production_limits_accepts_safe_velocity() {
+    async fn verify_with_production_limits_accepts_tick_contract_module() {
         let wat = r#"
             (module
-                (import "motor" "set_velocity" (func $sv (param f64) (result i32)))
-                (func (export "process") (param i64)
-                    (drop (call $sv (f64.const 0.5)))
-                )
+                (func (export "process") (param i64) nop)
             )
         "#;
         let tool = ExecuteCodeTool;
@@ -358,11 +380,36 @@ mod tests {
             verify_first: true,
         };
         let result = TypedToolExecutor::execute(&tool, input, &test_ctx()).await.unwrap();
-        assert!(result.is_success(), "safe velocity should pass verification");
+        assert!(result.is_success(), "tick contract module should pass verification");
         let output_str = result.output.to_string();
         assert!(
             !output_str.contains("Warning") && !output_str.contains("rejected"),
-            "safe velocity should not produce warnings, got: {output_str}"
+            "clean tick contract module should not produce warnings, got: {output_str}"
         );
+    }
+
+    #[test]
+    fn control_manifest_from_ctx_prefers_canonical_manifest() {
+        let ctx = test_ctx();
+        let manifest = control_manifest_from_ctx(&ctx).expect("manifest resolution should succeed");
+        assert_eq!(manifest.version, 1);
+        assert_eq!(manifest.channels.len(), 6);
+        assert_eq!(manifest.channels[0].name, "joint0/velocity");
+    }
+
+    #[test]
+    fn control_manifest_from_ctx_accepts_control_manifest_without_legacy_fallback() {
+        let control_manifest = compatible_control_manifest();
+        let mut ext = crate::dispatch::Extensions::new();
+        ext.insert(control_manifest.clone());
+        let ctx = ToolContext {
+            task_id: "test-task".into(),
+            tenant_id: "test-tenant".into(),
+            call_id: String::new(),
+            extensions: ext,
+        };
+
+        let manifest = control_manifest_from_ctx(&ctx).expect("control manifest should resolve");
+        assert_eq!(manifest, control_manifest);
     }
 }
