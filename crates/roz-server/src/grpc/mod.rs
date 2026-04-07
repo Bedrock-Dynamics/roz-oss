@@ -58,7 +58,7 @@ mod tests {
 
     #[test]
     fn register_host_request_has_capabilities_map() {
-        let mut caps = std::collections::HashMap::new();
+        let mut caps = std::collections::BTreeMap::new();
         caps.insert("arm".to_string(), "6dof".to_string());
         let req = RegisterHostRequest {
             name: "robot-1".into(),

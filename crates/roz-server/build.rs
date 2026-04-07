@@ -4,6 +4,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
+        .btree_map(&[".roz.v1"])
         .file_descriptor_set_path(out_dir.join("roz_v1_descriptor.bin"))
         .compile_protos(
             &[
@@ -11,6 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "../../proto/roz/v1/hosts.proto",
                 "../../proto/roz/v1/safety.proto",
                 "../../proto/roz/v1/agent.proto",
+                "../../proto/roz/v1/embodiment.proto",
             ],
             &["../../proto"],
         )?;

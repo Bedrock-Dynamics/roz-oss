@@ -1402,7 +1402,7 @@ async fn spawn_telemetry_relay(
                     .unwrap_or_default();
 
                 // Parse sensor readings from the worker telemetry JSON.
-                let sensor_readings: std::collections::HashMap<String, f64> = data["sensors"]
+                let sensor_readings: std::collections::BTreeMap<String, f64> = data["sensors"]
                     .as_object()
                     .map(|obj| obj.iter().filter_map(|(k, v)| Some((k.clone(), v.as_f64()?))).collect())
                     .unwrap_or_default();
