@@ -153,6 +153,7 @@ mod tests {
             rejection_count: 0,
             limit_clamp_count: 1,
             channels_untouched: vec!["shoulder".into()],
+            unexpected_channels_touched: vec![],
             state_freshness: roz_core::session::snapshot::FreshnessState::Unknown,
             created_at_rfc3339: "2026-04-02T00:00:00Z".into(),
         };

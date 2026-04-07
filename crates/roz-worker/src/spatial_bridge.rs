@@ -160,6 +160,7 @@ mod tests {
             rejection_count: 0,
             limit_clamp_count: 2,
             channels_untouched: vec![],
+            unexpected_channels_touched: vec![],
             state_freshness: roz_core::session::snapshot::FreshnessState::Unknown,
             created_at_rfc3339: "2026-04-02T00:00:00Z".into(),
         };
@@ -214,6 +215,7 @@ mod tests {
                 "rejection_count": 0,
                 "limit_clamp_count": 2,
                 "channels_untouched": [],
+                "unexpected_channels_touched": [],
                 "state_freshness": "unknown",
                 "created_at_rfc3339": "2026-04-02T00:00:00Z"
             }))

@@ -1343,6 +1343,7 @@ mod tests {
             watchdog_near_miss_count: 0,
             channels_touched: vec!["joint_0".into()],
             channels_untouched: vec![],
+            unexpected_channels_touched: vec![],
             config_reads: 1,
             tick_latency_p50: 100.into(),
             tick_latency_p95: 150.into(),

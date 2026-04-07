@@ -6,7 +6,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -36,9 +36,10 @@ pub struct EvidenceCollector {
     trap_count: u32,
     watchdog_near_miss_count: u32,
     channels_touched: BTreeSet<String>,
+    unexpected_channels_touched: Vec<String>,
     all_channels: Vec<String>,
     config_reads: u32,
-    tick_latencies: Vec<Duration>,
+    tick_latency_stats: TickLatencyStats,
     command_oscillation_detected: bool,
     previous_commands: Vec<f64>,
     steady_state_ticks: u32,
@@ -46,6 +47,59 @@ pub struct EvidenceCollector {
 
 /// Number of consecutive stable ticks required to declare steady state.
 const STEADY_STATE_THRESHOLD: u32 = 50;
+/// Number of tick latencies retained for bounded percentile calculation.
+const MAX_TICK_LATENCY_SAMPLES: usize = 2048;
+
+#[derive(Debug, Clone)]
+struct TickLatencyStats {
+    recent_samples_us: VecDeque<u64>,
+    sample_count: u64,
+    mean_us: f64,
+    m2_us: f64,
+}
+
+impl TickLatencyStats {
+    #[allow(clippy::cast_precision_loss)] // online jitter stats are approximate by design
+    fn record(&mut self, duration: Duration) {
+        let micros = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+        if self.recent_samples_us.len() == MAX_TICK_LATENCY_SAMPLES {
+            self.recent_samples_us.pop_front();
+        }
+        self.recent_samples_us.push_back(micros);
+
+        self.sample_count += 1;
+        let sample_count = self.sample_count as f64;
+        let value = micros as f64;
+        let delta = value - self.mean_us;
+        self.mean_us += delta / sample_count;
+        let delta2 = value - self.mean_us;
+        self.m2_us += delta * delta2;
+    }
+
+    fn percentiles(&self) -> (u64, u64, u64) {
+        let samples: Vec<u64> = self.recent_samples_us.iter().copied().collect();
+        compute_percentiles(&samples)
+    }
+
+    #[allow(clippy::cast_precision_loss)] // online jitter stats are approximate by design
+    fn jitter_us(&self) -> f64 {
+        if self.sample_count < 2 {
+            return 0.0;
+        }
+        (self.m2_us / (self.sample_count - 1) as f64).sqrt()
+    }
+}
+
+impl Default for TickLatencyStats {
+    fn default() -> Self {
+        Self {
+            recent_samples_us: VecDeque::with_capacity(MAX_TICK_LATENCY_SAMPLES),
+            sample_count: 0,
+            mean_us: 0.0,
+            m2_us: 0.0,
+        }
+    }
+}
 
 /// Extra replay/verification context that binds an evidence bundle to a concrete frame snapshot.
 #[derive(Debug, Clone)]
@@ -82,9 +136,10 @@ impl EvidenceCollector {
             trap_count: 0,
             watchdog_near_miss_count: 0,
             channels_touched: BTreeSet::new(),
+            unexpected_channels_touched: Vec::new(),
             all_channels: channel_names.to_vec(),
             config_reads: 0,
-            tick_latencies: Vec::new(),
+            tick_latency_stats: TickLatencyStats::default(),
             command_oscillation_detected: false,
             previous_commands: Vec::new(),
             steady_state_ticks: 0,
@@ -98,20 +153,18 @@ impl EvidenceCollector {
     /// `interventions` are the safety filter's actions on this tick.
     pub fn record_tick(&mut self, duration: Duration, output: &TickOutput, interventions: &[SafetyIntervention]) {
         self.tick_count += 1;
-        self.tick_latencies.push(duration);
+        self.tick_latency_stats.record(duration);
 
         // Track which channels the controller wrote to.
         // ANY output (including zero) counts as "touched" — the controller
         // explicitly produced command values.
         if !output.command_values.is_empty() {
             for (i, _) in output.command_values.iter().enumerate() {
-                // Use the actual channel name from all_channels if available.
-                let channel_name = self
-                    .all_channels
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(|| format!("channel_{i}"));
-                self.channels_touched.insert(channel_name);
+                if let Some(channel_name) = self.all_channels.get(i) {
+                    self.channels_touched.insert(channel_name.clone());
+                } else {
+                    self.record_unexpected_channel(format!("unexpected_output_{i}"));
+                }
             }
         }
 
@@ -191,7 +244,11 @@ impl EvidenceCollector {
 
     /// Record that a named channel was touched (non-zero command).
     pub fn record_channel_touched(&mut self, channel: &str) {
-        self.channels_touched.insert(channel.to_string());
+        if self.all_channels.iter().any(|known| known == channel) {
+            self.channels_touched.insert(channel.to_string());
+        } else {
+            self.record_unexpected_channel(channel.to_string());
+        }
     }
 
     /// Finalize into a [`ControllerEvidenceBundle`].
@@ -233,15 +290,16 @@ impl EvidenceCollector {
         compiler_version: &str,
         context: &EvidenceFinalizeContext,
     ) -> ControllerEvidenceBundle {
-        let (p50, p95, p99) = compute_percentiles(&self.tick_latencies);
-        let jitter_us = compute_jitter_us(&self.tick_latencies);
+        let (p50, p95, p99) = self.tick_latency_stats.percentiles();
+        let jitter_us = self.tick_latency_stats.jitter_us();
 
-        let channels_touched: Vec<String> = self
+        let mut channels_touched: Vec<String> = self
             .all_channels
             .iter()
             .filter(|channel| self.channels_touched.contains(channel.as_str()))
             .cloned()
             .collect();
+        channels_touched.extend(self.unexpected_channels_touched.iter().cloned());
         let channels_untouched: Vec<String> = self
             .all_channels
             .iter()
@@ -264,6 +322,7 @@ impl EvidenceCollector {
             watchdog_near_miss_count: self.watchdog_near_miss_count,
             channels_touched,
             channels_untouched,
+            unexpected_channels_touched: self.unexpected_channels_touched,
             config_reads: self.config_reads,
             tick_latency_p50: p50.into(),
             tick_latency_p95: p95.into(),
@@ -289,18 +348,24 @@ impl EvidenceCollector {
             state_freshness: context.state_freshness.clone(),
         }
     }
+
+    fn record_unexpected_channel(&mut self, channel: String) {
+        if !self.unexpected_channels_touched.contains(&channel) {
+            self.unexpected_channels_touched.push(channel);
+        }
+    }
 }
 
 /// Compute p50, p95, p99 latency percentiles in microseconds.
 ///
 /// Returns `(0, 0, 0)` if the input is empty.
 #[allow(clippy::cast_possible_truncation)] // tick latencies won't exceed u64 microseconds
-fn compute_percentiles(latencies: &[Duration]) -> (u64, u64, u64) {
-    if latencies.is_empty() {
+fn compute_percentiles(latencies_us: &[u64]) -> (u64, u64, u64) {
+    if latencies_us.is_empty() {
         return (0, 0, 0);
     }
 
-    let mut sorted: Vec<u64> = latencies.iter().map(|d| d.as_micros() as u64).collect();
+    let mut sorted = latencies_us.to_vec();
     sorted.sort_unstable();
 
     let len = sorted.len();
@@ -309,20 +374,6 @@ fn compute_percentiles(latencies: &[Duration]) -> (u64, u64, u64) {
     let p99 = sorted[(len * 99 / 100).min(len - 1)];
 
     (p50, p95, p99)
-}
-
-/// Compute the standard deviation of tick durations in microseconds.
-#[allow(clippy::cast_precision_loss)] // acceptable for statistics computation
-fn compute_jitter_us(latencies: &[Duration]) -> f64 {
-    if latencies.len() < 2 {
-        return 0.0;
-    }
-
-    let values: Vec<f64> = latencies.iter().map(|d| d.as_micros() as f64).collect();
-    let n = values.len() as f64;
-    let mean = values.iter().sum::<f64>() / n;
-    let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0);
-    variance.sqrt()
 }
 
 #[cfg(test)]
@@ -456,6 +507,26 @@ mod tests {
     }
 
     #[test]
+    fn evidence_collector_preserves_unexpected_output_channels() {
+        let all_channels: Vec<String> = vec!["joint_a".into(), "joint_b".into()];
+        let mut collector = EvidenceCollector::new("ctrl-extra", &all_channels);
+        collector.record_tick(Duration::from_micros(150), &make_output(vec![0.5, 0.1, 0.8]), &[]);
+        collector.record_channel_touched("joint_c");
+
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+
+        assert_eq!(
+            bundle.channels_touched,
+            vec!["joint_a", "joint_b", "unexpected_output_2", "joint_c"]
+        );
+        assert_eq!(
+            bundle.unexpected_channels_touched,
+            vec!["unexpected_output_2".to_string(), "joint_c".to_string()]
+        );
+        assert!(bundle.has_safety_issues());
+    }
+
+    #[test]
     fn evidence_collector_untouched_when_no_output() {
         let all_channels: Vec<String> = vec!["ch_a".into(), "ch_b".into()];
         let mut collector = EvidenceCollector::new("ctrl-005", &all_channels);
@@ -487,6 +558,26 @@ mod tests {
         assert_eq!(bundle.tick_latency_p95.as_micros(), 96);
         // p99 = index 99 = 100
         assert_eq!(bundle.tick_latency_p99.as_micros(), 100);
+    }
+
+    #[test]
+    fn evidence_collector_bounds_latency_samples() {
+        let mut collector = EvidenceCollector::new("ctrl-latency", &[]);
+        let lower_bound = 11_u64;
+        let upper_bound = MAX_TICK_LATENCY_SAMPLES as u64 + 10;
+
+        for i in 1..=upper_bound {
+            collector.record_tick(Duration::from_micros(i), &make_output(vec![0.1]), &[]);
+        }
+
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+
+        let expected_p50 = lower_bound + (MAX_TICK_LATENCY_SAMPLES * 50 / 100) as u64;
+        let expected_p99 = lower_bound + (MAX_TICK_LATENCY_SAMPLES * 99 / 100) as u64;
+
+        assert_eq!(bundle.tick_latency_p50.as_micros(), expected_p50);
+        assert_eq!(bundle.tick_latency_p99.as_micros(), expected_p99);
+        assert!(bundle.controller_stability_summary.runtime_jitter_us > 0.0);
     }
 
     #[test]
@@ -592,7 +683,7 @@ mod tests {
 
     #[test]
     fn compute_percentiles_single() {
-        let latencies = vec![Duration::from_micros(42)];
+        let latencies = vec![42];
         let (p50, p95, p99) = compute_percentiles(&latencies);
         assert_eq!(p50, 42);
         assert_eq!(p95, 42);
@@ -601,15 +692,20 @@ mod tests {
 
     #[test]
     fn compute_jitter_zero_for_constant() {
-        let latencies: Vec<Duration> = (0..10).map(|_| Duration::from_micros(100)).collect();
-        let jitter = compute_jitter_us(&latencies);
+        let mut stats = TickLatencyStats::default();
+        for _ in 0..10 {
+            stats.record(Duration::from_micros(100));
+        }
+        let jitter = stats.jitter_us();
         assert!(jitter < f64::EPSILON);
     }
 
     #[test]
     fn compute_jitter_nonzero_for_varying() {
-        let latencies = vec![Duration::from_micros(100), Duration::from_micros(200)];
-        let jitter = compute_jitter_us(&latencies);
+        let mut stats = TickLatencyStats::default();
+        stats.record(Duration::from_micros(100));
+        stats.record(Duration::from_micros(200));
+        let jitter = stats.jitter_us();
         assert!(jitter > 0.0);
     }
 }

@@ -56,6 +56,8 @@ pub struct ControllerEvidenceBundle {
     pub watchdog_near_miss_count: u32,
     pub channels_touched: Vec<String>,
     pub channels_untouched: Vec<String>,
+    #[serde(default)]
+    pub unexpected_channels_touched: Vec<String>,
     pub config_reads: u32,
     pub tick_latency_p50: TickLatency,
     pub tick_latency_p95: TickLatency,
@@ -134,6 +136,7 @@ impl ControllerEvidenceBundle {
         self.trap_count > 0
             || self.epoch_interrupt_count > 0
             || self.controller_stability_summary.command_oscillation_detected
+            || !self.unexpected_channels_touched.is_empty()
     }
 
     /// Whether the controller touched all expected channels.
@@ -161,6 +164,7 @@ mod tests {
             watchdog_near_miss_count: 0,
             channels_touched: vec!["shoulder".into(), "elbow".into()],
             channels_untouched: vec![],
+            unexpected_channels_touched: vec![],
             config_reads: 1,
             tick_latency_p50: 200.into(),
             tick_latency_p95: 500.into(),

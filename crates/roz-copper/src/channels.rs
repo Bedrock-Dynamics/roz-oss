@@ -133,6 +133,7 @@ pub struct EvidenceSummaryState {
     pub rejection_count: u32,
     pub limit_clamp_count: u32,
     pub channels_untouched: Vec<String>,
+    pub unexpected_channels_touched: Vec<String>,
     pub state_freshness: roz_core::session::snapshot::FreshnessState,
     pub created_at_rfc3339: String,
 }
@@ -150,6 +151,7 @@ impl From<&ControllerEvidenceBundle> for EvidenceSummaryState {
             rejection_count: bundle.rejection_count,
             limit_clamp_count: bundle.limit_clamp_count,
             channels_untouched: bundle.channels_untouched.clone(),
+            unexpected_channels_touched: bundle.unexpected_channels_touched.clone(),
             state_freshness: bundle.state_freshness.clone(),
             created_at_rfc3339: bundle.created_at.to_rfc3339(),
         }

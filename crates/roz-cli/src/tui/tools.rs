@@ -38,6 +38,15 @@ fn load_project_embodiment_manifest(
     }
 }
 
+fn websocket_url(base_url: &str, path: &str) -> String {
+    let base = base_url
+        .trim_end_matches('/')
+        .replace("http://", "ws://")
+        .replace("https://", "wss://");
+    let path = path.trim_start_matches('/');
+    format!("{base}/{path}")
+}
+
 /// Build a `ToolDispatcher` with **all** tools for CLI sessions:
 /// 6 built-in tools + daemon tools from the embodiment manifest (if present).
 ///
@@ -120,14 +129,7 @@ pub fn build_all_tools_with_copper(project_dir: &Path) -> AllTools {
             && let Some(ref ws_config) = daemon.websocket
         {
             // Build WS URL from daemon base_url + websocket path.
-            let ws_url = format!(
-                "{}{}",
-                daemon
-                    .base_url
-                    .replace("http://", "ws://")
-                    .replace("https://", "wss://"),
-                ws_config.path,
-            );
+            let ws_url = websocket_url(&daemon.base_url, &ws_config.path);
             let Some(body_template) = ws_config.set_target_body.clone() else {
                 tracing::error!(
                     manifest_path = %manifest_path.display(),
@@ -789,6 +791,22 @@ set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
         assert!(names.contains(&"replay_controller"));
         assert!(!names.contains(&"stop_controller"));
         assert!(!names.contains(&"get_controller_status"));
+    }
+
+    #[test]
+    fn websocket_url_normalizes_path_join() {
+        assert_eq!(
+            websocket_url("http://localhost:8080/", "/ws/sdk"),
+            "ws://localhost:8080/ws/sdk"
+        );
+        assert_eq!(
+            websocket_url("http://localhost:8080", "ws/sdk"),
+            "ws://localhost:8080/ws/sdk"
+        );
+        assert_eq!(
+            websocket_url("https://localhost:8080/", "ws/sdk"),
+            "wss://localhost:8080/ws/sdk"
+        );
     }
 
     /// Full copper path: websocket + channels -> spawns Copper, registers controller tools.
