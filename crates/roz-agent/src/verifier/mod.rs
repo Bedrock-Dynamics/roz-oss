@@ -58,6 +58,12 @@ impl Verifier {
 
     /// Run all rule checks against the evidence bundle and return a verdict.
     pub fn verify(&self, evidence: &ControllerEvidenceBundle) -> VerifierVerdict {
+        if self.rule_checks.is_empty() {
+            return VerifierVerdict::Unavailable {
+                reason: "no rule checks configured".into(),
+            };
+        }
+
         let mut failures = Vec::new();
         for check in &self.rule_checks {
             if let CheckResult::Fail { reason, severity } = check.check(evidence) {
@@ -214,5 +220,16 @@ mod tests {
     fn default_checks_count() {
         let verifier = Verifier::with_default_checks();
         assert_eq!(verifier.rule_checks.len(), 10);
+    }
+
+    #[test]
+    fn empty_rule_set_is_unavailable() {
+        let verifier = Verifier::new(vec![]);
+        let verdict = verifier.verify(&clean_evidence());
+        assert!(matches!(
+            verdict,
+            VerifierVerdict::Unavailable { ref reason } if reason == "no rule checks configured"
+        ));
+        assert!(!verdict.allows_promotion());
     }
 }

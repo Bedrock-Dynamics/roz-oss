@@ -35,6 +35,7 @@ pub struct EvidenceCollector {
     epoch_interrupt_count: u32,
     trap_count: u32,
     watchdog_near_miss_count: u32,
+    missed_tick_count: u32,
     channels_touched: BTreeSet<String>,
     unexpected_channels_touched: Vec<String>,
     all_channels: Vec<String>,
@@ -47,6 +48,8 @@ pub struct EvidenceCollector {
 
 /// Number of consecutive stable ticks required to declare steady state.
 const STEADY_STATE_THRESHOLD: u32 = 50;
+const STEADY_STATE_EPSILON: f64 = 0.005;
+const OSCILLATION_DELTA_THRESHOLD: f64 = 0.05;
 /// Number of tick latencies retained for bounded percentile calculation.
 const MAX_TICK_LATENCY_SAMPLES: usize = 2048;
 
@@ -135,6 +138,7 @@ impl EvidenceCollector {
             epoch_interrupt_count: 0,
             trap_count: 0,
             watchdog_near_miss_count: 0,
+            missed_tick_count: 0,
             channels_touched: BTreeSet::new(),
             unexpected_channels_touched: Vec::new(),
             all_channels: channel_names.to_vec(),
@@ -180,13 +184,15 @@ impl EvidenceCollector {
                 InterventionKind::NanReject => {
                     self.rejection_count += 1;
                 }
+                InterventionKind::TickOverrun => {
+                    self.missed_tick_count += 1;
+                }
                 InterventionKind::UnconfiguredJoint
                 | InterventionKind::VelocityClamp
                 | InterventionKind::JerkLimit
                 | InterventionKind::ForceLimit
                 | InterventionKind::TorqueLimit
                 | InterventionKind::WorkspaceBoundary
-                | InterventionKind::TickOverrun
                 | InterventionKind::ContactForceExceeded
                 | InterventionKind::SlipDetected
                 | InterventionKind::TactileOverload => {
@@ -195,28 +201,38 @@ impl EvidenceCollector {
             }
         }
 
-        // Detect command oscillation: sign changes in consecutive ticks
-        if !self.previous_commands.is_empty() && self.previous_commands.len() == output.command_values.len() {
+        // Detect command oscillation and only declare steady state when outputs
+        // remain within a small idle epsilon across the full command vector.
+        if self.previous_commands.is_empty() {
+            self.steady_state_ticks = 1;
+        } else if self.previous_commands.len() != output.command_values.len() {
+            self.steady_state_ticks = 0;
+        } else {
             let mut sign_changes = 0u32;
+            let mut all_within_idle_epsilon = true;
+            let mut exceeded_oscillation_threshold = false;
             for (prev, curr) in self.previous_commands.iter().zip(&output.command_values) {
                 if prev.signum() != curr.signum() && *prev != 0.0 && *curr != 0.0 {
                     sign_changes += 1;
                 }
-            }
-            if sign_changes > 0 {
-                // If more than half the channels flipped sign, that's oscillation
-                let threshold = output.command_values.len().max(1) / 2;
-                if sign_changes as usize > threshold {
-                    self.command_oscillation_detected = true;
-                    self.steady_state_ticks = 0;
-                } else {
-                    self.steady_state_ticks += 1;
+                let delta = (curr - prev).abs();
+                if delta > STEADY_STATE_EPSILON {
+                    all_within_idle_epsilon = false;
                 }
-            } else {
-                self.steady_state_ticks += 1;
+                if delta > OSCILLATION_DELTA_THRESHOLD {
+                    exceeded_oscillation_threshold = true;
+                }
             }
-        } else {
-            self.steady_state_ticks += 1;
+
+            let majority_threshold = output.command_values.len().max(1) / 2;
+            if sign_changes as usize > majority_threshold || exceeded_oscillation_threshold {
+                self.command_oscillation_detected = true;
+                self.steady_state_ticks = 0;
+            } else if all_within_idle_epsilon {
+                self.steady_state_ticks += 1;
+            } else {
+                self.steady_state_ticks = 0;
+            }
         }
 
         self.previous_commands.clone_from(&output.command_values);
@@ -331,7 +347,7 @@ impl EvidenceCollector {
                 command_oscillation_detected: self.command_oscillation_detected,
                 idle_output_stable: !self.command_oscillation_detected,
                 runtime_jitter_us: jitter_us,
-                missed_tick_count: 0, // TODO: wire missed tick detection from pipeline
+                missed_tick_count: self.missed_tick_count,
                 steady_state_reached,
             },
             verifier_status: VerifierStatus::Pending,
@@ -453,6 +469,21 @@ mod tests {
     }
 
     #[test]
+    fn evidence_collector_tracks_tick_overruns_separately() {
+        let mut collector = EvidenceCollector::new("ctrl-overrun", &[]);
+        let interventions = vec![
+            make_intervention(InterventionKind::TickOverrun, "joint_0"),
+            make_intervention(InterventionKind::VelocityClamp, "joint_0"),
+        ];
+
+        collector.record_tick(Duration::from_micros(500), &make_output(vec![0.1]), &interventions);
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Shadow, "wt");
+
+        assert_eq!(bundle.controller_stability_summary.missed_tick_count, 1);
+        assert_eq!(bundle.limit_clamp_count, 1);
+    }
+
+    #[test]
     fn evidence_collector_detects_oscillation() {
         // Single-channel oscillation: sign flips every tick, and > half channels
         // (1 channel, threshold = 0) means every sign change is detected.
@@ -468,6 +499,51 @@ mod tests {
 
         assert!(bundle.controller_stability_summary.command_oscillation_detected);
         // Because oscillation keeps resetting steady_state_ticks
+        assert!(!bundle.controller_stability_summary.steady_state_reached);
+    }
+
+    #[test]
+    fn evidence_collector_same_sign_drift_is_not_steady() {
+        let mut collector = EvidenceCollector::new("ctrl-drift", &[]);
+
+        for value in [0.1, 0.2, 0.4, 0.8, 1.0] {
+            collector.record_tick(Duration::from_micros(100), &make_output(vec![value]), &[]);
+        }
+
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+
+        assert!(!bundle.controller_stability_summary.steady_state_reached);
+        assert!(bundle.controller_stability_summary.command_oscillation_detected);
+    }
+
+    #[test]
+    fn evidence_collector_constant_output_reaches_steady_state() {
+        let mut collector = EvidenceCollector::new("ctrl-steady", &[]);
+
+        for _ in 0..STEADY_STATE_THRESHOLD {
+            collector.record_tick(Duration::from_micros(100), &make_output(vec![0.25, -0.25]), &[]);
+        }
+
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+
+        assert!(bundle.controller_stability_summary.steady_state_reached);
+        assert!(!bundle.controller_stability_summary.command_oscillation_detected);
+    }
+
+    #[test]
+    fn evidence_collector_width_change_resets_steady_state() {
+        let mut collector = EvidenceCollector::new("ctrl-width", &[]);
+
+        for _ in 0..(STEADY_STATE_THRESHOLD - 1) {
+            collector.record_tick(Duration::from_micros(100), &make_output(vec![0.25]), &[]);
+        }
+        collector.record_tick(Duration::from_micros(100), &make_output(vec![0.25, 0.25]), &[]);
+        for _ in 0..(STEADY_STATE_THRESHOLD - 1) {
+            collector.record_tick(Duration::from_micros(100), &make_output(vec![0.25]), &[]);
+        }
+
+        let bundle = collector.finalize("ctrl", "m", "c", "man", "1.0.0", ExecutionMode::Verify, "wt");
+
         assert!(!bundle.controller_stability_summary.steady_state_reached);
     }
 
