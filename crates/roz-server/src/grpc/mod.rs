@@ -1,5 +1,7 @@
 pub mod agent;
 pub mod convert;
+#[allow(dead_code)]
+pub mod embodiment_convert;
 pub mod event_mapper;
 pub mod tasks;
 
@@ -10,6 +12,7 @@ pub mod tasks;
     clippy::doc_markdown,
     clippy::enum_variant_names,
     clippy::missing_const_for_fn,
+    clippy::too_long_first_doc_paragraph,
     clippy::too_many_lines,
     clippy::wildcard_imports
 )]
@@ -24,22 +27,59 @@ pub mod roz_v1 {
 #[allow(unused_imports)]
 mod tests {
     use super::roz_v1::{
-        // Existing imports
-        CreateTaskRequest, FILE_DESCRIPTOR_SET, RegisterHostRequest, SafetyStatus,
-        TaskStatusUpdate,
-        // Embodiment imports
-        CalibrationOverlay, ChannelBinding, CollisionBody, CollisionPair, ControlChannelDef,
-        ControlInterfaceManifest, EmbodimentFamily, EmbodimentModel, EmbodimentRuntime,
-        FrameNode, FrameTree, Geometry, Joint, JointSafetyLimits, Link, Quaternion,
-        SafetyOverlay, SensorMount, ToolCenterPoint, Transform3D, Vec3, WorkspaceZone,
-        // Embodiment request/response types
-        GetModelRequest, GetRuntimeRequest, ListBindingsRequest, ListBindingsResponse,
-        ValidateBindingsRequest, ValidateBindingsResponse,
         // Enums
-        BindingType, CommandInterfaceType, FrameSource, JointType, SensorType, TcpType, ZoneType,
+        BindingType,
+        // Embodiment imports
+        CalibrationOverlay,
         // Misc
-        CameraFrustum, CameraResolution, ContactForceEnvelope, ForceSafetyLimits, SemanticRole,
-        SensorCalibration, UnboundChannel, WorkspaceShape,
+        CameraFrustum,
+        CameraResolution,
+        ChannelBinding,
+        CollisionBody,
+        CollisionPair,
+        CommandInterfaceType,
+        ContactForceEnvelope,
+        ControlChannelDef,
+        ControlInterfaceManifest,
+        // Existing imports
+        CreateTaskRequest,
+        EmbodimentFamily,
+        EmbodimentModel,
+        EmbodimentRuntime,
+        FILE_DESCRIPTOR_SET,
+        ForceSafetyLimits,
+        FrameNode,
+        FrameSource,
+        FrameTree,
+        Geometry,
+        // Embodiment request/response types
+        GetModelRequest,
+        GetRuntimeRequest,
+        Joint,
+        JointSafetyLimits,
+        JointType,
+        Link,
+        ListBindingsRequest,
+        ListBindingsResponse,
+        Quaternion,
+        RegisterHostRequest,
+        SafetyOverlay,
+        SafetyStatus,
+        SemanticRole,
+        SensorCalibration,
+        SensorMount,
+        SensorType,
+        TaskStatusUpdate,
+        TcpType,
+        ToolCenterPoint,
+        Transform3D,
+        UnboundChannel,
+        ValidateBindingsRequest,
+        ValidateBindingsResponse,
+        Vec3,
+        WorkspaceShape,
+        WorkspaceZone,
+        ZoneType,
     };
 
     #[test]
@@ -216,11 +256,7 @@ mod tests {
                 frame_id: "world".into(),
                 parent_id: None,
                 static_transform: Some(Transform3D {
-                    translation: Some(Vec3 {
-                        x: 0.0,
-                        y: 0.0,
-                        z: 0.0,
-                    }),
+                    translation: Some(Vec3 { x: 0.0, y: 0.0, z: 0.0 }),
                     rotation: Some(Quaternion {
                         x: 0.0,
                         y: 0.0,
@@ -278,7 +314,6 @@ mod tests {
     fn embodiment_service_trait_is_generated() {
         // This test proves the EmbodimentService trait exists and has the expected RPCs.
         // We don't implement it here (Phase 4), just confirm the generated code resolves.
-        fn _assert_trait_exists<T: super::roz_v1::embodiment_service_server::EmbodimentService>() {
-        }
+        fn _assert_trait_exists<T: super::roz_v1::embodiment_service_server::EmbodimentService>() {}
     }
 }
