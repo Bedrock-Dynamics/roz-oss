@@ -49,6 +49,12 @@ pub struct WorkerConfig {
     /// Defaults to 1.5 rad/s if not specified. Set via `ROZ_MAX_VELOCITY`.
     #[serde(default)]
     pub max_velocity: Option<f64>,
+    /// Path to a robot.toml or embodiment.toml manifest.
+    /// When set, the worker parses the manifest and uploads the embodiment
+    /// model to the server after host registration.
+    /// Set via `ROZ_ROBOT_TOML` env var or `robot_toml` in roz-worker.toml.
+    #[serde(default)]
+    pub robot_toml: Option<String>,
     /// Maximum number of concurrently executing tasks before new work is rejected.
     #[serde(default = "default_max_concurrent_tasks")]
     pub max_concurrent_tasks: usize,
@@ -326,5 +332,21 @@ mod tests {
             .merge(("max_concurrent_tasks", 9));
         let config = WorkerConfig::from_figment(&figment).unwrap();
         assert_eq!(config.max_concurrent_tasks, 9);
+    }
+
+    #[test]
+    fn config_robot_toml_defaults_to_none() {
+        let figment = Figment::new().merge(Serialized::defaults(base_config()));
+        let config = WorkerConfig::from_figment(&figment).unwrap();
+        assert!(config.robot_toml.is_none());
+    }
+
+    #[test]
+    fn config_robot_toml_loads_when_set() {
+        let mut vals = base_config();
+        vals["robot_toml"] = serde_json::json!("/etc/roz/robot.toml");
+        let figment = Figment::new().merge(Serialized::defaults(vals));
+        let config = WorkerConfig::from_figment(&figment).unwrap();
+        assert_eq!(config.robot_toml.as_deref(), Some("/etc/roz/robot.toml"));
     }
 }

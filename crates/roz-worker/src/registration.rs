@@ -126,7 +126,10 @@ pub async fn upload_embodiment(
     model: &roz_core::embodiment::model::EmbodimentModel,
     runtime: Option<&roz_core::embodiment::embodiment_runtime::EmbodimentRuntime>,
 ) -> Result<()> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("failed to build HTTP client")?;
     let base = api_url.trim_end_matches('/');
 
     let mut body = serde_json::json!({

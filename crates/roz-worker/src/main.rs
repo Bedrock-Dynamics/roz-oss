@@ -833,10 +833,47 @@ async fn main() -> Result<()> {
     tokio::spawn(async move { wd.run(wd_cancel).await });
     tracing::info!("idle watchdog active (30s deadline)");
 
+    // Load embodiment model from robot.toml if configured (D-01, D-02)
+    let embodiment_model: Option<roz_core::embodiment::model::EmbodimentModel> =
+        config.robot_toml.as_ref().and_then(|toml_path| {
+            match roz_core::manifest::EmbodimentManifest::load(std::path::Path::new(toml_path)) {
+                Ok(manifest) => {
+                    if let Some(rt) = manifest.embodiment_runtime() {
+                        tracing::info!(path = %toml_path, digest = %rt.model.model_digest, "loaded embodiment model from manifest");
+                        Some(rt.model)
+                    } else {
+                        tracing::info!(path = %toml_path, "manifest has no channels section, skipping embodiment upload");
+                        None
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(path = %toml_path, error = %e, "failed to load embodiment manifest");
+                    None
+                }
+            }
+        });
+
     // Register with server
     if !config.api_key.is_empty() {
         match roz_worker::registration::register_host(&config.api_url, &config.api_key, &config.worker_id).await {
-            Ok(host_id) => tracing::info!(host_id = %host_id, "registered with server"),
+            Ok(host_id) => {
+                tracing::info!(host_id = %host_id, "registered with server");
+                // Upload embodiment model if available (D-04: log-and-continue, D-05: None for runtime)
+                if let Some(ref model) = embodiment_model {
+                    match roz_worker::registration::upload_embodiment(
+                        &config.api_url,
+                        &config.api_key,
+                        host_id,
+                        model,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(()) => tracing::info!(host_id = %host_id, "embodiment model uploaded"),
+                        Err(e) => tracing::warn!(host_id = %host_id, error = %e, "embodiment upload failed"),
+                    }
+                }
+            }
             Err(e) => tracing::warn!(error = %e, "host registration failed"),
         }
     }
