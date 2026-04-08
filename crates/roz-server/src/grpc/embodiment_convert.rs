@@ -618,6 +618,35 @@ impl From<roz_v1::EmbodimentFamily> for EmbodimentFamily {
 }
 
 // ---------------------------------------------------------------------------
+// RetargetingMap: retargeting::RetargetingMap <-> roz_v1::RetargetingMap
+// ---------------------------------------------------------------------------
+
+impl From<&RetargetingMap> for roz_v1::RetargetingMap {
+    fn from(rm: &RetargetingMap) -> Self {
+        Self {
+            embodiment_family: Some(roz_v1::EmbodimentFamily::from(&rm.embodiment_family)),
+            canonical_to_local: rm.canonical_to_local.clone(),
+            local_to_canonical: rm.local_to_canonical.clone(),
+        }
+    }
+}
+
+impl TryFrom<roz_v1::RetargetingMap> for RetargetingMap {
+    type Error = EmbodimentConvertError;
+
+    fn try_from(proto: roz_v1::RetargetingMap) -> Result<Self, Self::Error> {
+        let family_proto = proto
+            .embodiment_family
+            .ok_or_else(|| EmbodimentConvertError::MissingField("embodiment_family".into()))?;
+        Ok(Self {
+            embodiment_family: EmbodimentFamily::from(family_proto),
+            canonical_to_local: proto.canonical_to_local,
+            local_to_canonical: proto.local_to_canonical,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Scalar wrapper: CollisionPair / (String, String)
 // ---------------------------------------------------------------------------
 
