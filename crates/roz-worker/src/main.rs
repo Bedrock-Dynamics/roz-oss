@@ -861,6 +861,7 @@ async fn main() -> Result<()> {
                 // Upload embodiment model if available (D-04: log-and-continue, D-05: None for runtime)
                 if let Some(ref model) = embodiment_model {
                     match roz_worker::registration::upload_embodiment(
+                        &http,
                         &config.api_url,
                         &config.api_key,
                         host_id,

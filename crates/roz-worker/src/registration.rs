@@ -120,16 +120,13 @@ fn find_host_by_name(body: &serde_json::Value, worker_id: &str) -> Option<Uuid> 
 /// embodiment data available. Sends `PUT /v1/hosts/{id}/embodiment` with the
 /// serialised model and optional runtime as JSON.
 pub async fn upload_embodiment(
+    client: &reqwest::Client,
     api_url: &str,
     api_key: &str,
     host_id: Uuid,
     model: &roz_core::embodiment::model::EmbodimentModel,
     runtime: Option<&roz_core::embodiment::embodiment_runtime::EmbodimentRuntime>,
 ) -> Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .context("failed to build HTTP client")?;
     let base = api_url.trim_end_matches('/');
 
     let mut body = serde_json::json!({
@@ -145,9 +142,9 @@ pub async fn upload_embodiment(
         .json(&body)
         .send()
         .await
-        .context("PUT /v1/hosts/{id}/embodiment request failed")?
+        .context(format!("PUT /v1/hosts/{host_id}/embodiment request failed"))?
         .error_for_status()
-        .context("PUT /v1/hosts/{id}/embodiment returned error status")?;
+        .context(format!("PUT /v1/hosts/{host_id}/embodiment returned error status"))?;
 
     Ok(())
 }
