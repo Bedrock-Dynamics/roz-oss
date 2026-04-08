@@ -60,8 +60,8 @@ Plans:
 **Plans:** 2 plans
 
 Plans:
-- [ ] 03-01-PLAN.md — Composite From/TryFrom impls for all ~16 type pairs, PartialEq on EmbodimentRuntime, proptest dev-dep
-- [ ] 03-02-PLAN.md — Proptest round-trip property tests for every converted type (CONV-05)
+- [x] 03-01-PLAN.md — Composite From/TryFrom impls for all ~16 type pairs, PartialEq on EmbodimentRuntime, proptest dev-dep
+- [x] 03-02-PLAN.md — Proptest round-trip property tests for every converted type (CONV-05)
 
 ### Phase 4: Service Implementation
 **Goal**: A working EmbodimentService serves GetModel, GetRuntime, ListBindings, and ValidateBindings RPCs; substrate-ide can fetch embodiment data over gRPC
@@ -72,10 +72,11 @@ Plans:
   2. `GetRuntime` RPC returns the compiled EmbodimentRuntime (model + calibration + safety overlays + digests)
   3. `ListBindings` and `ValidateBindings` RPCs return correct results
   4. Service is registered in server startup and appears in gRPC reflection
-**Plans**: TBD
+**Plans:** 2 plans
 
 Plans:
-- [ ] 04-01: TBD
+- [ ] 04-01-PLAN.md — DB migration, embodiments module, EmbodimentService gRPC impl, server registration
+- [ ] 04-02-PLAN.md — REST upload endpoint, worker registration extension for full data pipeline
 
 ## Progress
 
@@ -87,4 +88,4 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4
 | 1. Proto Definition and Build Integration | 0/2 | Not started | - |
 | 2. Leaf Type Conversions | 0/1 | Not started | - |
 | 3. Composite Type Conversions and Round-Trip Tests | 0/2 | Not started | - |
-| 4. Service Implementation | 0/1 | Not started | - |
+| 4. Service Implementation | 0/2 | Not started | - |
