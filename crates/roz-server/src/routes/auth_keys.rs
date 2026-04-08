@@ -1,11 +1,13 @@
+use axum::Extension;
 use axum::Json;
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::Path;
+use axum::http::StatusCode;
+use roz_core::auth::AuthIdentity;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::state::AppState;
+use crate::middleware::tx::Tx;
 
 #[derive(Deserialize)]
 pub struct CreateKeyRequest {
@@ -15,22 +17,17 @@ pub struct CreateKeyRequest {
 }
 
 pub async fn create_key(
-    State(state): State<AppState>,
-    headers: HeaderMap,
+    mut tx: Tx,
+    Extension(auth): Extension<AuthIdentity>,
     Json(body): Json<CreateKeyRequest>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
-    let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
-    let auth = crate::auth::extract_auth(&state.auth, &state.pool, auth_header)
-        .await
-        .map_err(|e| (StatusCode::UNAUTHORIZED, Json(json!({ "error": e.0 }))))?;
-
     let tenant_id = *auth.tenant_id().as_uuid();
     let created_by = match &auth {
-        roz_core::auth::AuthIdentity::User { user_id, .. } => user_id.clone(),
+        AuthIdentity::User { user_id, .. } => user_id.clone(),
         _ => "api_key".to_string(),
     };
 
-    let result = roz_db::api_keys::create_api_key(&state.pool, tenant_id, &body.name, &body.scopes, &created_by)
+    let result = roz_db::api_keys::create_api_key(&mut **tx, tenant_id, &body.name, &body.scopes, &created_by)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "database error in API key operation");
@@ -56,17 +53,12 @@ pub async fn create_key(
 }
 
 pub async fn list_keys(
-    State(state): State<AppState>,
-    headers: HeaderMap,
+    mut tx: Tx,
+    Extension(auth): Extension<AuthIdentity>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
-    let auth = crate::auth::extract_auth(&state.auth, &state.pool, auth_header)
-        .await
-        .map_err(|e| (StatusCode::UNAUTHORIZED, Json(json!({ "error": e.0 }))))?;
-
     let tenant_id = *auth.tenant_id().as_uuid();
 
-    let keys = roz_db::api_keys::list_api_keys(&state.pool, tenant_id)
+    let keys = roz_db::api_keys::list_api_keys(&mut **tx, tenant_id)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "database error in API key operation");
@@ -93,18 +85,13 @@ pub async fn list_keys(
 }
 
 pub async fn revoke_key(
-    State(state): State<AppState>,
-    headers: HeaderMap,
+    mut tx: Tx,
+    Extension(auth): Extension<AuthIdentity>,
     Path(key_id): Path<Uuid>,
 ) -> Result<StatusCode, (StatusCode, Json<Value>)> {
-    let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
-    let auth = crate::auth::extract_auth(&state.auth, &state.pool, auth_header)
-        .await
-        .map_err(|e| (StatusCode::UNAUTHORIZED, Json(json!({ "error": e.0 }))))?;
-
     let tenant_id = *auth.tenant_id().as_uuid();
 
-    let revoked = roz_db::api_keys::revoke_api_key(&state.pool, key_id, tenant_id)
+    let revoked = roz_db::api_keys::revoke_api_key(&mut **tx, key_id, tenant_id)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "database error in API key operation");
@@ -122,26 +109,13 @@ pub async fn revoke_key(
 }
 
 pub async fn rotate_key(
-    State(state): State<AppState>,
-    headers: HeaderMap,
+    mut tx: Tx,
+    Extension(auth): Extension<AuthIdentity>,
     Path(key_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
-    let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
-    let auth = crate::auth::extract_auth(&state.auth, &state.pool, auth_header)
-        .await
-        .map_err(|e| (StatusCode::UNAUTHORIZED, Json(json!({ "error": e.0 }))))?;
-
     let tenant_id = *auth.tenant_id().as_uuid();
 
-    let mut conn = state.pool.acquire().await.map_err(|e| {
-        tracing::error!(error = %e, "failed to acquire connection");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": "internal server error" })),
-        )
-    })?;
-
-    let result = roz_db::api_keys::rotate_api_key(&mut conn, key_id, tenant_id)
+    let result = roz_db::api_keys::rotate_api_key(&mut tx, key_id, tenant_id)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "database error in API key operation");

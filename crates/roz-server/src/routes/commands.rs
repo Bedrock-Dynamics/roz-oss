@@ -1,6 +1,6 @@
 use axum::Extension;
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use roz_core::auth::AuthIdentity;
 use serde::Deserialize;
@@ -8,7 +8,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::state::AppState;
+use crate::middleware::tx::Tx;
 
 #[derive(Deserialize)]
 pub struct CreateCommandRequest {
@@ -38,13 +38,13 @@ const fn default_limit() -> i64 {
 
 /// POST /v1/commands
 pub async fn create(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Json(body): Json<CreateCommandRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
     let cmd = roz_db::commands::create(
-        &state.pool,
+        &mut **tx,
         tenant_id,
         body.host_id,
         &body.command,
@@ -57,23 +57,23 @@ pub async fn create(
 
 /// GET /v1/commands
 pub async fn list(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
-    let cmds = roz_db::commands::list(&state.pool, tenant_id, params.limit, params.offset).await?;
+    let cmds = roz_db::commands::list(&mut **tx, tenant_id, params.limit, params.offset).await?;
     Ok(Json(json!({"data": cmds})))
 }
 
 /// GET /v1/commands/:id
 pub async fn get(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
-    let cmd = roz_db::commands::get_by_id(&state.pool, id)
+    let cmd = roz_db::commands::get_by_id(&mut **tx, id)
         .await?
         .ok_or_else(|| AppError::not_found("command not found"))?;
     if cmd.tenant_id != tenant_id {
@@ -84,21 +84,21 @@ pub async fn get(
 
 /// POST /v1/commands/:id/transition
 pub async fn transition(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Path(id): Path<Uuid>,
     Json(body): Json<TransitionStateRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     // Verify ownership first
     let tenant_id = *auth.tenant_id().as_uuid();
-    let existing = roz_db::commands::get_by_id(&state.pool, id)
+    let existing = roz_db::commands::get_by_id(&mut **tx, id)
         .await?
         .ok_or_else(|| AppError::not_found("command not found"))?;
     if existing.tenant_id != tenant_id {
         return Err(AppError::not_found("command not found"));
     }
 
-    let cmd = roz_db::commands::transition_state(&state.pool, id, &body.state)
+    let cmd = roz_db::commands::transition_state(&mut **tx, id, &body.state)
         .await?
         .ok_or_else(|| AppError::bad_request("invalid state transition"))?;
     Ok(Json(json!({"data": cmd})))
@@ -106,17 +106,17 @@ pub async fn transition(
 
 /// DELETE /v1/commands/:id
 pub async fn delete(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
-    let cmd = roz_db::commands::get_by_id(&state.pool, id)
+    let cmd = roz_db::commands::get_by_id(&mut **tx, id)
         .await?
         .ok_or_else(|| AppError::not_found("command not found"))?;
     if cmd.tenant_id != tenant_id {
         return Err(AppError::not_found("command not found"));
     }
-    roz_db::commands::delete(&state.pool, id).await?;
+    roz_db::commands::delete(&mut **tx, id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

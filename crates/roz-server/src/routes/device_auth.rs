@@ -1,8 +1,10 @@
+use axum::Extension;
 use axum::Json;
 use axum::extract::{Form, State};
 use axum::http::{HeaderMap, StatusCode};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
+use roz_core::auth::AuthIdentity;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -191,22 +193,19 @@ pub async fn poll_token(
 /// Requires API key authentication so we know who is authorizing the device.
 pub async fn complete_auth(
     State(state): State<AppState>,
+    mut tx: crate::middleware::tx::Tx,
+    Extension(auth): Extension<AuthIdentity>,
     headers: HeaderMap,
     Form(body): Form<CompleteRequest>,
 ) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
     let _ = roz_db::device_codes::purge_stale_device_codes(&state.pool).await;
     enforce_rate_limit(&state, &headers, "complete_auth")?;
 
-    let auth_header = headers.get("authorization").and_then(|v| v.to_str().ok());
-    let auth = crate::auth::extract_auth(&state.auth, &state.pool, auth_header)
-        .await
-        .map_err(|e| (StatusCode::UNAUTHORIZED, Json(json!({"error": e.0}))))?;
-
     let tenant_id = *auth.tenant_id().as_uuid();
     let user_id = "api_key".to_string();
 
     // Validate user code exists and is not expired
-    let row = roz_db::device_codes::get_by_user_code(&state.pool, &body.user_code)
+    let row = roz_db::device_codes::get_by_user_code(&mut **tx, &body.user_code)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "failed to look up user code");
@@ -225,7 +224,7 @@ pub async fn complete_auth(
         return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "code already used"}))));
     }
 
-    let completed = roz_db::device_codes::complete_device_code(&state.pool, &body.user_code, &user_id, tenant_id)
+    let completed = roz_db::device_codes::complete_device_code(&mut **tx, &body.user_code, &user_id, tenant_id)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "failed to complete device code");

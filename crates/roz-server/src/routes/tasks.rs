@@ -11,6 +11,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::middleware::tx::Tx;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -100,9 +101,10 @@ async fn publish_parent_approval_event(
 }
 
 /// POST /v1/tasks
-#[tracing::instrument(name = "tasks.create", skip(state, auth, body), fields(tenant_id))]
+#[tracing::instrument(name = "tasks.create", skip(state, tx, auth, body), fields(tenant_id))]
 pub async fn create(
     State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Json(body): Json<CreateTaskRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
@@ -119,7 +121,7 @@ pub async fn create(
         .as_ref()
         .ok_or_else(|| AppError::internal("task dispatch unavailable: NATS is not configured"))?;
     let host_uuid = Uuid::parse_str(host_id_str).map_err(|_| AppError::bad_request("host_id is not a valid UUID"))?;
-    let host = roz_db::hosts::get_by_id(&state.pool, host_uuid)
+    let host = roz_db::hosts::get_by_id(&mut **tx, host_uuid)
         .await
         .map_err(|e| AppError::internal(format!("failed to look up host: {e}")))?
         .ok_or_else(|| AppError::not_found(format!("host {host_id_str} not found")))?;
@@ -129,7 +131,7 @@ pub async fn create(
         .map_err(|e| AppError::internal(format!("failed to serialise phases: {e}")))?;
 
     let task = roz_db::tasks::create(
-        &state.pool,
+        &mut **tx,
         tenant_id,
         &body.prompt,
         body.environment_id,
@@ -138,7 +140,7 @@ pub async fn create(
         body.parent_task_id,
     )
     .await?;
-    let task = roz_db::tasks::assign_host(&state.pool, task.id, host_uuid)
+    let task = roz_db::tasks::assign_host(&mut **tx, task.id, host_uuid)
         .await?
         .ok_or_else(|| AppError::internal("created task disappeared before host assignment"))?;
 
@@ -157,12 +159,12 @@ pub async fn create(
     match state.http_client.post(&restate_url).json(&workflow_input).send().await {
         Ok(resp) => {
             if let Err(e) = resp.error_for_status() {
-                let _ = roz_db::tasks::update_status(&state.pool, task.id, "failed").await;
+                let _ = roz_db::tasks::update_status(&mut **tx, task.id, "failed").await;
                 return Err(AppError::internal(format!("failed to start workflow: {e}")));
             }
         }
         Err(e) => {
-            let _ = roz_db::tasks::update_status(&state.pool, task.id, "failed").await;
+            let _ = roz_db::tasks::update_status(&mut **tx, task.id, "failed").await;
             return Err(AppError::internal(format!("failed to start Restate workflow: {e}")));
         }
     }
@@ -188,11 +190,11 @@ pub async fn create(
     let payload = serde_json::to_vec(&invocation)
         .map_err(|e| AppError::internal(format!("failed to serialize task invocation: {e}")))?;
     if let Err(e) = nats.publish(subject, payload.into()).await {
-        let _ = roz_db::tasks::update_status(&state.pool, task.id, "failed").await;
+        let _ = roz_db::tasks::update_status(&mut **tx, task.id, "failed").await;
         return Err(AppError::internal(format!("failed to publish task invocation: {e}")));
     }
 
-    let task = roz_db::tasks::update_status(&state.pool, task.id, "queued")
+    let task = roz_db::tasks::update_status(&mut **tx, task.id, "queued")
         .await?
         .ok_or_else(|| AppError::internal("task disappeared after dispatch"))?;
 
@@ -200,9 +202,10 @@ pub async fn create(
 }
 
 /// POST /v1/tasks/:id/approve
-#[tracing::instrument(name = "tasks.approve", skip(state, auth, body), fields(tenant_id))]
+#[tracing::instrument(name = "tasks.approve", skip(state, tx, auth, body), fields(tenant_id))]
 pub async fn approve(
     State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Path(task_id): Path<Uuid>,
     Json(body): Json<crate::restate::task_workflow::ToolApproval>,
@@ -210,7 +213,7 @@ pub async fn approve(
     // Verify tenant ownership
     let tenant_id = *auth.tenant_id().as_uuid();
     tracing::Span::current().record("tenant_id", tracing::field::display(tenant_id));
-    let task = roz_db::tasks::get_by_id(&state.pool, task_id)
+    let task = roz_db::tasks::get_by_id(&mut **tx, task_id)
         .await?
         .ok_or_else(|| AppError::not_found("task not found"))?;
     if task.tenant_id != tenant_id {
@@ -268,28 +271,28 @@ pub async fn approve(
 }
 
 /// GET /v1/tasks
-#[tracing::instrument(name = "tasks.list", skip(state, auth, params), fields(tenant_id))]
+#[tracing::instrument(name = "tasks.list", skip(tx, auth, params), fields(tenant_id))]
 pub async fn list(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
     tracing::Span::current().record("tenant_id", tracing::field::display(tenant_id));
-    let tasks = roz_db::tasks::list(&state.pool, tenant_id, params.limit, params.offset).await?;
+    let tasks = roz_db::tasks::list(&mut **tx, tenant_id, params.limit, params.offset).await?;
     Ok(Json(json!({"data": tasks})))
 }
 
 /// GET /v1/tasks/:id
-#[tracing::instrument(name = "tasks.get", skip(state, auth), fields(tenant_id))]
+#[tracing::instrument(name = "tasks.get", skip(tx, auth), fields(tenant_id))]
 pub async fn get(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
     tracing::Span::current().record("tenant_id", tracing::field::display(tenant_id));
-    let task = roz_db::tasks::get_by_id(&state.pool, id)
+    let task = roz_db::tasks::get_by_id(&mut **tx, id)
         .await?
         .ok_or_else(|| AppError::not_found("task not found"))?;
     if task.tenant_id != tenant_id {
@@ -299,21 +302,21 @@ pub async fn get(
 }
 
 /// DELETE /v1/tasks/:id  (cancel)
-#[tracing::instrument(name = "tasks.delete", skip(state, auth), fields(tenant_id))]
+#[tracing::instrument(name = "tasks.delete", skip(tx, auth), fields(tenant_id))]
 pub async fn delete(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
     tracing::Span::current().record("tenant_id", tracing::field::display(tenant_id));
-    let task = roz_db::tasks::get_by_id(&state.pool, id)
+    let task = roz_db::tasks::get_by_id(&mut **tx, id)
         .await?
         .ok_or_else(|| AppError::not_found("task not found"))?;
     if task.tenant_id != tenant_id {
         return Err(AppError::not_found("task not found"));
     }
-    let updated = roz_db::tasks::update_status(&state.pool, id, "cancelled").await?;
+    let updated = roz_db::tasks::update_status(&mut **tx, id, "cancelled").await?;
     if updated.is_none() {
         return Err(AppError::not_found("task not found"));
     }

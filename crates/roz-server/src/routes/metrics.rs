@@ -1,12 +1,11 @@
 use axum::Extension;
 use axum::Json;
-use axum::extract::State;
 use roz_core::auth::AuthIdentity;
 use serde::Serialize;
 use serde_json::json;
 
 use crate::error::AppError;
-use crate::state::AppState;
+use crate::middleware::tx::Tx;
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
 #[allow(clippy::struct_field_names)]
@@ -33,7 +32,7 @@ pub struct HostMetrics {
 
 /// GET /v1/metrics/tasks
 pub async fn task_metrics(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
@@ -55,7 +54,7 @@ pub async fn task_metrics(
          WHERE tenant_id = $1",
     )
     .bind(tenant_id)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut **tx)
     .await?;
 
     let metrics = TaskMetrics {
@@ -76,7 +75,7 @@ pub async fn task_metrics(
 
 /// GET /v1/metrics/hosts
 pub async fn host_metrics(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
@@ -90,7 +89,7 @@ pub async fn host_metrics(
          WHERE tenant_id = $1",
     )
     .bind(tenant_id)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut **tx)
     .await?;
 
     Ok(Json(json!({ "data": metrics })))

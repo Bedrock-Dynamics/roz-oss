@@ -1,6 +1,6 @@
 use axum::Extension;
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use roz_core::auth::AuthIdentity;
 use serde::Deserialize;
@@ -8,7 +8,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::state::AppState;
+use crate::middleware::tx::Tx;
 
 #[derive(Deserialize)]
 pub struct CreatePolicyRequest {
@@ -48,13 +48,13 @@ const fn default_limit() -> i64 {
 
 /// POST /v1/safety-policies
 pub async fn create(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Json(body): Json<CreatePolicyRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
     let policy = roz_db::safety_policies::create(
-        &state.pool,
+        &mut **tx,
         tenant_id,
         &body.name,
         &body.policy_json,
@@ -69,23 +69,23 @@ pub async fn create(
 
 /// GET /v1/safety-policies
 pub async fn list(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
-    let policies = roz_db::safety_policies::list(&state.pool, tenant_id, params.limit, params.offset).await?;
+    let policies = roz_db::safety_policies::list(&mut **tx, tenant_id, params.limit, params.offset).await?;
     Ok(Json(json!({"data": policies})))
 }
 
 /// GET /v1/safety-policies/:id
 pub async fn get(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
-    let policy = roz_db::safety_policies::get_by_id(&state.pool, id)
+    let policy = roz_db::safety_policies::get_by_id(&mut **tx, id)
         .await?
         .ok_or_else(|| AppError::not_found("safety policy not found"))?;
     if policy.tenant_id != tenant_id {
@@ -96,20 +96,20 @@ pub async fn get(
 
 /// PUT /v1/safety-policies/:id
 pub async fn update(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdatePolicyRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
-    let existing = roz_db::safety_policies::get_by_id(&state.pool, id)
+    let existing = roz_db::safety_policies::get_by_id(&mut **tx, id)
         .await?
         .ok_or_else(|| AppError::not_found("safety policy not found"))?;
     if existing.tenant_id != tenant_id {
         return Err(AppError::not_found("safety policy not found"));
     }
     let policy = roz_db::safety_policies::update(
-        &state.pool,
+        &mut **tx,
         id,
         body.policy_json.as_ref(),
         body.limits.as_ref(),
@@ -124,17 +124,17 @@ pub async fn update(
 
 /// DELETE /v1/safety-policies/:id
 pub async fn delete(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
-    let policy = roz_db::safety_policies::get_by_id(&state.pool, id)
+    let policy = roz_db::safety_policies::get_by_id(&mut **tx, id)
         .await?
         .ok_or_else(|| AppError::not_found("safety policy not found"))?;
     if policy.tenant_id != tenant_id {
         return Err(AppError::not_found("safety policy not found"));
     }
-    roz_db::safety_policies::delete(&state.pool, id).await?;
+    roz_db::safety_policies::delete(&mut **tx, id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

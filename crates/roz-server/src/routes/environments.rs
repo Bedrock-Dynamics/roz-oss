@@ -8,6 +8,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::middleware::tx::Tx;
 use crate::state::AppState;
 
 /// Provision a NATS account keypair for a newly created environment.
@@ -65,11 +66,12 @@ const fn default_limit() -> i64 {
 /// POST /v1/environments
 pub async fn create(
     State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Json(body): Json<CreateEnvironmentRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
-    let env = roz_db::environments::create(&state.pool, tenant_id, &body.name, &body.kind, &body.config).await?;
+    let env = roz_db::environments::create(&mut **tx, tenant_id, &body.name, &body.kind, &body.config).await?;
 
     // Provision NATS account if operator seed is configured
     if let Some(ref operator_seed) = state.operator_seed {
@@ -80,7 +82,7 @@ pub async fn create(
     }
 
     // Re-fetch so the response includes the NATS fields if they were populated
-    let env = roz_db::environments::get_by_id(&state.pool, env.id)
+    let env = roz_db::environments::get_by_id(&mut **tx, env.id)
         .await?
         .ok_or_else(|| AppError::not_found("environment not found"))?;
 
@@ -89,23 +91,23 @@ pub async fn create(
 
 /// GET /v1/environments
 pub async fn list(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
-    let envs = roz_db::environments::list(&state.pool, tenant_id, params.limit, params.offset).await?;
+    let envs = roz_db::environments::list(&mut **tx, tenant_id, params.limit, params.offset).await?;
     Ok(Json(json!({"data": envs})))
 }
 
 /// GET /v1/environments/:id
 pub async fn get(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
-    let env = roz_db::environments::get_by_id(&state.pool, id)
+    let env = roz_db::environments::get_by_id(&mut **tx, id)
         .await?
         .ok_or_else(|| AppError::not_found("environment not found"))?;
     if env.tenant_id != tenant_id {
@@ -116,19 +118,19 @@ pub async fn get(
 
 /// PUT /v1/environments/:id
 pub async fn update(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateEnvironmentRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
-    let existing = roz_db::environments::get_by_id(&state.pool, id)
+    let existing = roz_db::environments::get_by_id(&mut **tx, id)
         .await?
         .ok_or_else(|| AppError::not_found("environment not found"))?;
     if existing.tenant_id != tenant_id {
         return Err(AppError::not_found("environment not found"));
     }
-    let env = roz_db::environments::update(&state.pool, id, body.name.as_deref(), body.config.as_ref())
+    let env = roz_db::environments::update(&mut **tx, id, body.name.as_deref(), body.config.as_ref())
         .await?
         .ok_or_else(|| AppError::not_found("environment not found"))?;
     Ok(Json(json!({"data": env})))
@@ -136,18 +138,18 @@ pub async fn update(
 
 /// DELETE /v1/environments/:id
 pub async fn delete(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
     // Fetch first to verify tenant ownership
-    let env = roz_db::environments::get_by_id(&state.pool, id)
+    let env = roz_db::environments::get_by_id(&mut **tx, id)
         .await?
         .ok_or_else(|| AppError::not_found("environment not found"))?;
     if env.tenant_id != tenant_id {
         return Err(AppError::not_found("environment not found"));
     }
-    roz_db::environments::delete(&state.pool, id).await?;
+    roz_db::environments::delete(&mut **tx, id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
