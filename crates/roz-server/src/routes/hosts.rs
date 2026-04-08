@@ -171,6 +171,19 @@ pub async fn update_embodiment(
         return Err(AppError::not_found("host not found"));
     }
 
+    // Validate that model contains a non-null model_digest so the conditional
+    // upsert can compare digests correctly (NULL digest always triggers a write).
+    if body
+        .model
+        .get("model_digest")
+        .and_then(|v| v.as_str())
+        .is_none()
+    {
+        return Err(AppError::bad_request(
+            "model must contain a non-null model_digest field",
+        ));
+    }
+
     // Per D-03: atomic conditional write -- skips when model_digest unchanged
     let wrote = roz_db::embodiments::conditional_upsert(
         &state.pool,
