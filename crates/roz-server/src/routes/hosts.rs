@@ -150,6 +150,30 @@ pub async fn delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Deserialize)]
+pub struct UpdateEmbodimentRequest {
+    pub model: serde_json::Value,
+    pub runtime: Option<serde_json::Value>,
+}
+
+/// PUT /v1/hosts/:id/embodiment -- worker uploads embodiment data.
+pub async fn update_embodiment(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthIdentity>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdateEmbodimentRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let tenant_id = *auth.tenant_id().as_uuid();
+    let host = roz_db::hosts::get_by_id(&state.pool, id)
+        .await?
+        .ok_or_else(|| AppError::not_found("host not found"))?;
+    if host.tenant_id != tenant_id {
+        return Err(AppError::not_found("host not found"));
+    }
+    roz_db::embodiments::upsert(&state.pool, id, &body.model, body.runtime.as_ref()).await?;
+    Ok(Json(json!({"status": "ok"})))
+}
+
 /// POST /v1/hosts/:id/estop — trigger emergency stop on a host via NATS.
 pub async fn estop(
     State(state): State<AppState>,

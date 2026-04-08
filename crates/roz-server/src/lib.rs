@@ -12,7 +12,7 @@ pub mod triggers;
 pub mod ws;
 
 use axum::Router;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use tower_http::trace::TraceLayer;
 
 use state::AppState;
@@ -51,6 +51,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/v1/hosts/{id}/status", patch(routes::hosts::update_status))
         .route("/v1/hosts/{id}/estop", post(routes::hosts::estop))
+        .route("/v1/hosts/{id}/embodiment", put(routes::hosts::update_embodiment))
         // Task CRUD
         .route("/v1/tasks", get(routes::tasks::list).post(routes::tasks::create))
         .route("/v1/tasks/{id}", get(routes::tasks::get).delete(routes::tasks::delete))
