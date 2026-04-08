@@ -1,4 +1,3 @@
-use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Row type matching the `roz_safety_audit_log` schema exactly.
@@ -19,8 +18,8 @@ pub struct SafetyAuditRow {
 
 /// Append a new safety audit event. This table is append-only.
 #[allow(clippy::too_many_arguments)]
-pub async fn append(
-    pool: &PgPool,
+pub async fn append<'e, E>(
+    executor: E,
     tenant_id: Uuid,
     event_type: &str,
     severity: &str,
@@ -29,7 +28,10 @@ pub async fn append(
     host_id: Option<Uuid>,
     task_id: Option<Uuid>,
     policy_id: Option<Uuid>,
-) -> Result<SafetyAuditRow, sqlx::Error> {
+) -> Result<SafetyAuditRow, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, SafetyAuditRow>(
         "INSERT INTO roz_safety_audit_log \
          (tenant_id, event_type, severity, source, details, host_id, task_id, policy_id) \
@@ -43,32 +45,38 @@ pub async fn append(
     .bind(host_id)
     .bind(task_id)
     .bind(policy_id)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
 /// List safety audit events for a tenant with limit/offset pagination.
 /// Includes `tenant_id` filter for defense-in-depth (don't rely solely on RLS).
-pub async fn list(pool: &PgPool, tenant_id: Uuid, limit: i64, offset: i64) -> Result<Vec<SafetyAuditRow>, sqlx::Error> {
+pub async fn list<'e, E>(executor: E, tenant_id: Uuid, limit: i64, offset: i64) -> Result<Vec<SafetyAuditRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, SafetyAuditRow>(
         "SELECT * FROM roz_safety_audit_log WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
     )
     .bind(tenant_id)
     .bind(limit)
     .bind(offset)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
 /// List safety audit events filtered by severity for a tenant.
 /// Includes `tenant_id` filter for defense-in-depth (don't rely solely on RLS).
-pub async fn list_by_severity(
-    pool: &PgPool,
+pub async fn list_by_severity<'e, E>(
+    executor: E,
     tenant_id: Uuid,
     severity: &str,
     limit: i64,
     offset: i64,
-) -> Result<Vec<SafetyAuditRow>, sqlx::Error> {
+) -> Result<Vec<SafetyAuditRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, SafetyAuditRow>(
         "SELECT * FROM roz_safety_audit_log \
          WHERE tenant_id = $1 AND severity = $2 \
@@ -78,13 +86,14 @@ pub async fn list_by_severity(
     .bind(severity)
     .bind(limit)
     .bind(offset)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::PgPool;
     async fn setup() -> PgPool {
         crate::shared_test_pool().await
     }

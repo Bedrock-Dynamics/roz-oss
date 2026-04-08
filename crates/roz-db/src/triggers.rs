@@ -1,4 +1,3 @@
-use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Row type matching the `roz_triggers` schema exactly.
@@ -17,15 +16,18 @@ pub struct TriggerRow {
 }
 
 /// Insert a new trigger and return the created row.
-pub async fn create(
-    pool: &PgPool,
+pub async fn create<'e, E>(
+    executor: E,
     tenant_id: Uuid,
     name: &str,
     trigger_type: &str,
     config: &serde_json::Value,
     task_prompt: &str,
     environment_id: Uuid,
-) -> Result<TriggerRow, sqlx::Error> {
+) -> Result<TriggerRow, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, TriggerRow>(
         "INSERT INTO roz_triggers (tenant_id, name, trigger_type, config, task_prompt, environment_id) \
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
@@ -36,40 +38,49 @@ pub async fn create(
     .bind(config)
     .bind(task_prompt)
     .bind(environment_id)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
 /// Fetch a single trigger by primary key, or `None` if not found.
-pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Option<TriggerRow>, sqlx::Error> {
+pub async fn get_by_id<'e, E>(executor: E, id: Uuid) -> Result<Option<TriggerRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, TriggerRow>("SELECT * FROM roz_triggers WHERE id = $1")
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
 }
 
 /// List triggers for a tenant with limit/offset pagination.
 /// Includes `tenant_id` filter for defense-in-depth (don't rely solely on RLS).
-pub async fn list(pool: &PgPool, tenant_id: Uuid, limit: i64, offset: i64) -> Result<Vec<TriggerRow>, sqlx::Error> {
+pub async fn list<'e, E>(executor: E, tenant_id: Uuid, limit: i64, offset: i64) -> Result<Vec<TriggerRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, TriggerRow>(
         "SELECT * FROM roz_triggers WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
     )
     .bind(tenant_id)
     .bind(limit)
     .bind(offset)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
 /// Partially update a trigger. Only non-`None` fields are changed.
 /// Returns `None` when the row does not exist.
-pub async fn update(
-    pool: &PgPool,
+pub async fn update<'e, E>(
+    executor: E,
     id: Uuid,
     name: Option<&str>,
     config: Option<&serde_json::Value>,
     task_prompt: Option<&str>,
-) -> Result<Option<TriggerRow>, sqlx::Error> {
+) -> Result<Option<TriggerRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, TriggerRow>(
         "UPDATE roz_triggers \
          SET name        = COALESCE($2, name), \
@@ -83,33 +94,42 @@ pub async fn update(
     .bind(name)
     .bind(config)
     .bind(task_prompt)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
 /// Delete a trigger by id. Returns `true` when a row was actually removed.
-pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+pub async fn delete<'e, E>(executor: E, id: Uuid) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let result = sqlx::query("DELETE FROM roz_triggers WHERE id = $1")
         .bind(id)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(result.rows_affected() > 0)
 }
 
 /// List enabled triggers for a tenant (where `enabled = true`).
 /// Includes `tenant_id` filter for defense-in-depth.
-pub async fn list_enabled(pool: &PgPool, tenant_id: Uuid) -> Result<Vec<TriggerRow>, sqlx::Error> {
+pub async fn list_enabled<'e, E>(executor: E, tenant_id: Uuid) -> Result<Vec<TriggerRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, TriggerRow>(
         "SELECT * FROM roz_triggers WHERE tenant_id = $1 AND enabled = true ORDER BY created_at DESC",
     )
     .bind(tenant_id)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
 /// Enable or disable a trigger. Sets `updated_at = now()`.
 /// Returns `None` when the row does not exist.
-pub async fn toggle(pool: &PgPool, id: Uuid, enabled: bool) -> Result<Option<TriggerRow>, sqlx::Error> {
+pub async fn toggle<'e, E>(executor: E, id: Uuid, enabled: bool) -> Result<Option<TriggerRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, TriggerRow>(
         "UPDATE roz_triggers \
          SET enabled    = $2, \
@@ -119,13 +139,14 @@ pub async fn toggle(pool: &PgPool, id: Uuid, enabled: bool) -> Result<Option<Tri
     )
     .bind(id)
     .bind(enabled)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::PgPool;
     async fn setup() -> PgPool {
         crate::shared_test_pool().await
     }

@@ -1,4 +1,3 @@
-use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Row type matching the `roz_hosts` schema exactly.
@@ -18,14 +17,17 @@ pub struct HostRow {
 }
 
 /// Insert a new host and return the created row.
-pub async fn create(
-    pool: &PgPool,
+pub async fn create<'e, E>(
+    executor: E,
     tenant_id: Uuid,
     name: &str,
     host_type: &str,
     capabilities: &[String],
     labels: &serde_json::Value,
-) -> Result<HostRow, sqlx::Error> {
+) -> Result<HostRow, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, HostRow>(
         "INSERT INTO roz_hosts (tenant_id, name, host_type, capabilities, labels) \
          VALUES ($1, $2, $3, $4, $5) RETURNING *",
@@ -35,39 +37,48 @@ pub async fn create(
     .bind(host_type)
     .bind(capabilities)
     .bind(labels)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
 /// Fetch a single host by primary key, or `None` if not found.
-pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Option<HostRow>, sqlx::Error> {
+pub async fn get_by_id<'e, E>(executor: E, id: Uuid) -> Result<Option<HostRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, HostRow>("SELECT * FROM roz_hosts WHERE id = $1")
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
 }
 
 /// List hosts for a tenant with limit/offset pagination.
 /// Includes `tenant_id` filter for defense-in-depth (don't rely solely on RLS).
-pub async fn list(pool: &PgPool, tenant_id: Uuid, limit: i64, offset: i64) -> Result<Vec<HostRow>, sqlx::Error> {
+pub async fn list<'e, E>(executor: E, tenant_id: Uuid, limit: i64, offset: i64) -> Result<Vec<HostRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, HostRow>(
         "SELECT * FROM roz_hosts WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
     )
     .bind(tenant_id)
     .bind(limit)
     .bind(offset)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
 /// Partially update a host. Only non-`None` fields are changed.
 /// Returns `None` when the row does not exist.
-pub async fn update(
-    pool: &PgPool,
+pub async fn update<'e, E>(
+    executor: E,
     id: Uuid,
     name: Option<&str>,
     labels: Option<&serde_json::Value>,
-) -> Result<Option<HostRow>, sqlx::Error> {
+) -> Result<Option<HostRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, HostRow>(
         "UPDATE roz_hosts \
          SET name       = COALESCE($2, name), \
@@ -79,22 +90,28 @@ pub async fn update(
     .bind(id)
     .bind(name)
     .bind(labels)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
 /// Delete a host by id. Returns `true` when a row was actually removed.
-pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+pub async fn delete<'e, E>(executor: E, id: Uuid) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let result = sqlx::query("DELETE FROM roz_hosts WHERE id = $1")
         .bind(id)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(result.rows_affected() > 0)
 }
 
 /// Update host status (for heartbeat/status changes). Also sets `updated_at = now()`.
 /// Returns `None` when the row does not exist.
-pub async fn update_status(pool: &PgPool, id: Uuid, status: &str) -> Result<Option<HostRow>, sqlx::Error> {
+pub async fn update_status<'e, E>(executor: E, id: Uuid, status: &str) -> Result<Option<HostRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, HostRow>(
         "UPDATE roz_hosts \
          SET status     = $2, \
@@ -104,38 +121,45 @@ pub async fn update_status(pool: &PgPool, id: Uuid, status: &str) -> Result<Opti
     )
     .bind(id)
     .bind(status)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
 /// Find hosts that have ALL the required capabilities (array containment: `capabilities @> $1`).
-pub async fn list_by_capabilities(
-    pool: &PgPool,
+pub async fn list_by_capabilities<'e, E>(
+    executor: E,
     tenant_id: Uuid,
     required_caps: &[String],
-) -> Result<Vec<HostRow>, sqlx::Error> {
+) -> Result<Vec<HostRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, HostRow>(
         "SELECT * FROM roz_hosts WHERE tenant_id = $1 AND capabilities @> $2 ORDER BY created_at DESC",
     )
     .bind(tenant_id)
     .bind(required_caps)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
 /// List hosts with `status = 'online'` for a tenant.
-pub async fn list_online(pool: &PgPool, tenant_id: Uuid) -> Result<Vec<HostRow>, sqlx::Error> {
+pub async fn list_online<'e, E>(executor: E, tenant_id: Uuid) -> Result<Vec<HostRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, HostRow>(
         "SELECT * FROM roz_hosts WHERE tenant_id = $1 AND status = 'online' ORDER BY created_at DESC",
     )
     .bind(tenant_id)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::PgPool;
     async fn setup() -> PgPool {
         crate::shared_test_pool().await
     }

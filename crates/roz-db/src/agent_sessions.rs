@@ -1,4 +1,3 @@
-use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Row type matching the `roz_agent_sessions` schema exactly.
@@ -19,37 +18,39 @@ pub struct AgentSessionRow {
 }
 
 /// Insert a new agent session and return the created row.
-pub async fn create_session(
-    pool: &PgPool,
+///
+/// The caller provides transactional context (Tx middleware sets tenant
+/// context before this runs).
+pub async fn create_session<'e, E>(
+    executor: E,
     tenant_id: Uuid,
     environment_id: Uuid,
     model_name: &str,
-) -> Result<AgentSessionRow, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    crate::set_tenant_context(&mut *tx, &tenant_id).await?;
-    let row = sqlx::query_as::<_, AgentSessionRow>(
+) -> Result<AgentSessionRow, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query_as::<_, AgentSessionRow>(
         "INSERT INTO roz_agent_sessions (tenant_id, environment_id, model_name) VALUES ($1, $2, $3) RETURNING *",
     )
     .bind(tenant_id)
     .bind(environment_id)
     .bind(model_name)
-    .fetch_one(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    Ok(row)
+    .fetch_one(executor)
+    .await
 }
 
 /// Increment token and turn counters for a session.
-pub async fn update_session_usage(
-    pool: &PgPool,
-    tenant_id: Uuid,
+pub async fn update_session_usage<'e, E>(
+    executor: E,
     session_id: Uuid,
     input_tokens: i64,
     output_tokens: i64,
     turn_count: i32,
-) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    crate::set_tenant_context(&mut *tx, &tenant_id).await?;
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let result = sqlx::query(
         "UPDATE roz_agent_sessions \
          SET input_tokens = input_tokens + $2, \
@@ -61,25 +62,24 @@ pub async fn update_session_usage(
     .bind(input_tokens)
     .bind(output_tokens)
     .bind(turn_count)
-    .execute(&mut *tx)
+    .execute(executor)
     .await?;
     if result.rows_affected() == 0 {
         return Err(sqlx::Error::RowNotFound);
     }
-    tx.commit().await?;
     Ok(())
 }
 
 /// Mark a session as completed/cancelled/error with an end timestamp.
 /// `status` must be one of: `"completed"`, `"cancelled"`, `"error"`.
-pub async fn complete_session(
-    pool: &PgPool,
-    tenant_id: Uuid,
+pub async fn complete_session<'e, E>(
+    executor: E,
     session_id: Uuid,
     status: &str,
-) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    crate::set_tenant_context(&mut *tx, &tenant_id).await?;
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let result = sqlx::query(
         "UPDATE roz_agent_sessions \
          SET status = $2, ended_at = now() \
@@ -87,11 +87,10 @@ pub async fn complete_session(
     )
     .bind(session_id)
     .bind(status)
-    .execute(&mut *tx)
+    .execute(executor)
     .await?;
     if result.rows_affected() == 0 {
         return Err(sqlx::Error::RowNotFound);
     }
-    tx.commit().await?;
     Ok(())
 }

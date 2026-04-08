@@ -1,4 +1,3 @@
-use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Row type matching the `roz_safety_policies` schema exactly.
@@ -19,8 +18,8 @@ pub struct SafetyPolicyRow {
 
 /// Insert a new safety policy and return the created row.
 #[allow(clippy::too_many_arguments)]
-pub async fn create(
-    pool: &PgPool,
+pub async fn create<'e, E>(
+    executor: E,
     tenant_id: Uuid,
     name: &str,
     policy_json: &serde_json::Value,
@@ -28,7 +27,10 @@ pub async fn create(
     geofences: &serde_json::Value,
     interlocks: &serde_json::Value,
     deadman_timers: &serde_json::Value,
-) -> Result<SafetyPolicyRow, sqlx::Error> {
+) -> Result<SafetyPolicyRow, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, SafetyPolicyRow>(
         "INSERT INTO roz_safety_policies (tenant_id, name, policy_json, limits, geofences, interlocks, deadman_timers) \
          VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *",
@@ -40,48 +42,57 @@ pub async fn create(
     .bind(geofences)
     .bind(interlocks)
     .bind(deadman_timers)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
 /// Fetch a single safety policy by primary key, or `None` if not found.
-pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Option<SafetyPolicyRow>, sqlx::Error> {
+pub async fn get_by_id<'e, E>(executor: E, id: Uuid) -> Result<Option<SafetyPolicyRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, SafetyPolicyRow>("SELECT * FROM roz_safety_policies WHERE id = $1")
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
 }
 
 /// List safety policies for a tenant with limit/offset pagination.
 /// Includes `tenant_id` filter for defense-in-depth (don't rely solely on RLS).
-pub async fn list(
-    pool: &PgPool,
+pub async fn list<'e, E>(
+    executor: E,
     tenant_id: Uuid,
     limit: i64,
     offset: i64,
-) -> Result<Vec<SafetyPolicyRow>, sqlx::Error> {
+) -> Result<Vec<SafetyPolicyRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, SafetyPolicyRow>(
         "SELECT * FROM roz_safety_policies WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
     )
     .bind(tenant_id)
     .bind(limit)
     .bind(offset)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
 /// Partially update a safety policy. Only non-`None` fields are changed.
 /// Auto-increments `version` on each update for audit trail.
 /// Returns `None` when the row does not exist.
-pub async fn update(
-    pool: &PgPool,
+pub async fn update<'e, E>(
+    executor: E,
     id: Uuid,
     policy_json: Option<&serde_json::Value>,
     limits: Option<&serde_json::Value>,
     geofences: Option<&serde_json::Value>,
     interlocks: Option<&serde_json::Value>,
     deadman_timers: Option<&serde_json::Value>,
-) -> Result<Option<SafetyPolicyRow>, sqlx::Error> {
+) -> Result<Option<SafetyPolicyRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, SafetyPolicyRow>(
         "UPDATE roz_safety_policies \
          SET policy_json    = COALESCE($2, policy_json), \
@@ -100,15 +111,18 @@ pub async fn update(
     .bind(geofences)
     .bind(interlocks)
     .bind(deadman_timers)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
 /// Delete a safety policy by id. Returns `true` when a row was actually removed.
-pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+pub async fn delete<'e, E>(executor: E, id: Uuid) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let result = sqlx::query("DELETE FROM roz_safety_policies WHERE id = $1")
         .bind(id)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -116,6 +130,7 @@ pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::PgPool;
     async fn setup() -> PgPool {
         crate::shared_test_pool().await
     }

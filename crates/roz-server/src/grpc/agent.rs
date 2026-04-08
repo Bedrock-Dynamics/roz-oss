@@ -538,7 +538,6 @@ async fn run_session_loop(
                             );
                             if let Err(e) = roz_db::agent_sessions::update_session_usage(
                                 pool,
-                                sess.tenant_id,
                                 sess.id,
                                 i64::try_from(output.input_tokens).unwrap_or(i64::MAX),
                                 i64::try_from(output.output_tokens).unwrap_or(i64::MAX),
@@ -1334,7 +1333,7 @@ async fn run_session_loop(
         );
     }
     if let Some(ref s) = session
-        && let Err(e) = roz_db::agent_sessions::complete_session(pool, s.tenant_id, s.id, status).await
+        && let Err(e) = roz_db::agent_sessions::complete_session(pool, s.id, status).await
     {
         tracing::warn!(session_id = %s.id, error = %e, "failed to complete session");
     }

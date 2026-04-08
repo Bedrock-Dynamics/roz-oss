@@ -1,6 +1,5 @@
 //! CRUD operations for embodiment JSONB data stored on `roz_hosts`.
 
-use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Row type for embodiment data queries. Contains host identity + JSONB columns.
@@ -13,23 +12,29 @@ pub struct EmbodimentRow {
 }
 
 /// Fetch embodiment data for a host by its primary key.
-pub async fn get_by_host_id(pool: &PgPool, host_id: Uuid) -> Result<Option<EmbodimentRow>, sqlx::Error> {
+pub async fn get_by_host_id<'e, E>(executor: E, host_id: Uuid) -> Result<Option<EmbodimentRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, EmbodimentRow>(
         "SELECT id, tenant_id, embodiment_model, embodiment_runtime FROM roz_hosts WHERE id = $1",
     )
     .bind(host_id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
 /// Upsert embodiment data for a host. Sets model and optionally runtime.
 /// Only updates if the host exists.
-pub async fn upsert(
-    pool: &PgPool,
+pub async fn upsert<'e, E>(
+    executor: E,
     host_id: Uuid,
     model: &serde_json::Value,
     runtime: Option<&serde_json::Value>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let result = sqlx::query(
         "UPDATE roz_hosts \
          SET embodiment_model = $2, \
@@ -40,7 +45,7 @@ pub async fn upsert(
     .bind(host_id)
     .bind(model)
     .bind(runtime)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -50,12 +55,15 @@ pub async fn upsert(
 /// Skips the write when the incoming model's `model_digest` matches the stored
 /// value (atomic in a single UPDATE query). Returns `true` when a write
 /// occurred, `false` when skipped because the digest was unchanged.
-pub async fn conditional_upsert(
-    pool: &PgPool,
+pub async fn conditional_upsert<'e, E>(
+    executor: E,
     host_id: Uuid,
     model: &serde_json::Value,
     runtime: Option<&serde_json::Value>,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let result = sqlx::query(
         "UPDATE roz_hosts \
          SET embodiment_model = $2, \
@@ -68,7 +76,7 @@ pub async fn conditional_upsert(
     .bind(host_id)
     .bind(model)
     .bind(runtime)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -76,6 +84,7 @@ pub async fn conditional_upsert(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::PgPool;
 
     async fn setup() -> PgPool {
         crate::shared_test_pool().await

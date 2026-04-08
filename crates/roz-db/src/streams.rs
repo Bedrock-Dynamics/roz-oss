@@ -1,4 +1,3 @@
-use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Row type matching the `roz_streams` schema exactly.
@@ -16,15 +15,18 @@ pub struct StreamRow {
 }
 
 /// Insert a new stream and return the created row.
-pub async fn create(
-    pool: &PgPool,
+pub async fn create<'e, E>(
+    executor: E,
     tenant_id: Uuid,
     name: &str,
     category: &str,
     host_id: Option<Uuid>,
     rate_hz: Option<f64>,
     config: &serde_json::Value,
-) -> Result<StreamRow, sqlx::Error> {
+) -> Result<StreamRow, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, StreamRow>(
         "INSERT INTO roz_streams (tenant_id, name, category, host_id, rate_hz, config) \
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
@@ -35,40 +37,49 @@ pub async fn create(
     .bind(host_id)
     .bind(rate_hz)
     .bind(config)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
 /// Fetch a single stream by primary key, or `None` if not found.
-pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Option<StreamRow>, sqlx::Error> {
+pub async fn get_by_id<'e, E>(executor: E, id: Uuid) -> Result<Option<StreamRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, StreamRow>("SELECT * FROM roz_streams WHERE id = $1")
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
 }
 
 /// List streams for a tenant with limit/offset pagination.
 /// Includes `tenant_id` filter for defense-in-depth (don't rely solely on RLS).
-pub async fn list(pool: &PgPool, tenant_id: Uuid, limit: i64, offset: i64) -> Result<Vec<StreamRow>, sqlx::Error> {
+pub async fn list<'e, E>(executor: E, tenant_id: Uuid, limit: i64, offset: i64) -> Result<Vec<StreamRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, StreamRow>(
         "SELECT * FROM roz_streams WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
     )
     .bind(tenant_id)
     .bind(limit)
     .bind(offset)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
 /// Partially update a stream. Only non-`None` fields are changed.
 /// Returns `None` when the row does not exist.
-pub async fn update(
-    pool: &PgPool,
+pub async fn update<'e, E>(
+    executor: E,
     id: Uuid,
     name: Option<&str>,
     rate_hz: Option<f64>,
     config: Option<&serde_json::Value>,
-) -> Result<Option<StreamRow>, sqlx::Error> {
+) -> Result<Option<StreamRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, StreamRow>(
         "UPDATE roz_streams \
          SET name       = COALESCE($2, name), \
@@ -82,15 +93,18 @@ pub async fn update(
     .bind(name)
     .bind(rate_hz)
     .bind(config)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
 /// Delete a stream by id. Returns `true` when a row was actually removed.
-pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+pub async fn delete<'e, E>(executor: E, id: Uuid) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let result = sqlx::query("DELETE FROM roz_streams WHERE id = $1")
         .bind(id)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -98,6 +112,7 @@ pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::PgPool;
     async fn setup() -> PgPool {
         crate::shared_test_pool().await
     }

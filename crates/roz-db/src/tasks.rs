@@ -1,4 +1,3 @@
-use sqlx::PgPool;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -50,15 +49,18 @@ fn is_terminal_status(status: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Insert a new task and return the created row.
-pub async fn create(
-    pool: &PgPool,
+pub async fn create<'e, E>(
+    executor: E,
     tenant_id: Uuid,
     prompt: &str,
     environment_id: Uuid,
     timeout_secs: Option<i32>,
     phases: serde_json::Value,
     parent_task_id: Option<Uuid>,
-) -> Result<TaskRow, sqlx::Error> {
+) -> Result<TaskRow, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, TaskRow>(
         "INSERT INTO roz_tasks (tenant_id, prompt, environment_id, timeout_secs, phases, parent_task_id) \
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING *",
@@ -69,43 +71,55 @@ pub async fn create(
     .bind(timeout_secs)
     .bind(phases)
     .bind(parent_task_id)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
 /// Fetch a single task by primary key, or `None` if not found.
-pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Option<TaskRow>, sqlx::Error> {
+pub async fn get_by_id<'e, E>(executor: E, id: Uuid) -> Result<Option<TaskRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, TaskRow>("SELECT * FROM roz_tasks WHERE id = $1")
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
 }
 
 /// List tasks for a tenant with limit/offset pagination.
 /// Includes `tenant_id` filter for defense-in-depth (don't rely solely on RLS).
-pub async fn list(pool: &PgPool, tenant_id: Uuid, limit: i64, offset: i64) -> Result<Vec<TaskRow>, sqlx::Error> {
+pub async fn list<'e, E>(executor: E, tenant_id: Uuid, limit: i64, offset: i64) -> Result<Vec<TaskRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, TaskRow>(
         "SELECT * FROM roz_tasks WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
     )
     .bind(tenant_id)
     .bind(limit)
     .bind(offset)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
 /// Delete a task by id. Returns `true` when a row was actually removed.
-pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+pub async fn delete<'e, E>(executor: E, id: Uuid) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let result = sqlx::query("DELETE FROM roz_tasks WHERE id = $1")
         .bind(id)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(result.rows_affected() > 0)
 }
 
 /// Update task status. Sets `updated_at = now()`.
 /// Returns `None` when the row does not exist.
-pub async fn update_status(pool: &PgPool, id: Uuid, status: &str) -> Result<Option<TaskRow>, sqlx::Error> {
+pub async fn update_status<'e, E>(executor: E, id: Uuid, status: &str) -> Result<Option<TaskRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, TaskRow>(
         "UPDATE roz_tasks \
          SET status     = $2, \
@@ -115,13 +129,16 @@ pub async fn update_status(pool: &PgPool, id: Uuid, status: &str) -> Result<Opti
     )
     .bind(id)
     .bind(status)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
 /// Assign a host to a task. Sets `updated_at = now()`.
 /// Returns `None` when the row does not exist.
-pub async fn assign_host(pool: &PgPool, task_id: Uuid, host_id: Uuid) -> Result<Option<TaskRow>, sqlx::Error> {
+pub async fn assign_host<'e, E>(executor: E, task_id: Uuid, host_id: Uuid) -> Result<Option<TaskRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, TaskRow>(
         "UPDATE roz_tasks \
          SET host_id    = $2, \
@@ -131,7 +148,7 @@ pub async fn assign_host(pool: &PgPool, task_id: Uuid, host_id: Uuid) -> Result<
     )
     .bind(task_id)
     .bind(host_id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
@@ -142,7 +159,10 @@ pub async fn assign_host(pool: &PgPool, task_id: Uuid, host_id: Uuid) -> Result<
 /// Create a task run record. Derives `tenant_id` from the parent task
 /// to prevent cross-tenant mismatches.
 /// Returns `RowNotFound` if the parent task does not exist.
-pub async fn create_run(pool: &PgPool, task_id: Uuid, host_id: Option<Uuid>) -> Result<TaskRunRow, sqlx::Error> {
+pub async fn create_run<'e, E>(executor: E, task_id: Uuid, host_id: Option<Uuid>) -> Result<TaskRunRow, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, TaskRunRow>(
         "INSERT INTO roz_task_runs (task_id, tenant_id, host_id) \
          SELECT $1, tenant_id, $2 FROM roz_tasks WHERE id = $1 \
@@ -150,13 +170,16 @@ pub async fn create_run(pool: &PgPool, task_id: Uuid, host_id: Option<Uuid>) -> 
     )
     .bind(task_id)
     .bind(host_id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?
     .ok_or(sqlx::Error::RowNotFound)
 }
 
 /// Fetch the most recent unfinished run for a task, if any.
-pub async fn active_run_for_task(pool: &PgPool, task_id: Uuid) -> Result<Option<TaskRunRow>, sqlx::Error> {
+pub async fn active_run_for_task<'e, E>(executor: E, task_id: Uuid) -> Result<Option<TaskRunRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, TaskRunRow>(
         "SELECT * FROM roz_task_runs \
          WHERE task_id = $1 AND completed_at IS NULL \
@@ -164,27 +187,38 @@ pub async fn active_run_for_task(pool: &PgPool, task_id: Uuid) -> Result<Option<
          LIMIT 1",
     )
     .bind(task_id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
 /// Ensure a task has an active run record once execution actually starts.
-pub async fn ensure_active_run(pool: &PgPool, task_id: Uuid, host_id: Option<Uuid>) -> Result<TaskRunRow, sqlx::Error> {
-    if let Some(run) = active_run_for_task(pool, task_id).await? {
+///
+/// Uses `&mut PgConnection` because it executes two queries (check + insert)
+/// that must run within the same connection. The mutable borrow can be
+/// reborrowed for each query.
+pub async fn ensure_active_run(
+    conn: &mut sqlx::PgConnection,
+    task_id: Uuid,
+    host_id: Option<Uuid>,
+) -> Result<TaskRunRow, sqlx::Error> {
+    if let Some(run) = active_run_for_task(&mut *conn, task_id).await? {
         return Ok(run);
     }
 
-    create_run(pool, task_id, host_id).await
+    create_run(&mut *conn, task_id, host_id).await
 }
 
 /// Mark a run complete with final status and optional error message.
 /// Sets `completed_at = now()`. Returns `None` when the run does not exist.
-pub async fn complete_run(
-    pool: &PgPool,
+pub async fn complete_run<'e, E>(
+    executor: E,
     run_id: Uuid,
     status: &str,
     error_message: Option<&str>,
-) -> Result<Option<TaskRunRow>, sqlx::Error> {
+) -> Result<Option<TaskRunRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, TaskRunRow>(
         "UPDATE roz_task_runs \
          SET status        = $2, \
@@ -196,17 +230,20 @@ pub async fn complete_run(
     .bind(run_id)
     .bind(status)
     .bind(error_message)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
 /// Complete the most recent unfinished run for a task.
-pub async fn complete_active_run_for_task(
-    pool: &PgPool,
+pub async fn complete_active_run_for_task<'e, E>(
+    executor: E,
     task_id: Uuid,
     status: &str,
     error_message: Option<&str>,
-) -> Result<Option<TaskRunRow>, sqlx::Error> {
+) -> Result<Option<TaskRunRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, TaskRunRow>(
         "UPDATE roz_task_runs \
          SET status = $2, completed_at = now(), error_message = $3 \
@@ -221,7 +258,7 @@ pub async fn complete_active_run_for_task(
     .bind(task_id)
     .bind(status)
     .bind(error_message)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
@@ -232,6 +269,7 @@ pub async fn complete_active_run_for_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::PgPool;
     async fn setup() -> PgPool {
         crate::shared_test_pool().await
     }
@@ -480,10 +518,11 @@ mod tests {
         .await
         .expect("Failed to create task");
 
-        let first = ensure_active_run(&pool, task.id, Some(host_id))
+        let mut conn = pool.acquire().await.expect("acquire conn");
+        let first = ensure_active_run(&mut *conn, task.id, Some(host_id))
             .await
             .expect("first run");
-        let second = ensure_active_run(&pool, task.id, Some(host_id))
+        let second = ensure_active_run(&mut *conn, task.id, Some(host_id))
             .await
             .expect("reuse run");
         assert_eq!(first.id, second.id);
@@ -507,7 +546,8 @@ mod tests {
         )
         .await
         .expect("Failed to create task");
-        let run = ensure_active_run(&pool, task.id, Some(host_id))
+        let mut conn = pool.acquire().await.expect("acquire conn");
+        let run = ensure_active_run(&mut *conn, task.id, Some(host_id))
             .await
             .expect("create run");
 

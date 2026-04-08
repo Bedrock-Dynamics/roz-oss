@@ -1,4 +1,3 @@
-use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Row type matching the `roz_run_provenance` schema exactly.
@@ -21,8 +20,8 @@ pub struct ProvenanceRow {
 
 /// Insert a new provenance record. This table is append-only.
 #[allow(clippy::too_many_arguments)]
-pub async fn create(
-    pool: &PgPool,
+pub async fn create<'e, E>(
+    executor: E,
     task_run_id: Uuid,
     tenant_id: Uuid,
     model_id: Option<&str>,
@@ -33,7 +32,10 @@ pub async fn create(
     calibration_hash: Option<&str>,
     sim_image: Option<&str>,
     environment_hash: Option<&str>,
-) -> Result<ProvenanceRow, sqlx::Error> {
+) -> Result<ProvenanceRow, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, ProvenanceRow>(
         "INSERT INTO roz_run_provenance \
          (task_run_id, tenant_id, model_id, model_version, prompt_hash, tool_versions, \
@@ -50,39 +52,46 @@ pub async fn create(
     .bind(calibration_hash)
     .bind(sim_image)
     .bind(environment_hash)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
 /// Fetch provenance by task run id. Returns `None` if no provenance record exists for this run.
-pub async fn get_by_run_id(pool: &PgPool, task_run_id: Uuid) -> Result<Option<ProvenanceRow>, sqlx::Error> {
+pub async fn get_by_run_id<'e, E>(executor: E, task_run_id: Uuid) -> Result<Option<ProvenanceRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, ProvenanceRow>("SELECT * FROM roz_run_provenance WHERE task_run_id = $1")
         .bind(task_run_id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
 }
 
 /// List provenance records for a tenant with limit/offset pagination.
 /// Includes `tenant_id` filter for defense-in-depth (don't rely solely on RLS).
-pub async fn list_by_tenant(
-    pool: &PgPool,
+pub async fn list_by_tenant<'e, E>(
+    executor: E,
     tenant_id: Uuid,
     limit: i64,
     offset: i64,
-) -> Result<Vec<ProvenanceRow>, sqlx::Error> {
+) -> Result<Vec<ProvenanceRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, ProvenanceRow>(
         "SELECT * FROM roz_run_provenance WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
     )
     .bind(tenant_id)
     .bind(limit)
     .bind(offset)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::PgPool;
     async fn setup() -> PgPool {
         crate::shared_test_pool().await
     }

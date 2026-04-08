@@ -1,4 +1,3 @@
-use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Row type matching the `roz_commands` schema exactly.
@@ -17,14 +16,17 @@ pub struct CommandRow {
 }
 
 /// Insert a new command and return the created row.
-pub async fn create(
-    pool: &PgPool,
+pub async fn create<'e, E>(
+    executor: E,
     tenant_id: Uuid,
     host_id: Uuid,
     command: &str,
     idempotency_key: &str,
     params: &serde_json::Value,
-) -> Result<CommandRow, sqlx::Error> {
+) -> Result<CommandRow, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, CommandRow>(
         "INSERT INTO roz_commands (tenant_id, host_id, command, idempotency_key, params) \
          VALUES ($1, $2, $3, $4, $5) RETURNING *",
@@ -34,28 +36,34 @@ pub async fn create(
     .bind(command)
     .bind(idempotency_key)
     .bind(params)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
 /// Fetch a single command by primary key, or `None` if not found.
-pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Option<CommandRow>, sqlx::Error> {
+pub async fn get_by_id<'e, E>(executor: E, id: Uuid) -> Result<Option<CommandRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, CommandRow>("SELECT * FROM roz_commands WHERE id = $1")
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
 }
 
 /// List commands for a tenant with limit/offset pagination.
 /// Includes `tenant_id` filter for defense-in-depth (don't rely solely on RLS).
-pub async fn list(pool: &PgPool, tenant_id: Uuid, limit: i64, offset: i64) -> Result<Vec<CommandRow>, sqlx::Error> {
+pub async fn list<'e, E>(executor: E, tenant_id: Uuid, limit: i64, offset: i64) -> Result<Vec<CommandRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, CommandRow>(
         "SELECT * FROM roz_commands WHERE tenant_id = $1 ORDER BY issued_at DESC LIMIT $2 OFFSET $3",
     )
     .bind(tenant_id)
     .bind(limit)
     .bind(offset)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
@@ -71,7 +79,10 @@ fn valid_from_states(new_state: &str) -> Option<&'static str> {
 /// Transition a command to a new state. Returns `None` when the row does not
 /// exist, the target state is unrecognized, or the transition is invalid
 /// (current state not in the allowed set).
-pub async fn transition_state(pool: &PgPool, id: Uuid, new_state: &str) -> Result<Option<CommandRow>, sqlx::Error> {
+pub async fn transition_state<'e, E>(executor: E, id: Uuid, new_state: &str) -> Result<Option<CommandRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let Some(valid_from) = valid_from_states(new_state) else {
         return Ok(None);
     };
@@ -89,15 +100,18 @@ pub async fn transition_state(pool: &PgPool, id: Uuid, new_state: &str) -> Resul
     sqlx::query_as::<_, CommandRow>(&sql)
         .bind(id)
         .bind(new_state)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
 }
 
 /// Delete a command by id. Returns `true` when a row was actually removed.
-pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+pub async fn delete<'e, E>(executor: E, id: Uuid) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let result = sqlx::query("DELETE FROM roz_commands WHERE id = $1")
         .bind(id)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -105,6 +119,7 @@ pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::PgPool;
     async fn setup() -> PgPool {
         crate::shared_test_pool().await
     }

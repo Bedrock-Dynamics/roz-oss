@@ -133,7 +133,15 @@ pub async fn rotate_key(
 
     let tenant_id = *auth.tenant_id().as_uuid();
 
-    let result = roz_db::api_keys::rotate_api_key(&state.pool, key_id, tenant_id)
+    let mut conn = state.pool.acquire().await.map_err(|e| {
+        tracing::error!(error = %e, "failed to acquire connection");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "internal server error" })),
+        )
+    })?;
+
+    let result = roz_db::api_keys::rotate_api_key(&mut *conn, key_id, tenant_id)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "database error in API key operation");
