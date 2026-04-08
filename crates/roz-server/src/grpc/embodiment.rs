@@ -106,7 +106,7 @@ impl EmbodimentService for EmbodimentServiceImpl {
         let domain_model: roz_core::embodiment::model::EmbodimentModel =
             serde_json::from_value(model_json).map_err(|e| {
                 tracing::error!(error = %e, host_id = %host_id, "corrupt model data");
-                Status::internal(format!("corrupt model data: {e}"))
+                Status::internal("failed to deserialize embodiment data")
             })?;
 
         Ok(Response::new(ProtoModel::from(&domain_model)))
@@ -125,7 +125,7 @@ impl EmbodimentService for EmbodimentServiceImpl {
         let domain_runtime: roz_core::embodiment::embodiment_runtime::EmbodimentRuntime =
             serde_json::from_value(runtime_json).map_err(|e| {
                 tracing::error!(error = %e, host_id = %host_id, "corrupt runtime data");
-                Status::internal(format!("corrupt model data: {e}"))
+                Status::internal("failed to deserialize embodiment data")
             })?;
 
         Ok(Response::new(ProtoRuntime::from(&domain_runtime)))
@@ -147,7 +147,7 @@ impl EmbodimentService for EmbodimentServiceImpl {
         let domain_model: roz_core::embodiment::model::EmbodimentModel =
             serde_json::from_value(model_json).map_err(|e| {
                 tracing::error!(error = %e, host_id = %host_id, "corrupt model data");
-                Status::internal(format!("corrupt model data: {e}"))
+                Status::internal("failed to deserialize embodiment data")
             })?;
 
         let bindings = domain_model
@@ -175,7 +175,7 @@ impl EmbodimentService for EmbodimentServiceImpl {
         let domain_runtime: roz_core::embodiment::embodiment_runtime::EmbodimentRuntime =
             serde_json::from_value(runtime_json).map_err(|e| {
                 tracing::error!(error = %e, host_id = %host_id, "corrupt runtime data");
-                Status::internal(format!("corrupt model data: {e}"))
+                Status::internal("failed to deserialize embodiment data")
             })?;
 
         let joint_names: Vec<&str> = domain_runtime.model.joints.iter().map(|j| j.name.as_str()).collect();
