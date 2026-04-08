@@ -16,6 +16,10 @@ service EmbodimentService {
   rpc ListBindings(ListBindingsRequest) returns (ListBindingsResponse);
   // Validates channel bindings against the embodiment model.
   rpc ValidateBindings(ValidateBindingsRequest) returns (ValidateBindingsResponse);
+  // Returns the retargeting map (canonical-to-local joint mapping) for a host.
+  rpc GetRetargetingMap(GetRetargetingMapRequest) returns (GetRetargetingMapResponse);
+  // Returns the control interface manifest for a host.
+  rpc GetManifest(GetManifestRequest) returns (GetManifestResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -51,6 +55,28 @@ message ValidateBindingsRequest {
 message ValidateBindingsResponse {
   bool valid = 1;
   repeated UnboundChannel unbound_channels = 2;
+}
+
+// Request for the retargeting map of a host's embodiment.
+message GetRetargetingMapRequest {
+  string host_id = 1;
+}
+
+// Response containing the retargeting map and coverage metadata.
+message GetRetargetingMapResponse {
+  RetargetingMap retargeting_map = 1;
+  uint32 mapped_count = 2;
+  uint32 total_binding_count = 3;
+}
+
+// Request for the control interface manifest of a host's embodiment.
+message GetManifestRequest {
+  string host_id = 1;
+}
+
+// Response containing the control interface manifest.
+message GetManifestResponse {
+  ControlInterfaceManifest manifest = 1;
 }
 
 // A channel that could not be bound during validation.
@@ -208,6 +234,14 @@ message CollisionPair {
 message EmbodimentFamily {
   string family_id = 1;
   string description = 2;
+}
+
+// Bidirectional mapping between canonical action space and local robot channels.
+// Maps to `retargeting::RetargetingMap` in roz-core.
+message RetargetingMap {
+  EmbodimentFamily embodiment_family = 1;
+  map<string, string> canonical_to_local = 2;
+  map<string, string> local_to_canonical = 3;
 }
 
 // A joint connecting two links in the kinematic chain.

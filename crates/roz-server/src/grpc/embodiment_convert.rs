@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use roz_core::embodiment::binding::{
     BindingType, ChannelBinding, CommandInterfaceType, ControlChannelDef, ControlInterfaceManifest,
 };
+use roz_core::embodiment::retargeting::RetargetingMap;
 use roz_core::embodiment::calibration::{CalibrationOverlay, SensorCalibration};
 use roz_core::embodiment::contact::ContactForceEnvelope;
 use roz_core::embodiment::embodiment_runtime::EmbodimentRuntime;
@@ -613,6 +614,35 @@ impl From<roz_v1::EmbodimentFamily> for EmbodimentFamily {
             family_id: proto.family_id,
             description: proto.description,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RetargetingMap: retargeting::RetargetingMap <-> roz_v1::RetargetingMap
+// ---------------------------------------------------------------------------
+
+impl From<&RetargetingMap> for roz_v1::RetargetingMap {
+    fn from(rm: &RetargetingMap) -> Self {
+        Self {
+            embodiment_family: Some(roz_v1::EmbodimentFamily::from(&rm.embodiment_family)),
+            canonical_to_local: rm.canonical_to_local.clone(),
+            local_to_canonical: rm.local_to_canonical.clone(),
+        }
+    }
+}
+
+impl TryFrom<roz_v1::RetargetingMap> for RetargetingMap {
+    type Error = EmbodimentConvertError;
+
+    fn try_from(proto: roz_v1::RetargetingMap) -> Result<Self, Self::Error> {
+        let family_proto = proto
+            .embodiment_family
+            .ok_or_else(|| EmbodimentConvertError::MissingField("embodiment_family".into()))?;
+        Ok(Self {
+            embodiment_family: EmbodimentFamily::from(family_proto),
+            canonical_to_local: proto.canonical_to_local,
+            local_to_canonical: proto.local_to_canonical,
+        })
     }
 }
 
@@ -2637,6 +2667,22 @@ mod tests {
     }
 
     prop_compose! {
+        fn arb_retargeting_map()(
+            family in arb_embodiment_family(),
+            keys in prop::collection::vec(arb_name(), 0..5),
+            vals in prop::collection::vec(arb_name(), 0..5),
+        ) -> RetargetingMap {
+            let c2l: BTreeMap<String, String> = keys.iter().zip(vals.iter()).map(|(k, v)| (k.clone(), v.clone())).collect();
+            let l2c: BTreeMap<String, String> = c2l.iter().map(|(k, v)| (v.clone(), k.clone())).collect();
+            RetargetingMap {
+                embodiment_family: family,
+                canonical_to_local: c2l,
+                local_to_canonical: l2c,
+            }
+        }
+    }
+
+    prop_compose! {
         fn arb_camera_frustum()(
             fov_horizontal_deg in arb_finite_f64(),
             fov_vertical_deg in arb_finite_f64(),
@@ -3182,6 +3228,13 @@ mod tests {
             prop_assert_eq!(&val.calibration_digest, &back.calibration_digest, "calibration_digest must round-trip as opaque string");
             prop_assert_eq!(&val.safety_digest, &back.safety_digest, "safety_digest must round-trip as opaque string");
             prop_assert_eq!(&val.combined_digest, &back.combined_digest, "combined_digest must round-trip as opaque string");
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_retargeting_map(val in arb_retargeting_map()) {
+            let proto = roz_v1::RetargetingMap::from(&val);
+            let back = RetargetingMap::try_from(proto).unwrap();
             prop_assert_eq!(val, back);
         }
     }
