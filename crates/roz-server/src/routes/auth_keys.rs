@@ -141,7 +141,7 @@ pub async fn rotate_key(
         )
     })?;
 
-    let result = roz_db::api_keys::rotate_api_key(&mut *conn, key_id, tenant_id)
+    let result = roz_db::api_keys::rotate_api_key(&mut conn, key_id, tenant_id)
         .await
         .map_err(|e| {
             tracing::error!(error = %e, "database error in API key operation");

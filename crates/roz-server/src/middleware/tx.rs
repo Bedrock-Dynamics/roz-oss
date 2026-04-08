@@ -83,47 +83,45 @@ impl Drop for Tx {
 impl FromRequestParts<AppState> for Tx {
     type Rejection = Response;
 
-    fn from_request_parts(
+    async fn from_request_parts(
         parts: &mut Parts,
         state: &AppState,
-    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
-        async move {
-            // Read the AuthIdentity placed by the auth middleware.
-            let auth = parts
-                .extensions
-                .get::<roz_core::auth::AuthIdentity>()
-                .cloned()
-                .ok_or_else(|| {
-                    (StatusCode::UNAUTHORIZED, "missing auth identity").into_response()
-                })?;
+    ) -> Result<Self, Self::Rejection> {
+        // Read the AuthIdentity placed by the auth middleware.
+        let auth = parts
+            .extensions
+            .get::<roz_core::auth::AuthIdentity>()
+            .cloned()
+            .ok_or_else(|| {
+                (StatusCode::UNAUTHORIZED, "missing auth identity").into_response()
+            })?;
 
-            // Begin a transaction on the shared pool.
-            let mut tx = state.pool.begin().await.map_err(|e| {
-                tracing::error!(error = %e, "tx begin failed");
+        // Begin a transaction on the shared pool.
+        let mut tx = state.pool.begin().await.map_err(|e| {
+            tracing::error!(error = %e, "tx begin failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?;
+
+        // Set the RLS tenant context so all queries within this
+        // transaction are scoped to the authenticated tenant.
+        roz_db::set_tenant_context(&mut *tx, auth.tenant_id().as_uuid())
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "set_tenant_context failed");
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
             })?;
 
-            // Set the RLS tenant context so all queries within this
-            // transaction are scoped to the authenticated tenant.
-            roz_db::set_tenant_context(&mut *tx, auth.tenant_id().as_uuid())
-                .await
-                .map_err(|e| {
-                    tracing::error!(error = %e, "set_tenant_context failed");
-                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                })?;
+        // Reuse the TxSlot pre-inserted by tx_layer, or create one.
+        let slot = parts
+            .extensions
+            .get::<TxSlot>()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(Mutex::new(None)));
 
-            // Reuse the TxSlot pre-inserted by tx_layer, or create one.
-            let slot = parts
-                .extensions
-                .get::<TxSlot>()
-                .cloned()
-                .unwrap_or_else(|| Arc::new(Mutex::new(None)));
-
-            Ok(Tx {
-                tx: Some(tx),
-                slot,
-            })
-        }
+        Ok(Self {
+            tx: Some(tx),
+            slot,
+        })
     }
 }
 
@@ -161,14 +159,12 @@ pub async fn tx_layer(
     // (handler dropped Tx without calling commit).
     let maybe_tx = slot.lock().take();
 
-    if let Some(tx) = maybe_tx {
-        if response.status().is_success() {
-            if let Err(e) = tx.commit().await {
-                tracing::error!(error = %e, "tx auto-commit failed");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        }
-        // Non-success: tx is dropped here, triggering implicit rollback.
+    if let Some(tx) = maybe_tx
+        && response.status().is_success()
+        && let Err(e) = tx.commit().await
+    {
+        tracing::error!(error = %e, "tx auto-commit failed");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     response
