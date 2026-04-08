@@ -36,8 +36,8 @@
   3. Server has embodiment data in DB for any registered worker that has an EmbodimentModel, enabling all downstream queries
 **Plans:** 2 plans
 Plans:
-- [ ] 05-01-PLAN.md — Server-side digest comparison for conditional write (204/200)
-- [ ] 05-02-PLAN.md — Worker config field, manifest loading, and upload wiring
+- [x] 05-01-PLAN.md — Server-side digest comparison for conditional write (204/200)
+- [x] 05-02-PLAN.md — Worker config field, manifest loading, and upload wiring
 
 ### Phase 6: Extension RPCs
 **Goal**: Clients can fetch retargeting maps and control interface manifests as standalone lightweight queries

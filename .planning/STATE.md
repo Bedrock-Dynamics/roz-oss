@@ -1,16 +1,16 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.0
-milestone_name: milestone
+milestone: v1.1
+milestone_name: Embodiment Streaming, CLI, and Extensions
 status: executing
 stopped_at: Phase 4 context gathered
-last_updated: "2026-04-08T15:30:43.866Z"
+last_updated: "2026-04-08T17:35:36.835Z"
 last_activity: 2026-04-08
 progress:
   total_phases: 4
-  completed_phases: 4
-  total_plans: 7
-  completed_plans: 7
+  completed_phases: 1
+  total_plans: 2
+  completed_plans: 2
   percent: 100
 ---
 
@@ -25,7 +25,7 @@ See: .planning/PROJECT.md (updated 2026-04-07)
 
 ## Current Position
 
-Phase: 04
+Phase: 6
 Plan: Not started
 Status: Executing Phase 04
 Last activity: 2026-04-08
@@ -36,7 +36,7 @@ Progress: [░░░░░░░░░░] 0%
 
 **Velocity:**
 
-- Total plans completed: 7
+- Total plans completed: 9
 - Average duration: -
 - Total execution time: 0 hours
 
@@ -48,6 +48,7 @@ Progress: [░░░░░░░░░░] 0%
 | 02 | 1 | - | - |
 | 03 | 2 | - | - |
 | 04 | 2 | - | - |
+| 05 | 2 | - | - |
 
 **Recent Trend:**
 
