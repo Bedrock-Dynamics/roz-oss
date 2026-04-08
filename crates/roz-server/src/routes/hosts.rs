@@ -162,7 +162,7 @@ pub async fn update_embodiment(
     Extension(auth): Extension<AuthIdentity>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateEmbodimentRequest>,
-) -> Result<Json<serde_json::Value>, AppError> {
+) -> Result<StatusCode, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
     let host = roz_db::hosts::get_by_id(&state.pool, id)
         .await?
@@ -170,8 +170,21 @@ pub async fn update_embodiment(
     if host.tenant_id != tenant_id {
         return Err(AppError::not_found("host not found"));
     }
-    roz_db::embodiments::upsert(&state.pool, id, &body.model, body.runtime.as_ref()).await?;
-    Ok(Json(json!({"status": "ok"})))
+
+    // Per D-03: atomic conditional write -- skips when model_digest unchanged
+    let wrote = roz_db::embodiments::conditional_upsert(
+        &state.pool,
+        id,
+        &body.model,
+        body.runtime.as_ref(),
+    )
+    .await?;
+
+    if wrote {
+        Ok(StatusCode::OK)
+    } else {
+        Ok(StatusCode::NO_CONTENT)
+    }
 }
 
 /// POST /v1/hosts/:id/estop — trigger emergency stop on a host via NATS.
