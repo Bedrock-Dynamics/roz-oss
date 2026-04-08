@@ -133,4 +133,81 @@ mod tests {
             .expect("Failed to get");
         assert!(row.is_none());
     }
+
+    #[tokio::test]
+    async fn conditional_upsert_first_upload() {
+        let pool = setup().await;
+        let tenant_id = create_test_tenant(&pool).await;
+        let host = crate::hosts::create(&pool, tenant_id, "cond-host-1", "edge", &[], &serde_json::json!({}))
+            .await
+            .expect("create host");
+
+        let model = serde_json::json!({"model_digest": "abc123", "joints": []});
+        let wrote = conditional_upsert(&pool, host.id, &model, None)
+            .await
+            .expect("conditional_upsert");
+        assert!(wrote, "first upload should write");
+
+        let row = get_by_host_id(&pool, host.id).await.unwrap().unwrap();
+        assert_eq!(row.embodiment_model.as_ref().unwrap()["model_digest"], "abc123");
+    }
+
+    #[tokio::test]
+    async fn conditional_upsert_skips_identical_digest() {
+        let pool = setup().await;
+        let tenant_id = create_test_tenant(&pool).await;
+        let host = crate::hosts::create(&pool, tenant_id, "cond-host-2", "edge", &[], &serde_json::json!({}))
+            .await
+            .expect("create host");
+
+        let model = serde_json::json!({"model_digest": "abc123", "joints": []});
+        conditional_upsert(&pool, host.id, &model, None).await.unwrap();
+
+        // Second upload with same digest -- should skip
+        let wrote = conditional_upsert(&pool, host.id, &model, None)
+            .await
+            .expect("conditional_upsert");
+        assert!(!wrote, "identical digest should skip write");
+    }
+
+    #[tokio::test]
+    async fn conditional_upsert_writes_on_changed_digest() {
+        let pool = setup().await;
+        let tenant_id = create_test_tenant(&pool).await;
+        let host = crate::hosts::create(&pool, tenant_id, "cond-host-3", "edge", &[], &serde_json::json!({}))
+            .await
+            .expect("create host");
+
+        let model_v1 = serde_json::json!({"model_digest": "abc123", "joints": []});
+        conditional_upsert(&pool, host.id, &model_v1, None).await.unwrap();
+
+        let model_v2 = serde_json::json!({"model_digest": "def456", "joints": [{"name": "j1"}]});
+        let wrote = conditional_upsert(&pool, host.id, &model_v2, None)
+            .await
+            .expect("conditional_upsert");
+        assert!(wrote, "changed digest should write");
+
+        let row = get_by_host_id(&pool, host.id).await.unwrap().unwrap();
+        assert_eq!(row.embodiment_model.as_ref().unwrap()["model_digest"], "def456");
+    }
+
+    #[tokio::test]
+    async fn conditional_upsert_writes_when_no_digest_field() {
+        let pool = setup().await;
+        let tenant_id = create_test_tenant(&pool).await;
+        let host = crate::hosts::create(&pool, tenant_id, "cond-host-4", "edge", &[], &serde_json::json!({}))
+            .await
+            .expect("create host");
+
+        // Seed with a model missing model_digest (legacy data)
+        let legacy = serde_json::json!({"joints": []});
+        upsert(&pool, host.id, &legacy, None).await.unwrap();
+
+        // Upload with digest should write (IS DISTINCT FROM treats null != "abc")
+        let model = serde_json::json!({"model_digest": "abc123", "joints": []});
+        let wrote = conditional_upsert(&pool, host.id, &model, None)
+            .await
+            .expect("conditional_upsert");
+        assert!(wrote, "missing digest field should write");
+    }
 }
