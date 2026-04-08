@@ -47,7 +47,7 @@ Plans:
 **Plans:** 1 plan
 
 Plans:
-- [ ] 02-01-PLAN.md — Error type, geometry primitives, enum conversions, oneof conversions, scalar wrappers, and comprehensive tests
+- [x] 02-01-PLAN.md — Error type, geometry primitives, enum conversions, oneof conversions, scalar wrappers, and comprehensive tests
 
 ### Phase 3: Composite Type Conversions and Round-Trip Tests
 **Goal**: All aggregate embodiment types (Joint, Link, EmbodimentModel, EmbodimentRuntime) convert losslessly; round-trip property tests prove identity
@@ -57,11 +57,11 @@ Plans:
   1. All ~25 type pairs have working From/TryFrom impls (domain -> proto -> domain == identity for every type)
   2. Digest fields (model_digest, calibration_digest, manifest_digest, combined_digest) pass through as opaque strings -- never recomputed
   3. Round-trip property tests pass for every converted type including EmbodimentModel and EmbodimentRuntime
-**Plans**: TBD
+**Plans:** 2 plans
 
 Plans:
-- [ ] 03-01: TBD
-- [ ] 03-02: TBD
+- [ ] 03-01-PLAN.md — Composite From/TryFrom impls for all ~16 type pairs, PartialEq on EmbodimentRuntime, proptest dev-dep
+- [ ] 03-02-PLAN.md — Proptest round-trip property tests for every converted type (CONV-05)
 
 ### Phase 4: Service Implementation
 **Goal**: A working EmbodimentService serves GetModel, GetRuntime, ListBindings, and ValidateBindings RPCs; substrate-ide can fetch embodiment data over gRPC
