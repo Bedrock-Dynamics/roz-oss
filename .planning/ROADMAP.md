@@ -75,8 +75,8 @@ Plans:
 **Plans:** 2 plans
 
 Plans:
-- [ ] 04-01-PLAN.md — DB migration, embodiments module, EmbodimentService gRPC impl, server registration
-- [ ] 04-02-PLAN.md — REST upload endpoint, worker registration extension for full data pipeline
+- [x] 04-01-PLAN.md — DB migration, embodiments module, EmbodimentService gRPC impl, server registration
+- [x] 04-02-PLAN.md — REST upload endpoint, worker registration extension for full data pipeline
 
 ## Progress
 
