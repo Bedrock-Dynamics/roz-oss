@@ -18,6 +18,9 @@ use crate::grpc::roz_v1::{
     GetModelRequest, GetRetargetingMapRequest, GetRetargetingMapResponse, GetRuntimeRequest, ListBindingsRequest,
     ListBindingsResponse, ValidateBindingsRequest, ValidateBindingsResponse,
 };
+use roz_core::embodiment::binding::{
+    BindingType, CommandInterfaceType, ControlChannelDef, ControlInterfaceManifest,
+};
 use roz_core::embodiment::retargeting::RetargetingMap;
 
 // ---------------------------------------------------------------------------
@@ -88,6 +91,52 @@ async fn fetch_embodiment_row(
     }
 
     Ok(row)
+}
+
+/// Synthesize a `ControlInterfaceManifest` from channel bindings.
+///
+/// The manifest is not stored in the DB -- it's constructed from the model's
+/// channel bindings. The `BindingType` -> `CommandInterfaceType` mapping is
+/// best-effort: `Command` maps to `JointPosition` and all three IMU binding
+/// types collapse to `ImuSensor`.
+fn synthesize_manifest(bindings: &[roz_core::embodiment::binding::ChannelBinding]) -> ControlInterfaceManifest {
+    let channels: Vec<ControlChannelDef> = bindings
+        .iter()
+        .map(|b| ControlChannelDef {
+            name: b.physical_name.clone(),
+            interface_type: binding_type_to_command_interface(&b.binding_type),
+            units: b.units.clone(),
+            frame_id: b.frame_id.clone(),
+        })
+        .collect();
+
+    let mut manifest = ControlInterfaceManifest {
+        version: 1,
+        manifest_digest: String::new(),
+        channels,
+        bindings: bindings.to_vec(),
+    };
+    manifest.stamp_digest();
+    manifest
+}
+
+/// Best-effort mapping from `BindingType` to `CommandInterfaceType`.
+///
+/// This is lossy: `Command` maps to `JointPosition` as fallback, and all
+/// three IMU binding types (`ImuOrientation`, `ImuAngularVelocity`,
+/// `ImuLinearAcceleration`) collapse to `ImuSensor`.
+const fn binding_type_to_command_interface(bt: &BindingType) -> CommandInterfaceType {
+    match bt {
+        // Command falls back to JointPosition (lossy -- see doc comment).
+        BindingType::JointPosition | BindingType::Command => CommandInterfaceType::JointPosition,
+        BindingType::JointVelocity => CommandInterfaceType::JointVelocity,
+        BindingType::ForceTorque => CommandInterfaceType::ForceTorqueSensor,
+        BindingType::GripperPosition => CommandInterfaceType::GripperPosition,
+        BindingType::GripperForce => CommandInterfaceType::GripperForce,
+        BindingType::ImuOrientation | BindingType::ImuAngularVelocity | BindingType::ImuLinearAcceleration => {
+            CommandInterfaceType::ImuSensor
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -250,9 +299,27 @@ impl EmbodimentService for EmbodimentServiceImpl {
 
     async fn get_manifest(
         &self,
-        _request: Request<GetManifestRequest>,
+        request: Request<GetManifestRequest>,
     ) -> Result<Response<GetManifestResponse>, Status> {
-        // Stub -- handler implementation in Plan 02.
-        Err(Status::unimplemented("GetManifest not yet implemented"))
+        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let host_id = parse_host_id(&request.get_ref().host_id)?;
+
+        let row = fetch_embodiment_row(&self.pool, host_id, tenant_id).await?;
+
+        let model_json = row
+            .embodiment_model
+            .ok_or_else(|| Status::failed_precondition("host has no embodiment model"))?;
+
+        let domain_model: roz_core::embodiment::model::EmbodimentModel =
+            serde_json::from_value(model_json).map_err(|e| {
+                tracing::error!(error = %e, host_id = %host_id, "corrupt model data");
+                Status::internal("failed to deserialize embodiment data")
+            })?;
+
+        let manifest = synthesize_manifest(&domain_model.channel_bindings);
+
+        Ok(Response::new(GetManifestResponse {
+            manifest: Some(crate::grpc::roz_v1::ControlInterfaceManifest::from(&manifest)),
+        }))
     }
 }
