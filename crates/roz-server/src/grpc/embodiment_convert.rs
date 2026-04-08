@@ -2497,4 +2497,692 @@ mod tests {
         let back = ControlInterfaceManifest::try_from(proto).unwrap();
         assert_eq!(back, domain);
     }
+
+    // ======================================================================
+    // Property-based round-trip tests (CONV-05)
+    // ======================================================================
+
+    use proptest::prelude::*;
+    use proptest::{collection, option, prop_compose, prop_oneof, proptest};
+
+    // ------------------------------------------------------------------
+    // Phase A: Leaf strategies
+    // ------------------------------------------------------------------
+
+    fn arb_finite_f64() -> impl Strategy<Value = f64> {
+        -1e6f64..1e6f64
+    }
+
+    fn arb_name() -> impl Strategy<Value = String> {
+        "[a-z_]{3,20}"
+    }
+
+    fn arb_digest() -> impl Strategy<Value = String> {
+        "[a-f0-9]{64}"
+    }
+
+    prop_compose! {
+        fn arb_transform3d()(
+            tx in arb_finite_f64(), ty in arb_finite_f64(), tz in arb_finite_f64(),
+            rw in arb_finite_f64(), rx in arb_finite_f64(), ry in arb_finite_f64(), rz in arb_finite_f64(),
+            timestamp_ns in any::<u64>(),
+        ) -> Transform3D {
+            Transform3D {
+                translation: [tx, ty, tz],
+                rotation: [rw, rx, ry, rz],
+                timestamp_ns,
+            }
+        }
+    }
+
+    prop_compose! {
+        fn arb_inertial()(
+            mass in arb_finite_f64(),
+            cx in arb_finite_f64(), cy in arb_finite_f64(), cz in arb_finite_f64(),
+        ) -> Inertial {
+            Inertial { mass, center_of_mass: [cx, cy, cz] }
+        }
+    }
+
+    fn arb_geometry() -> impl Strategy<Value = Geometry> {
+        prop_oneof![
+            (arb_finite_f64(), arb_finite_f64(), arb_finite_f64()).prop_map(|(x, y, z)| Geometry::Box {
+                half_extents: [x, y, z]
+            }),
+            arb_finite_f64().prop_map(|r| Geometry::Sphere { radius: r }),
+            (arb_finite_f64(), arb_finite_f64()).prop_map(|(r, l)| Geometry::Cylinder { radius: r, length: l }),
+            (
+                arb_name(),
+                option::of((arb_finite_f64(), arb_finite_f64(), arb_finite_f64()).prop_map(|(x, y, z)| [x, y, z]))
+            )
+                .prop_map(|(path, scale)| Geometry::Mesh { path, scale }),
+        ]
+    }
+
+    fn arb_workspace_shape() -> impl Strategy<Value = WorkspaceShape> {
+        prop_oneof![
+            (arb_finite_f64(), arb_finite_f64(), arb_finite_f64()).prop_map(|(x, y, z)| WorkspaceShape::Box {
+                half_extents: [x, y, z]
+            }),
+            arb_finite_f64().prop_map(|r| WorkspaceShape::Sphere { radius: r }),
+            (arb_finite_f64(), arb_finite_f64()).prop_map(|(r, h)| WorkspaceShape::Cylinder {
+                radius: r,
+                half_height: h
+            }),
+        ]
+    }
+
+    fn arb_semantic_role() -> impl Strategy<Value = SemanticRole> {
+        prop_oneof![
+            any::<u32>().prop_map(|i| SemanticRole::PrimaryManipulatorJoint { index: i }),
+            any::<u32>().prop_map(|i| SemanticRole::SecondaryManipulatorJoint { index: i }),
+            Just(SemanticRole::PrimaryGripper),
+            Just(SemanticRole::SecondaryGripper),
+            Just(SemanticRole::BaseTranslation),
+            Just(SemanticRole::BaseRotation),
+            Just(SemanticRole::HeadPan),
+            Just(SemanticRole::HeadTilt),
+            Just(SemanticRole::PrimaryCamera),
+            Just(SemanticRole::WristCamera),
+            Just(SemanticRole::ForceTorqueSensor),
+            arb_name().prop_map(|role| SemanticRole::Custom { role }),
+        ]
+    }
+
+    prop_compose! {
+        fn arb_joint_safety_limits()(
+            joint_name in arb_name(),
+            max_velocity in arb_finite_f64(),
+            max_acceleration in arb_finite_f64(),
+            max_jerk in arb_finite_f64(),
+            position_min in arb_finite_f64(),
+            position_max in arb_finite_f64(),
+            max_torque in option::of(arb_finite_f64()),
+        ) -> JointSafetyLimits {
+            JointSafetyLimits {
+                joint_name, max_velocity, max_acceleration, max_jerk,
+                position_min, position_max, max_torque,
+            }
+        }
+    }
+
+    prop_compose! {
+        fn arb_force_safety_limits()(
+            max_contact_force_n in arb_finite_f64(),
+            max_contact_torque_nm in arb_finite_f64(),
+            force_rate_limit in arb_finite_f64(),
+        ) -> ForceSafetyLimits {
+            ForceSafetyLimits { max_contact_force_n, max_contact_torque_nm, force_rate_limit }
+        }
+    }
+
+    prop_compose! {
+        fn arb_contact_force_envelope()(
+            link_name in arb_name(),
+            max_normal_force_n in arb_finite_f64(),
+            max_shear_force_n in arb_finite_f64(),
+            max_force_rate_n_per_s in arb_finite_f64(),
+        ) -> ContactForceEnvelope {
+            ContactForceEnvelope { link_name, max_normal_force_n, max_shear_force_n, max_force_rate_n_per_s }
+        }
+    }
+
+    prop_compose! {
+        fn arb_embodiment_family()(
+            family_id in arb_name(),
+            description in arb_name(),
+        ) -> EmbodimentFamily {
+            EmbodimentFamily { family_id, description }
+        }
+    }
+
+    prop_compose! {
+        fn arb_camera_frustum()(
+            fov_horizontal_deg in arb_finite_f64(),
+            fov_vertical_deg in arb_finite_f64(),
+            near_clip_m in arb_finite_f64(),
+            far_clip_m in arb_finite_f64(),
+            resolution in option::of((any::<u32>(), any::<u32>())),
+        ) -> CameraFrustum {
+            CameraFrustum { fov_horizontal_deg, fov_vertical_deg, near_clip_m, far_clip_m, resolution }
+        }
+    }
+
+    fn arb_joint_type() -> impl Strategy<Value = JointType> {
+        (0u8..4).prop_map(|v| match v {
+            0 => JointType::Revolute,
+            1 => JointType::Prismatic,
+            2 => JointType::Fixed,
+            _ => JointType::Continuous,
+        })
+    }
+
+    fn arb_tcp_type() -> impl Strategy<Value = TcpType> {
+        (0u8..4).prop_map(|v| match v {
+            0 => TcpType::Gripper,
+            1 => TcpType::Tool,
+            2 => TcpType::Sensor,
+            _ => TcpType::Custom,
+        })
+    }
+
+    fn arb_sensor_type() -> impl Strategy<Value = SensorType> {
+        (0u8..6).prop_map(|v| match v {
+            0 => SensorType::JointState,
+            1 => SensorType::ForceTorque,
+            2 => SensorType::Imu,
+            3 => SensorType::Camera,
+            4 => SensorType::PointCloud,
+            _ => SensorType::Other,
+        })
+    }
+
+    fn arb_zone_type() -> impl Strategy<Value = ZoneType> {
+        (0u8..3).prop_map(|v| match v {
+            0 => ZoneType::Allowed,
+            1 => ZoneType::Restricted,
+            _ => ZoneType::HumanPresence,
+        })
+    }
+
+    fn arb_frame_source() -> impl Strategy<Value = FrameSource> {
+        (0u8..3).prop_map(|v| match v {
+            0 => FrameSource::Static,
+            1 => FrameSource::Dynamic,
+            _ => FrameSource::Computed,
+        })
+    }
+
+    fn arb_binding_type() -> impl Strategy<Value = BindingType> {
+        (0u8..9).prop_map(|v| match v {
+            0 => BindingType::JointPosition,
+            1 => BindingType::JointVelocity,
+            2 => BindingType::ForceTorque,
+            3 => BindingType::Command,
+            4 => BindingType::GripperPosition,
+            5 => BindingType::GripperForce,
+            6 => BindingType::ImuOrientation,
+            7 => BindingType::ImuAngularVelocity,
+            _ => BindingType::ImuLinearAcceleration,
+        })
+    }
+
+    fn arb_command_interface_type() -> impl Strategy<Value = CommandInterfaceType> {
+        (0u8..7).prop_map(|v| match v {
+            0 => CommandInterfaceType::JointVelocity,
+            1 => CommandInterfaceType::JointPosition,
+            2 => CommandInterfaceType::JointTorque,
+            3 => CommandInterfaceType::GripperPosition,
+            4 => CommandInterfaceType::GripperForce,
+            5 => CommandInterfaceType::ForceTorqueSensor,
+            _ => CommandInterfaceType::ImuSensor,
+        })
+    }
+
+    // ------------------------------------------------------------------
+    // Phase B: Level 1 composite strategies
+    // ------------------------------------------------------------------
+
+    prop_compose! {
+        fn arb_joint()(
+            name in arb_name(),
+            joint_type in arb_joint_type(),
+            parent_link in arb_name(),
+            child_link in arb_name(),
+            ax in arb_finite_f64(), ay in arb_finite_f64(), az in arb_finite_f64(),
+            origin in arb_transform3d(),
+            limits in arb_joint_safety_limits(),
+        ) -> Joint {
+            Joint { name, joint_type, parent_link, child_link, axis: [ax, ay, az], origin, limits }
+        }
+    }
+
+    prop_compose! {
+        fn arb_link()(
+            name in arb_name(),
+            parent_joint in option::of(arb_name()),
+            inertial in option::of(arb_inertial()),
+            visual_geometry in option::of(arb_geometry()),
+            collision_geometry in option::of(arb_geometry()),
+        ) -> Link {
+            Link { name, parent_joint, inertial, visual_geometry, collision_geometry }
+        }
+    }
+
+    prop_compose! {
+        fn arb_collision_body()(
+            link_name in arb_name(),
+            geometry in arb_geometry(),
+            origin in arb_transform3d(),
+        ) -> CollisionBody {
+            CollisionBody { link_name, geometry, origin }
+        }
+    }
+
+    prop_compose! {
+        fn arb_tool_center_point()(
+            name in arb_name(),
+            parent_link in arb_name(),
+            offset in arb_transform3d(),
+            tcp_type in arb_tcp_type(),
+        ) -> ToolCenterPoint {
+            ToolCenterPoint { name, parent_link, offset, tcp_type }
+        }
+    }
+
+    prop_compose! {
+        fn arb_sensor_mount()(
+            sensor_id in arb_name(),
+            parent_link in arb_name(),
+            offset in arb_transform3d(),
+            sensor_type in arb_sensor_type(),
+            is_actuated in any::<bool>(),
+            actuation_joint in option::of(arb_name()),
+            frustum in option::of(arb_camera_frustum()),
+        ) -> SensorMount {
+            SensorMount { sensor_id, parent_link, offset, sensor_type, is_actuated, actuation_joint, frustum }
+        }
+    }
+
+    prop_compose! {
+        fn arb_workspace_zone()(
+            name in arb_name(),
+            shape in arb_workspace_shape(),
+            origin_frame in arb_name(),
+            zone_type in arb_zone_type(),
+            margin_m in arb_finite_f64(),
+        ) -> WorkspaceZone {
+            WorkspaceZone { name, shape, origin_frame, zone_type, margin_m }
+        }
+    }
+
+    prop_compose! {
+        fn arb_channel_binding()(
+            physical_name in arb_name(),
+            channel_index in any::<u32>(),
+            binding_type in arb_binding_type(),
+            frame_id in arb_name(),
+            units in arb_name(),
+            semantic_role in option::of(arb_semantic_role()),
+        ) -> ChannelBinding {
+            ChannelBinding { physical_name, channel_index, binding_type, frame_id, units, semantic_role }
+        }
+    }
+
+    prop_compose! {
+        fn arb_control_channel_def()(
+            name in arb_name(),
+            interface_type in arb_command_interface_type(),
+            units in arb_name(),
+            frame_id in arb_name(),
+        ) -> ControlChannelDef {
+            ControlChannelDef { name, interface_type, units, frame_id }
+        }
+    }
+
+    fn arb_datetime() -> impl Strategy<Value = chrono::DateTime<chrono::Utc>> {
+        (946_684_800i64..4_102_444_800i64).prop_map(|secs| chrono::DateTime::from_timestamp(secs, 0).unwrap())
+    }
+
+    prop_compose! {
+        fn arb_sensor_calibration()(
+            sensor_id in arb_name(),
+            offset in collection::vec(arb_finite_f64(), 0..6),
+            scale in option::of(collection::vec(arb_finite_f64(), 1..6)),
+            calibrated_at in arb_datetime(),
+        ) -> SensorCalibration {
+            SensorCalibration { sensor_id, offset, scale, calibrated_at }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Phase C: Level 2 composite strategies
+    // ------------------------------------------------------------------
+
+    /// Build a valid FrameTree: root + 0..5 children in a balanced-ish tree.
+    fn arb_frame_tree() -> impl Strategy<Value = FrameTree> {
+        let child_count = 0usize..6;
+        (
+            arb_frame_source(),
+            child_count,
+            collection::vec((arb_transform3d(), arb_frame_source()), 6),
+        )
+            .prop_map(|(root_source, n_children, child_data)| {
+                let mut tree = FrameTree::new();
+                tree.set_root("root", root_source);
+                let mut frame_names = vec!["root".to_string()];
+                for i in 0..n_children {
+                    let name = format!("frame_{i}");
+                    let parent_idx = i / 2; // balanced tree: parent of i is i/2
+                    let parent = &frame_names[parent_idx];
+                    let (transform, source) = child_data[i].clone();
+                    tree.add_frame(&name, parent, transform, source).unwrap();
+                    frame_names.push(name);
+                }
+                tree
+            })
+    }
+
+    prop_compose! {
+        fn arb_control_interface_manifest()(
+            version in any::<u32>(),
+            manifest_digest in arb_digest(),
+            channels in collection::vec(arb_control_channel_def(), 0..3),
+            bindings in collection::vec(arb_channel_binding(), 0..3),
+        ) -> ControlInterfaceManifest {
+            ControlInterfaceManifest { version, manifest_digest, channels, bindings }
+        }
+    }
+
+    prop_compose! {
+        fn arb_calibration_overlay()(
+            calibration_id in arb_name(),
+            calibration_digest in arb_digest(),
+            calibrated_at in arb_datetime(),
+            stale_after in option::of(arb_datetime()),
+            joint_offsets in collection::btree_map(arb_name(), arb_finite_f64(), 0..3),
+            frame_corrections in collection::btree_map(arb_name(), arb_transform3d(), 0..3),
+            sensor_calibrations in collection::btree_map(arb_name(), arb_sensor_calibration(), 0..3),
+            temp_pair in option::of((arb_finite_f64(), arb_finite_f64())),
+            valid_for_model_digest in arb_digest(),
+        ) -> CalibrationOverlay {
+            CalibrationOverlay {
+                calibration_id,
+                calibration_digest,
+                calibrated_at,
+                stale_after,
+                joint_offsets,
+                frame_corrections,
+                sensor_calibrations,
+                temperature_range: temp_pair,
+                valid_for_model_digest,
+            }
+        }
+    }
+
+    prop_compose! {
+        fn arb_safety_overlay()(
+            overlay_digest in arb_digest(),
+            workspace_restrictions in collection::vec(arb_workspace_zone(), 0..3),
+            joint_limit_overrides in collection::btree_map(arb_name(), arb_joint_safety_limits(), 0..3),
+            max_payload_kg in option::of(arb_finite_f64()),
+            human_presence_zones in collection::vec(arb_workspace_zone(), 0..2),
+            force_limits in option::of(arb_force_safety_limits()),
+            contact_force_envelopes in collection::vec(arb_contact_force_envelope(), 0..3),
+            contact_allowed_zones in collection::vec(arb_workspace_zone(), 0..2),
+            force_rate_limits in collection::btree_map(arb_name(), arb_finite_f64(), 0..3),
+        ) -> SafetyOverlay {
+            SafetyOverlay {
+                overlay_digest,
+                workspace_restrictions,
+                joint_limit_overrides,
+                max_payload_kg,
+                human_presence_zones,
+                force_limits,
+                contact_force_envelopes,
+                contact_allowed_zones,
+                force_rate_limits,
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Phase D: Level 3 aggregate strategies
+    // ------------------------------------------------------------------
+
+    prop_compose! {
+        fn arb_embodiment_model()(
+            model_id in arb_name(),
+            model_digest in arb_digest(),
+            embodiment_family in option::of(arb_embodiment_family()),
+            links in collection::vec(arb_link(), 0..3),
+            joints in collection::vec(arb_joint(), 0..3),
+            frame_tree in arb_frame_tree(),
+            collision_bodies in collection::vec(arb_collision_body(), 0..3),
+            allowed_collision_pairs in collection::vec((arb_name(), arb_name()), 0..3),
+            tcps in collection::vec(arb_tool_center_point(), 0..3),
+            sensor_mounts in collection::vec(arb_sensor_mount(), 0..3),
+            workspace_zones in collection::vec(arb_workspace_zone(), 0..3),
+            watched_frames in collection::vec(arb_name(), 0..3),
+            channel_bindings in collection::vec(arb_channel_binding(), 0..3),
+        ) -> EmbodimentModel {
+            EmbodimentModel {
+                model_id, model_digest, embodiment_family,
+                links, joints, frame_tree, collision_bodies,
+                allowed_collision_pairs, tcps, sensor_mounts,
+                workspace_zones, watched_frames, channel_bindings,
+            }
+        }
+    }
+
+    prop_compose! {
+        fn arb_embodiment_runtime()(
+            model in arb_embodiment_model(),
+            calibration in option::of(arb_calibration_overlay()),
+            safety_overlay in option::of(arb_safety_overlay()),
+            model_digest in arb_digest(),
+            calibration_digest in arb_digest(),
+            safety_digest in arb_digest(),
+            combined_digest in arb_digest(),
+            frame_graph in arb_frame_tree(),
+            active_calibration_id in option::of(arb_name()),
+            joint_count in 0u32..1000,
+            tcp_count in 0u32..1000,
+            watched_frames in collection::vec(arb_name(), 0..3),
+            validation_issues in collection::vec(arb_name(), 0..3),
+        ) -> EmbodimentRuntime {
+            EmbodimentRuntime {
+                model, calibration, safety_overlay,
+                model_digest, calibration_digest, safety_digest, combined_digest,
+                frame_graph, active_calibration_id,
+                joint_count: joint_count as usize,
+                tcp_count: tcp_count as usize,
+                watched_frames, validation_issues,
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Proptest round-trip assertions
+    // ------------------------------------------------------------------
+
+    proptest! {
+        #[test]
+        fn roundtrip_transform3d(val in arb_transform3d()) {
+            let proto = roz_v1::Transform3D::from(&val);
+            let back = Transform3D::try_from(proto).unwrap();
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_inertial(val in arb_inertial()) {
+            let proto = roz_v1::Inertial::from(&val);
+            let back = Inertial::try_from(proto).unwrap();
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_geometry(val in arb_geometry()) {
+            let proto = roz_v1::Geometry::from(&val);
+            let back = Geometry::try_from(proto).unwrap();
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_workspace_shape(val in arb_workspace_shape()) {
+            let proto = roz_v1::WorkspaceShape::from(&val);
+            let back = WorkspaceShape::try_from(proto).unwrap();
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_semantic_role(val in arb_semantic_role()) {
+            let proto = roz_v1::SemanticRole::from(&val);
+            let back = SemanticRole::try_from(proto).unwrap();
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_joint_safety_limits(val in arb_joint_safety_limits()) {
+            let proto = roz_v1::JointSafetyLimits::from(&val);
+            let back = JointSafetyLimits::from(proto);
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_force_safety_limits(val in arb_force_safety_limits()) {
+            let proto = roz_v1::ForceSafetyLimits::from(&val);
+            let back = ForceSafetyLimits::from(proto);
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_contact_force_envelope(val in arb_contact_force_envelope()) {
+            let proto = roz_v1::ContactForceEnvelope::from(&val);
+            let back = ContactForceEnvelope::from(proto);
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_camera_frustum(val in arb_camera_frustum()) {
+            let proto = roz_v1::CameraFrustum::from(&val);
+            let back = CameraFrustum::from(proto);
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_joint(val in arb_joint()) {
+            let proto = roz_v1::Joint::from(&val);
+            let back = Joint::try_from(proto).unwrap();
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_link(val in arb_link()) {
+            let proto = roz_v1::Link::from(&val);
+            let back = Link::try_from(proto).unwrap();
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_collision_body(val in arb_collision_body()) {
+            let proto = roz_v1::CollisionBody::from(&val);
+            let back = CollisionBody::try_from(proto).unwrap();
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_tool_center_point(val in arb_tool_center_point()) {
+            let proto = roz_v1::ToolCenterPoint::from(&val);
+            let back = ToolCenterPoint::try_from(proto).unwrap();
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_sensor_mount(val in arb_sensor_mount()) {
+            let proto = roz_v1::SensorMount::from(&val);
+            let back = SensorMount::try_from(proto).unwrap();
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_workspace_zone(val in arb_workspace_zone()) {
+            let proto = roz_v1::WorkspaceZone::from(&val);
+            let back = WorkspaceZone::try_from(proto).unwrap();
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_channel_binding(val in arb_channel_binding()) {
+            let proto = roz_v1::ChannelBinding::from(&val);
+            let back = ChannelBinding::try_from(proto).unwrap();
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_control_channel_def(val in arb_control_channel_def()) {
+            let proto = roz_v1::ControlChannelDef::from(&val);
+            let back = ControlChannelDef::try_from(proto).unwrap();
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_sensor_calibration(val in arb_sensor_calibration()) {
+            let proto = roz_v1::SensorCalibration::from(&val);
+            let back = SensorCalibration::try_from(proto).unwrap();
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_frame_tree(val in arb_frame_tree()) {
+            let proto = roz_v1::FrameTree::from(&val);
+            let back = FrameTree::try_from(proto).unwrap();
+            // Verify root preserved
+            prop_assert_eq!(val.root(), back.root());
+            // Verify all frame ids preserved
+            let mut orig_ids = val.all_frame_ids();
+            let mut back_ids = back.all_frame_ids();
+            orig_ids.sort();
+            back_ids.sort();
+            prop_assert_eq!(orig_ids, back_ids);
+            // Verify full equality
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_control_interface_manifest(val in arb_control_interface_manifest()) {
+            let proto = roz_v1::ControlInterfaceManifest::from(&val);
+            // CONV-04: digest pass-through
+            prop_assert_eq!(&val.manifest_digest, &proto.manifest_digest, "manifest_digest must round-trip as opaque string");
+            let back = ControlInterfaceManifest::try_from(proto).unwrap();
+            prop_assert_eq!(&val.manifest_digest, &back.manifest_digest, "manifest_digest must round-trip as opaque string");
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_calibration_overlay(val in arb_calibration_overlay()) {
+            let proto = roz_v1::CalibrationOverlay::from(&val);
+            // CONV-04: digest pass-through
+            prop_assert_eq!(&val.calibration_digest, &proto.calibration_digest, "calibration_digest must round-trip as opaque string");
+            let back = CalibrationOverlay::try_from(proto).unwrap();
+            prop_assert_eq!(&val.calibration_digest, &back.calibration_digest, "calibration_digest must round-trip as opaque string");
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_safety_overlay(val in arb_safety_overlay()) {
+            let proto = roz_v1::SafetyOverlay::from(&val);
+            // CONV-04: digest pass-through
+            prop_assert_eq!(&val.overlay_digest, &proto.overlay_digest, "overlay_digest must round-trip as opaque string");
+            let back = SafetyOverlay::try_from(proto).unwrap();
+            prop_assert_eq!(&val.overlay_digest, &back.overlay_digest, "overlay_digest must round-trip as opaque string");
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_embodiment_model(val in arb_embodiment_model()) {
+            let proto = roz_v1::EmbodimentModel::from(&val);
+            // CONV-04: digest pass-through
+            prop_assert_eq!(&val.model_digest, &proto.model_digest, "model_digest must round-trip as opaque string");
+            let back = EmbodimentModel::try_from(proto).unwrap();
+            prop_assert_eq!(&val.model_digest, &back.model_digest, "model_digest must round-trip as opaque string");
+            prop_assert_eq!(val, back);
+        }
+
+        #[test]
+        fn roundtrip_embodiment_runtime(val in arb_embodiment_runtime()) {
+            let proto = roz_v1::EmbodimentRuntime::from(&val);
+            // CONV-04: all four digest fields survive as opaque strings
+            prop_assert_eq!(&val.model_digest, &proto.model_digest, "model_digest must round-trip as opaque string");
+            prop_assert_eq!(&val.calibration_digest, &proto.calibration_digest, "calibration_digest must round-trip as opaque string");
+            prop_assert_eq!(&val.safety_digest, &proto.safety_digest, "safety_digest must round-trip as opaque string");
+            prop_assert_eq!(&val.combined_digest, &proto.combined_digest, "combined_digest must round-trip as opaque string");
+            let back = EmbodimentRuntime::try_from(proto).unwrap();
+            prop_assert_eq!(&val.model_digest, &back.model_digest, "model_digest must round-trip as opaque string");
+            prop_assert_eq!(&val.calibration_digest, &back.calibration_digest, "calibration_digest must round-trip as opaque string");
+            prop_assert_eq!(&val.safety_digest, &back.safety_digest, "safety_digest must round-trip as opaque string");
+            prop_assert_eq!(&val.combined_digest, &back.combined_digest, "combined_digest must round-trip as opaque string");
+            prop_assert_eq!(val, back);
+        }
+    }
 }
