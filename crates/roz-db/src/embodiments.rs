@@ -45,6 +45,34 @@ pub async fn upsert(
     Ok(result.rows_affected() > 0)
 }
 
+/// Conditionally upsert embodiment data for a host.
+///
+/// Skips the write when the incoming model's `model_digest` matches the stored
+/// value (atomic in a single UPDATE query). Returns `true` when a write
+/// occurred, `false` when skipped because the digest was unchanged.
+pub async fn conditional_upsert(
+    pool: &PgPool,
+    host_id: Uuid,
+    model: &serde_json::Value,
+    runtime: Option<&serde_json::Value>,
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE roz_hosts \
+         SET embodiment_model = $2, \
+             embodiment_runtime = COALESCE($3, embodiment_runtime), \
+             updated_at = now() \
+         WHERE id = $1 \
+           AND (embodiment_model IS NULL \
+                OR embodiment_model->>'model_digest' IS DISTINCT FROM $2->>'model_digest')",
+    )
+    .bind(host_id)
+    .bind(model)
+    .bind(runtime)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
