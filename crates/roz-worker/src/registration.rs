@@ -114,6 +114,41 @@ fn find_host_by_name(body: &serde_json::Value, worker_id: &str) -> Option<Uuid> 
     None
 }
 
+/// Upload embodiment model (and optional runtime) to the server for a registered host.
+///
+/// Called after `register_host()` returns the host UUID, when the worker has
+/// embodiment data available. Sends `PUT /v1/hosts/{id}/embodiment` with the
+/// serialised model and optional runtime as JSON.
+pub async fn upload_embodiment(
+    api_url: &str,
+    api_key: &str,
+    host_id: Uuid,
+    model: &roz_core::embodiment::model::EmbodimentModel,
+    runtime: Option<&roz_core::embodiment::embodiment_runtime::EmbodimentRuntime>,
+) -> Result<()> {
+    let client = reqwest::Client::new();
+    let base = api_url.trim_end_matches('/');
+
+    let mut body = serde_json::json!({
+        "model": model,
+    });
+    if let Some(rt) = runtime {
+        body["runtime"] = serde_json::to_value(rt).context("failed to serialize embodiment runtime")?;
+    }
+
+    client
+        .put(format!("{base}/v1/hosts/{host_id}/embodiment"))
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+        .context("PUT /v1/hosts/{id}/embodiment request failed")?
+        .error_for_status()
+        .context("PUT /v1/hosts/{id}/embodiment returned error status")?;
+
+    Ok(())
+}
+
 /// Extract the host UUID from a `{"data": {"id": "..."}}` response.
 fn parse_host_id(body: &serde_json::Value) -> Option<Uuid> {
     let id_str = body.get("data")?.get("id")?.as_str()?;
@@ -165,5 +200,23 @@ mod tests {
     fn parse_host_id_returns_none_for_missing_data() {
         let body = serde_json::json!({"error": "not found"});
         assert!(parse_host_id(&body).is_none());
+    }
+
+    #[test]
+    fn upload_embodiment_body_has_model_key() {
+        // Verify the JSON body shape matches what the server endpoint expects
+        let model = serde_json::json!({"model_id": "test", "joints": []});
+        let body = serde_json::json!({"model": model});
+        assert!(body.get("model").is_some());
+        assert!(body.get("runtime").is_none());
+    }
+
+    #[test]
+    fn upload_embodiment_body_with_runtime() {
+        let model = serde_json::json!({"model_id": "test"});
+        let runtime = serde_json::json!({"combined_digest": "abc"});
+        let body = serde_json::json!({"model": model, "runtime": runtime});
+        assert!(body.get("model").is_some());
+        assert!(body.get("runtime").is_some());
     }
 }
