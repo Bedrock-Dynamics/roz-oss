@@ -47,7 +47,10 @@ Plans:
   1. Client can fetch canonical-to-local joint mapping for a host via GetRetargetingMap RPC without fetching the full model
   2. Client can fetch ControlInterfaceManifest via GetManifest RPC without fetching the full model
   3. GetRetargetingMap response includes mapped and total binding counts so clients can report coverage percentage
-**Plans**: TBD
+**Plans:** 2 plans
+Plans:
+- [ ] 06-01-PLAN.md — Proto messages, RPC declarations, and RetargetingMap conversions with proptest
+- [ ] 06-02-PLAN.md — GetRetargetingMap and GetManifest handler implementations
 
 ### Phase 7: Streaming RPCs
 **Goal**: Connected clients receive real-time updates when a host's frame tree structure or calibration overlays change
@@ -80,6 +83,6 @@ Plans:
 | 3. Composite Type Conversions and Round-Trip Tests | v1.0 | 2/2 | Complete | 2026-04-07 |
 | 4. Service Implementation | v1.0 | 2/2 | Complete | 2026-04-08 |
 | 5. Worker Embodiment Upload Wiring | v1.1 | 0/2 | Planned | - |
-| 6. Extension RPCs | v1.1 | 0/0 | Not started | - |
+| 6. Extension RPCs | v1.1 | 0/2 | Planned | - |
 | 7. Streaming RPCs | v1.1 | 0/0 | Not started | - |
 | 8. CLI Embodiment Commands | v1.1 | 0/0 | Not started | - |
