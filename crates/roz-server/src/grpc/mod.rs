@@ -1,6 +1,5 @@
 pub mod agent;
 pub mod convert;
-#[allow(dead_code)]
 pub mod embodiment_convert;
 pub mod event_mapper;
 pub mod tasks;

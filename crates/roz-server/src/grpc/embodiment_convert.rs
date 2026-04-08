@@ -2,14 +2,22 @@
 //!
 //! Enum helper functions are `pub(crate)` for use by Phase 3 composite conversions.
 
-use roz_core::embodiment::binding::{BindingType, CommandInterfaceType};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+
+use roz_core::embodiment::binding::{
+    BindingType, ChannelBinding, CommandInterfaceType, ControlChannelDef, ControlInterfaceManifest,
+};
+use roz_core::embodiment::calibration::{CalibrationOverlay, SensorCalibration};
 use roz_core::embodiment::contact::ContactForceEnvelope;
-use roz_core::embodiment::frame_tree::{FrameSource, Transform3D};
+use roz_core::embodiment::embodiment_runtime::EmbodimentRuntime;
+use roz_core::embodiment::frame_tree::{FrameNode, FrameSource, FrameTree, Transform3D};
 use roz_core::embodiment::limits::{ForceSafetyLimits, JointSafetyLimits};
 use roz_core::embodiment::model::{
-    CameraFrustum, EmbodimentFamily, Geometry, Inertial, JointType, SemanticRole, SensorType, TcpType,
+    CameraFrustum, CollisionBody, EmbodimentFamily, EmbodimentModel, Geometry, Inertial, Joint, JointType, Link,
+    SemanticRole, SensorMount, SensorType, TcpType, ToolCenterPoint,
 };
-use roz_core::embodiment::workspace::{WorkspaceShape, ZoneType};
+use roz_core::embodiment::safety_overlay::SafetyOverlay;
+use roz_core::embodiment::workspace::{WorkspaceShape, WorkspaceZone, ZoneType};
 
 use super::roz_v1;
 
@@ -657,6 +665,758 @@ impl From<roz_v1::CameraFrustum> for CameraFrustum {
     }
 }
 
+// ===========================================================================
+// Composite type conversions (Phase 3)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Joint
+// ---------------------------------------------------------------------------
+
+impl From<&Joint> for roz_v1::Joint {
+    fn from(j: &Joint) -> Self {
+        Self {
+            name: j.name.clone(),
+            joint_type: domain_joint_type_to_proto(&j.joint_type),
+            parent_link: j.parent_link.clone(),
+            child_link: j.child_link.clone(),
+            axis: Some(roz_v1::Vec3::from(&j.axis)),
+            origin: Some(roz_v1::Transform3D::from(&j.origin)),
+            limits: Some(roz_v1::JointSafetyLimits::from(&j.limits)),
+        }
+    }
+}
+
+impl TryFrom<roz_v1::Joint> for Joint {
+    type Error = EmbodimentConvertError;
+
+    fn try_from(proto: roz_v1::Joint) -> Result<Self, Self::Error> {
+        let axis: [f64; 3] = proto
+            .axis
+            .ok_or_else(|| EmbodimentConvertError::MissingField("Joint.axis".into()))?
+            .into();
+        let origin = Transform3D::try_from(
+            proto
+                .origin
+                .ok_or_else(|| EmbodimentConvertError::MissingField("Joint.origin".into()))?,
+        )?;
+        let limits = JointSafetyLimits::from(
+            proto
+                .limits
+                .ok_or_else(|| EmbodimentConvertError::MissingField("Joint.limits".into()))?,
+        );
+        Ok(Self {
+            name: proto.name,
+            joint_type: proto_to_domain_joint_type(proto.joint_type)?,
+            parent_link: proto.parent_link,
+            child_link: proto.child_link,
+            axis,
+            origin,
+            limits,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Link
+// ---------------------------------------------------------------------------
+
+impl From<&Link> for roz_v1::Link {
+    fn from(l: &Link) -> Self {
+        Self {
+            name: l.name.clone(),
+            parent_joint: l.parent_joint.clone(),
+            inertial: l.inertial.as_ref().map(roz_v1::Inertial::from),
+            visual_geometry: l.visual_geometry.as_ref().map(roz_v1::Geometry::from),
+            collision_geometry: l.collision_geometry.as_ref().map(roz_v1::Geometry::from),
+        }
+    }
+}
+
+impl TryFrom<roz_v1::Link> for Link {
+    type Error = EmbodimentConvertError;
+
+    fn try_from(proto: roz_v1::Link) -> Result<Self, Self::Error> {
+        Ok(Self {
+            name: proto.name,
+            parent_joint: proto.parent_joint,
+            inertial: proto.inertial.map(Inertial::try_from).transpose()?,
+            visual_geometry: proto.visual_geometry.map(Geometry::try_from).transpose()?,
+            collision_geometry: proto.collision_geometry.map(Geometry::try_from).transpose()?,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CollisionBody
+// ---------------------------------------------------------------------------
+
+impl From<&CollisionBody> for roz_v1::CollisionBody {
+    fn from(cb: &CollisionBody) -> Self {
+        Self {
+            link_name: cb.link_name.clone(),
+            geometry: Some(roz_v1::Geometry::from(&cb.geometry)),
+            origin: Some(roz_v1::Transform3D::from(&cb.origin)),
+        }
+    }
+}
+
+impl TryFrom<roz_v1::CollisionBody> for CollisionBody {
+    type Error = EmbodimentConvertError;
+
+    fn try_from(proto: roz_v1::CollisionBody) -> Result<Self, Self::Error> {
+        let geometry = Geometry::try_from(
+            proto
+                .geometry
+                .ok_or_else(|| EmbodimentConvertError::MissingField("CollisionBody.geometry".into()))?,
+        )?;
+        let origin = Transform3D::try_from(
+            proto
+                .origin
+                .ok_or_else(|| EmbodimentConvertError::MissingField("CollisionBody.origin".into()))?,
+        )?;
+        Ok(Self {
+            link_name: proto.link_name,
+            geometry,
+            origin,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ToolCenterPoint
+// ---------------------------------------------------------------------------
+
+impl From<&ToolCenterPoint> for roz_v1::ToolCenterPoint {
+    fn from(tcp: &ToolCenterPoint) -> Self {
+        Self {
+            name: tcp.name.clone(),
+            parent_link: tcp.parent_link.clone(),
+            offset: Some(roz_v1::Transform3D::from(&tcp.offset)),
+            tcp_type: domain_tcp_type_to_proto(&tcp.tcp_type),
+        }
+    }
+}
+
+impl TryFrom<roz_v1::ToolCenterPoint> for ToolCenterPoint {
+    type Error = EmbodimentConvertError;
+
+    fn try_from(proto: roz_v1::ToolCenterPoint) -> Result<Self, Self::Error> {
+        let offset = Transform3D::try_from(
+            proto
+                .offset
+                .ok_or_else(|| EmbodimentConvertError::MissingField("ToolCenterPoint.offset".into()))?,
+        )?;
+        Ok(Self {
+            name: proto.name,
+            parent_link: proto.parent_link,
+            offset,
+            tcp_type: proto_to_domain_tcp_type(proto.tcp_type)?,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SensorMount
+// ---------------------------------------------------------------------------
+
+impl From<&SensorMount> for roz_v1::SensorMount {
+    fn from(sm: &SensorMount) -> Self {
+        Self {
+            sensor_id: sm.sensor_id.clone(),
+            parent_link: sm.parent_link.clone(),
+            offset: Some(roz_v1::Transform3D::from(&sm.offset)),
+            sensor_type: domain_sensor_type_to_proto(&sm.sensor_type),
+            is_actuated: sm.is_actuated,
+            actuation_joint: sm.actuation_joint.clone(),
+            frustum: sm.frustum.as_ref().map(roz_v1::CameraFrustum::from),
+        }
+    }
+}
+
+impl TryFrom<roz_v1::SensorMount> for SensorMount {
+    type Error = EmbodimentConvertError;
+
+    fn try_from(proto: roz_v1::SensorMount) -> Result<Self, Self::Error> {
+        let offset = Transform3D::try_from(
+            proto
+                .offset
+                .ok_or_else(|| EmbodimentConvertError::MissingField("SensorMount.offset".into()))?,
+        )?;
+        Ok(Self {
+            sensor_id: proto.sensor_id,
+            parent_link: proto.parent_link,
+            offset,
+            sensor_type: proto_to_domain_sensor_type(proto.sensor_type)?,
+            is_actuated: proto.is_actuated,
+            actuation_joint: proto.actuation_joint,
+            frustum: proto.frustum.map(CameraFrustum::from),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WorkspaceZone
+// ---------------------------------------------------------------------------
+
+impl From<&WorkspaceZone> for roz_v1::WorkspaceZone {
+    fn from(wz: &WorkspaceZone) -> Self {
+        Self {
+            name: wz.name.clone(),
+            shape: Some(roz_v1::WorkspaceShape::from(&wz.shape)),
+            origin_frame: wz.origin_frame.clone(),
+            zone_type: domain_zone_type_to_proto(&wz.zone_type),
+            margin_m: wz.margin_m,
+        }
+    }
+}
+
+impl TryFrom<roz_v1::WorkspaceZone> for WorkspaceZone {
+    type Error = EmbodimentConvertError;
+
+    fn try_from(proto: roz_v1::WorkspaceZone) -> Result<Self, Self::Error> {
+        let shape = WorkspaceShape::try_from(
+            proto
+                .shape
+                .ok_or_else(|| EmbodimentConvertError::MissingField("WorkspaceZone.shape".into()))?,
+        )?;
+        Ok(Self {
+            name: proto.name,
+            shape,
+            origin_frame: proto.origin_frame,
+            zone_type: proto_to_domain_zone_type(proto.zone_type)?,
+            margin_m: proto.margin_m,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FrameNode
+// ---------------------------------------------------------------------------
+
+impl From<&FrameNode> for roz_v1::FrameNode {
+    fn from(node: &FrameNode) -> Self {
+        Self {
+            frame_id: node.frame_id.clone(),
+            parent_id: node.parent_id.clone(),
+            static_transform: Some(roz_v1::Transform3D::from(&node.static_transform)),
+            source: domain_frame_source_to_proto(&node.source),
+        }
+    }
+}
+
+impl TryFrom<roz_v1::FrameNode> for FrameNode {
+    type Error = EmbodimentConvertError;
+
+    fn try_from(proto: roz_v1::FrameNode) -> Result<Self, Self::Error> {
+        let static_transform = Transform3D::try_from(
+            proto
+                .static_transform
+                .ok_or_else(|| EmbodimentConvertError::MissingField("FrameNode.static_transform".into()))?,
+        )?;
+        Ok(Self {
+            frame_id: proto.frame_id,
+            parent_id: proto.parent_id,
+            static_transform,
+            source: proto_to_domain_frame_source(proto.source)?,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ChannelBinding
+// ---------------------------------------------------------------------------
+
+impl From<&ChannelBinding> for roz_v1::ChannelBinding {
+    fn from(cb: &ChannelBinding) -> Self {
+        Self {
+            physical_name: cb.physical_name.clone(),
+            channel_index: cb.channel_index,
+            binding_type: domain_binding_type_to_proto(&cb.binding_type),
+            frame_id: cb.frame_id.clone(),
+            units: cb.units.clone(),
+            semantic_role: cb.semantic_role.as_ref().map(roz_v1::SemanticRole::from),
+        }
+    }
+}
+
+impl TryFrom<roz_v1::ChannelBinding> for ChannelBinding {
+    type Error = EmbodimentConvertError;
+
+    fn try_from(proto: roz_v1::ChannelBinding) -> Result<Self, Self::Error> {
+        Ok(Self {
+            physical_name: proto.physical_name,
+            channel_index: proto.channel_index,
+            binding_type: proto_to_domain_binding_type(proto.binding_type)?,
+            frame_id: proto.frame_id,
+            units: proto.units,
+            semantic_role: proto.semantic_role.map(SemanticRole::try_from).transpose()?,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ControlChannelDef
+// ---------------------------------------------------------------------------
+
+impl From<&ControlChannelDef> for roz_v1::ControlChannelDef {
+    fn from(cd: &ControlChannelDef) -> Self {
+        Self {
+            name: cd.name.clone(),
+            interface_type: domain_command_interface_type_to_proto(&cd.interface_type),
+            units: cd.units.clone(),
+            frame_id: cd.frame_id.clone(),
+        }
+    }
+}
+
+impl TryFrom<roz_v1::ControlChannelDef> for ControlChannelDef {
+    type Error = EmbodimentConvertError;
+
+    fn try_from(proto: roz_v1::ControlChannelDef) -> Result<Self, Self::Error> {
+        Ok(Self {
+            name: proto.name,
+            interface_type: proto_to_domain_command_interface_type(proto.interface_type)?,
+            units: proto.units,
+            frame_id: proto.frame_id,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SensorCalibration
+// ---------------------------------------------------------------------------
+
+impl From<&SensorCalibration> for roz_v1::SensorCalibration {
+    fn from(sc: &SensorCalibration) -> Self {
+        Self {
+            sensor_id: sc.sensor_id.clone(),
+            offset: sc.offset.clone(),
+            scale: sc.scale.clone().unwrap_or_default(),
+            calibrated_at: Some(datetime_to_proto(sc.calibrated_at)),
+        }
+    }
+}
+
+impl TryFrom<roz_v1::SensorCalibration> for SensorCalibration {
+    type Error = EmbodimentConvertError;
+
+    fn try_from(proto: roz_v1::SensorCalibration) -> Result<Self, Self::Error> {
+        let calibrated_at = proto_to_datetime(
+            proto
+                .calibrated_at
+                .ok_or_else(|| EmbodimentConvertError::MissingField("SensorCalibration.calibrated_at".into()))?,
+        )?;
+        Ok(Self {
+            sensor_id: proto.sensor_id,
+            offset: proto.offset,
+            scale: if proto.scale.is_empty() {
+                None
+            } else {
+                Some(proto.scale)
+            },
+            calibrated_at,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FrameTree (Level 2 — special case with private fields)
+// ---------------------------------------------------------------------------
+
+impl From<&FrameTree> for roz_v1::FrameTree {
+    fn from(ft: &FrameTree) -> Self {
+        let frames: BTreeMap<String, roz_v1::FrameNode> = ft
+            .all_frame_ids()
+            .into_iter()
+            .filter_map(|id| {
+                ft.get_frame(id)
+                    .map(|node| (id.to_string(), roz_v1::FrameNode::from(node)))
+            })
+            .collect();
+        Self {
+            frames,
+            root: ft.root().map(str::to_string),
+        }
+    }
+}
+
+impl TryFrom<roz_v1::FrameTree> for FrameTree {
+    type Error = EmbodimentConvertError;
+
+    fn try_from(proto: roz_v1::FrameTree) -> Result<Self, Self::Error> {
+        let root_id = proto
+            .root
+            .ok_or_else(|| EmbodimentConvertError::MissingField("FrameTree.root".into()))?;
+        let root_node = proto
+            .frames
+            .get(&root_id)
+            .ok_or_else(|| EmbodimentConvertError::MissingField(format!("FrameTree.frames[{root_id}]")))?;
+
+        let mut tree = Self::new();
+        tree.set_root(&root_id, proto_to_domain_frame_source(root_node.source)?);
+
+        // BFS from root to add children in topological order
+        let mut queue = VecDeque::new();
+        queue.push_back(root_id.clone());
+        let mut visited = HashSet::new();
+        visited.insert(root_id);
+
+        while let Some(parent_id) = queue.pop_front() {
+            for (frame_id, node) in &proto.frames {
+                if visited.contains(frame_id) {
+                    continue;
+                }
+                if node.parent_id.as_deref() == Some(parent_id.as_str()) {
+                    let transform = Transform3D::try_from(node.static_transform.ok_or_else(|| {
+                        EmbodimentConvertError::MissingField(format!("FrameNode({frame_id}).static_transform"))
+                    })?)?;
+                    let source = proto_to_domain_frame_source(node.source)?;
+                    tree.add_frame(frame_id, &parent_id, transform, source)
+                        .map_err(|e| EmbodimentConvertError::MissingField(format!("FrameTree BFS: {e}")))?;
+                    visited.insert(frame_id.clone());
+                    queue.push_back(frame_id.clone());
+                }
+            }
+        }
+
+        Ok(tree)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ControlInterfaceManifest (Level 2)
+// ---------------------------------------------------------------------------
+
+impl From<&ControlInterfaceManifest> for roz_v1::ControlInterfaceManifest {
+    fn from(cim: &ControlInterfaceManifest) -> Self {
+        Self {
+            version: cim.version,
+            manifest_digest: cim.manifest_digest.clone(),
+            channels: cim.channels.iter().map(roz_v1::ControlChannelDef::from).collect(),
+            bindings: cim.bindings.iter().map(roz_v1::ChannelBinding::from).collect(),
+        }
+    }
+}
+
+impl TryFrom<roz_v1::ControlInterfaceManifest> for ControlInterfaceManifest {
+    type Error = EmbodimentConvertError;
+
+    fn try_from(proto: roz_v1::ControlInterfaceManifest) -> Result<Self, Self::Error> {
+        Ok(Self {
+            version: proto.version,
+            manifest_digest: proto.manifest_digest,
+            channels: proto
+                .channels
+                .into_iter()
+                .map(ControlChannelDef::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            bindings: proto
+                .bindings
+                .into_iter()
+                .map(ChannelBinding::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CalibrationOverlay (Level 2)
+// ---------------------------------------------------------------------------
+
+impl From<&CalibrationOverlay> for roz_v1::CalibrationOverlay {
+    fn from(co: &CalibrationOverlay) -> Self {
+        let (temperature_min, temperature_max) = match co.temperature_range {
+            Some((min, max)) => (Some(min), Some(max)),
+            None => (None, None),
+        };
+        Self {
+            calibration_id: co.calibration_id.clone(),
+            calibration_digest: co.calibration_digest.clone(),
+            calibrated_at: Some(datetime_to_proto(co.calibrated_at)),
+            stale_after: co.stale_after.map(datetime_to_proto),
+            joint_offsets: co.joint_offsets.clone(),
+            frame_corrections: co
+                .frame_corrections
+                .iter()
+                .map(|(k, v)| (k.clone(), roz_v1::Transform3D::from(v)))
+                .collect(),
+            sensor_calibrations: co
+                .sensor_calibrations
+                .iter()
+                .map(|(k, v)| (k.clone(), roz_v1::SensorCalibration::from(v)))
+                .collect(),
+            temperature_min,
+            temperature_max,
+            valid_for_model_digest: co.valid_for_model_digest.clone(),
+        }
+    }
+}
+
+impl TryFrom<roz_v1::CalibrationOverlay> for CalibrationOverlay {
+    type Error = EmbodimentConvertError;
+
+    fn try_from(proto: roz_v1::CalibrationOverlay) -> Result<Self, Self::Error> {
+        let calibrated_at = proto_to_datetime(
+            proto
+                .calibrated_at
+                .ok_or_else(|| EmbodimentConvertError::MissingField("CalibrationOverlay.calibrated_at".into()))?,
+        )?;
+        let stale_after = proto.stale_after.map(proto_to_datetime).transpose()?;
+
+        let temperature_range = match (proto.temperature_min, proto.temperature_max) {
+            (Some(min), Some(max)) => Some((min, max)),
+            (None, None) => None,
+            _ => {
+                return Err(EmbodimentConvertError::MissingField(
+                    "CalibrationOverlay.temperature_min/max must both be set or both absent".into(),
+                ));
+            }
+        };
+
+        let frame_corrections = proto
+            .frame_corrections
+            .into_iter()
+            .map(|(k, v)| Transform3D::try_from(v).map(|t| (k, t)))
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+
+        let sensor_calibrations = proto
+            .sensor_calibrations
+            .into_iter()
+            .map(|(k, v)| SensorCalibration::try_from(v).map(|sc| (k, sc)))
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+
+        Ok(Self {
+            calibration_id: proto.calibration_id,
+            calibration_digest: proto.calibration_digest,
+            calibrated_at,
+            stale_after,
+            joint_offsets: proto.joint_offsets,
+            frame_corrections,
+            sensor_calibrations,
+            temperature_range,
+            valid_for_model_digest: proto.valid_for_model_digest,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SafetyOverlay (Level 2)
+// ---------------------------------------------------------------------------
+
+impl From<&SafetyOverlay> for roz_v1::SafetyOverlay {
+    fn from(so: &SafetyOverlay) -> Self {
+        Self {
+            overlay_digest: so.overlay_digest.clone(),
+            workspace_restrictions: so
+                .workspace_restrictions
+                .iter()
+                .map(roz_v1::WorkspaceZone::from)
+                .collect(),
+            joint_limit_overrides: so
+                .joint_limit_overrides
+                .iter()
+                .map(|(k, v)| (k.clone(), roz_v1::JointSafetyLimits::from(v)))
+                .collect(),
+            max_payload_kg: so.max_payload_kg,
+            human_presence_zones: so
+                .human_presence_zones
+                .iter()
+                .map(roz_v1::WorkspaceZone::from)
+                .collect(),
+            force_limits: so.force_limits.as_ref().map(roz_v1::ForceSafetyLimits::from),
+            contact_force_envelopes: so
+                .contact_force_envelopes
+                .iter()
+                .map(roz_v1::ContactForceEnvelope::from)
+                .collect(),
+            contact_allowed_zones: so
+                .contact_allowed_zones
+                .iter()
+                .map(roz_v1::WorkspaceZone::from)
+                .collect(),
+            force_rate_limits: so.force_rate_limits.clone(),
+        }
+    }
+}
+
+impl TryFrom<roz_v1::SafetyOverlay> for SafetyOverlay {
+    type Error = EmbodimentConvertError;
+
+    fn try_from(proto: roz_v1::SafetyOverlay) -> Result<Self, Self::Error> {
+        Ok(Self {
+            overlay_digest: proto.overlay_digest,
+            workspace_restrictions: proto
+                .workspace_restrictions
+                .into_iter()
+                .map(WorkspaceZone::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            joint_limit_overrides: proto
+                .joint_limit_overrides
+                .into_iter()
+                .map(|(k, v)| (k, JointSafetyLimits::from(v)))
+                .collect(),
+            max_payload_kg: proto.max_payload_kg,
+            human_presence_zones: proto
+                .human_presence_zones
+                .into_iter()
+                .map(WorkspaceZone::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            force_limits: proto.force_limits.map(ForceSafetyLimits::from),
+            contact_force_envelopes: proto
+                .contact_force_envelopes
+                .into_iter()
+                .map(ContactForceEnvelope::from)
+                .collect(),
+            contact_allowed_zones: proto
+                .contact_allowed_zones
+                .into_iter()
+                .map(WorkspaceZone::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            force_rate_limits: proto.force_rate_limits,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EmbodimentModel (Level 3)
+// ---------------------------------------------------------------------------
+
+impl From<&EmbodimentModel> for roz_v1::EmbodimentModel {
+    fn from(m: &EmbodimentModel) -> Self {
+        Self {
+            model_id: m.model_id.clone(),
+            model_digest: m.model_digest.clone(),
+            embodiment_family: m.embodiment_family.as_ref().map(roz_v1::EmbodimentFamily::from),
+            links: m.links.iter().map(roz_v1::Link::from).collect(),
+            joints: m.joints.iter().map(roz_v1::Joint::from).collect(),
+            frame_tree: Some(roz_v1::FrameTree::from(&m.frame_tree)),
+            collision_bodies: m.collision_bodies.iter().map(roz_v1::CollisionBody::from).collect(),
+            allowed_collision_pairs: m
+                .allowed_collision_pairs
+                .iter()
+                .map(roz_v1::CollisionPair::from)
+                .collect(),
+            tcps: m.tcps.iter().map(roz_v1::ToolCenterPoint::from).collect(),
+            sensor_mounts: m.sensor_mounts.iter().map(roz_v1::SensorMount::from).collect(),
+            workspace_zones: m.workspace_zones.iter().map(roz_v1::WorkspaceZone::from).collect(),
+            watched_frames: m.watched_frames.clone(),
+            channel_bindings: m.channel_bindings.iter().map(roz_v1::ChannelBinding::from).collect(),
+        }
+    }
+}
+
+impl TryFrom<roz_v1::EmbodimentModel> for EmbodimentModel {
+    type Error = EmbodimentConvertError;
+
+    fn try_from(proto: roz_v1::EmbodimentModel) -> Result<Self, Self::Error> {
+        let frame_tree = FrameTree::try_from(
+            proto
+                .frame_tree
+                .ok_or_else(|| EmbodimentConvertError::MissingField("EmbodimentModel.frame_tree".into()))?,
+        )?;
+        Ok(Self {
+            model_id: proto.model_id,
+            model_digest: proto.model_digest,
+            embodiment_family: proto.embodiment_family.map(EmbodimentFamily::from),
+            links: proto
+                .links
+                .into_iter()
+                .map(Link::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            joints: proto
+                .joints
+                .into_iter()
+                .map(Joint::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            frame_tree,
+            collision_bodies: proto
+                .collision_bodies
+                .into_iter()
+                .map(CollisionBody::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            allowed_collision_pairs: proto.allowed_collision_pairs.into_iter().map(Into::into).collect(),
+            tcps: proto
+                .tcps
+                .into_iter()
+                .map(ToolCenterPoint::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            sensor_mounts: proto
+                .sensor_mounts
+                .into_iter()
+                .map(SensorMount::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            workspace_zones: proto
+                .workspace_zones
+                .into_iter()
+                .map(WorkspaceZone::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+            watched_frames: proto.watched_frames,
+            channel_bindings: proto
+                .channel_bindings
+                .into_iter()
+                .map(ChannelBinding::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EmbodimentRuntime (Level 3)
+// ---------------------------------------------------------------------------
+
+impl From<&EmbodimentRuntime> for roz_v1::EmbodimentRuntime {
+    fn from(r: &EmbodimentRuntime) -> Self {
+        Self {
+            model: Some(roz_v1::EmbodimentModel::from(&r.model)),
+            calibration: r.calibration.as_ref().map(roz_v1::CalibrationOverlay::from),
+            safety_overlay: r.safety_overlay.as_ref().map(roz_v1::SafetyOverlay::from),
+            model_digest: r.model_digest.clone(),
+            calibration_digest: r.calibration_digest.clone(),
+            safety_digest: r.safety_digest.clone(),
+            combined_digest: r.combined_digest.clone(),
+            frame_graph: Some(roz_v1::FrameTree::from(&r.frame_graph)),
+            active_calibration_id: r.active_calibration_id.clone(),
+            joint_count: u32::try_from(r.joint_count).unwrap_or(u32::MAX),
+            tcp_count: u32::try_from(r.tcp_count).unwrap_or(u32::MAX),
+            watched_frames: r.watched_frames.clone(),
+            validation_issues: r.validation_issues.clone(),
+        }
+    }
+}
+
+impl TryFrom<roz_v1::EmbodimentRuntime> for EmbodimentRuntime {
+    type Error = EmbodimentConvertError;
+
+    fn try_from(proto: roz_v1::EmbodimentRuntime) -> Result<Self, Self::Error> {
+        let model = EmbodimentModel::try_from(
+            proto
+                .model
+                .ok_or_else(|| EmbodimentConvertError::MissingField("EmbodimentRuntime.model".into()))?,
+        )?;
+        let frame_graph = FrameTree::try_from(
+            proto
+                .frame_graph
+                .ok_or_else(|| EmbodimentConvertError::MissingField("EmbodimentRuntime.frame_graph".into()))?,
+        )?;
+        Ok(Self {
+            model,
+            calibration: proto.calibration.map(CalibrationOverlay::try_from).transpose()?,
+            safety_overlay: proto.safety_overlay.map(SafetyOverlay::try_from).transpose()?,
+            model_digest: proto.model_digest,
+            calibration_digest: proto.calibration_digest,
+            safety_digest: proto.safety_digest,
+            combined_digest: proto.combined_digest,
+            frame_graph,
+            active_calibration_id: proto.active_calibration_id,
+            joint_count: proto.joint_count as usize,
+            tcp_count: proto.tcp_count as usize,
+            watched_frames: proto.watched_frames,
+            validation_issues: proto.validation_issues,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1214,5 +1974,527 @@ mod tests {
 
         let e4 = EmbodimentConvertError::InvalidTimestamp;
         assert!(e4.to_string().contains("invalid timestamp"));
+    }
+
+    // -- Composite round-trip tests (Phase 3) --
+
+    #[test]
+    fn joint_roundtrip() {
+        let domain = Joint {
+            name: "shoulder_pitch".into(),
+            joint_type: JointType::Revolute,
+            parent_link: "base_link".into(),
+            child_link: "shoulder_link".into(),
+            axis: [0.0, 1.0, 0.0],
+            origin: Transform3D {
+                translation: [0.0, 0.0, 0.3],
+                rotation: [1.0, 0.0, 0.0, 0.0],
+                timestamp_ns: 0,
+            },
+            limits: JointSafetyLimits {
+                joint_name: "shoulder_pitch".into(),
+                max_velocity: 2.0,
+                max_acceleration: 5.0,
+                max_jerk: 50.0,
+                position_min: -3.14,
+                position_max: 3.14,
+                max_torque: Some(40.0),
+            },
+        };
+        let proto = roz_v1::Joint::from(&domain);
+        let back = Joint::try_from(proto).unwrap();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn link_roundtrip() {
+        let domain = Link {
+            name: "base_link".into(),
+            parent_joint: None,
+            inertial: Some(Inertial {
+                mass: 5.0,
+                center_of_mass: [0.0, 0.0, 0.15],
+            }),
+            visual_geometry: Some(Geometry::Cylinder {
+                radius: 0.1,
+                length: 0.3,
+            }),
+            collision_geometry: None,
+        };
+        let proto = roz_v1::Link::from(&domain);
+        let back = Link::try_from(proto).unwrap();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn collision_body_roundtrip() {
+        let domain = CollisionBody {
+            link_name: "base_link".into(),
+            geometry: Geometry::Box {
+                half_extents: [0.1, 0.1, 0.15],
+            },
+            origin: Transform3D::identity(),
+        };
+        let proto = roz_v1::CollisionBody::from(&domain);
+        let back = CollisionBody::try_from(proto).unwrap();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn tool_center_point_roundtrip() {
+        let domain = ToolCenterPoint {
+            name: "gripper".into(),
+            parent_link: "wrist_link".into(),
+            offset: Transform3D {
+                translation: [0.0, 0.0, 0.12],
+                rotation: [1.0, 0.0, 0.0, 0.0],
+                timestamp_ns: 0,
+            },
+            tcp_type: TcpType::Gripper,
+        };
+        let proto = roz_v1::ToolCenterPoint::from(&domain);
+        let back = ToolCenterPoint::try_from(proto).unwrap();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn sensor_mount_roundtrip_with_frustum() {
+        let domain = SensorMount {
+            sensor_id: "wrist_cam".into(),
+            parent_link: "wrist_link".into(),
+            offset: Transform3D::identity(),
+            sensor_type: SensorType::Camera,
+            is_actuated: true,
+            actuation_joint: Some("cam_pan".into()),
+            frustum: Some(CameraFrustum {
+                fov_horizontal_deg: 69.0,
+                fov_vertical_deg: 42.0,
+                near_clip_m: 0.01,
+                far_clip_m: 10.0,
+                resolution: Some((640, 480)),
+            }),
+        };
+        let proto = roz_v1::SensorMount::from(&domain);
+        let back = SensorMount::try_from(proto).unwrap();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn workspace_zone_roundtrip() {
+        let domain = WorkspaceZone {
+            name: "safe_area".into(),
+            shape: WorkspaceShape::Sphere { radius: 1.5 },
+            origin_frame: "base_link".into(),
+            zone_type: ZoneType::Allowed,
+            margin_m: 0.1,
+        };
+        let proto = roz_v1::WorkspaceZone::from(&domain);
+        let back = WorkspaceZone::try_from(proto).unwrap();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn channel_binding_roundtrip_with_semantic_role() {
+        let domain = ChannelBinding {
+            physical_name: "shoulder_pitch".into(),
+            channel_index: 0,
+            binding_type: BindingType::JointPosition,
+            frame_id: "base_link".into(),
+            units: "rad".into(),
+            semantic_role: Some(SemanticRole::PrimaryManipulatorJoint { index: 0 }),
+        };
+        let proto = roz_v1::ChannelBinding::from(&domain);
+        let back = ChannelBinding::try_from(proto).unwrap();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn control_channel_def_roundtrip() {
+        let domain = ControlChannelDef {
+            name: "shoulder_vel".into(),
+            interface_type: CommandInterfaceType::JointVelocity,
+            units: "rad/s".into(),
+            frame_id: "base_link".into(),
+        };
+        let proto = roz_v1::ControlChannelDef::from(&domain);
+        let back = ControlChannelDef::try_from(proto).unwrap();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn sensor_calibration_roundtrip() {
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-01-15T10:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let domain = SensorCalibration {
+            sensor_id: "wrist_ft".into(),
+            offset: vec![0.1, -0.05, 0.0, 0.0, 0.0, 0.0],
+            scale: Some(vec![1.01, 0.99, 1.0, 1.0, 1.0, 1.0]),
+            calibrated_at: ts,
+        };
+        let proto = roz_v1::SensorCalibration::from(&domain);
+        let back = SensorCalibration::try_from(proto).unwrap();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn sensor_calibration_none_scale_roundtrip() {
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-01-15T10:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let domain = SensorCalibration {
+            sensor_id: "imu".into(),
+            offset: vec![0.0, 0.0, 0.0],
+            scale: None,
+            calibrated_at: ts,
+        };
+        let proto = roz_v1::SensorCalibration::from(&domain);
+        assert!(proto.scale.is_empty());
+        let back = SensorCalibration::try_from(proto).unwrap();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn frame_tree_roundtrip_three_nodes() {
+        let mut tree = FrameTree::new();
+        tree.set_root("world", FrameSource::Static);
+        tree.add_frame(
+            "base_link",
+            "world",
+            Transform3D {
+                translation: [0.0, 0.0, 0.5],
+                rotation: [1.0, 0.0, 0.0, 0.0],
+                timestamp_ns: 0,
+            },
+            FrameSource::Static,
+        )
+        .unwrap();
+        tree.add_frame(
+            "shoulder_link",
+            "base_link",
+            Transform3D {
+                translation: [0.0, 0.0, 0.3],
+                rotation: [1.0, 0.0, 0.0, 0.0],
+                timestamp_ns: 0,
+            },
+            FrameSource::Dynamic,
+        )
+        .unwrap();
+
+        let proto = roz_v1::FrameTree::from(&tree);
+        assert_eq!(proto.frames.len(), 3);
+        assert_eq!(proto.root.as_deref(), Some("world"));
+
+        let back = FrameTree::try_from(proto).unwrap();
+        assert_eq!(back, tree);
+    }
+
+    #[test]
+    fn calibration_overlay_roundtrip() {
+        use std::collections::BTreeMap;
+
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-01-15T10:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let stale = chrono::DateTime::parse_from_rfc3339("2026-01-16T10:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let domain = CalibrationOverlay {
+            calibration_id: "cal-001".into(),
+            calibration_digest: "digest_abc".into(),
+            calibrated_at: ts,
+            stale_after: Some(stale),
+            joint_offsets: BTreeMap::from([("shoulder_pitch".into(), 0.02), ("elbow".into(), -0.01)]),
+            frame_corrections: BTreeMap::from([(
+                "camera_link".into(),
+                Transform3D {
+                    translation: [0.001, -0.002, 0.0],
+                    rotation: [1.0, 0.0, 0.0, 0.0],
+                    timestamp_ns: 0,
+                },
+            )]),
+            sensor_calibrations: BTreeMap::from([(
+                "wrist_ft".into(),
+                SensorCalibration {
+                    sensor_id: "wrist_ft".into(),
+                    offset: vec![0.1, -0.05, 0.0],
+                    scale: Some(vec![1.01, 0.99, 1.0]),
+                    calibrated_at: ts,
+                },
+            )]),
+            temperature_range: Some((15.0, 35.0)),
+            valid_for_model_digest: "model_sha_xyz".into(),
+        };
+
+        let proto = roz_v1::CalibrationOverlay::from(&domain);
+        // Verify digest is opaque pass-through
+        assert_eq!(proto.calibration_digest, "digest_abc");
+        assert_eq!(proto.temperature_min, Some(15.0));
+        assert_eq!(proto.temperature_max, Some(35.0));
+
+        let back = CalibrationOverlay::try_from(proto).unwrap();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn calibration_overlay_no_temperature_roundtrip() {
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-01-15T10:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let domain = CalibrationOverlay {
+            calibration_id: "cal-002".into(),
+            calibration_digest: "d".into(),
+            calibrated_at: ts,
+            stale_after: None,
+            joint_offsets: BTreeMap::new(),
+            frame_corrections: BTreeMap::new(),
+            sensor_calibrations: BTreeMap::new(),
+            temperature_range: None,
+            valid_for_model_digest: "m".into(),
+        };
+        let proto = roz_v1::CalibrationOverlay::from(&domain);
+        assert!(proto.temperature_min.is_none());
+        assert!(proto.temperature_max.is_none());
+        let back = CalibrationOverlay::try_from(proto).unwrap();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn safety_overlay_roundtrip() {
+        let domain = SafetyOverlay {
+            overlay_digest: "safety_abc".into(),
+            workspace_restrictions: vec![WorkspaceZone {
+                name: "no_go".into(),
+                shape: WorkspaceShape::Box {
+                    half_extents: [0.5, 0.5, 0.5],
+                },
+                origin_frame: "world".into(),
+                zone_type: ZoneType::Restricted,
+                margin_m: 0.1,
+            }],
+            joint_limit_overrides: BTreeMap::from([(
+                "shoulder_pitch".into(),
+                JointSafetyLimits {
+                    joint_name: "shoulder_pitch".into(),
+                    max_velocity: 1.0,
+                    max_acceleration: 3.0,
+                    max_jerk: 30.0,
+                    position_min: -2.0,
+                    position_max: 2.0,
+                    max_torque: Some(20.0),
+                },
+            )]),
+            max_payload_kg: Some(2.0),
+            human_presence_zones: vec![],
+            force_limits: Some(ForceSafetyLimits {
+                max_contact_force_n: 50.0,
+                max_contact_torque_nm: 5.0,
+                force_rate_limit: 100.0,
+            }),
+            contact_force_envelopes: vec![ContactForceEnvelope {
+                link_name: "finger".into(),
+                max_normal_force_n: 20.0,
+                max_shear_force_n: 5.0,
+                max_force_rate_n_per_s: 100.0,
+            }],
+            contact_allowed_zones: vec![],
+            force_rate_limits: BTreeMap::from([("wrist_ft".into(), 200.0)]),
+        };
+        let proto = roz_v1::SafetyOverlay::from(&domain);
+        // Verify digest is opaque pass-through
+        assert_eq!(proto.overlay_digest, "safety_abc");
+        let back = SafetyOverlay::try_from(proto).unwrap();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn embodiment_model_roundtrip() {
+        let mut frame_tree = FrameTree::new();
+        frame_tree.set_root("world", FrameSource::Static);
+        frame_tree
+            .add_frame(
+                "base_link",
+                "world",
+                Transform3D {
+                    translation: [0.0, 0.0, 0.5],
+                    rotation: [1.0, 0.0, 0.0, 0.0],
+                    timestamp_ns: 0,
+                },
+                FrameSource::Static,
+            )
+            .unwrap();
+
+        let domain = EmbodimentModel {
+            model_id: "test-robot-v1".into(),
+            model_digest: "abc123".into(),
+            embodiment_family: Some(EmbodimentFamily {
+                family_id: "single_arm".into(),
+                description: "Single-arm manipulator".into(),
+            }),
+            links: vec![Link {
+                name: "base_link".into(),
+                parent_joint: None,
+                inertial: Some(Inertial {
+                    mass: 5.0,
+                    center_of_mass: [0.0, 0.0, 0.15],
+                }),
+                visual_geometry: None,
+                collision_geometry: Some(Geometry::Cylinder {
+                    radius: 0.1,
+                    length: 0.3,
+                }),
+            }],
+            joints: vec![Joint {
+                name: "shoulder_pitch".into(),
+                joint_type: JointType::Revolute,
+                parent_link: "base_link".into(),
+                child_link: "shoulder_link".into(),
+                axis: [0.0, 1.0, 0.0],
+                origin: Transform3D {
+                    translation: [0.0, 0.0, 0.3],
+                    rotation: [1.0, 0.0, 0.0, 0.0],
+                    timestamp_ns: 0,
+                },
+                limits: JointSafetyLimits {
+                    joint_name: "shoulder_pitch".into(),
+                    max_velocity: 2.0,
+                    max_acceleration: 5.0,
+                    max_jerk: 50.0,
+                    position_min: -3.14,
+                    position_max: 3.14,
+                    max_torque: Some(40.0),
+                },
+            }],
+            frame_tree,
+            collision_bodies: vec![CollisionBody {
+                link_name: "base_link".into(),
+                geometry: Geometry::Cylinder {
+                    radius: 0.1,
+                    length: 0.3,
+                },
+                origin: Transform3D::identity(),
+            }],
+            allowed_collision_pairs: vec![("base_link".into(), "shoulder_link".into())],
+            tcps: vec![ToolCenterPoint {
+                name: "gripper".into(),
+                parent_link: "base_link".into(),
+                offset: Transform3D {
+                    translation: [0.0, 0.0, 0.12],
+                    rotation: [1.0, 0.0, 0.0, 0.0],
+                    timestamp_ns: 0,
+                },
+                tcp_type: TcpType::Gripper,
+            }],
+            sensor_mounts: vec![SensorMount {
+                sensor_id: "wrist_ft".into(),
+                parent_link: "base_link".into(),
+                offset: Transform3D::identity(),
+                sensor_type: SensorType::ForceTorque,
+                is_actuated: false,
+                actuation_joint: None,
+                frustum: None,
+            }],
+            workspace_zones: vec![WorkspaceZone {
+                name: "safe".into(),
+                shape: WorkspaceShape::Sphere { radius: 1.5 },
+                origin_frame: "base_link".into(),
+                zone_type: ZoneType::Allowed,
+                margin_m: 0.1,
+            }],
+            watched_frames: vec!["world".into(), "base_link".into()],
+            channel_bindings: vec![],
+        };
+
+        let proto = roz_v1::EmbodimentModel::from(&domain);
+        // Verify model_digest is opaque pass-through
+        assert_eq!(proto.model_digest, "abc123");
+        let back = EmbodimentModel::try_from(proto).unwrap();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn embodiment_runtime_roundtrip() {
+        let mut frame_tree = FrameTree::new();
+        frame_tree.set_root("world", FrameSource::Static);
+
+        let model = EmbodimentModel {
+            model_id: "r".into(),
+            model_digest: "md".into(),
+            embodiment_family: None,
+            links: vec![],
+            joints: vec![],
+            frame_tree: frame_tree.clone(),
+            collision_bodies: vec![],
+            allowed_collision_pairs: vec![],
+            tcps: vec![],
+            sensor_mounts: vec![],
+            workspace_zones: vec![],
+            watched_frames: vec![],
+            channel_bindings: vec![],
+        };
+
+        let domain = EmbodimentRuntime {
+            model,
+            calibration: None,
+            safety_overlay: None,
+            model_digest: "md".into(),
+            calibration_digest: "cd".into(),
+            safety_digest: "sd".into(),
+            combined_digest: "combined".into(),
+            frame_graph: frame_tree,
+            active_calibration_id: Some("cal-1".into()),
+            joint_count: 6,
+            tcp_count: 1,
+            watched_frames: vec!["world".into()],
+            validation_issues: vec!["minor issue".into()],
+        };
+
+        let proto = roz_v1::EmbodimentRuntime::from(&domain);
+        // Verify all digests are opaque pass-through
+        assert_eq!(proto.model_digest, "md");
+        assert_eq!(proto.calibration_digest, "cd");
+        assert_eq!(proto.safety_digest, "sd");
+        assert_eq!(proto.combined_digest, "combined");
+        assert_eq!(proto.joint_count, 6);
+        assert_eq!(proto.tcp_count, 1);
+
+        let back = EmbodimentRuntime::try_from(proto).unwrap();
+        assert_eq!(back, domain);
+    }
+
+    #[test]
+    fn control_interface_manifest_roundtrip() {
+        let domain = ControlInterfaceManifest {
+            version: 1,
+            manifest_digest: "manifest_abc".into(),
+            channels: vec![
+                ControlChannelDef {
+                    name: "shoulder_vel".into(),
+                    interface_type: CommandInterfaceType::JointVelocity,
+                    units: "rad/s".into(),
+                    frame_id: "base_link".into(),
+                },
+                ControlChannelDef {
+                    name: "wrist_ft".into(),
+                    interface_type: CommandInterfaceType::ForceTorqueSensor,
+                    units: "N".into(),
+                    frame_id: "wrist_link".into(),
+                },
+            ],
+            bindings: vec![ChannelBinding {
+                physical_name: "shoulder_pitch".into(),
+                channel_index: 0,
+                binding_type: BindingType::JointVelocity,
+                frame_id: "base_link".into(),
+                units: "rad/s".into(),
+                semantic_role: Some(SemanticRole::PrimaryManipulatorJoint { index: 0 }),
+            }],
+        };
+        let proto = roz_v1::ControlInterfaceManifest::from(&domain);
+        // Verify digest is opaque pass-through
+        assert_eq!(proto.manifest_digest, "manifest_abc");
+        let back = ControlInterfaceManifest::try_from(proto).unwrap();
+        assert_eq!(back, domain);
     }
 }
