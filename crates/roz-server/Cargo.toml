@@ -53,6 +53,7 @@ roz-worker = { path = "../roz-worker" }
 roz-copper = { path = "../roz-copper", default-features = false }
 roz-local = { path = "../roz-local" }
 nkeys = { workspace = true }
+proptest = "1.6"
 
 [lints]
 workspace = true
