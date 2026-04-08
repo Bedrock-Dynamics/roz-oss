@@ -13,8 +13,9 @@ use crate::grpc::agent::GrpcAuth;
 use crate::grpc::embodiment_convert::domain_binding_type_to_proto;
 use crate::grpc::roz_v1::embodiment_service_server::EmbodimentService;
 use crate::grpc::roz_v1::{
-    EmbodimentModel as ProtoModel, EmbodimentRuntime as ProtoRuntime, GetModelRequest, GetRuntimeRequest,
-    ListBindingsRequest, ListBindingsResponse, ValidateBindingsRequest, ValidateBindingsResponse,
+    EmbodimentModel as ProtoModel, EmbodimentRuntime as ProtoRuntime, GetManifestRequest, GetManifestResponse,
+    GetModelRequest, GetRetargetingMapRequest, GetRetargetingMapResponse, GetRuntimeRequest, ListBindingsRequest,
+    ListBindingsResponse, ValidateBindingsRequest, ValidateBindingsResponse,
 };
 
 // ---------------------------------------------------------------------------
@@ -209,5 +210,21 @@ impl EmbodimentService for EmbodimentServiceImpl {
             valid: unbound_channels.is_empty(),
             unbound_channels,
         }))
+    }
+
+    async fn get_retargeting_map(
+        &self,
+        _request: Request<GetRetargetingMapRequest>,
+    ) -> Result<Response<GetRetargetingMapResponse>, Status> {
+        // Stub -- handler implementation in Plan 02.
+        Err(Status::unimplemented("GetRetargetingMap not yet implemented"))
+    }
+
+    async fn get_manifest(
+        &self,
+        _request: Request<GetManifestRequest>,
+    ) -> Result<Response<GetManifestResponse>, Status> {
+        // Stub -- handler implementation in Plan 02.
+        Err(Status::unimplemented("GetManifest not yet implemented"))
     }
 }
