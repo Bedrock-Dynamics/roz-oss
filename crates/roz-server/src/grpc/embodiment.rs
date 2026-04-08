@@ -2,8 +2,9 @@
 
 //! gRPC implementation of the `EmbodimentService` trait.
 //!
-//! Provides `GetModel`, `GetRuntime`, `ListBindings`, and `ValidateBindings` RPCs
-//! backed by JSONB columns on the `roz_hosts` table.
+//! Provides `GetModel`, `GetRuntime`, `ListBindings`, `ValidateBindings`,
+//! `GetRetargetingMap`, and `GetManifest` RPCs backed by JSONB columns
+//! on the `roz_hosts` table.
 
 use sqlx::PgPool;
 use tonic::{Request, Response, Status};
@@ -17,6 +18,7 @@ use crate::grpc::roz_v1::{
     GetModelRequest, GetRetargetingMapRequest, GetRetargetingMapResponse, GetRuntimeRequest, ListBindingsRequest,
     ListBindingsResponse, ValidateBindingsRequest, ValidateBindingsResponse,
 };
+use roz_core::embodiment::retargeting::RetargetingMap;
 
 // ---------------------------------------------------------------------------
 // Service implementation
@@ -214,10 +216,36 @@ impl EmbodimentService for EmbodimentServiceImpl {
 
     async fn get_retargeting_map(
         &self,
-        _request: Request<GetRetargetingMapRequest>,
+        request: Request<GetRetargetingMapRequest>,
     ) -> Result<Response<GetRetargetingMapResponse>, Status> {
-        // Stub -- handler implementation in Plan 02.
-        Err(Status::unimplemented("GetRetargetingMap not yet implemented"))
+        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let host_id = parse_host_id(&request.get_ref().host_id)?;
+
+        let row = fetch_embodiment_row(&self.pool, host_id, tenant_id).await?;
+
+        let model_json = row
+            .embodiment_model
+            .ok_or_else(|| Status::failed_precondition("host has no embodiment model"))?;
+
+        let domain_model: roz_core::embodiment::model::EmbodimentModel =
+            serde_json::from_value(model_json).map_err(|e| {
+                tracing::error!(error = %e, host_id = %host_id, "corrupt model data");
+                Status::internal("failed to deserialize embodiment data")
+            })?;
+
+        let family = domain_model
+            .embodiment_family
+            .ok_or_else(|| Status::failed_precondition("host has no embodiment family -- retargeting requires a family classification"))?;
+
+        let retargeting_map = RetargetingMap::from_bindings(family, &domain_model.channel_bindings);
+        let mapped_count = u32::try_from(retargeting_map.canonical_to_local.len()).unwrap_or(u32::MAX);
+        let total_binding_count = u32::try_from(domain_model.channel_bindings.len()).unwrap_or(u32::MAX);
+
+        Ok(Response::new(GetRetargetingMapResponse {
+            retargeting_map: Some(crate::grpc::roz_v1::RetargetingMap::from(&retargeting_map)),
+            mapped_count,
+            total_binding_count,
+        }))
     }
 
     async fn get_manifest(
