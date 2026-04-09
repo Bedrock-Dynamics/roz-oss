@@ -1,5 +1,3 @@
-#![allow(clippy::result_large_err)]
-
 //! gRPC implementation of the `EmbodimentService` trait.
 //!
 //! Provides `GetModel`, `GetRuntime`, `ListBindings`, `ValidateBindings`,
@@ -143,6 +141,7 @@ const fn binding_type_to_command_interface(bt: &BindingType) -> CommandInterface
 // EmbodimentService trait impl
 // ---------------------------------------------------------------------------
 
+#[expect(clippy::result_large_err, reason = "tonic Status is the return error type for all gRPC RPCs")]
 #[tonic::async_trait]
 impl EmbodimentService for EmbodimentServiceImpl {
     async fn get_model(&self, request: Request<GetModelRequest>) -> Result<Response<ProtoModel>, Status> {
