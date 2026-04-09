@@ -81,6 +81,54 @@ where
     Ok(result.rows_affected() > 0)
 }
 
+/// Conditionally upsert embodiment data for a host, writing when EITHER the
+/// model digest changes OR new runtime data is provided.
+///
+/// - When `model` changes (different `model_digest`): writes model + runtime.
+/// - When `model` is unchanged but `runtime` is provided: writes runtime only
+///   (detected via `combined_digest` field on the runtime JSON).
+/// - When `model` is unchanged and `runtime` is None: skips (returns false).
+///
+/// Returns `true` when a write occurred, `false` when skipped.
+pub async fn conditional_upsert_or_runtime<'e, E>(
+    executor: E,
+    host_id: Uuid,
+    model: &serde_json::Value,
+    runtime: Option<&serde_json::Value>,
+) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    // If runtime is provided, also check runtime's combined_digest to detect
+    // calibration-only changes. Use COALESCE so if runtime is NULL the condition
+    // evaluates to model-digest check only (original behavior).
+    let result = sqlx::query(
+        "UPDATE roz_hosts \
+         SET embodiment_model = CASE \
+               WHEN (embodiment_model IS NULL \
+                     OR embodiment_model->>'model_digest' IS DISTINCT FROM $2->>'model_digest') \
+               THEN $2 \
+               ELSE embodiment_model \
+             END, \
+             embodiment_runtime = COALESCE($3, embodiment_runtime), \
+             updated_at = now() \
+         WHERE id = $1 \
+           AND ( \
+             embodiment_model IS NULL \
+             OR embodiment_model->>'model_digest' IS DISTINCT FROM $2->>'model_digest' \
+             OR ($3 IS NOT NULL \
+                 AND (embodiment_runtime IS NULL \
+                      OR embodiment_runtime->>'combined_digest' IS DISTINCT FROM $3->>'combined_digest')) \
+           )",
+    )
+    .bind(host_id)
+    .bind(model)
+    .bind(runtime)
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +274,44 @@ mod tests {
 
         let row = get_by_host_id(&pool, host.id).await.unwrap().unwrap();
         assert_eq!(row.embodiment_model.as_ref().unwrap()["model_digest"], "def456");
+    }
+
+    #[tokio::test]
+    async fn conditional_upsert_or_runtime_writes_on_new_runtime() {
+        let pool = setup().await;
+        let tenant_id = create_test_tenant(&pool).await;
+        let host = crate::hosts::create(&pool, tenant_id, "cond-rt-host-1", "edge", &[], &serde_json::json!({}))
+            .await
+            .expect("create host");
+
+        // First upload: model + runtime v1
+        let model = serde_json::json!({"model_digest": "abc123", "joints": []});
+        let runtime_v1 = serde_json::json!({"combined_digest": "rt-v1", "calibration": {}});
+        let wrote = conditional_upsert_or_runtime(&pool, host.id, &model, Some(&runtime_v1))
+            .await
+            .expect("conditional_upsert_or_runtime");
+        assert!(wrote, "first upload should write");
+
+        // Second upload: same model, same runtime -- should skip
+        let wrote = conditional_upsert_or_runtime(&pool, host.id, &model, Some(&runtime_v1))
+            .await
+            .expect("conditional_upsert_or_runtime");
+        assert!(!wrote, "identical model+runtime should skip");
+
+        // Third upload: same model, new runtime (calibration-only change) -- MUST write
+        let runtime_v2 =
+            serde_json::json!({"combined_digest": "rt-v2", "calibration": {"calibration_id": "new"}});
+        let wrote = conditional_upsert_or_runtime(&pool, host.id, &model, Some(&runtime_v2))
+            .await
+            .expect("conditional_upsert_or_runtime");
+        assert!(wrote, "calibration-only change (new runtime digest) must write");
+
+        let row = get_by_host_id(&pool, host.id).await.unwrap().unwrap();
+        assert_eq!(
+            row.embodiment_runtime.as_ref().unwrap()["combined_digest"],
+            "rt-v2",
+            "DB must store the new runtime"
+        );
     }
 
     #[tokio::test]

@@ -158,22 +158,19 @@ pub struct UpdateEmbodimentRequest {
 }
 
 /// PUT /v1/hosts/:id/embodiment -- worker uploads embodiment data.
+///
+/// The handler explicitly commits the transaction before publishing the
+/// NATS change event so streaming RPC subscribers always see committed
+/// DB state when they re-read after receiving the event.
 pub async fn update_embodiment(
-    mut tx: Tx,
+    State(state): State<AppState>,
     Extension(auth): Extension<AuthIdentity>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateEmbodimentRequest>,
 ) -> Result<StatusCode, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
-    let host = roz_db::hosts::get_by_id(&mut **tx, id)
-        .await?
-        .ok_or_else(|| AppError::not_found("host not found"))?;
-    if host.tenant_id != tenant_id {
-        return Err(AppError::not_found("host not found"));
-    }
 
-    // Validate that model contains a non-null model_digest so the conditional
-    // upsert can compare digests correctly (NULL digest always triggers a write).
+    // Validate model_digest present (same guard as before)
     if body
         .model
         .get("model_digest")
@@ -185,16 +182,51 @@ pub async fn update_embodiment(
         ));
     }
 
-    // Per D-03: atomic conditional write -- skips when model_digest unchanged
-    let wrote = roz_db::embodiments::conditional_upsert(
-        &mut **tx,
+    // Begin explicit transaction (replaces Tx middleware extractor).
+    let mut tx = state.pool.begin().await.map_err(AppError::from)?;
+
+    let host = roz_db::hosts::get_by_id(&mut *tx, id)
+        .await?
+        .ok_or_else(|| AppError::not_found("host not found"))?;
+    if host.tenant_id != tenant_id {
+        return Err(AppError::not_found("host not found"));
+    }
+
+    // Per REVIEWS.md fix: use conditional_upsert_or_runtime so calibration-only
+    // changes (same model_digest, new runtime/calibration) are not silently dropped.
+    let wrote = roz_db::embodiments::conditional_upsert_or_runtime(
+        &mut *tx,
         id,
         &body.model,
         body.runtime.as_ref(),
     )
     .await?;
 
+    // COMMIT BEFORE publishing to NATS. This guarantees that any streaming
+    // subscriber that re-reads the DB after receiving the NATS event sees
+    // the committed data. Accepts at-least-once semantics: if publish fails
+    // after commit, the caller receives a 500 and must retry.
+    tx.commit().await.map_err(AppError::from)?;
+
     if wrote {
+        // D-01: publish embodiment change event so streaming RPCs are notified.
+        if let Some(nats) = &state.nats_client {
+            let event = roz_nats::dispatch::EmbodimentChangedEvent {
+                host_id: id,
+                tenant_id,
+            };
+            let payload = serde_json::to_vec(&event).unwrap_or_default();
+            let subject = roz_nats::dispatch::embodiment_changed_subject(id);
+            // Per REVIEWS.md: publish failure returns an error (not just a warning).
+            // With D-02 rejecting polling fallback, a silent publish failure
+            // permanently desyncs active streams. The PUT returns 500; caller retries.
+            nats.publish(subject, payload.into())
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, %id, "failed to publish embodiment change event");
+                    AppError::internal("failed to notify streaming subscribers")
+                })?;
+        }
         Ok(StatusCode::OK)
     } else {
         Ok(StatusCode::NO_CONTENT)

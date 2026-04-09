@@ -81,6 +81,7 @@ impl EmbodimentServiceImpl {
 // ---------------------------------------------------------------------------
 
 /// Parse a `host_id` string as UUID, returning `INVALID_ARGUMENT` on failure.
+#[allow(clippy::result_large_err)]
 fn parse_host_id(host_id: &str) -> Result<Uuid, Status> {
     host_id
         .parse::<Uuid>()
@@ -161,7 +162,7 @@ const fn binding_type_to_command_interface(bt: &BindingType) -> CommandInterface
 // EmbodimentService trait impl
 // ---------------------------------------------------------------------------
 
-#[expect(clippy::result_large_err, reason = "tonic Status is the return error type for all gRPC RPCs")]
+#[allow(clippy::result_large_err)]
 #[tonic::async_trait]
 impl EmbodimentService for EmbodimentServiceImpl {
     async fn get_model(&self, request: Request<GetModelRequest>) -> Result<Response<ProtoModel>, Status> {
