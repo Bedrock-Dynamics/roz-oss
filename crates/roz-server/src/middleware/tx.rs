@@ -14,15 +14,13 @@
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
-use axum::extract::FromRequestParts;
+use axum::extract::{FromRef, FromRequestParts};
 use axum::http::StatusCode;
 use axum::http::request::Parts;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use parking_lot::Mutex;
-use sqlx::{Postgres, Transaction};
-
-use crate::state::AppState;
+use sqlx::{PgPool, Postgres, Transaction};
 
 /// Shared slot between the [`Tx`] extractor and the commit layer.
 ///
@@ -80,12 +78,16 @@ impl Drop for Tx {
     }
 }
 
-impl FromRequestParts<AppState> for Tx {
+impl<S> FromRequestParts<S> for Tx
+where
+    S: Send + Sync,
+    PgPool: FromRef<S>,
+{
     type Rejection = Response;
 
     async fn from_request_parts(
         parts: &mut Parts,
-        state: &AppState,
+        state: &S,
     ) -> Result<Self, Self::Rejection> {
         // Read the AuthIdentity placed by the auth middleware.
         let auth = parts
@@ -97,7 +99,8 @@ impl FromRequestParts<AppState> for Tx {
             })?;
 
         // Begin a transaction on the shared pool.
-        let mut tx = state.pool.begin().await.map_err(|e| {
+        let pool = PgPool::from_ref(state);
+        let mut tx = pool.begin().await.map_err(|e| {
             tracing::error!(error = %e, "tx begin failed");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         })?;
