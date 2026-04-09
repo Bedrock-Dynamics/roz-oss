@@ -14,7 +14,8 @@ use crate::grpc::roz_v1::embodiment_service_server::EmbodimentService;
 use crate::grpc::roz_v1::{
     EmbodimentModel as ProtoModel, EmbodimentRuntime as ProtoRuntime, GetManifestRequest, GetManifestResponse,
     GetModelRequest, GetRetargetingMapRequest, GetRetargetingMapResponse, GetRuntimeRequest, ListBindingsRequest,
-    ListBindingsResponse, ValidateBindingsRequest, ValidateBindingsResponse,
+    ListBindingsResponse, StreamFrameTreeRequest, StreamFrameTreeResponse, ValidateBindingsRequest,
+    ValidateBindingsResponse, WatchCalibrationRequest, WatchCalibrationResponse,
 };
 use roz_core::embodiment::binding::{
     BindingType, CommandInterfaceType, ControlChannelDef, ControlInterfaceManifest,
@@ -25,18 +26,37 @@ use roz_core::embodiment::retargeting::RetargetingMap;
 // Service implementation
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Stream type aliases (Plan 02 will replace these with real implementations)
+// ---------------------------------------------------------------------------
+
+type StreamFrameTreeStream =
+    tokio_stream::wrappers::ReceiverStream<Result<StreamFrameTreeResponse, tonic::Status>>;
+type WatchCalibrationStream =
+    tokio_stream::wrappers::ReceiverStream<Result<WatchCalibrationResponse, tonic::Status>>;
+
+// ---------------------------------------------------------------------------
+// Service implementation
+// ---------------------------------------------------------------------------
+
 /// gRPC implementation of the `EmbodimentService` trait.
 ///
-/// Holds only a database pool and auth injector -- no NATS, HTTP client, or
-/// Restate needed since embodiment queries are purely DB-backed.
+/// Holds a database pool, auth injector, and optional NATS client for streaming RPCs.
 pub struct EmbodimentServiceImpl {
     pool: PgPool,
     auth: std::sync::Arc<dyn GrpcAuth>,
+    // Used by Plan 02 streaming RPC handlers (StreamFrameTree, WatchCalibration).
+    #[expect(dead_code, reason = "consumed by Plan 02 streaming RPC handlers")]
+    nats_client: Option<async_nats::Client>,
 }
 
 impl EmbodimentServiceImpl {
-    pub const fn new(pool: PgPool, auth: std::sync::Arc<dyn GrpcAuth>) -> Self {
-        Self { pool, auth }
+    pub fn new(
+        pool: PgPool,
+        auth: std::sync::Arc<dyn GrpcAuth>,
+        nats_client: Option<async_nats::Client>,
+    ) -> Self {
+        Self { pool, auth, nats_client }
     }
 
     async fn authenticated_tenant_id<T: Sync>(&self, request: &Request<T>) -> Result<Uuid, Status> {
@@ -320,5 +340,23 @@ impl EmbodimentService for EmbodimentServiceImpl {
         Ok(Response::new(GetManifestResponse {
             manifest: Some(crate::grpc::roz_v1::ControlInterfaceManifest::from(&manifest)),
         }))
+    }
+
+    type StreamFrameTreeStream = StreamFrameTreeStream;
+
+    async fn stream_frame_tree(
+        &self,
+        _request: Request<StreamFrameTreeRequest>,
+    ) -> Result<Response<Self::StreamFrameTreeStream>, Status> {
+        Err(Status::unimplemented("StreamFrameTree not yet implemented -- see Plan 02"))
+    }
+
+    type WatchCalibrationStream = WatchCalibrationStream;
+
+    async fn watch_calibration(
+        &self,
+        _request: Request<WatchCalibrationRequest>,
+    ) -> Result<Response<Self::WatchCalibrationStream>, Status> {
+        Err(Status::unimplemented("WatchCalibration not yet implemented -- see Plan 02"))
     }
 }

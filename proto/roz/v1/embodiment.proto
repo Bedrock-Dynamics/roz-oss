@@ -20,6 +20,10 @@ service EmbodimentService {
   rpc GetRetargetingMap(GetRetargetingMapRequest) returns (GetRetargetingMapResponse);
   // Returns the control interface manifest for a host.
   rpc GetManifest(GetManifestRequest) returns (GetManifestResponse);
+  // Streams frame tree structural changes for a host. Per D-07, D-04, D-05.
+  rpc StreamFrameTree(StreamFrameTreeRequest) returns (stream StreamFrameTreeResponse);
+  // Streams calibration overlay changes for a host. Per D-08.
+  rpc WatchCalibration(WatchCalibrationRequest) returns (stream WatchCalibrationResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -642,4 +646,73 @@ message EmbodimentRuntime {
   repeated string watched_frames = 12;
   // Validation or degradation notes captured during compilation.
   repeated string validation_issues = 13;
+}
+
+// ---------------------------------------------------------------------------
+// Streaming messages
+// ---------------------------------------------------------------------------
+
+// Shared keepalive for embodiment streams (per D-09).
+// Named EmbodimentKeepalive to avoid collision with roz.v1.Keepalive in agent.proto.
+message EmbodimentKeepalive {
+  google.protobuf.Timestamp server_time = 1;
+  string digest = 2;
+}
+
+// --- StreamFrameTree ---
+
+message StreamFrameTreeRequest {
+  string host_id = 1;
+}
+
+// Server-streaming response with oneof payload (per D-07).
+message StreamFrameTreeResponse {
+  string host_id = 1;
+  string digest = 2;
+  oneof payload {
+    FrameTreeSnapshot snapshot = 3;
+    FrameTreeDelta delta = 4;
+    EmbodimentKeepalive keepalive = 5;
+  }
+}
+
+// Initial full snapshot of the frame tree (per D-04).
+message FrameTreeSnapshot {
+  FrameTree frame_tree = 1;
+}
+
+// Delta update containing only changed/removed frames (per D-05, STRM-04).
+message FrameTreeDelta {
+  map<string, FrameNode> changed_frames = 1;
+  repeated string removed_frame_ids = 2;
+  optional string new_root = 3;
+}
+
+// --- WatchCalibration ---
+
+message WatchCalibrationRequest {
+  string host_id = 1;
+}
+
+// Server-streaming response with oneof payload (per D-08).
+message WatchCalibrationResponse {
+  string host_id = 1;
+  string digest = 2;
+  oneof payload {
+    CalibrationSnapshot snapshot = 3;
+    CalibrationDelta delta = 4;
+    EmbodimentKeepalive keepalive = 5;
+  }
+}
+
+// Initial full snapshot of calibration data (per D-04).
+message CalibrationSnapshot {
+  CalibrationOverlay calibration = 1;
+}
+
+// Whole-overlay replacement delta for calibration changes (per D-05).
+// The server always sends the full CalibrationOverlay on any change.
+// This avoids partial-patch incompleteness issues.
+message CalibrationDelta {
+  CalibrationOverlay calibration = 1;
 }

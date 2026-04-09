@@ -128,6 +128,7 @@ fn grpc_router(state: &AppState) -> Router {
     let embodiment_svc = roz_server::grpc::embodiment::EmbodimentServiceImpl::new(
         state.pool.clone(),
         Arc::new(AppGrpcAuth) as Arc<dyn roz_server::grpc::agent::GrpcAuth>,
+        state.nats_client.clone(),
     );
 
     // Use tonic::service::Routes directly (bypasses tonic::transport::Server
