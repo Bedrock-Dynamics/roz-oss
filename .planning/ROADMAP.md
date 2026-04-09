@@ -61,7 +61,10 @@ Plans:
   2. Client connected via WatchCalibration receives calibration overlay updates when calibration data changes on the server
   3. Streaming responses include a digest field so clients can compare against their local state and detect actual data changes vs keepalives
   4. Streams remain open and deliver keepalives when no changes occur, without dropping the connection
-**Plans**: TBD
+**Plans:** 2 plans
+Plans:
+- [ ] 07-01-PLAN.md — Streaming proto messages, NATS change event plumbing, and EmbodimentServiceImpl wiring
+- [ ] 07-02-PLAN.md — StreamFrameTree and WatchCalibration RPC handler implementations
 
 ### Phase 8: CLI Embodiment Commands
 **Goal**: Operators can inspect and validate embodiment data for any registered host from the command line
@@ -84,5 +87,5 @@ Plans:
 | 4. Service Implementation | v1.0 | 2/2 | Complete | 2026-04-08 |
 | 5. Worker Embodiment Upload Wiring | v1.1 | 0/2 | Planned | - |
 | 6. Extension RPCs | v1.1 | 0/2 | Planned | - |
-| 7. Streaming RPCs | v1.1 | 0/0 | Not started | - |
+| 7. Streaming RPCs | v1.1 | 0/2 | Planned | - |
 | 8. CLI Embodiment Commands | v1.1 | 0/0 | Not started | - |
