@@ -127,9 +127,12 @@ fn frame_tree_model_json(model_digest: &str) -> serde_json::Value {
             "root": "world"
         },
         "channel_bindings": [],
-        "safety_zones": [],
         "embodiment_family": null,
-        "sensor_mounts": []
+        "sensor_mounts": [],
+        "collision_bodies": [],
+        "allowed_collision_pairs": [],
+        "tcps": [],
+        "workspace_zones": []
     })
 }
 
@@ -158,18 +161,42 @@ fn frame_tree_model_json_two_frames(model_digest: &str) -> serde_json::Value {
             "root": "world"
         },
         "channel_bindings": [],
-        "safety_zones": [],
         "embodiment_family": null,
-        "sensor_mounts": []
+        "sensor_mounts": [],
+        "collision_bodies": [],
+        "allowed_collision_pairs": [],
+        "tcps": [],
+        "workspace_zones": []
     })
 }
 
 fn calibration_runtime_json(combined_digest: &str, cal_id: &str, cal_digest: &str) -> serde_json::Value {
     json!({
         "combined_digest": combined_digest,
-        "model": {"model_id": "m", "model_digest": "v1", "joints": [], "links": [],
-                  "frame_tree": null, "channel_bindings": [], "safety_zones": [],
-                  "embodiment_family": null, "sensor_mounts": []},
+        "model": {
+            "model_id": "m",
+            "model_digest": "v1",
+            "joints": [],
+            "links": [],
+            "frame_tree": {
+                "frames": {
+                    "world": {
+                        "frame_id": "world",
+                        "parent_id": null,
+                        "static_transform": {"translation": [0,0,0], "rotation": [1,0,0,0], "timestamp_ns": 0},
+                        "source": "static"
+                    }
+                },
+                "root": "world"
+            },
+            "channel_bindings": [],
+            "embodiment_family": null,
+            "sensor_mounts": [],
+            "collision_bodies": [],
+            "allowed_collision_pairs": [],
+            "tcps": [],
+            "workspace_zones": []
+        },
         "calibration": {
             "calibration_id": cal_id,
             "calibration_digest": cal_digest,
@@ -553,7 +580,21 @@ async fn watch_calibration_delta_after_put() {
 #[tokio::test]
 #[ignore = "requires Docker for testcontainers (Postgres + NATS)"]
 async fn stream_frame_tree_terminal_on_nats_drop() {
-    let (port, pool, host_id, api_key, nats_guard) = start_grpc_server(None).await;
+    // Create a dedicated NATS container so we control which connection the server uses.
+    // The server NATS client is configured with max_reconnects(1) and zero reconnect delay
+    // so that when the container stops, the client gives up quickly and closes subscriptions,
+    // causing sub.next() to return None (D-10 path).
+    let d10_nats = roz_test::nats_container().await;
+    let server_nats = async_nats::ConnectOptions::new()
+        .max_reconnects(1)
+        .reconnect_delay_callback(|_| Duration::ZERO)
+        .connect(d10_nats.url())
+        .await
+        .expect("connect server nats (d10)");
+
+    // start_grpc_server creates its own internal NATS container (unused by the server here);
+    // keep _unused_nats alive so it doesn't interfere with the test.
+    let (port, pool, host_id, api_key, _unused_nats) = start_grpc_server(Some(server_nats)).await;
 
     let model_v1 = frame_tree_model_json("v1");
     roz_db::embodiments::upsert(&pool, host_id, &model_v1, None)
@@ -570,14 +611,14 @@ async fn stream_frame_tree_terminal_on_nats_drop() {
     // Consume initial snapshot.
     let _ = stream.next().await;
 
-    // Simulate NATS drop: stop the NATS container by dropping the guard.
-    // The background task should detect the closed subscription and send Status::internal.
-    // NOTE: testcontainers may take a moment to fully stop. Allow 10s for detection.
-    drop(nats_guard);
+    // Stop the NATS container the server is actually connected to.
+    // With max_reconnects(1) + zero delay, the client tries once, fails, and shuts down.
+    // This closes all subscriptions → sub.next() returns None → D-10 error path fires.
+    drop(d10_nats);
 
-    let terminal = tokio::time::timeout(Duration::from_secs(10), stream.next())
+    let terminal = tokio::time::timeout(Duration::from_secs(20), stream.next())
         .await
-        .expect("timed out waiting for terminal error after NATS drop")
+        .expect("timed out waiting for terminal error after NATS drop (D-10)")
         .expect("stream closed without sending error (D-10 violation)");
 
     match terminal {

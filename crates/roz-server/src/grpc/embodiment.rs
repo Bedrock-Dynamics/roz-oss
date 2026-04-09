@@ -355,6 +355,7 @@ impl EmbodimentService for EmbodimentServiceImpl {
 
     type StreamFrameTreeStream = StreamFrameTreeStream;
 
+    #[allow(clippy::too_many_lines)]
     async fn stream_frame_tree(
         &self,
         request: Request<StreamFrameTreeRequest>,
@@ -408,60 +409,57 @@ impl EmbodimentService for EmbodimentServiceImpl {
             loop {
                 tokio::select! {
                     msg = sub.next() => {
-                        match msg {
-                            Some(nats_msg) => {
-                                let event: roz_nats::dispatch::EmbodimentChangedEvent =
-                                    match serde_json::from_slice(&nats_msg.payload) {
-                                        Ok(e) => e,
-                                        Err(e) => {
-                                            tracing::warn!(error = %e, "failed to deserialize EmbodimentChangedEvent");
-                                            continue;
-                                        }
-                                    };
-                                // Multi-tenant safety: only process events for this tenant's host.
-                                if event.tenant_id != tenant_id {
-                                    continue;
-                                }
-
-                                // Re-read from DB. DB is the source of truth.
-                                let row = match roz_db::embodiments::get_by_host_id(&pool, host_id).await {
-                                    Ok(Some(r)) => r,
-                                    Ok(None) => { tracing::warn!(%host_id, "host disappeared"); continue; }
-                                    Err(e) => { tracing::warn!(error = %e, "DB read error"); continue; }
+                        if let Some(nats_msg) = msg {
+                            let event: roz_nats::dispatch::EmbodimentChangedEvent =
+                                match serde_json::from_slice(&nats_msg.payload) {
+                                    Ok(e) => e,
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "failed to deserialize EmbodimentChangedEvent");
+                                        continue;
+                                    }
                                 };
-                                let new_model: roz_core::embodiment::model::EmbodimentModel =
-                                    match serde_json::from_value(match row.embodiment_model {
-                                        Some(v) => v,
-                                        None => { continue; }
-                                    }) {
-                                        Ok(m) => m,
-                                        Err(e) => { tracing::warn!(error = %e, "deserialize error"); continue; }
-                                    };
+                            // Multi-tenant safety: only process events for this tenant's host.
+                            if event.tenant_id != tenant_id {
+                                continue;
+                            }
 
-                                let new_digest = compute_frame_tree_digest(&new_model.frame_tree);
-                                if new_digest == last_digest {
-                                    // No frame-tree change (e.g., only channel_bindings changed). Skip.
-                                    continue;
-                                }
-
-                                let delta = compute_frame_tree_delta(&last_tree, &new_model.frame_tree);
-                                let response = StreamFrameTreeResponse {
-                                    host_id: host_id.to_string(),
-                                    digest: new_digest.clone(),
-                                    payload: Some(FrameTreePayload::Delta(delta)),
+                            // Re-read from DB. DB is the source of truth.
+                            let row = match roz_db::embodiments::get_by_host_id(&pool, host_id).await {
+                                Ok(Some(r)) => r,
+                                Ok(None) => { tracing::warn!(%host_id, "host disappeared"); continue; }
+                                Err(e) => { tracing::warn!(error = %e, "DB read error"); continue; }
+                            };
+                            let new_model: roz_core::embodiment::model::EmbodimentModel =
+                                match serde_json::from_value(match row.embodiment_model {
+                                    Some(v) => v,
+                                    None => { continue; }
+                                }) {
+                                    Ok(m) => m,
+                                    Err(e) => { tracing::warn!(error = %e, "deserialize error"); continue; }
                                 };
-                                if tx.send(Ok(response)).await.is_err() {
-                                    break; // client disconnected
-                                }
-                                last_digest = new_digest;
-                                last_tree = new_model.frame_tree;
+
+                            let new_digest = compute_frame_tree_digest(&new_model.frame_tree);
+                            if new_digest == last_digest {
+                                // No frame-tree change (e.g., only channel_bindings changed). Skip.
+                                continue;
                             }
-                            None => {
-                                // D-10: NATS subscription closed unexpectedly.
-                                // Send explicit error item so client receives Status::internal.
-                                let _ = tx.send(Err(Status::internal("NATS subscription closed"))).await;
-                                break;
+
+                            let delta = compute_frame_tree_delta(&last_tree, &new_model.frame_tree);
+                            let response = StreamFrameTreeResponse {
+                                host_id: host_id.to_string(),
+                                digest: new_digest.clone(),
+                                payload: Some(FrameTreePayload::Delta(delta)),
+                            };
+                            if tx.send(Ok(response)).await.is_err() {
+                                break; // client disconnected
                             }
+                            last_digest = new_digest;
+                            last_tree = new_model.frame_tree;
+                        } else {
+                            // D-10: NATS subscription closed unexpectedly.
+                            // Send explicit error item so client receives Status::internal.
+                            let _ = tx.send(Err(Status::internal("NATS subscription closed"))).await;
+                            break;
                         }
                     }
                     _ = keepalive_interval.tick() => {
@@ -487,6 +485,7 @@ impl EmbodimentService for EmbodimentServiceImpl {
 
     type WatchCalibrationStream = WatchCalibrationStream;
 
+    #[allow(clippy::too_many_lines)]
     async fn watch_calibration(
         &self,
         request: Request<WatchCalibrationRequest>,
@@ -543,64 +542,58 @@ impl EmbodimentService for EmbodimentServiceImpl {
             loop {
                 tokio::select! {
                     msg = sub.next() => {
-                        match msg {
-                            Some(nats_msg) => {
-                                let event: roz_nats::dispatch::EmbodimentChangedEvent =
-                                    match serde_json::from_slice(&nats_msg.payload) {
-                                        Ok(e) => e,
-                                        Err(e) => {
-                                            tracing::warn!(error = %e, "failed to deserialize EmbodimentChangedEvent");
-                                            continue;
-                                        }
-                                    };
-                                if event.tenant_id != tenant_id {
-                                    continue;
-                                }
-
-                                let row = match roz_db::embodiments::get_by_host_id(&pool, host_id).await {
-                                    Ok(Some(r)) => r,
-                                    Ok(None) => { tracing::warn!(%host_id, "host disappeared"); continue; }
-                                    Err(e) => { tracing::warn!(error = %e, "DB read error"); continue; }
+                        if let Some(nats_msg) = msg {
+                            let event: roz_nats::dispatch::EmbodimentChangedEvent =
+                                match serde_json::from_slice(&nats_msg.payload) {
+                                    Ok(e) => e,
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "failed to deserialize EmbodimentChangedEvent");
+                                        continue;
+                                    }
                                 };
-
-                                let runtime: roz_core::embodiment::embodiment_runtime::EmbodimentRuntime =
-                                    match serde_json::from_value(match row.embodiment_runtime {
-                                        Some(v) => v,
-                                        None => { continue; } // runtime removed; no delta to send
-                                    }) {
-                                        Ok(r) => r,
-                                        Err(e) => { tracing::warn!(error = %e, "deserialize runtime"); continue; }
-                                    };
-
-                                let new_calibration = match runtime.calibration {
-                                    Some(c) => c,
-                                    None => { continue; } // calibration removed; no delta
-                                };
-
-                                // Use canonical compute_digest() -- no custom hash.
-                                let new_digest = new_calibration.compute_digest();
-                                if new_digest == last_digest {
-                                    continue; // no change
-                                }
-
-                                // Whole-overlay replacement delta (D-05, STRM-04).
-                                let response = WatchCalibrationResponse {
-                                    host_id: host_id.to_string(),
-                                    digest: new_digest.clone(),
-                                    payload: Some(CalibrationPayload::Delta(CalibrationDelta {
-                                        calibration: Some(crate::grpc::roz_v1::CalibrationOverlay::from(&new_calibration)),
-                                    })),
-                                };
-                                if tx.send(Ok(response)).await.is_err() {
-                                    break; // client disconnected
-                                }
-                                last_digest = new_digest;
+                            if event.tenant_id != tenant_id {
+                                continue;
                             }
-                            None => {
-                                // D-10: NATS subscription closed unexpectedly.
-                                let _ = tx.send(Err(Status::internal("NATS subscription closed"))).await;
-                                break;
+
+                            let row = match roz_db::embodiments::get_by_host_id(&pool, host_id).await {
+                                Ok(Some(r)) => r,
+                                Ok(None) => { tracing::warn!(%host_id, "host disappeared"); continue; }
+                                Err(e) => { tracing::warn!(error = %e, "DB read error"); continue; }
+                            };
+
+                            let runtime: roz_core::embodiment::embodiment_runtime::EmbodimentRuntime =
+                                match serde_json::from_value(match row.embodiment_runtime {
+                                    Some(v) => v,
+                                    None => { continue; } // runtime removed; no delta to send
+                                }) {
+                                    Ok(r) => r,
+                                    Err(e) => { tracing::warn!(error = %e, "deserialize runtime"); continue; }
+                                };
+
+                            let Some(new_calibration) = runtime.calibration else { continue; }; // calibration removed; no delta
+
+                            // Use canonical compute_digest() -- no custom hash.
+                            let new_digest = new_calibration.compute_digest();
+                            if new_digest == last_digest {
+                                continue; // no change
                             }
+
+                            // Whole-overlay replacement delta (D-05, STRM-04).
+                            let response = WatchCalibrationResponse {
+                                host_id: host_id.to_string(),
+                                digest: new_digest.clone(),
+                                payload: Some(CalibrationPayload::Delta(CalibrationDelta {
+                                    calibration: Some(crate::grpc::roz_v1::CalibrationOverlay::from(&new_calibration)),
+                                })),
+                            };
+                            if tx.send(Ok(response)).await.is_err() {
+                                break; // client disconnected
+                            }
+                            last_digest = new_digest;
+                        } else {
+                            // D-10: NATS subscription closed unexpectedly.
+                            let _ = tx.send(Err(Status::internal("NATS subscription closed"))).await;
+                            break;
                         }
                     }
                     _ = keepalive_interval.tick() => {
@@ -628,10 +621,10 @@ impl EmbodimentService for EmbodimentServiceImpl {
 // Private helpers
 // ---------------------------------------------------------------------------
 
-/// Compute a SHA-256 digest of the FrameTree payload alone.
+/// Compute a SHA-256 digest of the `FrameTree` payload alone.
 ///
 /// MUST NOT delegate to `EmbodimentModel::compute_digest()`: that function hashes
-/// the full model, so a channel_bindings change would flip the digest while the
+/// the full model, so a `channel_bindings` change would flip the digest while the
 /// frame tree payload is unchanged — clients would see digest mismatches with no
 /// corresponding delta.
 fn compute_frame_tree_digest(tree: &roz_core::embodiment::frame_tree::FrameTree) -> String {
@@ -664,7 +657,7 @@ fn compute_frame_tree_delta(
 
     let removed_frame_ids: Vec<String> = old_ids.difference(&new_ids).map(|id| (*id).to_string()).collect();
 
-    let new_root = if old.root() != new.root() { new.root().map(String::from) } else { None };
+    let new_root = if old.root() == new.root() { None } else { new.root().map(String::from) };
 
     FrameTreeDelta { changed_frames, removed_frame_ids, new_root }
 }
