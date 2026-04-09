@@ -49,8 +49,8 @@ Plans:
   3. GetRetargetingMap response includes mapped and total binding counts so clients can report coverage percentage
 **Plans:** 2 plans
 Plans:
-- [ ] 06-01-PLAN.md — Proto messages, RPC declarations, and RetargetingMap conversions with proptest
-- [ ] 06-02-PLAN.md — GetRetargetingMap and GetManifest handler implementations
+- [x] 06-01-PLAN.md — Proto messages, RPC declarations, and RetargetingMap conversions with proptest
+- [x] 06-02-PLAN.md — GetRetargetingMap and GetManifest handler implementations
 
 ### Phase 7: Streaming RPCs
 **Goal**: Connected clients receive real-time updates when a host's frame tree structure or calibration overlays change
