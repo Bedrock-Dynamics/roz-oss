@@ -1110,6 +1110,19 @@ impl TryFrom<roz_v1::FrameTree> for FrameTree {
             }
         }
 
+        if visited.len() != proto.frames.len() {
+            let orphaned: Vec<&str> = proto
+                .frames
+                .keys()
+                .filter(|k| !visited.contains(k.as_str()))
+                .map(String::as_str)
+                .collect();
+            return Err(EmbodimentConvertError::MissingField(format!(
+                "FrameTree has {} orphaned frames: {orphaned:?}",
+                orphaned.len()
+            )));
+        }
+
         Ok(tree)
     }
 }
