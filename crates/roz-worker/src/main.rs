@@ -574,14 +574,23 @@ async fn execute_task(
     let approval_runtime = session_runtime.approval_handle();
 
     if let Some(parent_task_id) = invocation.parent_task_id {
+        // Child task: consume inbound resolutions from parent, relay outbound requests up.
         tokio::spawn(consume_team_approval_events(
             task_js.clone(),
             parent_task_id,
             task_id,
             approval_runtime.clone(),
+            task_sidecars_cancel.clone(),
+        ));
+        tokio::spawn(relay_worker_approval_events(
+            session_runtime.subscribe_events(),
+            task_js.clone(),
+            parent_task_id,
+            task_id,
             task_sidecars_cancel.clone(),
         ));
     } else {
+        // Orchestrator task: relay outbound requests and consume own resolutions.
         tokio::spawn(relay_worker_approval_events(
             session_runtime.subscribe_events(),
             task_js.clone(),
@@ -594,16 +603,6 @@ async fn execute_task(
             task_id,
             task_id,
             approval_runtime.clone(),
-            task_sidecars_cancel.clone(),
-        ));
-    }
-
-    if let Some(parent_task_id) = invocation.parent_task_id {
-        tokio::spawn(relay_worker_approval_events(
-            session_runtime.subscribe_events(),
-            task_js.clone(),
-            parent_task_id,
-            task_id,
             task_sidecars_cancel.clone(),
         ));
     }
