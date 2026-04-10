@@ -12,8 +12,12 @@ use uuid::Uuid;
 /// 2. If found: `PATCH /v1/hosts/{id}/status` with `{"status": "online"}`, return id.
 /// 3. If not found: `POST /v1/hosts` with `{"name": worker_id, "host_type": "edge"}`,
 ///    then `PATCH` status to `online`, return id.
-pub async fn register_host(api_url: &str, api_key: &str, worker_id: &str) -> Result<Uuid> {
-    let client = reqwest::Client::new();
+pub async fn register_host(
+    client: &reqwest::Client,
+    api_url: &str,
+    api_key: &str,
+    worker_id: &str,
+) -> Result<Uuid> {
     let base = api_url.trim_end_matches('/');
 
     // 1. List hosts and find matching name (paginated)
