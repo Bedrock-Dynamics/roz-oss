@@ -12,8 +12,8 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 /// Spin up the full REST server backed by a real Postgres instance.
-/// Returns `(base_url, api_key, host_id)` for the test to use.
-async fn start_server() -> (String, String, uuid::Uuid) {
+/// Returns `(base_url, api_key, host_id, pool)` for the test to use.
+async fn start_server() -> (String, String, uuid::Uuid, sqlx::PgPool) {
     let pg = roz_test::pg_container().await;
     let pool = roz_db::create_pool(pg.url()).await.expect("create pool");
     roz_db::run_migrations(&pool).await.expect("run migrations");
@@ -66,6 +66,9 @@ async fn start_server() -> (String, String, uuid::Uuid) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().unwrap().port();
 
+    // Clone pool before moving pg into the spawned task
+    let pool_for_caller = pool.clone();
+
     // Spawn server in background — keep pg guard alive by moving it into the task
     tokio::spawn(async move {
         let _pg = pg; // prevent drop (keeps container alive)
@@ -75,13 +78,13 @@ async fn start_server() -> (String, String, uuid::Uuid) {
     // Give the server a moment to start
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    (format!("http://127.0.0.1:{port}"), api_key, host.id)
+    (format!("http://127.0.0.1:{port}"), api_key, host.id, pool_for_caller)
 }
 
 #[tokio::test]
 #[ignore = "requires Docker for testcontainers (Postgres)"]
 async fn first_upload_returns_200() {
-    let (base, key, host_id) = start_server().await;
+    let (base, key, host_id, _pool) = start_server().await;
     let client = reqwest::Client::new();
 
     let resp = client
@@ -103,7 +106,7 @@ async fn first_upload_returns_200() {
 #[tokio::test]
 #[ignore = "requires Docker for testcontainers (Postgres)"]
 async fn identical_digest_returns_204() {
-    let (base, key, host_id) = start_server().await;
+    let (base, key, host_id, _pool) = start_server().await;
     let client = reqwest::Client::new();
 
     let body = json!({
@@ -141,7 +144,7 @@ async fn identical_digest_returns_204() {
 #[tokio::test]
 #[ignore = "requires Docker for testcontainers (Postgres)"]
 async fn changed_digest_returns_200() {
-    let (base, key, host_id) = start_server().await;
+    let (base, key, host_id, _pool) = start_server().await;
     let client = reqwest::Client::new();
 
     // First upload
@@ -176,5 +179,52 @@ async fn changed_digest_returns_200() {
         resp.status(),
         StatusCode::OK,
         "changed digest should return 200"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Docker for testcontainers (Postgres)"]
+async fn upload_with_runtime_populates_db_column() {
+    let (base, key, host_id, pool) = start_server().await;
+    let client = reqwest::Client::new();
+
+    let runtime = serde_json::json!({
+        "combined_digest": "rt-e2e-001",
+        "calibration": {
+            "calibration_id": "cal-42",
+            "frame_offsets": []
+        }
+    });
+
+    let resp = client
+        .put(format!("{base}/v1/hosts/{host_id}/embodiment"))
+        .bearer_auth(&key)
+        .json(&serde_json::json!({
+            "model": {
+                "model_digest": "abc123",
+                "joints": [{"name": "j1"}]
+            },
+            "runtime": runtime
+        }))
+        .send()
+        .await
+        .expect("PUT request failed");
+
+    assert_eq!(resp.status(), StatusCode::OK, "upload with runtime should return 200");
+
+    // Read back from DB to confirm runtime was stored
+    let row = roz_db::embodiments::get_by_host_id(&pool, host_id)
+        .await
+        .expect("DB read failed")
+        .expect("host row must exist");
+
+    let stored_runtime = row.embodiment_runtime.expect("embodiment_runtime must be Some");
+    assert_eq!(
+        stored_runtime["combined_digest"], "rt-e2e-001",
+        "DB must store the runtime combined_digest sent in the PUT body"
+    );
+    assert_eq!(
+        stored_runtime["calibration"]["calibration_id"], "cal-42",
+        "DB must store the calibration subtree"
     );
 }
