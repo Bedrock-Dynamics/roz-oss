@@ -87,7 +87,9 @@ Plans:
   1. Worker extracts EmbodimentRuntime from the loaded EmbodimentManifest and passes it to upload_embodiment (replacing hardcoded None)
   2. Workers with no calibration data continue to pass None (no regression)
   3. WatchCalibration streams calibration overlays for a worker that has calibration data in its manifest
-**Plans**: TBD
+**Plans:** 1 plan
+Plans:
+- [ ] 09-01-PLAN.md — Fix worker startup to pass full EmbodimentRuntime (not None) to upload_embodiment
 
 ## Progress
 
