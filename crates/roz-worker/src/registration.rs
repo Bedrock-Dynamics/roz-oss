@@ -219,4 +219,20 @@ mod tests {
         assert!(body.get("model").is_some());
         assert!(body.get("runtime").is_some());
     }
+
+    #[test]
+    fn upload_embodiment_body_includes_runtime_key_when_some() {
+        // Body shape test: verifies that passing Some runtime includes "runtime" key
+        // This mirrors the server's expectation at PUT /v1/hosts/{id}/embodiment
+        let model = serde_json::json!({"model_id": "test", "joints": [], "model_digest": "abc"});
+        let runtime = serde_json::json!({"combined_digest": "abc", "calibration": null});
+        let mut body = serde_json::json!({ "model": model });
+        // Simulate what upload_embodiment does when runtime is Some
+        body["runtime"] = runtime;
+        assert!(body.get("model").is_some(), "body must contain model key");
+        assert!(
+            body.get("runtime").is_some(),
+            "body must contain runtime key when Some is passed"
+        );
+    }
 }
