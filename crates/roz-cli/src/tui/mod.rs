@@ -9,7 +9,7 @@ mod history;
 mod input;
 pub mod markdown;
 mod pricing;
-mod proto;
+pub mod proto;
 pub mod provider;
 pub(crate) mod providers;
 #[allow(dead_code)] // State variants/modes used as backends mature.

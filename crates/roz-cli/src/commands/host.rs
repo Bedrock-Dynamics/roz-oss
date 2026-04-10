@@ -3,9 +3,11 @@ use tonic::transport::{Channel, ClientTlsConfig};
 
 use crate::config::CliConfig;
 use crate::tui::proto::roz_v1::{
-    embodiment_service_client::EmbodimentServiceClient, BindingType, GetModelRequest,
-    ListBindingsRequest, ValidateBindingsRequest,
+    BindingType, GetModelRequest, ListBindingsRequest, ValidateBindingsRequest,
+    embodiment_service_client::EmbodimentServiceClient,
 };
+
+type Bearer = tonic::metadata::MetadataValue<tonic::metadata::Ascii>;
 
 /// Host management commands.
 #[derive(Debug, Args)]
@@ -119,9 +121,7 @@ async fn deregister(config: &CliConfig, id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn make_embodiment_client(
-    config: &CliConfig,
-) -> anyhow::Result<EmbodimentServiceClient<impl tonic::client::GrpcService<tonic::body::BoxBody>>> {
+async fn embodiment_channel(config: &CliConfig) -> anyhow::Result<(Channel, Bearer)> {
     let token_str = config
         .access_token
         .as_deref()
@@ -134,19 +134,16 @@ async fn make_embodiment_client(
         .connect()
         .await?;
 
-    let bearer: tonic::metadata::MetadataValue<_> = format!("Bearer {token_str}").parse()?;
-
-    Ok(EmbodimentServiceClient::with_interceptor(
-        channel,
-        move |mut req: tonic::Request<()>| {
-            req.metadata_mut().insert("authorization", bearer.clone());
-            Ok(req)
-        },
-    ))
+    let bearer: Bearer = format!("Bearer {token_str}").parse()?;
+    Ok((channel, bearer))
 }
 
 async fn embodiment(config: &CliConfig, id: &str) -> anyhow::Result<()> {
-    let mut client = make_embodiment_client(config).await?;
+    let (channel, bearer) = embodiment_channel(config).await?;
+    let mut client = EmbodimentServiceClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
+        req.metadata_mut().insert("authorization", bearer.clone());
+        Ok(req)
+    });
     let model = client
         .get_model(GetModelRequest {
             host_id: id.to_string(),
@@ -157,28 +154,28 @@ async fn embodiment(config: &CliConfig, id: &str) -> anyhow::Result<()> {
 
     let joint_count = model.joints.len();
     let link_count = model.links.len();
-    let (frame_count, frame_depth) = model
-        .frame_tree
-        .as_ref()
-        .map(|ft| {
-            let count = ft.frames.len();
-            let depth = ft
-                .frames
-                .values()
-                .map(|node| {
-                    let mut d = 0usize;
-                    let mut current_parent = node.parent_id.as_deref();
-                    while let Some(p) = current_parent {
-                        d += 1;
-                        current_parent = ft.frames.get(p).and_then(|n| n.parent_id.as_deref());
+    let (frame_count, frame_depth) = model.frame_tree.as_ref().map_or((0, 0), |ft| {
+        let count = ft.frames.len();
+        let depth = ft
+            .frames
+            .values()
+            .map(|node| {
+                let mut d = 0usize;
+                let mut current_parent = node.parent_id.as_deref();
+                let mut visited = std::collections::HashSet::new();
+                while let Some(p) = current_parent {
+                    if !visited.insert(p) {
+                        break; // cycle detected
                     }
-                    d
-                })
-                .max()
-                .unwrap_or(0);
-            (count, depth)
-        })
-        .unwrap_or((0, 0));
+                    d += 1;
+                    current_parent = ft.frames.get(p).and_then(|n| n.parent_id.as_deref());
+                }
+                d
+            })
+            .max()
+            .unwrap_or(0);
+        (count, depth)
+    });
     let family = model
         .embodiment_family
         .as_ref()
@@ -194,7 +191,11 @@ async fn embodiment(config: &CliConfig, id: &str) -> anyhow::Result<()> {
 }
 
 async fn bindings(config: &CliConfig, id: &str) -> anyhow::Result<()> {
-    let mut client = make_embodiment_client(config).await?;
+    let (channel, bearer) = embodiment_channel(config).await?;
+    let mut client = EmbodimentServiceClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
+        req.metadata_mut().insert("authorization", bearer.clone());
+        Ok(req)
+    });
     let resp = client
         .list_bindings(ListBindingsRequest {
             host_id: id.to_string(),
@@ -202,13 +203,30 @@ async fn bindings(config: &CliConfig, id: &str) -> anyhow::Result<()> {
         .await
         .map_err(|s| anyhow::anyhow!("gRPC {}: {}", s.code(), s.message()))?
         .into_inner();
-    crate::output::render_json(&resp.bindings)?;
+    let json_bindings: Vec<serde_json::Value> = resp
+        .bindings
+        .iter()
+        .map(|b| {
+            serde_json::json!({
+                "physical_name": b.physical_name,
+                "channel_index": b.channel_index,
+                "binding_type": b.binding_type,
+                "frame_id": b.frame_id,
+                "units": b.units,
+            })
+        })
+        .collect();
+    crate::output::render_json(&json_bindings)?;
     Ok(())
 }
 
 #[allow(clippy::exit, reason = "explicit exit code 1 on validation failure (D-09)")]
 async fn validate(config: &CliConfig, id: &str) -> anyhow::Result<()> {
-    let mut client = make_embodiment_client(config).await?;
+    let (channel, bearer) = embodiment_channel(config).await?;
+    let mut client = EmbodimentServiceClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
+        req.metadata_mut().insert("authorization", bearer.clone());
+        Ok(req)
+    });
     let resp = client
         .validate_bindings(ValidateBindingsRequest {
             host_id: id.to_string(),
