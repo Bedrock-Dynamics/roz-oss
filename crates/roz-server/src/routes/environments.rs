@@ -81,8 +81,8 @@ pub async fn create(
         }
     }
 
-    // Re-fetch so the response includes the NATS fields if they were populated
-    let env = roz_db::environments::get_by_id(&mut **tx, env.id)
+    // Re-fetch via pool (not tx) so NATS fields written by provision_nats_account are visible
+    let env = roz_db::environments::get_by_id(&state.pool, env.id)
         .await?
         .ok_or_else(|| AppError::not_found("environment not found"))?;
 
