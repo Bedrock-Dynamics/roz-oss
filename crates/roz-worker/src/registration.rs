@@ -16,7 +16,7 @@ pub async fn register_host(client: &reqwest::Client, api_url: &str, api_key: &st
     let base = api_url.trim_end_matches('/');
 
     // 1. List hosts and find matching name (paginated)
-    let host_id = find_host_paginated(&client, base, api_key, worker_id).await?;
+    let host_id = find_host_paginated(client, base, api_key, worker_id).await?;
 
     let id = if let Some(existing_id) = host_id {
         existing_id
@@ -36,7 +36,7 @@ pub async fn register_host(client: &reqwest::Client, api_url: &str, api_key: &st
 
         // Handle 409 Conflict: another worker registered the same name concurrently.
         if resp.status() == reqwest::StatusCode::CONFLICT {
-            find_host_paginated(&client, base, api_key, worker_id)
+            find_host_paginated(client, base, api_key, worker_id)
                 .await?
                 .context("host not found after conflict retry")?
         } else {

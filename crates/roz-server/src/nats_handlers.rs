@@ -72,7 +72,7 @@ async fn apply_task_status_event(pool: &PgPool, event: &TaskStatusEvent) {
                 }
             }
             Err(error) => {
-                tracing::warn!(%error, task_id = %event.task_id, "failed to acquire connection for ensure_active_run")
+                tracing::warn!(%error, task_id = %event.task_id, "failed to acquire connection for ensure_active_run");
             }
         }
     } else if is_terminal_task_status(&event.status) {
