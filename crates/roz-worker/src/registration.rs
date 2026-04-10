@@ -75,9 +75,16 @@ async fn find_host_paginated(
     api_key: &str,
     worker_id: &str,
 ) -> Result<Option<Uuid>> {
+    const MAX_PAGES: usize = 200; // 200 * 50 = 10 000 hosts
     let limit: usize = 50;
     let mut offset: usize = 0;
+    let mut pages_fetched: usize = 0;
     loop {
+        if pages_fetched >= MAX_PAGES {
+            tracing::warn!("find_host_paginated hit max page limit without finding host");
+            break;
+        }
+        pages_fetched += 1;
         let resp = client
             .get(format!("{base}/v1/hosts?limit={limit}&offset={offset}"))
             .bearer_auth(api_key)
