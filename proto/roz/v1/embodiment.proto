@@ -242,6 +242,12 @@ message EmbodimentFamily {
 
 // Bidirectional mapping between canonical action space and local robot channels.
 // Maps to `retargeting::RetargetingMap` in roz-core.
+//
+// Invariant (enforced by the server, not checked at the proto layer):
+//   local_to_canonical == inverse(canonical_to_local)
+// i.e. for every (k, v) in canonical_to_local there must be a matching
+// (v, k) in local_to_canonical, and vice versa. Violating this invariant
+// will cause retargeting to produce undefined behavior at runtime.
 message RetargetingMap {
   EmbodimentFamily embodiment_family = 1;
   map<string, string> canonical_to_local = 2;
