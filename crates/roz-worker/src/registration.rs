@@ -114,6 +114,21 @@ fn find_host_by_name(body: &serde_json::Value, worker_id: &str) -> Option<Uuid> 
     None
 }
 
+/// Build the JSON body for `PUT /v1/hosts/{id}/embodiment`.
+///
+/// Generic over `Serialize` for testability — production callers pass
+/// `&EmbodimentModel` / `&EmbodimentRuntime`; tests can pass `serde_json::Value`.
+pub(crate) fn build_embodiment_body(
+    model: &impl serde::Serialize,
+    runtime: Option<&impl serde::Serialize>,
+) -> Result<serde_json::Value> {
+    let mut body = serde_json::json!({ "model": model });
+    if let Some(rt) = runtime {
+        body["runtime"] = serde_json::to_value(rt).context("failed to serialize embodiment runtime")?;
+    }
+    Ok(body)
+}
+
 /// Upload embodiment model (and optional runtime) to the server for a registered host.
 ///
 /// Called after `register_host()` returns the host UUID, when the worker has
@@ -128,13 +143,7 @@ pub async fn upload_embodiment(
     runtime: Option<&roz_core::embodiment::embodiment_runtime::EmbodimentRuntime>,
 ) -> Result<()> {
     let base = api_url.trim_end_matches('/');
-
-    let mut body = serde_json::json!({
-        "model": model,
-    });
-    if let Some(rt) = runtime {
-        body["runtime"] = serde_json::to_value(rt).context("failed to serialize embodiment runtime")?;
-    }
+    let body = build_embodiment_body(model, runtime)?;
 
     client
         .put(format!("{base}/v1/hosts/{host_id}/embodiment"))
@@ -203,36 +212,22 @@ mod tests {
     }
 
     #[test]
-    fn upload_embodiment_body_has_model_key() {
-        // Verify the JSON body shape matches what the server endpoint expects
-        let model = serde_json::json!({"model_id": "test", "joints": []});
-        let body = serde_json::json!({"model": model});
-        assert!(body.get("model").is_some());
-        assert!(body.get("runtime").is_none());
-    }
-
-    #[test]
-    fn upload_embodiment_body_with_runtime() {
-        let model = serde_json::json!({"model_id": "test"});
-        let runtime = serde_json::json!({"combined_digest": "abc"});
-        let body = serde_json::json!({"model": model, "runtime": runtime});
-        assert!(body.get("model").is_some());
-        assert!(body.get("runtime").is_some());
+    fn upload_embodiment_body_omits_runtime_key_when_none() {
+        let model = serde_json::json!({"model_id": "test", "model_digest": "abc"});
+        let body = build_embodiment_body(&model, Option::<&serde_json::Value>::None).unwrap();
+        assert!(body.get("model").is_some(), "body must contain model key");
+        assert!(
+            body.get("runtime").is_none(),
+            "body must not contain runtime key when None"
+        );
     }
 
     #[test]
     fn upload_embodiment_body_includes_runtime_key_when_some() {
-        // Body shape test: verifies that passing Some runtime includes "runtime" key
-        // This mirrors the server's expectation at PUT /v1/hosts/{id}/embodiment
-        let model = serde_json::json!({"model_id": "test", "joints": [], "model_digest": "abc"});
-        let runtime = serde_json::json!({"combined_digest": "abc", "calibration": null});
-        let mut body = serde_json::json!({ "model": model });
-        // Simulate what upload_embodiment does when runtime is Some
-        body["runtime"] = runtime;
+        let model = serde_json::json!({"model_id": "test", "model_digest": "abc"});
+        let runtime = serde_json::json!({"combined_digest": "abc"});
+        let body = build_embodiment_body(&model, Some(&runtime)).unwrap();
         assert!(body.get("model").is_some(), "body must contain model key");
-        assert!(
-            body.get("runtime").is_some(),
-            "body must contain runtime key when Some is passed"
-        );
+        assert!(body.get("runtime").is_some(), "body must contain runtime key when Some");
     }
 }
