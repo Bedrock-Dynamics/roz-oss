@@ -85,18 +85,13 @@ where
 {
     type Rejection = Response;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         // Read the AuthIdentity placed by the auth middleware.
         let auth = parts
             .extensions
             .get::<roz_core::auth::AuthIdentity>()
             .cloned()
-            .ok_or_else(|| {
-                (StatusCode::UNAUTHORIZED, "missing auth identity").into_response()
-            })?;
+            .ok_or_else(|| (StatusCode::UNAUTHORIZED, "missing auth identity").into_response())?;
 
         // Begin a transaction on the shared pool.
         let pool = PgPool::from_ref(state);
@@ -121,10 +116,7 @@ where
             .cloned()
             .unwrap_or_else(|| Arc::new(Mutex::new(None)));
 
-        Ok(Self {
-            tx: Some(tx),
-            slot,
-        })
+        Ok(Self { tx: Some(tx), slot })
     }
 }
 
@@ -147,10 +139,7 @@ where
 ///     .layer(axum::middleware::from_fn(tx_layer))
 ///     .layer(auth_middleware);
 /// ```
-pub async fn tx_layer(
-    mut req: axum::http::Request<axum::body::Body>,
-    next: Next,
-) -> Response {
+pub async fn tx_layer(mut req: axum::http::Request<axum::body::Body>, next: Next) -> Response {
     // Pre-insert the slot so the Tx extractor can find it during
     // FromRequestParts (which runs inside next.run()).
     let slot: TxSlot = Arc::new(Mutex::new(None));

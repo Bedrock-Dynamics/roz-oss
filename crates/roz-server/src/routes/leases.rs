@@ -49,10 +49,7 @@ pub async fn create(
 }
 
 /// GET /v1/leases
-pub async fn list(
-    mut tx: Tx,
-    Extension(auth): Extension<AuthIdentity>,
-) -> Result<Json<serde_json::Value>, AppError> {
+pub async fn list(mut tx: Tx, Extension(auth): Extension<AuthIdentity>) -> Result<Json<serde_json::Value>, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
     let leases = roz_db::leases::list_active(&mut **tx, tenant_id).await?;
     Ok(Json(json!({"data": leases})))

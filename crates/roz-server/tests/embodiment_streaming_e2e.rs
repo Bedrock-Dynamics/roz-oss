@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use futures::StreamExt as _;
 use roz_core::auth::{AuthIdentity, TenantId};
-use roz_nats::dispatch::{embodiment_changed_subject, EmbodimentChangedEvent};
+use roz_nats::dispatch::{EmbodimentChangedEvent, embodiment_changed_subject};
 use roz_server::grpc::agent::GrpcAuth;
 use roz_server::grpc::roz_v1::embodiment_service_client::EmbodimentServiceClient;
 use roz_server::grpc::roz_v1::embodiment_service_server::EmbodimentServiceServer;
@@ -76,11 +76,7 @@ async fn start_grpc_server(
     let server_nats = if nats_client.is_some() {
         nats_client
     } else {
-        Some(
-            async_nats::connect(nats_guard.url())
-                .await
-                .expect("connect nats"),
-        )
+        Some(async_nats::connect(nats_guard.url()).await.expect("connect nats"))
     };
 
     let embodiment_svc = roz_server::grpc::embodiment::EmbodimentServiceImpl::new(
@@ -89,9 +85,7 @@ async fn start_grpc_server(
         server_nats,
     );
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind grpc");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind grpc");
     let port = listener.local_addr().expect("local addr").port();
 
     tokio::spawn(async move {
@@ -231,10 +225,8 @@ async fn grpc_client(
     let channel = grpc_channel(port).await;
     let key = api_key.to_string();
     EmbodimentServiceClient::with_interceptor(channel, move |mut req: tonic::Request<()>| {
-        req.metadata_mut().insert(
-            "authorization",
-            format!("Bearer {key}").parse().expect("parse auth"),
-        );
+        req.metadata_mut()
+            .insert("authorization", format!("Bearer {key}").parse().expect("parse auth"));
         Ok(req)
     })
 }
@@ -256,7 +248,9 @@ async fn stream_frame_tree_initial_snapshot() {
 
     let mut client = grpc_client(port, &api_key).await;
     let mut stream = client
-        .stream_frame_tree(StreamFrameTreeRequest { host_id: host_id.to_string() })
+        .stream_frame_tree(StreamFrameTreeRequest {
+            host_id: host_id.to_string(),
+        })
         .await
         .expect("stream_frame_tree")
         .into_inner();
@@ -269,7 +263,10 @@ async fn stream_frame_tree_initial_snapshot() {
 
     let payload = first.payload.expect("payload must be set");
     assert!(
-        matches!(payload, roz_server::grpc::roz_v1::stream_frame_tree_response::Payload::Snapshot(_)),
+        matches!(
+            payload,
+            roz_server::grpc::roz_v1::stream_frame_tree_response::Payload::Snapshot(_)
+        ),
         "first message must be Snapshot; got {payload:?}"
     );
     assert!(!first.digest.is_empty(), "digest must not be empty");
@@ -299,7 +296,9 @@ async fn stream_frame_tree_delta_after_put() {
 
     let mut client = grpc_client(port, &api_key).await;
     let mut stream = client
-        .stream_frame_tree(StreamFrameTreeRequest { host_id: host_id.to_string() })
+        .stream_frame_tree(StreamFrameTreeRequest {
+            host_id: host_id.to_string(),
+        })
         .await
         .expect("stream_frame_tree")
         .into_inner();
@@ -317,9 +316,7 @@ async fn stream_frame_tree_delta_after_put() {
         .await
         .expect("upsert v2 model");
 
-    let test_nats = async_nats::connect(nats_guard.url())
-        .await
-        .expect("test nats client");
+    let test_nats = async_nats::connect(nats_guard.url()).await.expect("test nats client");
     let event = EmbodimentChangedEvent { host_id, tenant_id };
     test_nats
         .publish(
@@ -367,7 +364,9 @@ async fn stream_frame_tree_keepalive() {
 
     let mut client = grpc_client(port, &api_key).await;
     let mut stream = client
-        .stream_frame_tree(StreamFrameTreeRequest { host_id: host_id.to_string() })
+        .stream_frame_tree(StreamFrameTreeRequest {
+            host_id: host_id.to_string(),
+        })
         .await
         .expect("stream_frame_tree")
         .into_inner();
@@ -443,7 +442,9 @@ async fn stream_frame_tree_failed_precondition_no_nats() {
 
     let mut client = grpc_client(port, &key.full_key).await;
     let result = client
-        .stream_frame_tree(StreamFrameTreeRequest { host_id: host.id.to_string() })
+        .stream_frame_tree(StreamFrameTreeRequest {
+            host_id: host.id.to_string(),
+        })
         .await;
 
     match result {
@@ -477,7 +478,9 @@ async fn watch_calibration_initial_snapshot() {
 
     let mut client = grpc_client(port, &api_key).await;
     let mut stream = client
-        .watch_calibration(WatchCalibrationRequest { host_id: host_id.to_string() })
+        .watch_calibration(WatchCalibrationRequest {
+            host_id: host_id.to_string(),
+        })
         .await
         .expect("watch_calibration")
         .into_inner();
@@ -524,7 +527,9 @@ async fn watch_calibration_delta_after_put() {
 
     let mut client = grpc_client(port, &api_key).await;
     let mut stream = client
-        .watch_calibration(WatchCalibrationRequest { host_id: host_id.to_string() })
+        .watch_calibration(WatchCalibrationRequest {
+            host_id: host_id.to_string(),
+        })
         .await
         .expect("watch_calibration")
         .into_inner();
@@ -544,9 +549,7 @@ async fn watch_calibration_delta_after_put() {
         .await
         .expect("upsert v2");
 
-    let test_nats = async_nats::connect(nats_guard.url())
-        .await
-        .expect("test nats");
+    let test_nats = async_nats::connect(nats_guard.url()).await.expect("test nats");
     let event = EmbodimentChangedEvent { host_id, tenant_id };
     test_nats
         .publish(
@@ -566,7 +569,9 @@ async fn watch_calibration_delta_after_put() {
     let payload = delta_msg.payload.expect("payload");
     match payload {
         roz_server::grpc::roz_v1::watch_calibration_response::Payload::Delta(delta) => {
-            let cal = delta.calibration.expect("CalibrationDelta must include calibration overlay");
+            let cal = delta
+                .calibration
+                .expect("CalibrationDelta must include calibration overlay");
             assert_eq!(cal.calibration_id, "cal-2", "delta must contain updated calibration_id");
         }
         other => panic!("expected CalibrationDelta, got {other:?}"),
@@ -603,7 +608,9 @@ async fn stream_frame_tree_terminal_on_nats_drop() {
 
     let mut client = grpc_client(port, &api_key).await;
     let mut stream = client
-        .stream_frame_tree(StreamFrameTreeRequest { host_id: host_id.to_string() })
+        .stream_frame_tree(StreamFrameTreeRequest {
+            host_id: host_id.to_string(),
+        })
         .await
         .expect("stream_frame_tree")
         .into_inner();

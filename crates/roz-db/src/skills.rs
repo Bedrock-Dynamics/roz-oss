@@ -147,7 +147,11 @@ where
 }
 
 /// Get a specific version of a skill.
-pub async fn get_version<'e, E>(executor: E, skill_id: Uuid, version: &str) -> Result<Option<SkillVersionRow>, sqlx::Error>
+pub async fn get_version<'e, E>(
+    executor: E,
+    skill_id: Uuid,
+    version: &str,
+) -> Result<Option<SkillVersionRow>, sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {

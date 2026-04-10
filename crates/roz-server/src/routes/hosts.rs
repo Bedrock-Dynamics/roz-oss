@@ -171,12 +171,7 @@ pub async fn update_embodiment(
     let tenant_id = *auth.tenant_id().as_uuid();
 
     // Validate model_digest present (same guard as before)
-    if body
-        .model
-        .get("model_digest")
-        .and_then(|v| v.as_str())
-        .is_none()
-    {
+    if body.model.get("model_digest").and_then(|v| v.as_str()).is_none() {
         return Err(AppError::bad_request(
             "model must contain a non-null model_digest field",
         ));
@@ -194,13 +189,8 @@ pub async fn update_embodiment(
 
     // Per REVIEWS.md fix: use conditional_upsert_or_runtime so calibration-only
     // changes (same model_digest, new runtime/calibration) are not silently dropped.
-    let wrote = roz_db::embodiments::conditional_upsert_or_runtime(
-        &mut *tx,
-        id,
-        &body.model,
-        body.runtime.as_ref(),
-    )
-    .await?;
+    let wrote =
+        roz_db::embodiments::conditional_upsert_or_runtime(&mut *tx, id, &body.model, body.runtime.as_ref()).await?;
 
     // COMMIT BEFORE publishing to NATS. This guarantees that any streaming
     // subscriber that re-reads the DB after receiving the NATS event sees
@@ -211,21 +201,16 @@ pub async fn update_embodiment(
     if wrote {
         // D-01: publish embodiment change event so streaming RPCs are notified.
         if let Some(nats) = &state.nats_client {
-            let event = roz_nats::dispatch::EmbodimentChangedEvent {
-                host_id: id,
-                tenant_id,
-            };
+            let event = roz_nats::dispatch::EmbodimentChangedEvent { host_id: id, tenant_id };
             let payload = serde_json::to_vec(&event).unwrap_or_default();
             let subject = roz_nats::dispatch::embodiment_changed_subject(id);
             // Per REVIEWS.md: publish failure returns an error (not just a warning).
             // With D-02 rejecting polling fallback, a silent publish failure
             // permanently desyncs active streams. The PUT returns 500; caller retries.
-            nats.publish(subject, payload.into())
-                .await
-                .map_err(|e| {
-                    tracing::error!(error = %e, %id, "failed to publish embodiment change event");
-                    AppError::internal("failed to notify streaming subscribers")
-                })?;
+            nats.publish(subject, payload.into()).await.map_err(|e| {
+                tracing::error!(error = %e, %id, "failed to publish embodiment change event");
+                AppError::internal("failed to notify streaming subscribers")
+            })?;
         }
         Ok(StatusCode::OK)
     } else {

@@ -71,7 +71,9 @@ async fn apply_task_status_event(pool: &PgPool, event: &TaskStatusEvent) {
                     tracing::warn!(%error, task_id = %event.task_id, "failed to ensure active task run");
                 }
             }
-            Err(error) => tracing::warn!(%error, task_id = %event.task_id, "failed to acquire connection for ensure_active_run"),
+            Err(error) => {
+                tracing::warn!(%error, task_id = %event.task_id, "failed to acquire connection for ensure_active_run")
+            }
         }
     } else if is_terminal_task_status(&event.status) {
         if matches!(roz_db::tasks::active_run_for_task(pool, event.task_id).await, Ok(None))

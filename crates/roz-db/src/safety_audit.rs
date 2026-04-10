@@ -51,7 +51,12 @@ where
 
 /// List safety audit events for a tenant with limit/offset pagination.
 /// Includes `tenant_id` filter for defense-in-depth (don't rely solely on RLS).
-pub async fn list<'e, E>(executor: E, tenant_id: Uuid, limit: i64, offset: i64) -> Result<Vec<SafetyAuditRow>, sqlx::Error>
+pub async fn list<'e, E>(
+    executor: E,
+    tenant_id: Uuid,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<SafetyAuditRow>, sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {

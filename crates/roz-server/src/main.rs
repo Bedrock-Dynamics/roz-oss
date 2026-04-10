@@ -139,9 +139,7 @@ fn grpc_router(state: &AppState) -> Router {
     .add_service(roz_server::grpc::roz_v1::agent_service_server::AgentServiceServer::new(
         agent_svc,
     ))
-    .add_service(roz_server::grpc::roz_v1::embodiment_service_server::EmbodimentServiceServer::new(
-        embodiment_svc,
-    ))
+    .add_service(roz_server::grpc::roz_v1::embodiment_service_server::EmbodimentServiceServer::new(embodiment_svc))
     .add_service(
         tonic_reflection::server::Builder::configure()
             .register_encoded_file_descriptor_set(roz_server::grpc::roz_v1::FILE_DESCRIPTOR_SET)

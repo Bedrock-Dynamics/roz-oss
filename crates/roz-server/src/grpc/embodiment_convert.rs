@@ -7,7 +7,6 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use roz_core::embodiment::binding::{
     BindingType, ChannelBinding, CommandInterfaceType, ControlChannelDef, ControlInterfaceManifest,
 };
-use roz_core::embodiment::retargeting::RetargetingMap;
 use roz_core::embodiment::calibration::{CalibrationOverlay, SensorCalibration};
 use roz_core::embodiment::contact::ContactForceEnvelope;
 use roz_core::embodiment::embodiment_runtime::EmbodimentRuntime;
@@ -17,6 +16,7 @@ use roz_core::embodiment::model::{
     CameraFrustum, CollisionBody, EmbodimentFamily, EmbodimentModel, Geometry, Inertial, Joint, JointType, Link,
     SemanticRole, SensorMount, SensorType, TcpType, ToolCenterPoint,
 };
+use roz_core::embodiment::retargeting::RetargetingMap;
 use roz_core::embodiment::safety_overlay::SafetyOverlay;
 use roz_core::embodiment::workspace::{WorkspaceShape, WorkspaceZone, ZoneType};
 

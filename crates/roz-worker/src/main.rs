@@ -854,7 +854,8 @@ async fn main() -> Result<()> {
 
     // Register with server
     if !config.api_key.is_empty() {
-        match roz_worker::registration::register_host(&http, &config.api_url, &config.api_key, &config.worker_id).await {
+        match roz_worker::registration::register_host(&http, &config.api_url, &config.api_key, &config.worker_id).await
+        {
             Ok(host_id) => {
                 tracing::info!(host_id = %host_id, "registered with server");
                 // Upload embodiment runtime if available (D-04: log-and-continue; runtime now passed per STRM-02)

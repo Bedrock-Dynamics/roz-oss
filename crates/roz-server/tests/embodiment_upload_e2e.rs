@@ -35,12 +35,11 @@ async fn start_server() -> (String, String, uuid::Uuid, sqlx::PgPool) {
         .expect("create host");
 
     // Build AppState
-    let rate_limiter = roz_server::middleware::rate_limit::create_rate_limiter(
-        &roz_server::middleware::rate_limit::RateLimitConfig {
+    let rate_limiter =
+        roz_server::middleware::rate_limit::create_rate_limiter(&roz_server::middleware::rate_limit::RateLimitConfig {
             requests_per_second: NonZeroU32::new(100).unwrap(),
             burst_size: NonZeroU32::new(100).unwrap(),
-        },
-    );
+        });
 
     let state = roz_server::state::AppState {
         pool: pool.clone(),
@@ -175,11 +174,7 @@ async fn changed_digest_returns_200() {
         .send()
         .await
         .expect("second PUT failed");
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "changed digest should return 200"
-    );
+    assert_eq!(resp.status(), StatusCode::OK, "changed digest should return 200");
 }
 
 #[tokio::test]

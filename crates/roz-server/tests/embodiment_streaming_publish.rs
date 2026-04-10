@@ -8,7 +8,7 @@
 //! Run: `cargo test -p roz-server --test embodiment_streaming_publish -- --ignored`
 
 use futures::StreamExt;
-use roz_nats::dispatch::{embodiment_changed_subject, EmbodimentChangedEvent};
+use roz_nats::dispatch::{EmbodimentChangedEvent, embodiment_changed_subject};
 use serde_json::json;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -24,14 +24,10 @@ async fn start_server_with_nats() -> (String, String, uuid::Uuid, uuid::Uuid, ro
     roz_db::run_migrations(&pool).await.expect("run migrations");
 
     // Seed tenant
-    let tenant = roz_db::tenant::create_tenant(
-        &pool,
-        "streaming-publish-org",
-        "streaming-publish-test",
-        "organization",
-    )
-    .await
-    .expect("create tenant");
+    let tenant =
+        roz_db::tenant::create_tenant(&pool, "streaming-publish-org", "streaming-publish-test", "organization")
+            .await
+            .expect("create tenant");
 
     // Seed API key
     let key_result = roz_db::api_keys::create_api_key(&pool, tenant.id, "streaming-key", &[], "e2e")
@@ -49,12 +45,11 @@ async fn start_server_with_nats() -> (String, String, uuid::Uuid, uuid::Uuid, ro
         .await
         .expect("connect server nats client");
 
-    let rate_limiter = roz_server::middleware::rate_limit::create_rate_limiter(
-        &roz_server::middleware::rate_limit::RateLimitConfig {
+    let rate_limiter =
+        roz_server::middleware::rate_limit::create_rate_limiter(&roz_server::middleware::rate_limit::RateLimitConfig {
             requests_per_second: NonZeroU32::new(100).unwrap(),
             burst_size: NonZeroU32::new(100).unwrap(),
-        },
-    );
+        });
 
     let state = roz_server::state::AppState {
         pool: pool.clone(),

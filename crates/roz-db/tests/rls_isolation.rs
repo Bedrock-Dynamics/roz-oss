@@ -91,9 +91,7 @@ async fn tenant_a_cannot_see_tenant_b_data() {
             .execute(&mut *tx)
             .await
             .unwrap();
-        roz_db::set_tenant_context(&mut *tx, &tenant_a.id)
-            .await
-            .unwrap();
+        roz_db::set_tenant_context(&mut *tx, &tenant_a.id).await.unwrap();
         roz_db::environments::create(&mut *tx, tenant_a.id, "test-env", "simulation", &serde_json::json!({}))
             .await
             .unwrap();
@@ -109,11 +107,13 @@ async fn tenant_a_cannot_see_tenant_b_data() {
             .execute(&mut *tx)
             .await
             .unwrap();
-        roz_db::set_tenant_context(&mut *tx, &tenant_b.id)
-            .await
-            .unwrap();
+        roz_db::set_tenant_context(&mut *tx, &tenant_b.id).await.unwrap();
         let rows = roz_db::environments::list(&mut *tx, tenant_a.id, 100, 0).await.unwrap();
-        assert!(rows.is_empty(), "Tenant B should not see tenant A's data, got {} rows", rows.len());
+        assert!(
+            rows.is_empty(),
+            "Tenant B should not see tenant A's data, got {} rows",
+            rows.len()
+        );
         tx.rollback().await.unwrap();
     }
 
@@ -141,9 +141,7 @@ async fn tenant_a_sees_own_data() {
             .execute(&mut *tx)
             .await
             .unwrap();
-        roz_db::set_tenant_context(&mut *tx, &tenant_a.id)
-            .await
-            .unwrap();
+        roz_db::set_tenant_context(&mut *tx, &tenant_a.id).await.unwrap();
         roz_db::environments::create(
             &mut *tx,
             tenant_a.id,
@@ -163,9 +161,7 @@ async fn tenant_a_sees_own_data() {
             .execute(&mut *tx)
             .await
             .unwrap();
-        roz_db::set_tenant_context(&mut *tx, &tenant_a.id)
-            .await
-            .unwrap();
+        roz_db::set_tenant_context(&mut *tx, &tenant_a.id).await.unwrap();
         let rows = roz_db::environments::list(&mut *tx, tenant_a.id, 100, 0).await.unwrap();
         assert_eq!(rows.len(), 1, "Tenant A should see exactly 1 environment");
         assert_eq!(rows[0].name, "my-env");

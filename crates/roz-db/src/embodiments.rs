@@ -150,21 +150,12 @@ mod tests {
     async fn upsert_and_get_model() {
         let pool = setup().await;
         let tenant_id = create_test_tenant(&pool).await;
-        let host = crate::hosts::create(
-            &pool,
-            tenant_id,
-            "emb-host-1",
-            "edge",
-            &[],
-            &serde_json::json!({}),
-        )
-        .await
-        .expect("Failed to create host");
+        let host = crate::hosts::create(&pool, tenant_id, "emb-host-1", "edge", &[], &serde_json::json!({}))
+            .await
+            .expect("Failed to create host");
 
         let model = serde_json::json!({"model_id": "test-model", "joints": []});
-        let updated = upsert(&pool, host.id, &model, None)
-            .await
-            .expect("Failed to upsert");
+        let updated = upsert(&pool, host.id, &model, None).await.expect("Failed to upsert");
         assert!(updated);
 
         let row = get_by_host_id(&pool, host.id)
@@ -182,16 +173,9 @@ mod tests {
     async fn upsert_with_runtime() {
         let pool = setup().await;
         let tenant_id = create_test_tenant(&pool).await;
-        let host = crate::hosts::create(
-            &pool,
-            tenant_id,
-            "emb-host-2",
-            "edge",
-            &[],
-            &serde_json::json!({}),
-        )
-        .await
-        .expect("Failed to create host");
+        let host = crate::hosts::create(&pool, tenant_id, "emb-host-2", "edge", &[], &serde_json::json!({}))
+            .await
+            .expect("Failed to create host");
 
         let model = serde_json::json!({"model_id": "test-model"});
         let runtime = serde_json::json!({"combined_digest": "abc123"});
@@ -213,9 +197,7 @@ mod tests {
     async fn get_returns_none_for_missing_host() {
         let pool = setup().await;
         let missing_id = Uuid::new_v4();
-        let row = get_by_host_id(&pool, missing_id)
-            .await
-            .expect("Failed to get");
+        let row = get_by_host_id(&pool, missing_id).await.expect("Failed to get");
         assert!(row.is_none());
     }
 
@@ -299,8 +281,7 @@ mod tests {
         assert!(!wrote, "identical model+runtime should skip");
 
         // Third upload: same model, new runtime (calibration-only change) -- MUST write
-        let runtime_v2 =
-            serde_json::json!({"combined_digest": "rt-v2", "calibration": {"calibration_id": "new"}});
+        let runtime_v2 = serde_json::json!({"combined_digest": "rt-v2", "calibration": {"calibration_id": "new"}});
         let wrote = conditional_upsert_or_runtime(&pool, host.id, &model, Some(&runtime_v2))
             .await
             .expect("conditional_upsert_or_runtime");

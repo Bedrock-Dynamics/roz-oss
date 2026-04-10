@@ -26,12 +26,9 @@ use crate::grpc::roz_v1::{
     ValidateBindingsResponse, WatchCalibrationRequest, WatchCalibrationResponse,
 };
 use crate::grpc::roz_v1::{
-    stream_frame_tree_response::Payload as FrameTreePayload,
-    watch_calibration_response::Payload as CalibrationPayload,
+    stream_frame_tree_response::Payload as FrameTreePayload, watch_calibration_response::Payload as CalibrationPayload,
 };
-use roz_core::embodiment::binding::{
-    BindingType, CommandInterfaceType, ControlChannelDef, ControlInterfaceManifest,
-};
+use roz_core::embodiment::binding::{BindingType, CommandInterfaceType, ControlChannelDef, ControlInterfaceManifest};
 use roz_core::embodiment::retargeting::RetargetingMap;
 
 // ---------------------------------------------------------------------------
@@ -42,10 +39,8 @@ use roz_core::embodiment::retargeting::RetargetingMap;
 // Stream type aliases (Plan 02 will replace these with real implementations)
 // ---------------------------------------------------------------------------
 
-type StreamFrameTreeStream =
-    tokio_stream::wrappers::ReceiverStream<Result<StreamFrameTreeResponse, tonic::Status>>;
-type WatchCalibrationStream =
-    tokio_stream::wrappers::ReceiverStream<Result<WatchCalibrationResponse, tonic::Status>>;
+type StreamFrameTreeStream = tokio_stream::wrappers::ReceiverStream<Result<StreamFrameTreeResponse, tonic::Status>>;
+type WatchCalibrationStream = tokio_stream::wrappers::ReceiverStream<Result<WatchCalibrationResponse, tonic::Status>>;
 
 // ---------------------------------------------------------------------------
 // Service implementation
@@ -61,12 +56,12 @@ pub struct EmbodimentServiceImpl {
 }
 
 impl EmbodimentServiceImpl {
-    pub fn new(
-        pool: PgPool,
-        auth: std::sync::Arc<dyn GrpcAuth>,
-        nats_client: Option<async_nats::Client>,
-    ) -> Self {
-        Self { pool, auth, nats_client }
+    pub fn new(pool: PgPool, auth: std::sync::Arc<dyn GrpcAuth>, nats_client: Option<async_nats::Client>) -> Self {
+        Self {
+            pool,
+            auth,
+            nats_client,
+        }
     }
 
     async fn authenticated_tenant_id<T: Sync>(&self, request: &Request<T>) -> Result<Uuid, Status> {
@@ -312,9 +307,9 @@ impl EmbodimentService for EmbodimentServiceImpl {
                 Status::internal("failed to deserialize embodiment data")
             })?;
 
-        let family = domain_model
-            .embodiment_family
-            .ok_or_else(|| Status::failed_precondition("host has no embodiment family -- retargeting requires a family classification"))?;
+        let family = domain_model.embodiment_family.ok_or_else(|| {
+            Status::failed_precondition("host has no embodiment family -- retargeting requires a family classification")
+        })?;
 
         let retargeting_map = RetargetingMap::from_bindings(family, &domain_model.channel_bindings);
         let mapped_count = u32::try_from(retargeting_map.canonical_to_local.len()).unwrap_or(u32::MAX);
@@ -380,11 +375,11 @@ impl EmbodimentService for EmbodimentServiceImpl {
 
         // D-04: Send initial full snapshot.
         let row = fetch_embodiment_row(&self.pool, host_id, tenant_id).await?;
-        let model: roz_core::embodiment::model::EmbodimentModel =
-            serde_json::from_value(row.embodiment_model.ok_or_else(|| {
-                Status::not_found("host has no embodiment model")
-            })?)
-            .map_err(|e| Status::internal(format!("deserialize model: {e}")))?;
+        let model: roz_core::embodiment::model::EmbodimentModel = serde_json::from_value(
+            row.embodiment_model
+                .ok_or_else(|| Status::not_found("host has no embodiment model"))?,
+        )
+        .map_err(|e| Status::internal(format!("deserialize model: {e}")))?;
 
         let initial_digest = compute_frame_tree_digest(&model.frame_tree);
 
@@ -509,11 +504,11 @@ impl EmbodimentService for EmbodimentServiceImpl {
 
         // D-04: Send initial full calibration snapshot.
         let row = fetch_embodiment_row(&self.pool, host_id, tenant_id).await?;
-        let runtime: roz_core::embodiment::embodiment_runtime::EmbodimentRuntime =
-            serde_json::from_value(row.embodiment_runtime.ok_or_else(|| {
-                Status::not_found("host has no embodiment runtime")
-            })?)
-            .map_err(|e| Status::internal(format!("deserialize runtime: {e}")))?;
+        let runtime: roz_core::embodiment::embodiment_runtime::EmbodimentRuntime = serde_json::from_value(
+            row.embodiment_runtime
+                .ok_or_else(|| Status::not_found("host has no embodiment runtime"))?,
+        )
+        .map_err(|e| Status::internal(format!("deserialize runtime: {e}")))?;
 
         let calibration = runtime
             .calibration
@@ -657,9 +652,17 @@ fn compute_frame_tree_delta(
 
     let removed_frame_ids: Vec<String> = old_ids.difference(&new_ids).map(|id| (*id).to_string()).collect();
 
-    let new_root = if old.root() == new.root() { None } else { new.root().map(String::from) };
+    let new_root = if old.root() == new.root() {
+        None
+    } else {
+        new.root().map(String::from)
+    };
 
-    FrameTreeDelta { changed_frames, removed_frame_ids, new_root }
+    FrameTreeDelta {
+        changed_frames,
+        removed_frame_ids,
+        new_root,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -686,7 +689,8 @@ mod tests {
         let mut old = FrameTree::new();
         old.set_root("world", FrameSource::Static);
         let mut new = old.clone();
-        new.add_frame("base", "world", Transform3D::identity(), FrameSource::Static).unwrap();
+        new.add_frame("base", "world", Transform3D::identity(), FrameSource::Static)
+            .unwrap();
         let delta = compute_frame_tree_delta(&old, &new);
         assert!(delta.changed_frames.contains_key("base"));
         assert!(delta.removed_frame_ids.is_empty());
@@ -696,7 +700,8 @@ mod tests {
     fn delta_removed_frame() {
         let mut old = FrameTree::new();
         old.set_root("world", FrameSource::Static);
-        old.add_frame("base", "world", Transform3D::identity(), FrameSource::Static).unwrap();
+        old.add_frame("base", "world", Transform3D::identity(), FrameSource::Static)
+            .unwrap();
         let mut new = FrameTree::new();
         new.set_root("world", FrameSource::Static);
         let delta = compute_frame_tree_delta(&old, &new);
@@ -718,7 +723,8 @@ mod tests {
     fn frame_tree_digest_stable_for_identical_trees() {
         let mut a = FrameTree::new();
         a.set_root("world", FrameSource::Static);
-        a.add_frame("base", "world", Transform3D::identity(), FrameSource::Static).unwrap();
+        a.add_frame("base", "world", Transform3D::identity(), FrameSource::Static)
+            .unwrap();
         let b = a.clone();
         assert_eq!(compute_frame_tree_digest(&a), compute_frame_tree_digest(&b));
     }
@@ -728,7 +734,8 @@ mod tests {
         let mut old = FrameTree::new();
         old.set_root("world", FrameSource::Static);
         let mut new = old.clone();
-        new.add_frame("base", "world", Transform3D::identity(), FrameSource::Static).unwrap();
+        new.add_frame("base", "world", Transform3D::identity(), FrameSource::Static)
+            .unwrap();
         assert_ne!(compute_frame_tree_digest(&old), compute_frame_tree_digest(&new));
     }
 }

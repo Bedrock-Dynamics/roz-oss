@@ -51,7 +51,12 @@ where
 }
 
 /// List environments for a tenant with limit/offset pagination.
-pub async fn list<'e, E>(executor: E, tenant_id: Uuid, limit: i64, offset: i64) -> Result<Vec<EnvironmentRow>, sqlx::Error>
+pub async fn list<'e, E>(
+    executor: E,
+    tenant_id: Uuid,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<EnvironmentRow>, sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {

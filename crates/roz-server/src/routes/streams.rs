@@ -100,15 +100,9 @@ pub async fn update(
     if existing.tenant_id != tenant_id {
         return Err(AppError::not_found("stream not found"));
     }
-    let stream = roz_db::streams::update(
-        &mut **tx,
-        id,
-        body.name.as_deref(),
-        body.rate_hz,
-        body.config.as_ref(),
-    )
-    .await?
-    .ok_or_else(|| AppError::not_found("stream not found"))?;
+    let stream = roz_db::streams::update(&mut **tx, id, body.name.as_deref(), body.rate_hz, body.config.as_ref())
+        .await?
+        .ok_or_else(|| AppError::not_found("stream not found"))?;
     Ok(Json(json!({"data": stream})))
 }
 

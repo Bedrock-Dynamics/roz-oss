@@ -72,11 +72,7 @@ where
 
 /// Mark a session as completed/cancelled/error with an end timestamp.
 /// `status` must be one of: `"completed"`, `"cancelled"`, `"error"`.
-pub async fn complete_session<'e, E>(
-    executor: E,
-    session_id: Uuid,
-    status: &str,
-) -> Result<(), sqlx::Error>
+pub async fn complete_session<'e, E>(executor: E, session_id: Uuid, status: &str) -> Result<(), sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
