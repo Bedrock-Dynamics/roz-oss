@@ -23,6 +23,7 @@
 - [ ] **Phase 6: Extension RPCs** - Add GetRetargetingMap and GetManifest unary RPCs with coverage metadata
 - [ ] **Phase 7: Streaming RPCs** - Add StreamFrameTree and WatchCalibration server-streaming RPCs with digest-based change detection
 - [ ] **Phase 8: CLI Embodiment Commands** - Add host embodiment inspection and validation commands to roz CLI
+- [ ] **Phase 9: Fix Worker EmbodimentRuntime Upload (STRM-02 Gap Closure)** - Pass EmbodimentRuntime to upload_embodiment at worker startup so WatchCalibration can stream
 
 ## Phase Details
 
@@ -63,8 +64,8 @@ Plans:
   4. Streams remain open and deliver keepalives when no changes occur, without dropping the connection
 **Plans:** 2 plans
 Plans:
-- [x] 07-01-PLAN.md — Streaming proto messages, NATS change event plumbing, and EmbodimentServiceImpl wiring
-- [x] 07-02-PLAN.md — StreamFrameTree and WatchCalibration RPC handler implementations
+- [ ] 07-01-PLAN.md — Streaming proto messages, NATS change event plumbing, and EmbodimentServiceImpl wiring
+- [ ] 07-02-PLAN.md — StreamFrameTree and WatchCalibration RPC handler implementations
 
 ### Phase 8: CLI Embodiment Commands
 **Goal**: Operators can inspect and validate embodiment data for any registered host from the command line
@@ -74,9 +75,19 @@ Plans:
   1. Operator can run `roz host embodiment <id>` and see the host's embodiment model summary (joints, links, frame tree stats)
   2. Operator can run `roz host bindings <id>` and see the host's channel bindings with semantic roles
   3. Operator can run `roz host validate <id>` and see binding validation results with pass/fail status and specific errors
-**Plans:** 1 plan
-Plans:
-- [ ] 08-01-PLAN.md — build.rs proto registration + embodiment, bindings, and validate gRPC commands
+**Plans**: TBD
+**UI hint**: yes
+
+### Phase 9: Fix Worker EmbodimentRuntime Upload (STRM-02 Gap Closure)
+**Goal**: Workers with calibration data pass EmbodimentRuntime to upload_embodiment so WatchCalibration can stream instead of returning NOT_FOUND
+**Depends on**: Phase 5 (upload_embodiment function exists); Phase 7 (WatchCalibration handler correctly gates on embodiment_runtime)
+**Requirements**: STRM-02
+**Gap Closure**: Closes gaps from v1.1 audit — requirement STRM-02 (partial), integration Phase 5→Phase 7 (WatchCalibration), flow "Calibration streaming"
+**Success Criteria** (what must be TRUE):
+  1. Worker extracts EmbodimentRuntime from the loaded EmbodimentManifest and passes it to upload_embodiment (replacing hardcoded None)
+  2. Workers with no calibration data continue to pass None (no regression)
+  3. WatchCalibration streams calibration overlays for a worker that has calibration data in its manifest
+**Plans**: TBD
 
 ## Progress
 
@@ -88,5 +99,6 @@ Plans:
 | 4. Service Implementation | v1.0 | 2/2 | Complete | 2026-04-08 |
 | 5. Worker Embodiment Upload Wiring | v1.1 | 0/2 | Planned | - |
 | 6. Extension RPCs | v1.1 | 0/2 | Planned | - |
-| 7. Streaming RPCs | v1.1 | 2/2 | Complete | 2026-04-09 |
-| 8. CLI Embodiment Commands | v1.1 | 0/1 | Not started | - |
+| 7. Streaming RPCs | v1.1 | 0/2 | Planned | - |
+| 8. CLI Embodiment Commands | v1.1 | 0/0 | Not started | - |
+| 9. Fix Worker EmbodimentRuntime Upload | v1.1 | 0/1 | Planned | - |
