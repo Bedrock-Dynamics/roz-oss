@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.1
 milestone_name: Embodiment Streaming, CLI, and Extensions
-status: executing
-stopped_at: Phase 7 context gathered
-last_updated: "2026-04-10T06:14:41.785Z"
+status: complete
+stopped_at: ""
+last_updated: "2026-04-10T10:00:00.000Z"
 last_activity: 2026-04-10
 progress:
-  total_phases: 5
-  completed_phases: 5
-  total_plans: 8
-  completed_plans: 8
+  total_phases: 9
+  completed_phases: 9
+  total_plans: 14
+  completed_plans: 14
   percent: 100
 ---
 
@@ -18,19 +18,17 @@ progress:
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-04-07)
+See: .planning/PROJECT.md (updated 2026-04-10)
 
 **Core value:** substrate-ide can fetch the complete embodiment model over gRPC
-**Current focus:** Phase 09 — fix-strm02-runtime-upload
+**Current focus:** Planning next milestone
 
 ## Current Position
 
-Phase: 09 (fix-strm02-runtime-upload) — EXECUTING
-Plan: 1 of 1
-Status: Executing Phase 09
-Last activity: 2026-04-10
+Milestone v1.1 — COMPLETE
+All 9 phases shipped. Git tag v1.1 created.
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
