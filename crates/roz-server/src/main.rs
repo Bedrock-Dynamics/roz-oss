@@ -301,8 +301,8 @@ async fn main() {
     if let Ok(admin_url) = std::env::var("RESTATE_ADMIN_URL") {
         let client = state.http_client.clone();
         tokio::spawn(async move {
-            let deployment_uri = std::env::var("RESTATE_DEPLOYMENT_URI")
-                .unwrap_or_else(|_| format!("http://localhost:{restate_port}"));
+            let deployment_uri =
+                std::env::var("RESTATE_DEPLOYMENT_URI").unwrap_or_else(|_| format!("http://localhost:{restate_port}"));
             let resp = client
                 .post(format!("{admin_url}/deployments"))
                 .json(&serde_json::json!({"uri": deployment_uri}))

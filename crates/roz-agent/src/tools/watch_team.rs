@@ -357,9 +357,7 @@ mod tests {
                 run: docker run -d -p 4222:4222 nats -js && cargo test ... -- --ignored"]
     async fn watch_team_execute_with_no_events_returns_empty_array() {
         let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
-        let nats = async_nats::connect(&nats_url)
-            .await
-            .expect("connect to NATS");
+        let nats = async_nats::connect(&nats_url).await.expect("connect to NATS");
         let js = async_nats::jetstream::new(nats);
 
         // Create the stream so get_stream() succeeds.
