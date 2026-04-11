@@ -16,11 +16,14 @@ use crate::state::AppState;
 /// Generates an account keypair, validates the operator seed can decode, and
 /// stores credentials in the database. JWT creation and NATS push are deferred
 /// until a NATS client is available in `AppState`.
-async fn provision_nats_account(
-    pool: &sqlx::PgPool,
+async fn provision_nats_account<'e, E>(
+    executor: E,
     env_id: Uuid,
     operator_seed: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     // Validate the operator seed is decodable (fail fast on bad config)
     let _operator = roz_nats::operator::decode_seed(operator_seed)?;
     let account = roz_nats::operator::generate_account_keypair();
@@ -28,9 +31,8 @@ async fn provision_nats_account(
     let public_key = account.public_key();
     let seed = roz_nats::operator::encode_seed(&account);
 
-    // Store in DB (seed stored as plaintext for now -- encryption deferred).
-    // JWT creation and NATS push deferred until NATS client is wired into AppState.
-    roz_db::environments::update_nats_account(pool, env_id, &public_key, &seed).await?;
+    // Store in DB within the same transaction so the caller's re-fetch sees the fields.
+    roz_db::environments::update_nats_account(executor, env_id, &public_key, &seed).await?;
 
     tracing::debug!(env_id = %env_id, %public_key, "NATS account keypair provisioned");
 
@@ -73,16 +75,16 @@ pub async fn create(
     let tenant_id = *auth.tenant_id().as_uuid();
     let env = roz_db::environments::create(&mut **tx, tenant_id, &body.name, &body.kind, &body.config).await?;
 
-    // Provision NATS account if operator seed is configured
+    // Provision NATS account within the same transaction so the re-fetch sees the fields.
     if let Some(ref operator_seed) = state.operator_seed {
-        match provision_nats_account(&state.pool, env.id, operator_seed).await {
+        match provision_nats_account(&mut **tx, env.id, operator_seed).await {
             Ok(()) => tracing::info!(env_id = %env.id, "NATS account provisioned"),
             Err(e) => tracing::error!(env_id = %env.id, ?e, "failed to provision NATS account"),
         }
     }
 
-    // Re-fetch via pool (not tx) so NATS fields written by provision_nats_account are visible
-    let env = roz_db::environments::get_by_id(&state.pool, env.id)
+    // Re-fetch within the same transaction to include NATS fields if provisioned.
+    let env = roz_db::environments::get_by_id(&mut **tx, env.id)
         .await?
         .ok_or_else(|| AppError::not_found("environment not found"))?;
 
