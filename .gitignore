@@ -11,3 +11,4 @@ paper/
 .claude/
 .mcp.json
 CLAUDE.md
+fly.*.toml

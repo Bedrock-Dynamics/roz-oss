@@ -207,7 +207,11 @@ async fn main() {
     let operator_seed = std::env::var("NATS_OPERATOR_SEED").ok();
 
     let nats_client = if let Ok(nats_url) = std::env::var("NATS_URL") {
-        match async_nats::connect(&nats_url).await {
+        match async_nats::ConnectOptions::new()
+            .retry_on_initial_connect()
+            .connect(&nats_url)
+            .await
+        {
             Ok(client) => {
                 tracing::info!(nats_url, "connected to NATS");
                 Some(client)
@@ -263,6 +267,55 @@ async fn main() {
             state.restate_ingress_url.clone(),
             state.http_client.clone(),
         );
+    }
+
+    // Serve Restate TaskWorkflow endpoint on a separate port for service discovery.
+    let restate_port: u16 = std::env::var("RESTATE_ENDPOINT_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(9080);
+    {
+        use restate_sdk::endpoint::Endpoint;
+        use restate_sdk::http_server::HttpServer;
+        use roz_server::restate::task_workflow::TaskWorkflow;
+
+        let endpoint = Endpoint::builder()
+            .bind(roz_server::restate::TaskWorkflowImpl.serve())
+            .build();
+
+        let restate_addr = format!("[::]:{restate_port}");
+        match tokio::net::TcpListener::bind(&restate_addr).await {
+            Ok(listener) => {
+                tracing::info!("Restate TaskWorkflow endpoint on {restate_addr}");
+                tokio::spawn(async move {
+                    HttpServer::new(endpoint).serve(listener).await;
+                });
+            }
+            Err(e) => {
+                tracing::warn!(restate_addr, error = %e, "failed to bind Restate endpoint, continuing without");
+            }
+        }
+    }
+
+    // Register deployment with Restate admin API if configured.
+    if let Ok(admin_url) = std::env::var("RESTATE_ADMIN_URL") {
+        let client = state.http_client.clone();
+        tokio::spawn(async move {
+            let deployment_uri =
+                std::env::var("RESTATE_DEPLOYMENT_URI").unwrap_or_else(|_| format!("http://localhost:{restate_port}"));
+            let resp = client
+                .post(format!("{admin_url}/deployments"))
+                .json(&serde_json::json!({"uri": deployment_uri}))
+                .send()
+                .await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    tracing::info!("registered TaskWorkflow with Restate");
+                }
+                Ok(r) => tracing::warn!(status = %r.status(), "failed to register with Restate"),
+                Err(e) => tracing::warn!(error = %e, "could not reach Restate admin"),
+            }
+        });
     }
 
     let grpc = grpc_router(&state);

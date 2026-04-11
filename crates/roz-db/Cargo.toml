@@ -21,6 +21,10 @@ hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[[bin]]
+name = "seed_dev"
+path = "src/bin/seed_dev.rs"
+
 [dev-dependencies]
 roz-test = { path = "../roz-test" }
 

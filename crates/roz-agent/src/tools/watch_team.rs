@@ -19,7 +19,7 @@
 use async_nats::jetstream::{Context as JetStreamContext, consumer::pull};
 use async_trait::async_trait;
 use futures::StreamExt as _;
-use roz_core::team::TeamEvent;
+use roz_core::team::{SequencedTeamEvent, TeamEvent};
 use roz_core::tools::ToolResult;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -203,14 +203,14 @@ impl TypedToolExecutor for WatchTeamTool {
                 }
             };
 
-            // Deserialize the payload.
-            let event: TeamEvent = match serde_json::from_slice(&msg.payload) {
-                Ok(ev) => ev,
+            // Deserialize the payload (published as SequencedTeamEvent).
+            let event: TeamEvent = match serde_json::from_slice::<SequencedTeamEvent>(&msg.payload) {
+                Ok(seq_ev) => seq_ev.event,
                 Err(e) => {
                     tracing::warn!(
                         parent_task_id = %self.parent_task_id,
                         error = %e,
-                        "watch_team: failed to decode TeamEvent, acking and skipping"
+                        "watch_team: failed to decode SequencedTeamEvent, acking and skipping"
                     );
                     // Ack bad messages so they don't block the consumer.
                     if let Err(ack_err) = msg.ack().await {
@@ -356,9 +356,8 @@ mod tests {
     #[ignore = "requires live NATS JetStream; \
                 run: docker run -d -p 4222:4222 nats -js && cargo test ... -- --ignored"]
     async fn watch_team_execute_with_no_events_returns_empty_array() {
-        let nats = async_nats::connect("nats://localhost:4222")
-            .await
-            .expect("connect to NATS");
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
+        let nats = async_nats::connect(&nats_url).await.expect("connect to NATS");
         let js = async_nats::jetstream::new(nats);
 
         // Create the stream so get_stream() succeeds.
