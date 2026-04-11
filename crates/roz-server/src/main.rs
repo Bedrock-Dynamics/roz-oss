@@ -207,7 +207,11 @@ async fn main() {
     let operator_seed = std::env::var("NATS_OPERATOR_SEED").ok();
 
     let nats_client = if let Ok(nats_url) = std::env::var("NATS_URL") {
-        match async_nats::connect(&nats_url).await {
+        match async_nats::ConnectOptions::new()
+            .retry_on_initial_connect()
+            .connect(&nats_url)
+            .await
+        {
             Ok(client) => {
                 tracing::info!(nats_url, "connected to NATS");
                 Some(client)
