@@ -178,15 +178,20 @@ fn init_tracing() -> Option<logfire::ShutdownGuard> {
 async fn main() {
     let _logfire_guard = init_tracing();
 
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "roz-server starting");
+
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let pool = roz_db::create_pool(&database_url).await.expect("Failed to create pool");
 
-    match roz_db::run_migrations(&pool).await {
-        Ok(()) => tracing::info!("Database migrations applied successfully"),
-        Err(err) => {
-            // In production, migrations are managed externally via Supabase.
-            // A failure here likely means they were already applied out-of-band.
-            tracing::warn!("Migration runner error (may be externally managed): {err}");
+    if std::env::var("ROZ_SKIP_MIGRATIONS").is_ok_and(|v| !v.is_empty()) {
+        tracing::info!("ROZ_SKIP_MIGRATIONS is set — skipping database migrations");
+    } else {
+        match roz_db::run_migrations(&pool).await {
+            Ok(()) => tracing::info!("Database migrations applied successfully"),
+            Err(err) => {
+                tracing::error!(error = %err, "database migration failed — aborting startup");
+                std::process::exit(1);
+            }
         }
     }
 
@@ -225,6 +230,16 @@ async fn main() {
         tracing::info!("NATS_URL not set — task dispatch via NATS disabled");
         None
     };
+
+    if nats_client.is_some() && operator_seed.is_none() {
+        let env = std::env::var("ROZ_ENVIRONMENT").unwrap_or_else(|_| "development".into());
+        if env != "dev" && env != "development" {
+            tracing::warn!(
+                environment = %env,
+                "NATS connection has no operator credentials — messages are unauthenticated"
+            );
+        }
+    }
 
     let model_config = ModelConfig {
         gateway_url: std::env::var("ROZ_GATEWAY_URL").unwrap_or_else(|_| "https://gateway-us.pydantic.dev".into()),
