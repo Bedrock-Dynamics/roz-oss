@@ -40,6 +40,7 @@ impl IntoResponse for AppError {
             RozError::Recording(_) | RozError::TrustVerification(_) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, self.0.to_string())
             }
+            RozError::ServiceUnavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, self.0.to_string()),
             RozError::InvalidFrame(_)
             | RozError::InvalidUnit(_)
             | RozError::LeaseNotHeld { .. }
@@ -57,7 +58,14 @@ impl From<roz_core::errors::RozError> for AppError {
 
 impl From<sqlx::Error> for AppError {
     fn from(err: sqlx::Error) -> Self {
-        tracing::error!(error = %err, "database error");
-        Self::internal("internal server error")
+        if matches!(&err, sqlx::Error::PoolTimedOut) {
+            tracing::error!("database pool timed out");
+            Self(roz_core::errors::RozError::ServiceUnavailable(
+                "service temporarily unavailable".into(),
+            ))
+        } else {
+            tracing::error!(error = %err, "database error");
+            Self::internal("internal server error")
+        }
     }
 }
