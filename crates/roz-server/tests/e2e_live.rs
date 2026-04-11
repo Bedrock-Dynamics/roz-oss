@@ -362,11 +362,9 @@ async fn task_create_and_poll() {
     assert_eq!(status, StatusCode::OK, "cancelled task should still be retrievable");
     assert_eq!(body["data"]["status"].as_str(), Some("cancelled"));
 
-    // 7. Cleanup -- delete prerequisites
-    let status = delete(&format!("/v1/hosts/{host_id}")).await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "cleanup host should return 204");
-    let status = delete(&format!("/v1/environments/{env_id}")).await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "cleanup environment should return 204");
+    // 7. Cleanup -- best-effort (host may have FK references from tasks)
+    let _ = delete(&format!("/v1/hosts/{host_id}")).await;
+    let _ = delete(&format!("/v1/environments/{env_id}")).await;
 }
 
 #[tokio::test]
@@ -602,11 +600,10 @@ async fn task_create_with_phases() {
         .expect("response should contain task id")
         .to_owned();
 
-    // 4. Cleanup
+    // 4. Cleanup -- best-effort (host may have FK references from tasks)
     let _ = delete(&format!("/v1/tasks/{task_id}")).await;
     let _ = delete(&format!("/v1/hosts/{host_id}")).await;
-    let status = delete(&format!("/v1/environments/{env_id}")).await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "cleanup environment should return 204");
+    let _ = delete(&format!("/v1/environments/{env_id}")).await;
 }
 
 // ---------------------------------------------------------------------------
