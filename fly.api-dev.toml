@@ -46,3 +46,8 @@ kill_timeout = "5s"
   timeout = "5s"
 
 # gRPC is now multiplexed with REST on [http_service] port via h2_backend
+
+# Restate TaskWorkflow endpoint (internal only, for Restate service discovery)
+[[services]]
+  internal_port = 9080
+  protocol = "tcp"
