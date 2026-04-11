@@ -45,16 +45,13 @@ where
         let offset = raw.offset.unwrap_or(0);
 
         if !(1..=MAX_LIMIT).contains(&limit) {
-            return Err(AppError::bad_request(format!(
-                "limit must be between 1 and {MAX_LIMIT}, got {limit}"
-            ))
-            .into_response());
+            return Err(
+                AppError::bad_request(format!("limit must be between 1 and {MAX_LIMIT}, got {limit}")).into_response(),
+            );
         }
 
         if offset < 0 {
-            return Err(
-                AppError::bad_request(format!("offset must be >= 0, got {offset}")).into_response()
-            );
+            return Err(AppError::bad_request(format!("offset must be >= 0, got {offset}")).into_response());
         }
 
         Ok(Self { limit, offset })
@@ -72,9 +69,7 @@ mod tests {
         let offset_val = offset.unwrap_or(0);
 
         if !(1..=MAX_LIMIT).contains(&limit_val) {
-            return Err(format!(
-                "limit must be between 1 and {MAX_LIMIT}, got {limit_val}"
-            ));
+            return Err(format!("limit must be between 1 and {MAX_LIMIT}, got {limit_val}"));
         }
 
         if offset_val < 0 {

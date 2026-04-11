@@ -1,7 +1,7 @@
 use async_nats::jetstream::Context as JetStreamContext;
 use axum::Extension;
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use roz_core::auth::AuthIdentity;
 use roz_core::phases::PhaseSpec;
@@ -11,6 +11,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::extractors::pagination::ValidatedPagination;
 use crate::middleware::tx::Tx;
 use crate::state::AppState;
 
@@ -30,18 +31,6 @@ pub struct CreateTaskRequest {
     pub control_interface_manifest: Option<roz_core::embodiment::binding::ControlInterfaceManifest>,
     /// Optional inherited delegation scope forwarded to the worker invocation.
     pub delegation_scope: Option<roz_core::tasks::DelegationScope>,
-}
-
-#[derive(Deserialize)]
-pub struct PaginationParams {
-    #[serde(default = "default_limit")]
-    pub limit: i64,
-    #[serde(default)]
-    pub offset: i64,
-}
-
-const fn default_limit() -> i64 {
-    50
 }
 
 fn mode_from_phases(phases: &[PhaseSpec]) -> roz_nats::dispatch::ExecutionMode {
@@ -271,15 +260,15 @@ pub async fn approve(
 }
 
 /// GET /v1/tasks
-#[tracing::instrument(name = "tasks.list", skip(tx, auth, params), fields(tenant_id))]
+#[tracing::instrument(name = "tasks.list", skip(tx, auth, pagination), fields(tenant_id))]
 pub async fn list(
     mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
-    Query(params): Query<PaginationParams>,
+    pagination: ValidatedPagination,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
     tracing::Span::current().record("tenant_id", tracing::field::display(tenant_id));
-    let tasks = roz_db::tasks::list(&mut **tx, tenant_id, params.limit, params.offset).await?;
+    let tasks = roz_db::tasks::list(&mut **tx, tenant_id, pagination.limit, pagination.offset).await?;
     Ok(Json(json!({"data": tasks})))
 }
 
