@@ -65,12 +65,21 @@ async fn apply_task_status_event(pool: &PgPool, event: &TaskStatusEvent) {
     }
 
     if event.status == "running" {
-        if let Err(error) = roz_db::tasks::ensure_active_run(pool, event.task_id, event.host_id).await {
-            tracing::warn!(%error, task_id = %event.task_id, "failed to ensure active task run");
+        match pool.acquire().await {
+            Ok(mut conn) => {
+                if let Err(error) = roz_db::tasks::ensure_active_run(&mut conn, event.task_id, event.host_id).await {
+                    tracing::warn!(%error, task_id = %event.task_id, "failed to ensure active task run");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, task_id = %event.task_id, "failed to acquire connection for ensure_active_run");
+            }
         }
     } else if is_terminal_task_status(&event.status) {
-        if matches!(roz_db::tasks::active_run_for_task(pool, event.task_id).await, Ok(None)) {
-            let _ = roz_db::tasks::ensure_active_run(pool, event.task_id, event.host_id).await;
+        if matches!(roz_db::tasks::active_run_for_task(pool, event.task_id).await, Ok(None))
+            && let Ok(mut conn) = pool.acquire().await
+        {
+            let _ = roz_db::tasks::ensure_active_run(&mut conn, event.task_id, event.host_id).await;
         }
         if let Err(error) =
             roz_db::tasks::complete_active_run_for_task(pool, event.task_id, &event.status, event.detail.as_deref())
@@ -132,8 +141,24 @@ async fn spawn_task_handler(nats: NatsClient, pool: PgPool, restate_ingress_url:
             }
         };
 
+        // Wrap DB call in a transaction with RLS tenant context.
+        // The tenant_id comes from the NATS payload (untrusted), so RLS
+        // enforcement via set_tenant_context is essential.
+        let mut tx = match pool.begin().await {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to begin tx for internal spawn");
+                send_error(&nats, &reply_subject, &format!("tx begin failed: {e}")).await;
+                continue;
+            }
+        };
+        if let Err(e) = roz_db::set_tenant_context(&mut *tx, &req.tenant_id).await {
+            tracing::error!(error = %e, tenant_id = %req.tenant_id, "failed to set tenant context");
+            send_error(&nats, &reply_subject, &format!("tenant context failed: {e}")).await;
+            continue;
+        }
         let task = match roz_db::tasks::create(
-            &pool,
+            &mut *tx,
             req.tenant_id,
             &req.prompt,
             req.environment_id,
@@ -143,7 +168,14 @@ async fn spawn_task_handler(nats: NatsClient, pool: PgPool, restate_ingress_url:
         )
         .await
         {
-            Ok(t) => t,
+            Ok(t) => {
+                if let Err(e) = tx.commit().await {
+                    tracing::error!(error = %e, "failed to commit spawn tx");
+                    send_error(&nats, &reply_subject, &format!("commit failed: {e}")).await;
+                    continue;
+                }
+                t
+            }
             Err(e) => {
                 tracing::error!(
                     error = %e,

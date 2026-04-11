@@ -1,6 +1,6 @@
 use axum::Extension;
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use roz_core::auth::AuthIdentity;
 use serde::Deserialize;
@@ -8,7 +8,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::state::AppState;
+use crate::middleware::tx::Tx;
 
 #[derive(Deserialize)]
 pub struct CreateTriggerRequest {
@@ -46,13 +46,13 @@ const fn default_limit() -> i64 {
 
 /// POST /v1/triggers
 pub async fn create(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Json(body): Json<CreateTriggerRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
     let trigger = roz_db::triggers::create(
-        &state.pool,
+        &mut **tx,
         tenant_id,
         &body.name,
         &body.trigger_type,
@@ -66,23 +66,23 @@ pub async fn create(
 
 /// GET /v1/triggers
 pub async fn list(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
-    let triggers = roz_db::triggers::list(&state.pool, tenant_id, params.limit, params.offset).await?;
+    let triggers = roz_db::triggers::list(&mut **tx, tenant_id, params.limit, params.offset).await?;
     Ok(Json(json!({"data": triggers})))
 }
 
 /// GET /v1/triggers/:id
 pub async fn get(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
-    let trigger = roz_db::triggers::get_by_id(&state.pool, id)
+    let trigger = roz_db::triggers::get_by_id(&mut **tx, id)
         .await?
         .ok_or_else(|| AppError::not_found("trigger not found"))?;
     if trigger.tenant_id != tenant_id {
@@ -93,20 +93,20 @@ pub async fn get(
 
 /// PUT /v1/triggers/:id
 pub async fn update(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateTriggerRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
-    let existing = roz_db::triggers::get_by_id(&state.pool, id)
+    let existing = roz_db::triggers::get_by_id(&mut **tx, id)
         .await?
         .ok_or_else(|| AppError::not_found("trigger not found"))?;
     if existing.tenant_id != tenant_id {
         return Err(AppError::not_found("trigger not found"));
     }
     let trigger = roz_db::triggers::update(
-        &state.pool,
+        &mut **tx,
         id,
         body.name.as_deref(),
         body.config.as_ref(),
@@ -119,19 +119,19 @@ pub async fn update(
 
 /// POST /v1/triggers/:id/toggle
 pub async fn toggle(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Path(id): Path<Uuid>,
     Json(body): Json<ToggleRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
-    let existing = roz_db::triggers::get_by_id(&state.pool, id)
+    let existing = roz_db::triggers::get_by_id(&mut **tx, id)
         .await?
         .ok_or_else(|| AppError::not_found("trigger not found"))?;
     if existing.tenant_id != tenant_id {
         return Err(AppError::not_found("trigger not found"));
     }
-    let trigger = roz_db::triggers::toggle(&state.pool, id, body.enabled)
+    let trigger = roz_db::triggers::toggle(&mut **tx, id, body.enabled)
         .await?
         .ok_or_else(|| AppError::not_found("trigger not found"))?;
     Ok(Json(json!({"data": trigger})))
@@ -139,17 +139,17 @@ pub async fn toggle(
 
 /// DELETE /v1/triggers/:id
 pub async fn delete(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
-    let trigger = roz_db::triggers::get_by_id(&state.pool, id)
+    let trigger = roz_db::triggers::get_by_id(&mut **tx, id)
         .await?
         .ok_or_else(|| AppError::not_found("trigger not found"))?;
     if trigger.tenant_id != tenant_id {
         return Err(AppError::not_found("trigger not found"));
     }
-    roz_db::triggers::delete(&state.pool, id).await?;
+    roz_db::triggers::delete(&mut **tx, id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

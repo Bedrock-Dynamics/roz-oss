@@ -1,4 +1,3 @@
-use sqlx::PgPool;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -13,45 +12,57 @@ pub struct DeviceCodeRow {
 }
 
 /// Insert a new device authorization code.
-pub async fn create_device_code(
-    pool: &PgPool,
+pub async fn create_device_code<'e, E>(
+    executor: E,
     device_code: &str,
     user_code: &str,
     expires_at: chrono::DateTime<chrono::Utc>,
-) -> Result<DeviceCodeRow, sqlx::Error> {
+) -> Result<DeviceCodeRow, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, DeviceCodeRow>(
         "INSERT INTO roz_device_codes (device_code, user_code, expires_at) VALUES ($1, $2, $3) RETURNING *",
     )
     .bind(device_code)
     .bind(user_code)
     .bind(expires_at)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
 /// Fetch a device code row by its opaque device code.
-pub async fn get_by_device_code(pool: &PgPool, device_code: &str) -> Result<Option<DeviceCodeRow>, sqlx::Error> {
+pub async fn get_by_device_code<'e, E>(executor: E, device_code: &str) -> Result<Option<DeviceCodeRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, DeviceCodeRow>("SELECT * FROM roz_device_codes WHERE device_code = $1")
         .bind(device_code)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
 }
 
 /// Fetch a device code row by the human-readable user code.
-pub async fn get_by_user_code(pool: &PgPool, user_code: &str) -> Result<Option<DeviceCodeRow>, sqlx::Error> {
+pub async fn get_by_user_code<'e, E>(executor: E, user_code: &str) -> Result<Option<DeviceCodeRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, DeviceCodeRow>("SELECT * FROM roz_device_codes WHERE user_code = $1")
         .bind(user_code)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
 }
 
 /// Mark a device code as completed, linking it to the authenticated user.
-pub async fn complete_device_code(
-    pool: &PgPool,
+pub async fn complete_device_code<'e, E>(
+    executor: E,
     user_code: &str,
     user_id: &str,
     tenant_id: Uuid,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let result = sqlx::query(
         "UPDATE roz_device_codes SET user_id = $1, tenant_id = $2, completed_at = now() \
          WHERE user_code = $3 AND completed_at IS NULL AND expires_at > now()",
@@ -59,20 +70,23 @@ pub async fn complete_device_code(
     .bind(user_id)
     .bind(tenant_id)
     .bind(user_code)
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     Ok(result.rows_affected() > 0)
 }
 
 /// Best-effort cleanup for expired or completed device codes.
-pub async fn purge_stale_device_codes(pool: &PgPool) -> Result<u64, sqlx::Error> {
+pub async fn purge_stale_device_codes<'e, E>(executor: E) -> Result<u64, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let result = sqlx::query(
         "DELETE FROM roz_device_codes \
          WHERE expires_at < now() \
             OR (completed_at IS NOT NULL AND completed_at < now() - interval '1 hour')",
     )
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     Ok(result.rows_affected())
@@ -81,6 +95,7 @@ pub async fn purge_stale_device_codes(pool: &PgPool) -> Result<u64, sqlx::Error>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::PgPool;
     async fn setup() -> PgPool {
         crate::shared_test_pool().await
     }

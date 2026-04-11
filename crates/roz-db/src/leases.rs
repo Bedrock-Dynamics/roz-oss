@@ -1,4 +1,3 @@
-use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Row type matching the `roz_capability_leases` schema exactly.
@@ -16,14 +15,17 @@ pub struct LeaseRow {
 
 /// Acquire a new capability lease with a TTL in seconds.
 /// Sets `expires_at = now() + make_interval(secs => ttl_secs)`.
-pub async fn acquire(
-    pool: &PgPool,
+pub async fn acquire<'e, E>(
+    executor: E,
     tenant_id: Uuid,
     host_id: Uuid,
     resource: &str,
     holder_id: &str,
     ttl_secs: i64,
-) -> Result<LeaseRow, sqlx::Error> {
+) -> Result<LeaseRow, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     #[allow(clippy::cast_precision_loss)] // TTL values are always small enough for f64
     let ttl = ttl_secs as f64;
     sqlx::query_as::<_, LeaseRow>(
@@ -35,22 +37,28 @@ pub async fn acquire(
     .bind(resource)
     .bind(holder_id)
     .bind(ttl)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
 /// Fetch a single lease by primary key, or `None` if not found.
-pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Option<LeaseRow>, sqlx::Error> {
+pub async fn get_by_id<'e, E>(executor: E, id: Uuid) -> Result<Option<LeaseRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, LeaseRow>("SELECT * FROM roz_capability_leases WHERE id = $1")
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
 }
 
 /// Release a lease by setting `released_at = now()`.
 /// Only releases if not already released. Returns `None` when the row does not exist
 /// or is already released.
-pub async fn release(pool: &PgPool, id: Uuid) -> Result<Option<LeaseRow>, sqlx::Error> {
+pub async fn release<'e, E>(executor: E, id: Uuid) -> Result<Option<LeaseRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, LeaseRow>(
         "UPDATE roz_capability_leases \
          SET released_at = now() \
@@ -58,32 +66,38 @@ pub async fn release(pool: &PgPool, id: Uuid) -> Result<Option<LeaseRow>, sqlx::
          RETURNING *",
     )
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
 /// List active leases for a tenant (not released and not yet expired).
 /// Includes `tenant_id` filter for defense-in-depth (don't rely solely on RLS).
-pub async fn list_active(pool: &PgPool, tenant_id: Uuid) -> Result<Vec<LeaseRow>, sqlx::Error> {
+pub async fn list_active<'e, E>(executor: E, tenant_id: Uuid) -> Result<Vec<LeaseRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, LeaseRow>(
         "SELECT * FROM roz_capability_leases \
          WHERE tenant_id = $1 AND released_at IS NULL AND expires_at > now() \
          ORDER BY acquired_at DESC",
     )
     .bind(tenant_id)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
 /// Expire stale leases: set `released_at = now()` for all leases where
 /// `released_at IS NULL AND expires_at <= now()`. Returns the number of rows affected.
-pub async fn expire_stale(pool: &PgPool) -> Result<u64, sqlx::Error> {
+pub async fn expire_stale<'e, E>(executor: E) -> Result<u64, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let result = sqlx::query(
         "UPDATE roz_capability_leases \
          SET released_at = now() \
          WHERE released_at IS NULL AND expires_at <= now()",
     )
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(result.rows_affected())
 }
@@ -91,6 +105,7 @@ pub async fn expire_stale(pool: &PgPool) -> Result<u64, sqlx::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::PgPool;
     async fn setup() -> PgPool {
         crate::shared_test_pool().await
     }

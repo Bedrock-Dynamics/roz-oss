@@ -11,6 +11,8 @@ use uuid::Uuid;
 pub const INTERNAL_APPROVAL_SUBJECT_PREFIX: &str = "roz.internal.tasks.approval";
 /// Internal NATS subject prefix used to report task lifecycle transitions back to the server.
 pub const INTERNAL_TASK_STATUS_SUBJECT_PREFIX: &str = "roz.internal.tasks.status";
+/// Internal NATS subject prefix for embodiment change notifications.
+pub const INTERNAL_EMBODIMENT_CHANGED_PREFIX: &str = "roz.internal.embodiment.changed";
 
 /// Subject carrying approval responses for a specific task.
 #[must_use]
@@ -22,6 +24,20 @@ pub fn approval_subject(task_id: Uuid) -> String {
 #[must_use]
 pub fn task_status_subject(task_id: Uuid) -> String {
     format!("{INTERNAL_TASK_STATUS_SUBJECT_PREFIX}.{task_id}")
+}
+
+/// Subject carrying embodiment change events for a specific host.
+#[must_use]
+pub fn embodiment_changed_subject(host_id: Uuid) -> String {
+    format!("{INTERNAL_EMBODIMENT_CHANGED_PREFIX}.{host_id}")
+}
+
+/// Wire event published when a host's embodiment data changes.
+/// Subscribers receive this to know they should re-read from DB.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmbodimentChangedEvent {
+    pub host_id: Uuid,
+    pub tenant_id: Uuid,
 }
 
 /// Wire event published by workers as task execution progresses.
@@ -426,6 +442,20 @@ mod tests {
         assert_eq!(
             approval_subject(task_id),
             format!("{INTERNAL_APPROVAL_SUBJECT_PREFIX}.{task_id}")
+        );
+    }
+
+    #[test]
+    fn embodiment_changed_event_roundtrip() {
+        let host_id = Uuid::new_v4();
+        let tenant_id = Uuid::new_v4();
+        let event = EmbodimentChangedEvent { host_id, tenant_id };
+        let bytes = serde_json::to_vec(&event).expect("serialize");
+        let deserialized: EmbodimentChangedEvent = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(deserialized, event);
+        assert_eq!(
+            embodiment_changed_subject(host_id),
+            format!("{INTERNAL_EMBODIMENT_CHANGED_PREFIX}.{host_id}")
         );
     }
 }

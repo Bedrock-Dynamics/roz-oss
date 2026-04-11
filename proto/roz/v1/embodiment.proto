@@ -1,0 +1,724 @@
+syntax = "proto3";
+
+package roz.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Service for querying robot embodiment models, runtime configurations,
+// and channel binding validation. Used by substrate-ide to fetch the
+// complete physical model for visualization and control interface binding.
+service EmbodimentService {
+  // Returns the full embodiment model for a host's robot.
+  rpc GetModel(GetModelRequest) returns (EmbodimentModel);
+  // Returns the compiled runtime (model + calibration + safety overlays).
+  rpc GetRuntime(GetRuntimeRequest) returns (EmbodimentRuntime);
+  // Lists channel bindings for a host's embodiment.
+  rpc ListBindings(ListBindingsRequest) returns (ListBindingsResponse);
+  // Validates channel bindings against the embodiment model.
+  rpc ValidateBindings(ValidateBindingsRequest) returns (ValidateBindingsResponse);
+  // Returns the retargeting map (canonical-to-local joint mapping) for a host.
+  rpc GetRetargetingMap(GetRetargetingMapRequest) returns (GetRetargetingMapResponse);
+  // Returns the control interface manifest for a host.
+  rpc GetManifest(GetManifestRequest) returns (GetManifestResponse);
+  // Streams frame tree structural changes for a host. Per D-07, D-04, D-05.
+  rpc StreamFrameTree(StreamFrameTreeRequest) returns (stream StreamFrameTreeResponse);
+  // Streams calibration overlay changes for a host. Per D-08.
+  rpc WatchCalibration(WatchCalibrationRequest) returns (stream WatchCalibrationResponse);
+}
+
+// ---------------------------------------------------------------------------
+// RPC request/response messages
+// ---------------------------------------------------------------------------
+
+// Request for the full embodiment model of a host's robot.
+message GetModelRequest {
+  string host_id = 1;
+}
+
+// Request for the compiled runtime of a host's robot.
+message GetRuntimeRequest {
+  string host_id = 1;
+}
+
+// Request for the channel bindings of a host's embodiment.
+message ListBindingsRequest {
+  string host_id = 1;
+}
+
+// Response containing all channel bindings for a host's embodiment.
+message ListBindingsResponse {
+  repeated ChannelBinding bindings = 1;
+}
+
+// Request to validate channel bindings against the embodiment model.
+message ValidateBindingsRequest {
+  string host_id = 1;
+}
+
+// Response with binding validation results.
+message ValidateBindingsResponse {
+  bool valid = 1;
+  repeated UnboundChannel unbound_channels = 2;
+}
+
+// Request for the retargeting map of a host's embodiment.
+message GetRetargetingMapRequest {
+  string host_id = 1;
+}
+
+// Response containing the retargeting map and coverage metadata.
+message GetRetargetingMapResponse {
+  RetargetingMap retargeting_map = 1;
+  uint32 mapped_count = 2;
+  uint32 total_binding_count = 3;
+}
+
+// Request for the control interface manifest of a host's embodiment.
+message GetManifestRequest {
+  string host_id = 1;
+}
+
+// Response containing the control interface manifest.
+message GetManifestResponse {
+  ControlInterfaceManifest manifest = 1;
+}
+
+// A channel that could not be bound during validation.
+// Maps to `binding::UnboundChannel` in roz-core.
+message UnboundChannel {
+  string physical_name = 1;
+  BindingType binding_type = 2;
+  string reason = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Geometry primitives
+// ---------------------------------------------------------------------------
+
+// 3D vector. Maps to `[f64; 3]` in Rust.
+message Vec3 {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+}
+
+// Unit quaternion in XYZW field order.
+// Note: Rust stores quaternions as [w, x, y, z] (WXYZ). The conversion
+// layer (Phase 2) handles the reordering.
+message Quaternion {
+  double x = 1;
+  double y = 2;
+  double z = 3;
+  double w = 4;
+}
+
+// Rigid 3D transform: translation + quaternion rotation.
+// Maps to `frame_tree::Transform3D` in roz-core.
+message Transform3D {
+  Vec3 translation = 1;
+  Quaternion rotation = 2;
+  uint64 timestamp_ns = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+// Type of joint in the kinematic chain.
+// Maps to `model::JointType` in roz-core.
+enum JointType {
+  JOINT_TYPE_UNSPECIFIED = 0;
+  JOINT_TYPE_REVOLUTE = 1;
+  JOINT_TYPE_PRISMATIC = 2;
+  JOINT_TYPE_FIXED = 3;
+  JOINT_TYPE_CONTINUOUS = 4;
+}
+
+// Type of tool center point.
+// Maps to `model::TcpType` in roz-core.
+enum TcpType {
+  TCP_TYPE_UNSPECIFIED = 0;
+  TCP_TYPE_GRIPPER = 1;
+  TCP_TYPE_TOOL = 2;
+  TCP_TYPE_SENSOR = 3;
+  TCP_TYPE_CUSTOM = 4;
+}
+
+// Type of sensor mounted on the robot.
+// Maps to `model::SensorType` in roz-core.
+enum SensorType {
+  SENSOR_TYPE_UNSPECIFIED = 0;
+  SENSOR_TYPE_JOINT_STATE = 1;
+  SENSOR_TYPE_FORCE_TORQUE = 2;
+  SENSOR_TYPE_IMU = 3;
+  SENSOR_TYPE_CAMERA = 4;
+  SENSOR_TYPE_POINT_CLOUD = 5;
+  SENSOR_TYPE_OTHER = 6;
+}
+
+// Type of workspace zone.
+// Maps to `workspace::ZoneType` in roz-core.
+enum ZoneType {
+  ZONE_TYPE_UNSPECIFIED = 0;
+  ZONE_TYPE_ALLOWED = 1;
+  ZONE_TYPE_RESTRICTED = 2;
+  ZONE_TYPE_HUMAN_PRESENCE = 3;
+}
+
+// Where a frame's transform comes from.
+// Maps to `frame_tree::FrameSource` in roz-core.
+enum FrameSource {
+  FRAME_SOURCE_UNSPECIFIED = 0;
+  FRAME_SOURCE_STATIC = 1;
+  FRAME_SOURCE_DYNAMIC = 2;
+  FRAME_SOURCE_COMPUTED = 3;
+}
+
+// What kind of data a channel carries.
+// Maps to `binding::BindingType` in roz-core.
+enum BindingType {
+  BINDING_TYPE_UNSPECIFIED = 0;
+  BINDING_TYPE_JOINT_POSITION = 1;
+  BINDING_TYPE_JOINT_VELOCITY = 2;
+  BINDING_TYPE_FORCE_TORQUE = 3;
+  BINDING_TYPE_COMMAND = 4;
+  BINDING_TYPE_GRIPPER_POSITION = 5;
+  BINDING_TYPE_GRIPPER_FORCE = 6;
+  BINDING_TYPE_IMU_ORIENTATION = 7;
+  BINDING_TYPE_IMU_ANGULAR_VELOCITY = 8;
+  BINDING_TYPE_IMU_LINEAR_ACCELERATION = 9;
+}
+
+// What kind of command interface a control channel provides.
+// Maps to `binding::CommandInterfaceType` in roz-core.
+enum CommandInterfaceType {
+  COMMAND_INTERFACE_TYPE_UNSPECIFIED = 0;
+  COMMAND_INTERFACE_TYPE_JOINT_VELOCITY = 1;
+  COMMAND_INTERFACE_TYPE_JOINT_POSITION = 2;
+  COMMAND_INTERFACE_TYPE_JOINT_TORQUE = 3;
+  COMMAND_INTERFACE_TYPE_GRIPPER_POSITION = 4;
+  COMMAND_INTERFACE_TYPE_GRIPPER_FORCE = 5;
+  COMMAND_INTERFACE_TYPE_FORCE_TORQUE_SENSOR = 6;
+  COMMAND_INTERFACE_TYPE_IMU_SENSOR = 7;
+}
+
+// ---------------------------------------------------------------------------
+// Core model messages
+// ---------------------------------------------------------------------------
+
+// The canonical embodiment model describing a robot's physical structure.
+// Maps to `model::EmbodimentModel` in roz-core.
+message EmbodimentModel {
+  string model_id = 1;
+  // SHA-256 digest computed from canonical serialization.
+  string model_digest = 2;
+  // Cross-embodiment family for retargeting. Optional in Rust.
+  optional EmbodimentFamily embodiment_family = 3;
+  repeated Link links = 4;
+  repeated Joint joints = 5;
+  FrameTree frame_tree = 6;
+  repeated CollisionBody collision_bodies = 7;
+  // Maps to Vec<(String, String)> -- each pair is a CollisionPair.
+  repeated CollisionPair allowed_collision_pairs = 8;
+  repeated ToolCenterPoint tcps = 9;
+  repeated SensorMount sensor_mounts = 10;
+  repeated WorkspaceZone workspace_zones = 11;
+  repeated string watched_frames = 12;
+  repeated ChannelBinding channel_bindings = 13;
+}
+
+// Wrapper for a (String, String) collision pair tuple.
+message CollisionPair {
+  string link_a = 1;
+  string link_b = 2;
+}
+
+// Cross-embodiment family identifier for skill transfer.
+// Maps to `model::EmbodimentFamily` in roz-core.
+message EmbodimentFamily {
+  string family_id = 1;
+  string description = 2;
+}
+
+// Bidirectional mapping between canonical action space and local robot channels.
+// Maps to `retargeting::RetargetingMap` in roz-core.
+//
+// Invariant (enforced by the server, not checked at the proto layer):
+//   local_to_canonical == inverse(canonical_to_local)
+// i.e. for every (k, v) in canonical_to_local there must be a matching
+// (v, k) in local_to_canonical, and vice versa. Violating this invariant
+// will cause retargeting to produce undefined behavior at runtime.
+message RetargetingMap {
+  EmbodimentFamily embodiment_family = 1;
+  map<string, string> canonical_to_local = 2;
+  map<string, string> local_to_canonical = 3;
+}
+
+// A joint connecting two links in the kinematic chain.
+// Maps to `model::Joint` in roz-core.
+message Joint {
+  string name = 1;
+  JointType joint_type = 2;
+  string parent_link = 3;
+  string child_link = 4;
+  Vec3 axis = 5;
+  Transform3D origin = 6;
+  JointSafetyLimits limits = 7;
+}
+
+// A rigid link in the kinematic chain.
+// Maps to `model::Link` in roz-core.
+message Link {
+  string name = 1;
+  // Optional parent joint name. Absent for root links.
+  optional string parent_joint = 2;
+  optional Inertial inertial = 3;
+  Geometry visual_geometry = 4;
+  Geometry collision_geometry = 5;
+}
+
+// Inertial properties of a link.
+// Maps to `model::Inertial` in roz-core.
+message Inertial {
+  double mass = 1;
+  Vec3 center_of_mass = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Geometry oneof
+// ---------------------------------------------------------------------------
+
+// Geometry specification for visual and collision shapes.
+// Maps to `model::Geometry` enum in roz-core.
+message Geometry {
+  oneof shape {
+    BoxGeometry box = 1;
+    SphereGeometry sphere = 2;
+    CylinderGeometry cylinder = 3;
+    MeshGeometry mesh = 4;
+  }
+}
+
+// Box geometry defined by half-extents.
+// Maps to `Geometry::Box { half_extents: [f64; 3] }` in roz-core.
+message BoxGeometry {
+  double half_extent_x = 1;
+  double half_extent_y = 2;
+  double half_extent_z = 3;
+}
+
+// Sphere geometry defined by radius.
+// Maps to `Geometry::Sphere { radius: f64 }` in roz-core.
+message SphereGeometry {
+  double radius = 1;
+}
+
+// Cylinder geometry defined by radius and length.
+// Maps to `Geometry::Cylinder { radius, length }` in roz-core.
+message CylinderGeometry {
+  double radius = 1;
+  double length = 2;
+}
+
+// Mesh geometry with optional scale factor.
+// Maps to `Geometry::Mesh { path, scale: Option<[f64; 3]> }` in roz-core.
+message MeshGeometry {
+  string path = 1;
+  // Optional scale factor. Absent means default (1,1,1).
+  optional Vec3 scale = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Frame tree
+// ---------------------------------------------------------------------------
+
+// A tree of coordinate frames with transform lookup.
+// Maps to `frame_tree::FrameTree` in roz-core.
+message FrameTree {
+  map<string, FrameNode> frames = 1;
+  optional string root = 2;
+}
+
+// A node in the frame tree.
+// Maps to `frame_tree::FrameNode` in roz-core.
+message FrameNode {
+  string frame_id = 1;
+  optional string parent_id = 2;
+  Transform3D static_transform = 3;
+  FrameSource source = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Workspace
+// ---------------------------------------------------------------------------
+
+// A named workspace zone with shape, frame reference, and margin.
+// Maps to `workspace::WorkspaceZone` in roz-core.
+message WorkspaceZone {
+  string name = 1;
+  WorkspaceShape shape = 2;
+  string origin_frame = 3;
+  ZoneType zone_type = 4;
+  double margin_m = 5;
+}
+
+// Workspace zone shape. Uses separate message names to avoid collision
+// with the geometry types above.
+// Maps to `workspace::WorkspaceShape` enum in roz-core.
+message WorkspaceShape {
+  oneof shape {
+    WorkspaceBoxShape box = 1;
+    WorkspaceSphereShape sphere = 2;
+    WorkspaceCylinderShape cylinder = 3;
+  }
+}
+
+// Box-shaped workspace zone defined by half-extents.
+message WorkspaceBoxShape {
+  double half_extent_x = 1;
+  double half_extent_y = 2;
+  double half_extent_z = 3;
+}
+
+// Sphere-shaped workspace zone defined by radius.
+message WorkspaceSphereShape {
+  double radius = 1;
+}
+
+// Cylinder-shaped workspace zone defined by radius and half-height.
+// Note: uses half_height (not length) to match workspace.rs.
+message WorkspaceCylinderShape {
+  double radius = 1;
+  double half_height = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Tool center point
+// ---------------------------------------------------------------------------
+
+// A tool center point mounted on a link.
+// Maps to `model::ToolCenterPoint` in roz-core.
+message ToolCenterPoint {
+  string name = 1;
+  string parent_link = 2;
+  Transform3D offset = 3;
+  TcpType tcp_type = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Sensor mount
+// ---------------------------------------------------------------------------
+
+// A sensor mounted on a link.
+// Maps to `model::SensorMount` in roz-core.
+message SensorMount {
+  string sensor_id = 1;
+  string parent_link = 2;
+  Transform3D offset = 3;
+  SensorType sensor_type = 4;
+  bool is_actuated = 5;
+  // Joint controlling this sensor's pose, if actuated.
+  optional string actuation_joint = 6;
+  // Camera FOV parameters, if this is a camera sensor.
+  optional CameraFrustum frustum = 7;
+}
+
+// Camera frustum / field of view for active perception planning.
+// Maps to `model::CameraFrustum` in roz-core.
+message CameraFrustum {
+  double fov_horizontal_deg = 1;
+  double fov_vertical_deg = 2;
+  double near_clip_m = 3;
+  double far_clip_m = 4;
+  // Optional resolution. Maps to `Option<(u32, u32)>` in Rust.
+  optional CameraResolution resolution = 5;
+}
+
+// Camera resolution as width x height.
+// Wrapper for `(u32, u32)` tuple in Rust.
+message CameraResolution {
+  uint32 width = 1;
+  uint32 height = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Collision body
+// ---------------------------------------------------------------------------
+
+// Collision body for a link.
+// Maps to `model::CollisionBody` in roz-core.
+message CollisionBody {
+  string link_name = 1;
+  Geometry geometry = 2;
+  Transform3D origin = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Semantic role
+// ---------------------------------------------------------------------------
+
+// Semantic role of a joint, effector, or sensor in the canonical action space.
+// Uses oneof to represent the Rust enum variants with associated data.
+// Maps to `model::SemanticRole` in roz-core.
+message SemanticRole {
+  oneof role {
+    ManipulatorJointRole primary_manipulator_joint = 1;
+    ManipulatorJointRole secondary_manipulator_joint = 2;
+    EmptyRole primary_gripper = 3;
+    EmptyRole secondary_gripper = 4;
+    EmptyRole base_translation = 5;
+    EmptyRole base_rotation = 6;
+    EmptyRole head_pan = 7;
+    EmptyRole head_tilt = 8;
+    EmptyRole primary_camera = 9;
+    EmptyRole wrist_camera = 10;
+    EmptyRole force_torque_sensor = 11;
+    CustomRole custom = 12;
+  }
+}
+
+// Manipulator joint role with positional index.
+// Maps to `SemanticRole::PrimaryManipulatorJoint { index }` etc.
+message ManipulatorJointRole {
+  uint32 index = 1;
+}
+
+// Custom semantic role with a string identifier.
+// Maps to `SemanticRole::Custom { role }`.
+message CustomRole {
+  string role = 1;
+}
+
+// Marker message for enum variants with no associated data.
+message EmptyRole {}
+
+// ---------------------------------------------------------------------------
+// Channel binding
+// ---------------------------------------------------------------------------
+
+// Binds a physical joint/sensor to a channel index in the control interface.
+// Maps to `binding::ChannelBinding` in roz-core.
+message ChannelBinding {
+  string physical_name = 1;
+  uint32 channel_index = 2;
+  BindingType binding_type = 3;
+  string frame_id = 4;
+  string units = 5;
+  // Semantic role in the canonical action space. Optional in Rust.
+  optional SemanticRole semantic_role = 6;
+}
+
+// ---------------------------------------------------------------------------
+// Control interface manifest
+// ---------------------------------------------------------------------------
+
+// The control interface manifest describing the I/O contract between
+// the controller and hardware.
+// Maps to `binding::ControlInterfaceManifest` in roz-core.
+message ControlInterfaceManifest {
+  uint32 version = 1;
+  // SHA-256 digest of the canonical serialization.
+  string manifest_digest = 2;
+  repeated ControlChannelDef channels = 3;
+  repeated ChannelBinding bindings = 4;
+}
+
+// A single channel in the control interface.
+// Maps to `binding::ControlChannelDef` in roz-core.
+message ControlChannelDef {
+  string name = 1;
+  CommandInterfaceType interface_type = 2;
+  string units = 3;
+  string frame_id = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Safety limits
+// ---------------------------------------------------------------------------
+
+// Per-joint safety limits.
+// Maps to `limits::JointSafetyLimits` in roz-core.
+message JointSafetyLimits {
+  string joint_name = 1;
+  double max_velocity = 2;
+  double max_acceleration = 3;
+  double max_jerk = 4;
+  double position_min = 5;
+  double position_max = 6;
+  // Optional for zero-value preservation. Maps to `Option<f64>` in Rust.
+  optional double max_torque = 7;
+}
+
+// Force/torque safety limits applied when F/T sensor data is available.
+// Maps to `limits::ForceSafetyLimits` in roz-core.
+message ForceSafetyLimits {
+  double max_contact_force_n = 1;
+  double max_contact_torque_nm = 2;
+  double force_rate_limit = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Contact force envelope
+// ---------------------------------------------------------------------------
+
+// Force envelope for a specific link or contact zone.
+// Maps to `contact::ContactForceEnvelope` in roz-core.
+message ContactForceEnvelope {
+  string link_name = 1;
+  double max_normal_force_n = 2;
+  double max_shear_force_n = 3;
+  double max_force_rate_n_per_s = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Calibration
+// ---------------------------------------------------------------------------
+
+// A versioned calibration overlay applied on top of the base embodiment model.
+// Maps to `calibration::CalibrationOverlay` in roz-core.
+message CalibrationOverlay {
+  string calibration_id = 1;
+  // SHA-256 digest of the canonical serialization.
+  string calibration_digest = 2;
+  google.protobuf.Timestamp calibrated_at = 3;
+  // Optional staleness deadline. Maps to `Option<DateTime<Utc>>` in Rust.
+  optional google.protobuf.Timestamp stale_after = 4;
+  map<string, double> joint_offsets = 5;
+  map<string, Transform3D> frame_corrections = 6;
+  map<string, SensorCalibration> sensor_calibrations = 7;
+  // Temperature range split into min/max for proto scalar representation.
+  // Maps to `Option<(f64, f64)>` in Rust.
+  optional double temperature_min = 8;
+  optional double temperature_max = 9;
+  string valid_for_model_digest = 10;
+}
+
+// Per-sensor calibration data.
+// Maps to `calibration::SensorCalibration` in roz-core.
+message SensorCalibration {
+  string sensor_id = 1;
+  repeated double offset = 2;
+  // Maps to `Option<Vec<f64>>` -- empty repeated = None semantics.
+  repeated double scale = 3;
+  google.protobuf.Timestamp calibrated_at = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Safety overlay
+// ---------------------------------------------------------------------------
+
+// Safety constraints for a specific deployment.
+// Maps to `safety_overlay::SafetyOverlay` in roz-core.
+message SafetyOverlay {
+  // SHA-256 digest of the overlay.
+  string overlay_digest = 1;
+  repeated WorkspaceZone workspace_restrictions = 2;
+  map<string, JointSafetyLimits> joint_limit_overrides = 3;
+  // Optional for zero-value preservation. Maps to `Option<f64>` in Rust.
+  optional double max_payload_kg = 4;
+  // Zones where humans may be present (triggers reduced speed/force).
+  repeated WorkspaceZone human_presence_zones = 5;
+  optional ForceSafetyLimits force_limits = 6;
+  repeated ContactForceEnvelope contact_force_envelopes = 7;
+  repeated WorkspaceZone contact_allowed_zones = 8;
+  // Per-sensor force rate limits (N/s).
+  map<string, double> force_rate_limits = 9;
+}
+
+// ---------------------------------------------------------------------------
+// Embodiment runtime
+// ---------------------------------------------------------------------------
+
+// Fully-resolved embodiment configuration for runtime use.
+// Compiled from base model + calibration + safety overlay.
+// Maps to `embodiment_runtime::EmbodimentRuntime` in roz-core.
+message EmbodimentRuntime {
+  EmbodimentModel model = 1;
+  optional CalibrationOverlay calibration = 2;
+  optional SafetyOverlay safety_overlay = 3;
+  // SHA-256 digest of the active embodiment model.
+  string model_digest = 4;
+  // SHA-256 digest of the active calibration layer.
+  string calibration_digest = 5;
+  // SHA-256 digest of the active safety overlay.
+  string safety_digest = 6;
+  // SHA-256 over (model_digest, calibration_digest, safety_digest).
+  string combined_digest = 7;
+  // Compiled frame graph with calibration corrections applied.
+  FrameTree frame_graph = 8;
+  optional string active_calibration_id = 9;
+  uint32 joint_count = 10;
+  uint32 tcp_count = 11;
+  repeated string watched_frames = 12;
+  // Validation or degradation notes captured during compilation.
+  repeated string validation_issues = 13;
+}
+
+// ---------------------------------------------------------------------------
+// Streaming messages
+// ---------------------------------------------------------------------------
+
+// Shared keepalive for embodiment streams (per D-09).
+// Named EmbodimentKeepalive to avoid collision with roz.v1.Keepalive in agent.proto.
+message EmbodimentKeepalive {
+  google.protobuf.Timestamp server_time = 1;
+  string digest = 2;
+}
+
+// --- StreamFrameTree ---
+
+message StreamFrameTreeRequest {
+  string host_id = 1;
+}
+
+// Server-streaming response with oneof payload (per D-07).
+message StreamFrameTreeResponse {
+  string host_id = 1;
+  string digest = 2;
+  oneof payload {
+    FrameTreeSnapshot snapshot = 3;
+    FrameTreeDelta delta = 4;
+    EmbodimentKeepalive keepalive = 5;
+  }
+}
+
+// Initial full snapshot of the frame tree (per D-04).
+message FrameTreeSnapshot {
+  FrameTree frame_tree = 1;
+}
+
+// Delta update containing only changed/removed frames (per D-05, STRM-04).
+message FrameTreeDelta {
+  map<string, FrameNode> changed_frames = 1;
+  repeated string removed_frame_ids = 2;
+  optional string new_root = 3;
+}
+
+// --- WatchCalibration ---
+
+message WatchCalibrationRequest {
+  string host_id = 1;
+}
+
+// Server-streaming response with oneof payload (per D-08).
+message WatchCalibrationResponse {
+  string host_id = 1;
+  string digest = 2;
+  oneof payload {
+    CalibrationSnapshot snapshot = 3;
+    CalibrationDelta delta = 4;
+    EmbodimentKeepalive keepalive = 5;
+  }
+}
+
+// Initial full snapshot of calibration data (per D-04).
+message CalibrationSnapshot {
+  CalibrationOverlay calibration = 1;
+}
+
+// Whole-overlay replacement delta for calibration changes (per D-05).
+// The server always sends the full CalibrationOverlay on any change.
+// This avoids partial-patch incompleteness issues.
+message CalibrationDelta {
+  CalibrationOverlay calibration = 1;
+}

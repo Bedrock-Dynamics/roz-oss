@@ -1,4 +1,3 @@
-use sqlx::PgPool;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -41,46 +40,58 @@ pub struct SkillVersionRow {
 // ---------------------------------------------------------------------------
 
 /// Insert a new skill and return the created row.
-pub async fn create(pool: &PgPool, tenant_id: Uuid, name: &str, description: &str) -> Result<SkillRow, sqlx::Error> {
+pub async fn create<'e, E>(executor: E, tenant_id: Uuid, name: &str, description: &str) -> Result<SkillRow, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, SkillRow>(
         "INSERT INTO roz_skills (tenant_id, name, description) VALUES ($1, $2, $3) RETURNING *",
     )
     .bind(tenant_id)
     .bind(name)
     .bind(description)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
 /// Fetch a single skill by primary key, or `None` if not found.
-pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Option<SkillRow>, sqlx::Error> {
+pub async fn get_by_id<'e, E>(executor: E, id: Uuid) -> Result<Option<SkillRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, SkillRow>("SELECT * FROM roz_skills WHERE id = $1")
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
 }
 
 /// List skills for a tenant with limit/offset pagination.
 /// Includes `tenant_id` filter for defense-in-depth (don't rely solely on RLS).
-pub async fn list(pool: &PgPool, tenant_id: Uuid, limit: i64, offset: i64) -> Result<Vec<SkillRow>, sqlx::Error> {
+pub async fn list<'e, E>(executor: E, tenant_id: Uuid, limit: i64, offset: i64) -> Result<Vec<SkillRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, SkillRow>(
         "SELECT * FROM roz_skills WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
     )
     .bind(tenant_id)
     .bind(limit)
     .bind(offset)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
 /// Partially update a skill. Only non-`None` fields are changed.
 /// Returns `None` when the row does not exist.
-pub async fn update(
-    pool: &PgPool,
+pub async fn update<'e, E>(
+    executor: E,
     id: Uuid,
     name: Option<&str>,
     description: Option<&str>,
-) -> Result<Option<SkillRow>, sqlx::Error> {
+) -> Result<Option<SkillRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, SkillRow>(
         "UPDATE roz_skills \
          SET name        = COALESCE($2, name), \
@@ -92,15 +103,18 @@ pub async fn update(
     .bind(id)
     .bind(name)
     .bind(description)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
 /// Delete a skill by id. Returns `true` when a row was actually removed.
-pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+pub async fn delete<'e, E>(executor: E, id: Uuid) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let result = sqlx::query("DELETE FROM roz_skills WHERE id = $1")
         .bind(id)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -111,12 +125,15 @@ pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
 
 /// Create a new version for a skill. Derives `tenant_id` from the parent skill
 /// to prevent cross-tenant mismatches.
-pub async fn create_version(
-    pool: &PgPool,
+pub async fn create_version<'e, E>(
+    executor: E,
     skill_id: Uuid,
     version: &str,
     content: &str,
-) -> Result<SkillVersionRow, sqlx::Error> {
+) -> Result<SkillVersionRow, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, SkillVersionRow>(
         "INSERT INTO roz_skill_versions (skill_id, tenant_id, version, content) \
          SELECT $1, tenant_id, $2, $3 FROM roz_skills WHERE id = $1 \
@@ -125,26 +142,36 @@ pub async fn create_version(
     .bind(skill_id)
     .bind(version)
     .bind(content)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
 /// Get a specific version of a skill.
-pub async fn get_version(pool: &PgPool, skill_id: Uuid, version: &str) -> Result<Option<SkillVersionRow>, sqlx::Error> {
+pub async fn get_version<'e, E>(
+    executor: E,
+    skill_id: Uuid,
+    version: &str,
+) -> Result<Option<SkillVersionRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, SkillVersionRow>("SELECT * FROM roz_skill_versions WHERE skill_id = $1 AND version = $2")
         .bind(skill_id)
         .bind(version)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
 }
 
 /// List all versions for a skill, ordered by creation time (newest first).
-pub async fn list_versions(pool: &PgPool, skill_id: Uuid) -> Result<Vec<SkillVersionRow>, sqlx::Error> {
+pub async fn list_versions<'e, E>(executor: E, skill_id: Uuid) -> Result<Vec<SkillVersionRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, SkillVersionRow>(
         "SELECT * FROM roz_skill_versions WHERE skill_id = $1 ORDER BY created_at DESC",
     )
     .bind(skill_id)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
@@ -154,8 +181,8 @@ pub async fn list_versions(pool: &PgPool, skill_id: Uuid) -> Result<Vec<SkillVer
 
 /// Create a skill with all Phase 4 metadata fields.
 #[allow(clippy::too_many_arguments)]
-pub async fn create_with_metadata(
-    pool: &PgPool,
+pub async fn create_with_metadata<'e, E>(
+    executor: E,
     tenant_id: Uuid,
     name: &str,
     description: &str,
@@ -167,7 +194,10 @@ pub async fn create_with_metadata(
     safety_overrides: Option<&serde_json::Value>,
     environment_constraints: &serde_json::Value,
     allowed_tools: &[String],
-) -> Result<SkillRow, sqlx::Error> {
+) -> Result<SkillRow, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, SkillRow>(
         "INSERT INTO roz_skills \
              (tenant_id, name, description, kind, tags, platform, \
@@ -187,18 +217,21 @@ pub async fn create_with_metadata(
     .bind(safety_overrides)
     .bind(environment_constraints)
     .bind(allowed_tools)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
 /// List skills filtered by kind (`ai` or `execution`) for a tenant.
-pub async fn list_by_kind(
-    pool: &PgPool,
+pub async fn list_by_kind<'e, E>(
+    executor: E,
     tenant_id: Uuid,
     kind: &str,
     limit: i64,
     offset: i64,
-) -> Result<Vec<SkillRow>, sqlx::Error> {
+) -> Result<Vec<SkillRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, SkillRow>(
         "SELECT * FROM roz_skills \
          WHERE tenant_id = $1 AND kind = $2 \
@@ -208,18 +241,21 @@ pub async fn list_by_kind(
     .bind(kind)
     .bind(limit)
     .bind(offset)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
 /// List skills that contain a specific tag (uses `@>` array containment).
-pub async fn list_by_tag(
-    pool: &PgPool,
+pub async fn list_by_tag<'e, E>(
+    executor: E,
     tenant_id: Uuid,
     tag: &str,
     limit: i64,
     offset: i64,
-) -> Result<Vec<SkillRow>, sqlx::Error> {
+) -> Result<Vec<SkillRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, SkillRow>(
         "SELECT * FROM roz_skills \
          WHERE tenant_id = $1 AND tags @> ARRAY[$2]::text[] \
@@ -229,27 +265,33 @@ pub async fn list_by_tag(
     .bind(tag)
     .bind(limit)
     .bind(offset)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
 /// Get a skill by name within a tenant, or `None` if not found.
-pub async fn get_by_name(pool: &PgPool, tenant_id: Uuid, name: &str) -> Result<Option<SkillRow>, sqlx::Error> {
+pub async fn get_by_name<'e, E>(executor: E, tenant_id: Uuid, name: &str) -> Result<Option<SkillRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, SkillRow>("SELECT * FROM roz_skills WHERE tenant_id = $1 AND name = $2")
         .bind(tenant_id)
         .bind(name)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
 }
 
 /// Search skills by name or description using case-insensitive pattern matching.
-pub async fn search(
-    pool: &PgPool,
+pub async fn search<'e, E>(
+    executor: E,
     tenant_id: Uuid,
     query: &str,
     limit: i64,
     offset: i64,
-) -> Result<Vec<SkillRow>, sqlx::Error> {
+) -> Result<Vec<SkillRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let pattern = format!("%{query}%");
     sqlx::query_as::<_, SkillRow>(
         "SELECT * FROM roz_skills \
@@ -260,13 +302,14 @@ pub async fn search(
     .bind(&pattern)
     .bind(limit)
     .bind(offset)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::PgPool;
     async fn setup() -> PgPool {
         crate::shared_test_pool().await
     }

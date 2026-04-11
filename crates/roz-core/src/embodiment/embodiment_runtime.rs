@@ -27,7 +27,7 @@ use crate::session::snapshot::FreshnessState;
 /// Produced by `compile()` from the three layers. The `combined_digest`
 /// is a SHA-256 over the three layer digests, providing a single cache key
 /// for the entire physical configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EmbodimentRuntime {
     /// The base physical model.
     pub model: EmbodimentModel,

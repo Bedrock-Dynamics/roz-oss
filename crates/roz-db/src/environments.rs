@@ -1,4 +1,3 @@
-use sqlx::PgPool;
 use uuid::Uuid;
 
 /// Row type matching the `roz_environments` schema exactly.
@@ -19,13 +18,16 @@ pub struct EnvironmentRow {
 }
 
 /// Insert a new environment and return the created row.
-pub async fn create(
-    pool: &PgPool,
+pub async fn create<'e, E>(
+    executor: E,
     tenant_id: Uuid,
     name: &str,
     kind: &str,
     config: &serde_json::Value,
-) -> Result<EnvironmentRow, sqlx::Error> {
+) -> Result<EnvironmentRow, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, EnvironmentRow>(
         "INSERT INTO roz_environments (tenant_id, name, kind, config) VALUES ($1, $2, $3, $4) RETURNING *",
     )
@@ -33,38 +35,52 @@ pub async fn create(
     .bind(name)
     .bind(kind)
     .bind(config)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
 /// Fetch a single environment by primary key, or `None` if not found.
-pub async fn get_by_id(pool: &PgPool, id: Uuid) -> Result<Option<EnvironmentRow>, sqlx::Error> {
+pub async fn get_by_id<'e, E>(executor: E, id: Uuid) -> Result<Option<EnvironmentRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, EnvironmentRow>("SELECT * FROM roz_environments WHERE id = $1")
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
 }
 
 /// List environments for a tenant with limit/offset pagination.
-pub async fn list(pool: &PgPool, tenant_id: Uuid, limit: i64, offset: i64) -> Result<Vec<EnvironmentRow>, sqlx::Error> {
+pub async fn list<'e, E>(
+    executor: E,
+    tenant_id: Uuid,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<EnvironmentRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, EnvironmentRow>(
         "SELECT * FROM roz_environments WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
     )
     .bind(tenant_id)
     .bind(limit)
     .bind(offset)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
 /// Partially update an environment. Only non-`None` fields are changed.
 /// Returns `None` when the row does not exist.
-pub async fn update(
-    pool: &PgPool,
+pub async fn update<'e, E>(
+    executor: E,
     id: Uuid,
     name: Option<&str>,
     config: Option<&serde_json::Value>,
-) -> Result<Option<EnvironmentRow>, sqlx::Error> {
+) -> Result<Option<EnvironmentRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, EnvironmentRow>(
         "UPDATE roz_environments \
          SET name       = COALESCE($2, name), \
@@ -76,27 +92,33 @@ pub async fn update(
     .bind(id)
     .bind(name)
     .bind(config)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
 /// Delete an environment by id. Returns `true` when a row was actually removed.
-pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+pub async fn delete<'e, E>(executor: E, id: Uuid) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let result = sqlx::query("DELETE FROM roz_environments WHERE id = $1")
         .bind(id)
-        .execute(pool)
+        .execute(executor)
         .await?;
     Ok(result.rows_affected() > 0)
 }
 
 /// Update the NATS account credentials for an environment.
 /// Returns `true` when a row was actually updated.
-pub async fn update_nats_account(
-    pool: &PgPool,
+pub async fn update_nats_account<'e, E>(
+    executor: E,
     id: Uuid,
     public_key: &str,
     seed_encrypted: &str,
-) -> Result<bool, sqlx::Error> {
+) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let result = sqlx::query(
         "UPDATE roz_environments \
          SET nats_account_public_key = $2, nats_account_seed_encrypted = $3, updated_at = now() \
@@ -105,7 +127,7 @@ pub async fn update_nats_account(
     .bind(id)
     .bind(public_key)
     .bind(seed_encrypted)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(result.rows_affected() > 0)
 }
@@ -113,6 +135,7 @@ pub async fn update_nats_account(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::PgPool;
     async fn setup() -> PgPool {
         crate::shared_test_pool().await
     }

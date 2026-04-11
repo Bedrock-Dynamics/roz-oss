@@ -1,6 +1,6 @@
 use axum::Extension;
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query};
 use axum::http::StatusCode;
 use roz_core::auth::AuthIdentity;
 use serde::Deserialize;
@@ -8,7 +8,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::state::AppState;
+use crate::middleware::tx::Tx;
 
 #[derive(Deserialize)]
 pub struct CreateStreamRequest {
@@ -41,13 +41,13 @@ const fn default_limit() -> i64 {
 
 /// POST /v1/streams
 pub async fn create(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Json(body): Json<CreateStreamRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
     let stream = roz_db::streams::create(
-        &state.pool,
+        &mut **tx,
         tenant_id,
         &body.name,
         &body.category,
@@ -61,23 +61,23 @@ pub async fn create(
 
 /// GET /v1/streams
 pub async fn list(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Query(params): Query<PaginationParams>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
-    let streams = roz_db::streams::list(&state.pool, tenant_id, params.limit, params.offset).await?;
+    let streams = roz_db::streams::list(&mut **tx, tenant_id, params.limit, params.offset).await?;
     Ok(Json(json!({"data": streams})))
 }
 
 /// GET /v1/streams/:id
 pub async fn get(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
-    let stream = roz_db::streams::get_by_id(&state.pool, id)
+    let stream = roz_db::streams::get_by_id(&mut **tx, id)
         .await?
         .ok_or_else(|| AppError::not_found("stream not found"))?;
     if stream.tenant_id != tenant_id {
@@ -88,43 +88,37 @@ pub async fn get(
 
 /// PUT /v1/streams/:id
 pub async fn update(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateStreamRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
-    let existing = roz_db::streams::get_by_id(&state.pool, id)
+    let existing = roz_db::streams::get_by_id(&mut **tx, id)
         .await?
         .ok_or_else(|| AppError::not_found("stream not found"))?;
     if existing.tenant_id != tenant_id {
         return Err(AppError::not_found("stream not found"));
     }
-    let stream = roz_db::streams::update(
-        &state.pool,
-        id,
-        body.name.as_deref(),
-        body.rate_hz,
-        body.config.as_ref(),
-    )
-    .await?
-    .ok_or_else(|| AppError::not_found("stream not found"))?;
+    let stream = roz_db::streams::update(&mut **tx, id, body.name.as_deref(), body.rate_hz, body.config.as_ref())
+        .await?
+        .ok_or_else(|| AppError::not_found("stream not found"))?;
     Ok(Json(json!({"data": stream})))
 }
 
 /// DELETE /v1/streams/:id
 pub async fn delete(
-    State(state): State<AppState>,
+    mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
-    let stream = roz_db::streams::get_by_id(&state.pool, id)
+    let stream = roz_db::streams::get_by_id(&mut **tx, id)
         .await?
         .ok_or_else(|| AppError::not_found("stream not found"))?;
     if stream.tenant_id != tenant_id {
         return Err(AppError::not_found("stream not found"));
     }
-    roz_db::streams::delete(&state.pool, id).await?;
+    roz_db::streams::delete(&mut **tx, id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

@@ -128,6 +128,10 @@ message BinaryContent {
 
 message ToolResult {
   string tool_call_id = 1;
+  // Logical success: true if the tool completed its intended action.
+  // When exit_code is present, success MUST equal (exit_code == 0).
+  // For non-shell tools with no meaningful exit code, set success directly
+  // and leave exit_code absent.
   bool success = 2;
   string result = 3;
   // Structured metadata from tool execution (added in D1).
@@ -188,6 +192,10 @@ message RegisterTools {
 // --- Server → Client ---
 
 message SessionResponse {
+  // Fields 1-6 were never assigned. Fields 9-13 were reserved for future
+  // server→client variants but never allocated; reserved here for
+  // forward-compatibility safety.
+  reserved 1 to 6, 9 to 13;
   oneof response {
     Keepalive keepalive = 7;
     Pong pong = 8;

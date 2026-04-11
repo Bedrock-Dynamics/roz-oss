@@ -12,21 +12,36 @@ pub mod triggers;
 pub mod ws;
 
 use axum::Router;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use tower_http::trace::TraceLayer;
 
 use state::AppState;
 
 /// Build the full REST + WebSocket router with all routes and middleware.
 ///
+/// Routes are split into two layers:
+/// - **Public:** health checks, device auth initiation, webhooks. No auth, no Tx.
+/// - **Authenticated:** all tenant-scoped routes. Auth middleware sets `AuthIdentity`,
+///   Tx middleware begins a transaction with `set_tenant_context`.
+///
 /// Cloud wrappers can call this and layer their own auth middleware on top.
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
+    // -----------------------------------------------------------------------
+    // Public routes: no auth, no Tx middleware
+    // -----------------------------------------------------------------------
+    let public = Router::new()
         .route("/v1/health", get(routes::health::health))
         .route("/v1/ready", get(routes::health::ready))
         .route("/healthz", get(routes::health::healthz))
         .route("/readyz", get(routes::health::readyz))
         .route("/startupz", get(routes::health::startupz))
+        .route("/v1/auth/device/code", post(routes::device_auth::request_code))
+        .route("/v1/auth/device/token", post(routes::device_auth::poll_token));
+
+    // -----------------------------------------------------------------------
+    // Authenticated routes: auth middleware + Tx middleware
+    // -----------------------------------------------------------------------
+    let authenticated = Router::new()
         .route("/v1/auth/keys", post(routes::auth_keys::create_key))
         .route("/v1/auth/keys", get(routes::auth_keys::list_keys))
         .route("/v1/auth/keys/{id}", delete(routes::auth_keys::revoke_key))
@@ -51,6 +66,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/v1/hosts/{id}/status", patch(routes::hosts::update_status))
         .route("/v1/hosts/{id}/estop", post(routes::hosts::estop))
+        .route("/v1/hosts/{id}/embodiment", put(routes::hosts::update_embodiment))
         // Task CRUD
         .route("/v1/tasks", get(routes::tasks::list).post(routes::tasks::create))
         .route("/v1/tasks/{id}", get(routes::tasks::get).delete(routes::tasks::delete))
@@ -95,14 +111,21 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/metrics/hosts", get(routes::metrics::host_metrics))
         // WebSocket
         .route("/v1/ws", get(ws::handler::ws_upgrade))
-        .route("/v1/auth/device/code", post(routes::device_auth::request_code))
-        .route("/v1/auth/device/token", post(routes::device_auth::poll_token))
+        // Device auth completion (requires auth)
         .route("/v1/auth/device/complete", post(routes::device_auth::complete_auth))
-        // Webhook routes can be added here for custom integrations.
+        // Tx middleware (innermost = runs after auth but before handler)
+        .layer(axum::middleware::from_fn(middleware::tx::tx_layer))
+        // Auth middleware (outermost = runs first)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::tenant::auth_middleware,
-        ))
+        ));
+
+    // -----------------------------------------------------------------------
+    // Merge and apply cross-cutting middleware
+    // -----------------------------------------------------------------------
+    public
+        .merge(authenticated)
         .layer(axum::middleware::from_fn(middleware::request_id::request_id_middleware))
         .with_state(state)
         .layer(

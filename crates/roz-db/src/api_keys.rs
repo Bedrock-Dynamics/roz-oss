@@ -1,7 +1,6 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -37,13 +36,16 @@ fn hash_key(key: &str) -> String {
     hex::encode(Sha256::digest(key.as_bytes()))
 }
 
-pub async fn create_api_key(
-    pool: &PgPool,
+pub async fn create_api_key<'e, E>(
+    executor: E,
     tenant_id: Uuid,
     name: &str,
     scopes: &[String],
     created_by: &str,
-) -> Result<CreateApiKeyResult, sqlx::Error> {
+) -> Result<CreateApiKeyResult, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let (full_key, key_prefix, key_hash) = generate_key();
 
     let api_key = sqlx::query_as::<_, ApiKey>(
@@ -56,22 +58,28 @@ pub async fn create_api_key(
     .bind(&key_hash)
     .bind(scopes)
     .bind(created_by)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
 
     Ok(CreateApiKeyResult { api_key, full_key })
 }
 
-pub async fn list_api_keys(pool: &PgPool, tenant_id: Uuid) -> Result<Vec<ApiKey>, sqlx::Error> {
+pub async fn list_api_keys<'e, E>(executor: E, tenant_id: Uuid) -> Result<Vec<ApiKey>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, ApiKey>(
         "SELECT * FROM roz_api_keys WHERE tenant_id = $1 AND revoked_at IS NULL ORDER BY created_at DESC",
     )
     .bind(tenant_id)
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await
 }
 
-pub async fn verify_api_key(pool: &PgPool, key: &str) -> Result<Option<ApiKey>, sqlx::Error> {
+pub async fn verify_api_key<'e, E>(executor: E, key: &str) -> Result<Option<ApiKey>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let key_hash = hash_key(key);
     let key_prefix = &key[..std::cmp::min(16, key.len())];
 
@@ -84,29 +92,35 @@ pub async fn verify_api_key(pool: &PgPool, key: &str) -> Result<Option<ApiKey>, 
     )
     .bind(key_prefix)
     .bind(key_hash)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await
 }
 
-pub async fn revoke_api_key(pool: &PgPool, id: Uuid, tenant_id: Uuid) -> Result<bool, sqlx::Error> {
+pub async fn revoke_api_key<'e, E>(executor: E, id: Uuid, tenant_id: Uuid) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     let result = sqlx::query(
         "UPDATE roz_api_keys SET revoked_at = now() WHERE id = $1 AND tenant_id = $2 AND revoked_at IS NULL",
     )
     .bind(id)
     .bind(tenant_id)
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     Ok(result.rows_affected() > 0)
 }
 
+/// Rotate an API key: revoke the old one and create a new one atomically.
+///
+/// Uses `&mut PgConnection` because it executes two queries (revoke + insert)
+/// that must run within the same transaction. The caller provides the
+/// transactional context.
 pub async fn rotate_api_key(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     id: Uuid,
     tenant_id: Uuid,
 ) -> Result<Option<CreateApiKeyResult>, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-
     // Find and revoke old key atomically
     let old_key = sqlx::query_as::<_, ApiKey>(
         "UPDATE roz_api_keys SET revoked_at = now() \
@@ -115,7 +129,7 @@ pub async fn rotate_api_key(
     )
     .bind(id)
     .bind(tenant_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut *conn)
     .await?;
 
     let Some(old_key) = old_key else {
@@ -135,10 +149,8 @@ pub async fn rotate_api_key(
     .bind(&key_hash)
     .bind(&old_key.scopes)
     .bind(&old_key.created_by)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut *conn)
     .await?;
-
-    tx.commit().await?;
 
     Ok(Some(CreateApiKeyResult { api_key, full_key }))
 }
@@ -146,6 +158,7 @@ pub async fn rotate_api_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::PgPool;
     async fn setup() -> PgPool {
         crate::shared_test_pool().await
     }
@@ -248,10 +261,12 @@ mod tests {
             .await
             .expect("Failed to create key");
 
-        let rotated = rotate_api_key(&pool, original.api_key.id, tenant_id)
+        let mut tx = pool.begin().await.expect("Failed to begin tx");
+        let rotated = rotate_api_key(&mut *tx, original.api_key.id, tenant_id)
             .await
             .expect("Failed to rotate key")
             .expect("Expected Some");
+        tx.commit().await.expect("Failed to commit");
 
         // Old key no longer works
         let old_verified = verify_api_key(&pool, &original.full_key).await.expect("verify old key");

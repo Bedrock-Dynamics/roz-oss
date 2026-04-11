@@ -1,3 +1,5 @@
+use axum::extract::FromRef;
+
 use crate::auth::RestAuth;
 use crate::middleware::rate_limit::KeyedRateLimiter;
 use sqlx::PgPool;
@@ -44,4 +46,10 @@ pub struct AppState {
     pub auth: Arc<dyn RestAuth>,
     /// Pluggable usage metering. OSS uses `NoOpMeter`, cloud injects billing logic.
     pub meter: Arc<dyn roz_agent::meter::UsageMeter>,
+}
+
+impl FromRef<AppState> for PgPool {
+    fn from_ref(state: &AppState) -> Self {
+        state.pool.clone()
+    }
 }

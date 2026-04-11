@@ -574,14 +574,23 @@ async fn execute_task(
     let approval_runtime = session_runtime.approval_handle();
 
     if let Some(parent_task_id) = invocation.parent_task_id {
+        // Child task: consume inbound resolutions from parent, relay outbound requests up.
         tokio::spawn(consume_team_approval_events(
             task_js.clone(),
             parent_task_id,
             task_id,
             approval_runtime.clone(),
+            task_sidecars_cancel.clone(),
+        ));
+        tokio::spawn(relay_worker_approval_events(
+            session_runtime.subscribe_events(),
+            task_js.clone(),
+            parent_task_id,
+            task_id,
             task_sidecars_cancel.clone(),
         ));
     } else {
+        // Orchestrator task: relay outbound requests and consume own resolutions.
         tokio::spawn(relay_worker_approval_events(
             session_runtime.subscribe_events(),
             task_js.clone(),
@@ -594,16 +603,6 @@ async fn execute_task(
             task_id,
             task_id,
             approval_runtime.clone(),
-            task_sidecars_cancel.clone(),
-        ));
-    }
-
-    if let Some(parent_task_id) = invocation.parent_task_id {
-        tokio::spawn(relay_worker_approval_events(
-            session_runtime.subscribe_events(),
-            task_js.clone(),
-            parent_task_id,
-            task_id,
             task_sidecars_cancel.clone(),
         ));
     }
@@ -833,10 +832,49 @@ async fn main() -> Result<()> {
     tokio::spawn(async move { wd.run(wd_cancel).await });
     tracing::info!("idle watchdog active (30s deadline)");
 
+    // Load embodiment runtime from robot.toml if configured (D-01, D-02)
+    let embodiment_runtime: Option<roz_core::embodiment::embodiment_runtime::EmbodimentRuntime> =
+        config.robot_toml.as_ref().and_then(|toml_path| {
+            match roz_core::manifest::EmbodimentManifest::load(std::path::Path::new(toml_path)) {
+                Ok(manifest) => {
+                    if let Some(rt) = manifest.embodiment_runtime() {
+                        tracing::info!(path = %toml_path, digest = %rt.model.model_digest, "loaded embodiment runtime from manifest");
+                        Some(rt)
+                    } else {
+                        tracing::info!(path = %toml_path, "manifest has no channels section, skipping embodiment upload");
+                        None
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(path = %toml_path, error = %e, "failed to load embodiment manifest");
+                    None
+                }
+            }
+        });
+
     // Register with server
     if !config.api_key.is_empty() {
-        match roz_worker::registration::register_host(&config.api_url, &config.api_key, &config.worker_id).await {
-            Ok(host_id) => tracing::info!(host_id = %host_id, "registered with server"),
+        match roz_worker::registration::register_host(&http, &config.api_url, &config.api_key, &config.worker_id).await
+        {
+            Ok(host_id) => {
+                tracing::info!(host_id = %host_id, "registered with server");
+                // Upload embodiment runtime if available (D-04: log-and-continue; runtime now passed per STRM-02)
+                if let Some(ref rt) = embodiment_runtime {
+                    match roz_worker::registration::upload_embodiment(
+                        &http,
+                        &config.api_url,
+                        &config.api_key,
+                        host_id,
+                        &rt.model,
+                        Some(rt),
+                    )
+                    .await
+                    {
+                        Ok(()) => tracing::info!(host_id = %host_id, "embodiment runtime uploaded"),
+                        Err(e) => tracing::warn!(host_id = %host_id, error = %e, "embodiment upload failed"),
+                    }
+                }
+            }
             Err(e) => tracing::warn!(error = %e, "host registration failed"),
         }
     }

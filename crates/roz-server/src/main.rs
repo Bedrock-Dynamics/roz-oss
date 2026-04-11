@@ -125,6 +125,12 @@ fn grpc_router(state: &AppState) -> Router {
         state.meter.clone(),
     );
 
+    let embodiment_svc = roz_server::grpc::embodiment::EmbodimentServiceImpl::new(
+        state.pool.clone(),
+        Arc::new(AppGrpcAuth) as Arc<dyn roz_server::grpc::agent::GrpcAuth>,
+        state.nats_client.clone(),
+    );
+
     // Use tonic::service::Routes directly (bypasses tonic::transport::Server
     // since axum manages TCP/TLS). into_axum_router() extracts the inner Router.
     tonic::service::Routes::new(roz_server::grpc::roz_v1::task_service_server::TaskServiceServer::new(
@@ -133,6 +139,7 @@ fn grpc_router(state: &AppState) -> Router {
     .add_service(roz_server::grpc::roz_v1::agent_service_server::AgentServiceServer::new(
         agent_svc,
     ))
+    .add_service(roz_server::grpc::roz_v1::embodiment_service_server::EmbodimentServiceServer::new(embodiment_svc))
     .add_service(
         tonic_reflection::server::Builder::configure()
             .register_encoded_file_descriptor_set(roz_server::grpc::roz_v1::FILE_DESCRIPTOR_SET)

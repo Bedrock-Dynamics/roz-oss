@@ -12,12 +12,11 @@ use uuid::Uuid;
 /// 2. If found: `PATCH /v1/hosts/{id}/status` with `{"status": "online"}`, return id.
 /// 3. If not found: `POST /v1/hosts` with `{"name": worker_id, "host_type": "edge"}`,
 ///    then `PATCH` status to `online`, return id.
-pub async fn register_host(api_url: &str, api_key: &str, worker_id: &str) -> Result<Uuid> {
-    let client = reqwest::Client::new();
+pub async fn register_host(client: &reqwest::Client, api_url: &str, api_key: &str, worker_id: &str) -> Result<Uuid> {
     let base = api_url.trim_end_matches('/');
 
     // 1. List hosts and find matching name (paginated)
-    let host_id = find_host_paginated(&client, base, api_key, worker_id).await?;
+    let host_id = find_host_paginated(client, base, api_key, worker_id).await?;
 
     let id = if let Some(existing_id) = host_id {
         existing_id
@@ -37,7 +36,7 @@ pub async fn register_host(api_url: &str, api_key: &str, worker_id: &str) -> Res
 
         // Handle 409 Conflict: another worker registered the same name concurrently.
         if resp.status() == reqwest::StatusCode::CONFLICT {
-            find_host_paginated(&client, base, api_key, worker_id)
+            find_host_paginated(client, base, api_key, worker_id)
                 .await?
                 .context("host not found after conflict retry")?
         } else {
@@ -71,9 +70,16 @@ async fn find_host_paginated(
     api_key: &str,
     worker_id: &str,
 ) -> Result<Option<Uuid>> {
+    const MAX_PAGES: usize = 200; // 200 * 50 = 10 000 hosts
     let limit: usize = 50;
     let mut offset: usize = 0;
+    let mut pages_fetched: usize = 0;
     loop {
+        if pages_fetched >= MAX_PAGES {
+            tracing::warn!("find_host_paginated hit max page limit without finding host");
+            break;
+        }
+        pages_fetched += 1;
         let resp = client
             .get(format!("{base}/v1/hosts?limit={limit}&offset={offset}"))
             .bearer_auth(api_key)
@@ -112,6 +118,50 @@ fn find_host_by_name(body: &serde_json::Value, worker_id: &str) -> Option<Uuid> 
         }
     }
     None
+}
+
+/// Build the JSON body for `PUT /v1/hosts/{id}/embodiment`.
+///
+/// Generic over `Serialize` for testability — production callers pass
+/// `&EmbodimentModel` / `&EmbodimentRuntime`; tests can pass `serde_json::Value`.
+pub(crate) fn build_embodiment_body(
+    model: &impl serde::Serialize,
+    runtime: Option<&impl serde::Serialize>,
+) -> Result<serde_json::Value> {
+    let mut body = serde_json::json!({ "model": model });
+    if let Some(rt) = runtime {
+        body["runtime"] = serde_json::to_value(rt).context("failed to serialize embodiment runtime")?;
+    }
+    Ok(body)
+}
+
+/// Upload embodiment model (and optional runtime) to the server for a registered host.
+///
+/// Called after `register_host()` returns the host UUID, when the worker has
+/// embodiment data available. Sends `PUT /v1/hosts/{id}/embodiment` with the
+/// serialised model and optional runtime as JSON.
+pub async fn upload_embodiment(
+    client: &reqwest::Client,
+    api_url: &str,
+    api_key: &str,
+    host_id: Uuid,
+    model: &roz_core::embodiment::model::EmbodimentModel,
+    runtime: Option<&roz_core::embodiment::embodiment_runtime::EmbodimentRuntime>,
+) -> Result<()> {
+    let base = api_url.trim_end_matches('/');
+    let body = build_embodiment_body(model, runtime)?;
+
+    client
+        .put(format!("{base}/v1/hosts/{host_id}/embodiment"))
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+        .context(format!("PUT /v1/hosts/{host_id}/embodiment request failed"))?
+        .error_for_status()
+        .context(format!("PUT /v1/hosts/{host_id}/embodiment returned error status"))?;
+
+    Ok(())
 }
 
 /// Extract the host UUID from a `{"data": {"id": "..."}}` response.
@@ -165,5 +215,25 @@ mod tests {
     fn parse_host_id_returns_none_for_missing_data() {
         let body = serde_json::json!({"error": "not found"});
         assert!(parse_host_id(&body).is_none());
+    }
+
+    #[test]
+    fn upload_embodiment_body_omits_runtime_key_when_none() {
+        let model = serde_json::json!({"model_id": "test", "model_digest": "abc"});
+        let body = build_embodiment_body(&model, Option::<&serde_json::Value>::None).unwrap();
+        assert!(body.get("model").is_some(), "body must contain model key");
+        assert!(
+            body.get("runtime").is_none(),
+            "body must not contain runtime key when None"
+        );
+    }
+
+    #[test]
+    fn upload_embodiment_body_includes_runtime_key_when_some() {
+        let model = serde_json::json!({"model_id": "test", "model_digest": "abc"});
+        let runtime = serde_json::json!({"combined_digest": "abc"});
+        let body = build_embodiment_body(&model, Some(&runtime)).unwrap();
+        assert!(body.get("model").is_some(), "body must contain model key");
+        assert!(body.get("runtime").is_some(), "body must contain runtime key when Some");
     }
 }

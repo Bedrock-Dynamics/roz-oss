@@ -1,4 +1,3 @@
-use sqlx::PgPool;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -26,30 +25,39 @@ pub struct TenantMember {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
-pub async fn create_tenant(pool: &PgPool, name: &str, slug: &str, kind: &str) -> Result<Tenant, sqlx::Error> {
+pub async fn create_tenant<'e, E>(executor: E, name: &str, slug: &str, kind: &str) -> Result<Tenant, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, Tenant>("INSERT INTO roz_tenants (name, slug, kind) VALUES ($1, $2, $3) RETURNING *")
         .bind(name)
         .bind(slug)
         .bind(kind)
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await
 }
 
-pub async fn get_tenant(pool: &PgPool, id: Uuid) -> Result<Option<Tenant>, sqlx::Error> {
+pub async fn get_tenant<'e, E>(executor: E, id: Uuid) -> Result<Option<Tenant>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, Tenant>("SELECT * FROM roz_tenants WHERE id = $1")
         .bind(id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
 }
 
 /// Create a tenant with an external ID (e.g., Clerk org / user ID).
-pub async fn create_tenant_with_external_id(
-    pool: &PgPool,
+pub async fn create_tenant_with_external_id<'e, E>(
+    executor: E,
     name: &str,
     slug: &str,
     kind: &str,
     external_id: &str,
-) -> Result<Tenant, sqlx::Error> {
+) -> Result<Tenant, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, Tenant>(
         "INSERT INTO roz_tenants (name, slug, kind, external_id) VALUES ($1, $2, $3, $4) RETURNING *",
     )
@@ -57,44 +65,54 @@ pub async fn create_tenant_with_external_id(
     .bind(slug)
     .bind(kind)
     .bind(external_id)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
 /// Look up a tenant by its external ID (e.g., Clerk `org_id` or `user_id`).
-pub async fn get_tenant_by_external_id(pool: &PgPool, external_id: &str) -> Result<Option<Tenant>, sqlx::Error> {
+pub async fn get_tenant_by_external_id<'e, E>(executor: E, external_id: &str) -> Result<Option<Tenant>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, Tenant>("SELECT * FROM roz_tenants WHERE external_id = $1")
         .bind(external_id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
 }
 
-pub async fn add_member(
-    pool: &PgPool,
+pub async fn add_member<'e, E>(
+    executor: E,
     tenant_id: Uuid,
     user_id: &str,
     role: &str,
-) -> Result<TenantMember, sqlx::Error> {
+) -> Result<TenantMember, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, TenantMember>(
         "INSERT INTO roz_tenant_members (tenant_id, user_id, role) VALUES ($1, $2, $3) RETURNING *",
     )
     .bind(tenant_id)
     .bind(user_id)
     .bind(role)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await
 }
 
-pub async fn list_members(pool: &PgPool, tenant_id: Uuid) -> Result<Vec<TenantMember>, sqlx::Error> {
+pub async fn list_members<'e, E>(executor: E, tenant_id: Uuid) -> Result<Vec<TenantMember>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     sqlx::query_as::<_, TenantMember>("SELECT * FROM roz_tenant_members WHERE tenant_id = $1")
         .bind(tenant_id)
-        .fetch_all(pool)
+        .fetch_all(executor)
         .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::PgPool;
     async fn setup() -> PgPool {
         crate::shared_test_pool().await
     }
