@@ -109,6 +109,36 @@ impl TurnEmitter {
 /// already in the channel via `try_recv` then exits. Any envelopes still in
 /// flight after cancel are silently dropped (acceptable per Phase 13
 /// CONTEXT.md — persistence is best-effort, not agent-critical).
+///
+/// ## Concurrent-writer correctness
+///
+/// The `MAX(turn_index)+1` seed read runs inside the per-write transaction
+/// at Postgres's default `READ COMMITTED` isolation. If two processes share
+/// the same DB (e.g., two workers pointed at one `ROZ_DATABASE_URL`, or an
+/// in-place restart racing the previous process's final flush) both may see
+/// the same MAX, compute the same base offset, and race on the first
+/// INSERT. The loser's INSERT hits `UNIQUE(session_id, turn_index)`
+/// (SQLSTATE `23505`); [`flush_one`] invalidates the cache entry and the
+/// run-loop retries once, which re-reads MAX and succeeds. In practice a
+/// single worker owns a given session (see `grpc/agent.rs` edge-relay
+/// gating), so this races only at boundary conditions, but the retry is
+/// the structural guarantee — not a comment-level contract.
+///
+/// ## Cache growth bound
+///
+/// `base_offsets` grows by one entry per distinct `(tenant_id, session_id)`
+/// this task observes. All current call sites spawn **one flush task per
+/// session lifetime**:
+/// - gRPC server: `crates/roz-server/src/grpc/agent.rs` cancels the task on
+///   `relay_cancel` firing (end of session).
+/// - Worker: `crates/roz-worker/src/turn_flush.rs` + `main.rs` build a
+///   fresh task per `execute_task` invocation.
+///
+/// So the cache is bounded to ~1 entry in practice, and at most to the
+/// number of distinct sessions a single `execute_task` could ever touch
+/// (always 1 today). Do NOT reuse a single flush task across many sessions
+/// without adding a bounded LRU — the per-session-lifetime scope is the
+/// structural bound that keeps this map from growing.
 pub async fn run_flush_task(mut rx: Receiver<TurnEnvelope>, pool: sqlx::PgPool, cancel: CancellationToken) {
     // Keyed by (tenant_id, session_id) for defense-in-depth against any
     // upstream bug that could route an envelope with a mismatched tenant to a
