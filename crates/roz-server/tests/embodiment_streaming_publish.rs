@@ -69,6 +69,7 @@ async fn start_server_with_nats() -> (String, String, uuid::Uuid, uuid::Uuid, ro
         },
         auth: Arc::new(roz_server::auth::ApiKeyAuth),
         meter: Arc::new(roz_agent::meter::NoOpMeter),
+        trust_policy: Arc::new(roz_server::trust::permissive_policy_for_integration_tests()),
     };
 
     let app = roz_server::build_router(state);

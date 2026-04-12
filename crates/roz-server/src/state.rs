@@ -46,6 +46,14 @@ pub struct AppState {
     pub auth: Arc<dyn RestAuth>,
     /// Pluggable usage metering. OSS uses `NoOpMeter`, cloud injects billing logic.
     pub meter: Arc<dyn roz_agent::meter::UsageMeter>,
+    /// Device trust policy loaded at startup from `ROZ_TRUST_*` env vars.
+    ///
+    /// Shared immutable reference — cloned per handler via `Arc`. Enforced by
+    /// `crate::trust::check_host_trust` in BOTH the REST `routes::tasks::create`
+    /// and gRPC `grpc::tasks::create_task` paths BEFORE Restate workflow
+    /// creation / NATS publish. Fail-closed: see `trust::load_trust_policy_from_env`
+    /// for defaults.
+    pub trust_policy: Arc<roz_core::device_trust::evaluator::TrustPolicy>,
 }
 
 impl FromRef<AppState> for PgPool {

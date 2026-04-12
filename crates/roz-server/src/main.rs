@@ -178,11 +178,7 @@ async fn main() {
         }),
     });
 
-    tracing::info!(
-        rps = rate_limit_rps,
-        burst = rate_limit_burst,
-        "rate limit configured"
-    );
+    tracing::info!(rps = rate_limit_rps, burst = rate_limit_burst, "rate limit configured");
 
     let base_url = std::env::var("ROZ_BASE_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
 
@@ -245,6 +241,8 @@ async fn main() {
         tracing::warn!("ROZ_GATEWAY_API_KEY not set — gRPC agent sessions disabled");
     }
 
+    let trust_policy = Arc::new(roz_server::trust::load_trust_policy_from_env());
+
     let state = AppState {
         pool,
         rate_limiter,
@@ -256,6 +254,7 @@ async fn main() {
         model_config,
         auth: Arc::new(roz_server::auth::ApiKeyAuth),
         meter: Arc::new(roz_agent::meter::NoOpMeter),
+        trust_policy,
     };
 
     // Spawn internal NATS request-reply handlers (e.g. spawn_worker tool bypass).
@@ -366,6 +365,7 @@ mod tests {
             },
             auth: Arc::new(roz_server::auth::ApiKeyAuth),
             meter: Arc::new(roz_agent::meter::NoOpMeter),
+            trust_policy: Arc::new(roz_server::trust::permissive_policy_for_integration_tests()),
         }
     }
 
@@ -2028,6 +2028,7 @@ mod tests {
             },
             auth: Arc::new(roz_server::auth::ApiKeyAuth),
             meter: Arc::new(roz_agent::meter::NoOpMeter),
+            trust_policy: Arc::new(roz_server::trust::permissive_policy_for_integration_tests()),
         }
     }
 

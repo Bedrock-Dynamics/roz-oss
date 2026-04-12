@@ -155,7 +155,7 @@ pub fn load_trust_policy_from_env() -> TrustPolicy {
 /// production; callers must use `load_trust_policy_from_env` at startup.
 #[cfg(test)]
 #[must_use]
-pub fn permissive_test_policy() -> TrustPolicy {
+pub const fn permissive_test_policy() -> TrustPolicy {
     TrustPolicy {
         max_attestation_age_secs: u64::MAX,
         require_firmware_signature: false,
