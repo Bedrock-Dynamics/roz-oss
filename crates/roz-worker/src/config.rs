@@ -61,6 +61,18 @@ pub struct WorkerConfig {
     /// Camera subsystem configuration.
     #[serde(default)]
     pub camera: CameraConfig,
+    /// Optional Postgres URL for worker-side session turn persistence (DEBT-03).
+    ///
+    /// When `Some`, the worker connects directly to Postgres and spawns a
+    /// [`roz_agent::agent_loop::TurnEmitter`] + flush task per `execute_task`
+    /// invocation so agent turns are durably persisted to `roz_session_turns`.
+    ///
+    /// Fail-closed when unset: turn persistence is disabled, agent loop runs
+    /// normally, no pool is created. Set via `ROZ_DATABASE_URL` (NOT
+    /// `DATABASE_URL` — kept separate to avoid picking up unrelated server DB
+    /// URLs in dev).
+    #[serde(default)]
+    pub database_url: Option<String>,
 }
 
 /// Camera subsystem configuration for the worker.

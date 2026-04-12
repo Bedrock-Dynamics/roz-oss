@@ -8,8 +8,10 @@ authors.workspace      = true
 
 [dependencies]
 roz-core = { path = "../roz-core" }
+roz-db = { path = "../roz-db" }
 roz-nats = { path = "../roz-nats" }
 roz-agent = { path = "../roz-agent" }
+sqlx = { workspace = true }
 async-nats.workspace = true
 tokio = { workspace = true, features = ["full"] }
 figment.workspace = true

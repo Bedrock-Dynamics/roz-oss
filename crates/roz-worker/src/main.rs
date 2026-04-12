@@ -607,9 +607,14 @@ async fn execute_task(
         ));
     }
 
+    // DEBT-03: worker-side turn persistence. Opt-in via ROZ_DATABASE_URL.
+    // Fail-closed when unset: bundle is inert and the agent runs as before.
+    let turn_flush = roz_worker::turn_flush::build_turn_flush(&task_config).await;
+
     let agent = AgentLoop::new(model, dispatcher, safety, spatial)
         .with_extensions(extensions)
-        .with_approval_runtime(approval_runtime);
+        .with_approval_runtime(approval_runtime)
+        .with_turn_emitter_opt(turn_flush.emitter.clone());
     let mut executor = WorkerTaskStreamingExecutor {
         agent: Some(agent),
         agent_input,
@@ -700,6 +705,10 @@ async fn execute_task(
     if let Some(handle) = copper_handle {
         handle.shutdown().await;
     }
+
+    // DEBT-03: drain the write-behind flush task before returning so any
+    // queued turns are persisted and the task does not leak.
+    turn_flush.drain().await;
 }
 
 #[tokio::main]

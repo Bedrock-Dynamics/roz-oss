@@ -427,6 +427,9 @@ impl EdgeTurnExecutor {
         )];
         let safety = SafetyStack::new(guards);
         let spatial: Box<dyn WorldStateProvider> = Box::new(spatial_provider);
+        // TODO(phase 13+): confirm edge-relay persistence routing (server-side
+        // emission already covers this; DEBT-03 intentionally omits worker-side
+        // TurnEmitter here to avoid double-persist).
         let agent = AgentLoop::new(model, dispatcher, safety, spatial)
             .with_extensions(extensions)
             .with_approval_runtime(approval_runtime);
