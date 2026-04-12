@@ -195,10 +195,16 @@ impl AgentLoop {
         }
     }
 
-    /// Associated form of [`collect_modifier_changes`] retained so existing test
-    /// callsites (`AgentLoop::collect_modifier_changes`) continue to compile.
-    #[cfg(test)]
-    pub(crate) fn collect_modifier_changes(
+    /// Associated form of [`collect_modifier_changes`] retained so existing
+    /// integration-test callsites (`AgentLoop::collect_modifier_changes`)
+    /// continue to compile.
+    ///
+    /// Visibility is `#[doc(hidden)] pub` (per accepted deviation #7) so the
+    /// integration test crate `tests/agent_loop.rs` can reach it. The
+    /// `#[cfg(test)]` attribute used in Plan 12-01 does not transfer to
+    /// integration-test binary builds — see Plan 12-RESEARCH Pitfall 2.
+    #[doc(hidden)]
+    pub fn collect_modifier_changes(
         base: &serde_json::Value,
         modifier: &serde_json::Value,
         path: &str,
