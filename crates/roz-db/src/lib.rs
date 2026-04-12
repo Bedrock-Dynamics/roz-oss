@@ -3,6 +3,7 @@ pub mod agent_sessions;
 pub mod api_keys;
 pub mod commands;
 pub mod device_codes;
+pub mod device_trust;
 pub mod embodiments;
 pub mod environments;
 pub mod hosts;

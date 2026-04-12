@@ -10,6 +10,7 @@ pub mod restate;
 pub mod routes;
 pub mod state;
 pub mod triggers;
+pub mod trust;
 pub mod ws;
 
 use axum::Router;
