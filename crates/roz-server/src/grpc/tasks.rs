@@ -241,6 +241,21 @@ impl TaskService for TaskServiceImpl {
 
         validate_child_task_delegation_scope(parent_task_id, delegation_scope.as_ref())?;
 
+        // WR-06: when parent_task_id is provided, verify the parent exists and
+        // belongs to the same tenant. Without this check, a caller could forge
+        // a parent_task_id pointing at another tenant's task, which would
+        // later cause approve_tool_use to publish team events onto that
+        // foreign tenant's team subject.
+        if let Some(parent_id) = parent_task_id {
+            let parent = roz_db::tasks::get_by_id(&self.pool, parent_id)
+                .await
+                .map_err(|e| db_err_to_status(&e))?
+                .ok_or_else(|| Status::invalid_argument("parent_task_id not found"))?;
+            if parent.tenant_id != tenant_id {
+                return Err(Status::invalid_argument("parent_task_id not found"));
+            }
+        }
+
         let host_id_str = host_id.trim();
         if host_id_str.is_empty() {
             return Err(Status::invalid_argument(
