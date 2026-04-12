@@ -110,7 +110,12 @@ impl TurnEmitter {
 /// flight after cancel are silently dropped (acceptable per Phase 13
 /// CONTEXT.md — persistence is best-effort, not agent-critical).
 pub async fn run_flush_task(mut rx: Receiver<TurnEnvelope>, pool: sqlx::PgPool, cancel: CancellationToken) {
-    let mut base_offsets: HashMap<Uuid, i32> = HashMap::new();
+    // Keyed by (tenant_id, session_id) for defense-in-depth against any
+    // upstream bug that could route an envelope with a mismatched tenant to a
+    // session the tenant does not own. Even though `session_id` is a v4 UUID
+    // (collision-free in practice), this tuple key also hardens against test
+    // fixtures that reuse `Uuid::nil()` and future non-UUID session IDs.
+    let mut base_offsets: HashMap<(Uuid, Uuid), i32> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -158,20 +163,21 @@ pub async fn run_flush_task(mut rx: Receiver<TurnEnvelope>, pool: sqlx::PgPool, 
 /// `turn_index`, preserving `UNIQUE(session_id, turn_index)` across resumes.
 async fn flush_one(
     pool: &sqlx::PgPool,
-    base_offsets: &mut HashMap<Uuid, i32>,
+    base_offsets: &mut HashMap<(Uuid, Uuid), i32>,
     env: &TurnEnvelope,
 ) -> Result<(), sqlx::Error> {
+    let key = (env.tenant_id, env.session_id);
     let mut tx = pool.begin().await?;
     roz_db::set_tenant_context(&mut *tx, &env.tenant_id).await?;
 
     // Seed the base offset for this session if not cached yet.
-    if let std::collections::hash_map::Entry::Vacant(slot) = base_offsets.entry(env.session_id) {
+    if let std::collections::hash_map::Entry::Vacant(slot) = base_offsets.entry(key) {
         let base = match roz_db::session_turns::max_turn_index(&mut *tx, env.session_id).await {
             Ok(max) => max.map_or(0, |m| m + 1),
             Err(e) => {
                 tracing::warn!(
                     session_id = %env.session_id,
-                    error = ?e,
+                    error = %e,
                     "failed to seed turn_index base offset; starting at 0 — duplicate-key may follow"
                 );
                 0
@@ -180,7 +186,7 @@ async fn flush_one(
         slot.insert(base);
     }
 
-    let base = base_offsets.get(&env.session_id).copied().unwrap_or(0);
+    let base = base_offsets.get(&key).copied().unwrap_or(0);
     let absolute_index = env.turn_index.saturating_add(base);
 
     roz_db::session_turns::insert_turn(
