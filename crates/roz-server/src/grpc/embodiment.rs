@@ -352,7 +352,10 @@ impl EmbodimentService for EmbodimentServiceImpl {
         let mut sub = nats
             .subscribe(subject)
             .await
-            .map_err(|e| Status::internal(format!("NATS subscribe failed: {e}")))?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "NATS subscribe failed");
+                Status::internal("NATS subscribe failed")
+            })?;
 
         // D-04: Send initial full snapshot.
         let row = fetch_embodiment_row(&self.pool, host_id, tenant_id).await?;
@@ -360,7 +363,10 @@ impl EmbodimentService for EmbodimentServiceImpl {
             row.embodiment_model
                 .ok_or_else(|| Status::not_found("host has no embodiment model"))?,
         )
-        .map_err(|e| Status::internal(format!("deserialize model: {e}")))?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to deserialize embodiment model");
+            Status::internal("failed to deserialize embodiment data")
+        })?;
 
         let initial_digest = compute_frame_tree_digest(&model.frame_tree);
 
@@ -481,7 +487,10 @@ impl EmbodimentService for EmbodimentServiceImpl {
         let mut sub = nats
             .subscribe(subject)
             .await
-            .map_err(|e| Status::internal(format!("NATS subscribe failed: {e}")))?;
+            .map_err(|e| {
+                tracing::error!(error = %e, "NATS subscribe failed");
+                Status::internal("NATS subscribe failed")
+            })?;
 
         // D-04: Send initial full calibration snapshot.
         let row = fetch_embodiment_row(&self.pool, host_id, tenant_id).await?;
@@ -489,7 +498,10 @@ impl EmbodimentService for EmbodimentServiceImpl {
             row.embodiment_runtime
                 .ok_or_else(|| Status::not_found("host has no embodiment runtime"))?,
         )
-        .map_err(|e| Status::internal(format!("deserialize runtime: {e}")))?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to deserialize embodiment runtime");
+            Status::internal("failed to deserialize embodiment data")
+        })?;
 
         let calibration = runtime
             .calibration
