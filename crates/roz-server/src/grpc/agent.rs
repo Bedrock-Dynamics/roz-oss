@@ -476,6 +476,12 @@ async fn run_session_loop(
     // Cancelled when the session loop exits to stop the infinite relay loops.
     let relay_cancel = tokio_util::sync::CancellationToken::new();
 
+    // DEBT-03: session-scoped write-behind persistence.
+    // The emitter is spawned when the session is established (post `handle_start`)
+    // and cancelled alongside other relay tasks via `relay_cancel`.
+    // Edge sessions (is_edge == true) are deferred — see TODO below.
+    let mut turn_emitter: Option<roz_agent::agent_loop::TurnEmitter> = None;
+
     loop {
         // Wait for either the next inbound message or a turn-done signal.
         let req = tokio::select! {
@@ -611,6 +617,19 @@ async fn run_session_loop(
                         let host_id_for_telem = sess.host_id.clone().unwrap_or_else(|| worker_name.clone());
                         spawn_telemetry_relay(nats, worker_name, &host_id_for_telem, tx, relay_cancel.clone()).await;
                         spawn_webrtc_signaling_relay(nats, worker_name, tx, relay_cancel.clone()).await;
+                    }
+
+                    // DEBT-03: spawn write-behind flush task for cloud (non-edge) sessions.
+                    // TODO(phase 13+): edge session turn persistence deferred — the server
+                    // would double-persist if the worker also emitted. See 13-01 plan.
+                    if !sess.is_edge && turn_emitter.is_none() {
+                        let (emitter, rx) = roz_agent::agent_loop::TurnEmitter::new();
+                        turn_emitter = Some(emitter);
+                        let flush_cancel = relay_cancel.child_token();
+                        let flush_pool = pool.clone();
+                        tokio::spawn(async move {
+                            roz_agent::agent_loop::run_flush_task(rx, flush_pool, flush_cancel).await;
+                        });
                     }
 
                     // Edge mode: relay the entire session to the worker via NATS
@@ -847,7 +866,8 @@ async fn run_session_loop(
                 let spatial = spatial_bootstrap.provider;
                 let agent_loop = AgentLoop::new(model, dispatcher, safety, spatial)
                     .with_approval_runtime(approval_runtime.clone())
-                    .with_meter(meter.clone());
+                    .with_meter(meter.clone())
+                    .with_turn_emitter_opt(turn_emitter.clone());
 
                 let turn_cancel = tokio_util::sync::CancellationToken::new();
                 let message_id = msg

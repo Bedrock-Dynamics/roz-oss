@@ -6,10 +6,12 @@
 //! already constructed a noop `presence_tx`).
 
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use super::input::{ActivityState, AgentInput, AgentOutput, PresenceLevel, PresenceSignal, RESPOND_TOOL_NAME};
 use super::retry::check_circuit_breaker;
 use super::spatial::build_spatial_observation;
+use super::turn_emitter::{TurnEmitter, TurnEnvelope};
 use super::{AgentLoop, AgentLoopMode};
 use crate::context::ContextManager;
 use crate::dispatch::ToolContext;
@@ -18,6 +20,43 @@ use crate::meter::BudgetStatus;
 use crate::model::types::{CompletionRequest, Message, StopReason, StreamChunk, TokenUsage, ToolChoiceStrategy};
 use roz_core::session::control::CognitionMode;
 use roz_core::spatial::WorldState;
+
+/// Emit one turn envelope if a turn emitter is attached AND both `session_id`
+/// and `tenant_id` parsed as valid UUIDs. Increments `turn_index` on success.
+///
+/// Serialization failures are logged at `tracing::debug!` but do not crash
+/// the agent loop — persistence is best-effort (DEBT-03).
+fn emit_turn_if_enabled(
+    emitter: Option<&TurnEmitter>,
+    session_id: Option<Uuid>,
+    tenant_id: Option<Uuid>,
+    turn_index: &mut i32,
+    role: &'static str,
+    message: &Message,
+    usage: Option<&TokenUsage>,
+) {
+    let (Some(em), Some(sid), Some(tid)) = (emitter, session_id, tenant_id) else {
+        return;
+    };
+    let content = serde_json::to_value(message).unwrap_or(serde_json::Value::Null);
+    let token_usage = usage.map(|u| {
+        serde_json::json!({
+            "input_tokens": u.input_tokens,
+            "output_tokens": u.output_tokens,
+            "cache_read_tokens": u.cache_read_tokens,
+            "cache_creation_tokens": u.cache_creation_tokens,
+        })
+    });
+    em.emit(TurnEnvelope {
+        session_id: sid,
+        tenant_id: tid,
+        turn_index: *turn_index,
+        role,
+        content,
+        token_usage,
+    });
+    *turn_index = turn_index.saturating_add(1);
+}
 
 impl AgentLoop {
     /// Shared turn / tool-dispatch state machine consumed by both `run_streaming`
@@ -44,6 +83,31 @@ impl AgentLoop {
         self.system_prompt_seed.clear();
         self.history_seed.clear();
         self.user_message_seed = None;
+
+        // DEBT-03: parse session/tenant UUIDs once for write-behind emission.
+        // Non-UUID task_id (e.g. local CLI runs) silently skips emission.
+        let session_uuid = Uuid::parse_str(&input.task_id).ok();
+        let tenant_uuid = Uuid::parse_str(&input.tenant_id).ok();
+        if self.turn_emitter.is_some() && (session_uuid.is_none() || tenant_uuid.is_none()) {
+            tracing::debug!(
+                task_id = %input.task_id,
+                "turn emission disabled: task_id or tenant_id is not a UUID"
+            );
+        }
+        let mut turn_index: i32 = 0;
+
+        // Emit the user message that was just appended to `messages`.
+        if let Some(user_msg) = messages.last() {
+            emit_turn_if_enabled(
+                self.turn_emitter.as_ref(),
+                session_uuid,
+                tenant_uuid,
+                &mut turn_index,
+                "user",
+                user_msg,
+                None,
+            );
+        }
 
         let mut total_usage = TokenUsage::default();
         let mut cycles = 0u32;
@@ -138,6 +202,17 @@ impl AgentLoop {
                         final_response = Some(text);
                     }
                     messages.push(Message::assistant_parts(resp.parts.clone()));
+                    if let Some(assistant_msg) = messages.last() {
+                        emit_turn_if_enabled(
+                            self.turn_emitter.as_ref(),
+                            session_uuid,
+                            tenant_uuid,
+                            &mut turn_index,
+                            "assistant",
+                            assistant_msg,
+                            Some(&resp.usage),
+                        );
+                    }
                     total_usage.input_tokens += resp.usage.input_tokens;
                     total_usage.output_tokens += resp.usage.output_tokens;
                     total_usage.cache_read_tokens += resp.usage.cache_read_tokens;
@@ -299,6 +374,17 @@ impl AgentLoop {
             }
 
             messages.push(Message::assistant_parts(resp.parts.clone()));
+            if let Some(assistant_msg) = messages.last() {
+                emit_turn_if_enabled(
+                    self.turn_emitter.as_ref(),
+                    session_uuid,
+                    tenant_uuid,
+                    &mut turn_index,
+                    "assistant",
+                    assistant_msg,
+                    Some(&resp.usage),
+                );
+            }
             if let Some(text) = resp.text() {
                 final_response = Some(text);
             }
@@ -347,6 +433,7 @@ impl AgentLoop {
                 .await;
 
             // Act: dispatch tool calls through safety stack
+            let pre_dispatch_len = messages.len();
             self.dispatch_tool_calls(
                 &tool_calls,
                 &spatial_ctx,
@@ -356,6 +443,21 @@ impl AgentLoop {
                 input.cancellation_token.as_ref(),
             )
             .await;
+
+            // DEBT-03: emit one row per tool-result message appended by dispatch.
+            // `dispatch_tool_calls` currently pushes at most one batched message,
+            // but iterate the tail to stay future-proof if that changes.
+            for tool_msg in messages.iter().skip(pre_dispatch_len) {
+                emit_turn_if_enabled(
+                    self.turn_emitter.as_ref(),
+                    session_uuid,
+                    tenant_uuid,
+                    &mut turn_index,
+                    "tool",
+                    tool_msg,
+                    None,
+                );
+            }
 
             // Circuit breaker: abort if all tool calls have failed in several consecutive turns.
             consecutive_error_turns = check_circuit_breaker(&messages, consecutive_error_turns)?;
