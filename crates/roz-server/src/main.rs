@@ -155,10 +155,34 @@ async fn main() {
         }
     }
 
-    let rate_limiter = middleware::rate_limit::create_rate_limiter(&middleware::rate_limit::RateLimitConfig {
-        requests_per_second: NonZeroU32::new(100).expect("non-zero"),
-        burst_size: NonZeroU32::new(200).expect("non-zero"),
+    let rate_limit_rps: u32 = std::env::var("ROZ_RATE_LIMIT_RPS").map_or(100, |s| {
+        s.parse().unwrap_or_else(|e| {
+            tracing::warn!(value = %s, error = %e, "invalid ROZ_RATE_LIMIT_RPS, using default 100");
+            100
+        })
     });
+    let rate_limit_burst: u32 = std::env::var("ROZ_RATE_LIMIT_BURST").map_or(200, |s| {
+        s.parse().unwrap_or_else(|e| {
+            tracing::warn!(value = %s, error = %e, "invalid ROZ_RATE_LIMIT_BURST, using default 200");
+            200
+        })
+    });
+    let rate_limiter = middleware::rate_limit::create_rate_limiter(&middleware::rate_limit::RateLimitConfig {
+        requests_per_second: NonZeroU32::new(rate_limit_rps).unwrap_or_else(|| {
+            tracing::warn!("ROZ_RATE_LIMIT_RPS must be > 0, using default 100");
+            NonZeroU32::new(100).expect("non-zero")
+        }),
+        burst_size: NonZeroU32::new(rate_limit_burst).unwrap_or_else(|| {
+            tracing::warn!("ROZ_RATE_LIMIT_BURST must be > 0, using default 200");
+            NonZeroU32::new(200).expect("non-zero")
+        }),
+    });
+
+    tracing::info!(
+        rps = rate_limit_rps,
+        burst = rate_limit_burst,
+        "rate limit configured"
+    );
 
     let base_url = std::env::var("ROZ_BASE_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
 
