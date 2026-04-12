@@ -60,21 +60,31 @@ pub async fn rate_limit_middleware(
     req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    if let Some(identity) = req.extensions().get::<AuthIdentity>() {
-        let key = auth_ext::rate_limit_key(identity);
-        if let Err(retry_after_ms) = check_rate_limit(&state.rate_limiter, &key) {
-            // Ceil to seconds for the Retry-After header (per D-02).
-            let retry_after_secs = retry_after_ms.div_ceil(1000);
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [(axum::http::header::RETRY_AFTER, retry_after_secs.to_string())],
-                Json(json!({
-                    "error": "rate limit exceeded",
-                    "retry_after_ms": retry_after_ms
-                })),
-            )
-                .into_response();
-        }
+    // Fail closed: this middleware is only ever meant to run after auth. If
+    // AuthIdentity is missing, a prior refactor has broken the middleware
+    // ordering invariant and we must not silently pass traffic through
+    // without rate limiting.
+    let Some(identity) = req.extensions().get::<AuthIdentity>() else {
+        tracing::error!("rate limit middleware ran without AuthIdentity -- misconfiguration");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "rate limit misconfigured" })),
+        )
+            .into_response();
+    };
+    let key = auth_ext::rate_limit_key(identity);
+    if let Err(retry_after_ms) = check_rate_limit(&state.rate_limiter, &key) {
+        // Ceil to seconds for the Retry-After header (per D-02).
+        let retry_after_secs = retry_after_ms.div_ceil(1000);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::RETRY_AFTER, retry_after_secs.to_string())],
+            Json(json!({
+                "error": "rate limit exceeded",
+                "retry_after_ms": retry_after_ms
+            })),
+        )
+            .into_response();
     }
     next.run(req).await
 }
@@ -99,15 +109,23 @@ pub async fn grpc_rate_limit_middleware(
     req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    if let Some(identity) = req.extensions().get::<AuthIdentity>() {
-        let key = auth_ext::rate_limit_key(identity);
-        if let Err(retry_after_ms) = check_rate_limit(&limiter, &key) {
-            let message = format!("rate limit exceeded, retry after {retry_after_ms}ms");
-            // tonic::Status::resource_exhausted returns the standard gRPC code 8.
-            let status = tonic::Status::resource_exhausted(message);
-            let http_resp: axum::http::Response<axum::body::Body> = status.into_http();
-            return http_resp.into_response();
-        }
+    // Fail closed: this middleware is only ever meant to run after
+    // grpc_auth_middleware. If AuthIdentity is missing, a prior refactor has
+    // broken the middleware ordering invariant and we must not silently pass
+    // traffic through without rate limiting.
+    let Some(identity) = req.extensions().get::<AuthIdentity>() else {
+        tracing::error!("grpc rate limit middleware ran without AuthIdentity -- misconfiguration");
+        let status = tonic::Status::internal("rate limit misconfigured");
+        let http_resp: axum::http::Response<axum::body::Body> = status.into_http();
+        return http_resp.into_response();
+    };
+    let key = auth_ext::rate_limit_key(identity);
+    if let Err(retry_after_ms) = check_rate_limit(&limiter, &key) {
+        let message = format!("rate limit exceeded, retry after {retry_after_ms}ms");
+        // tonic::Status::resource_exhausted returns the standard gRPC code 8.
+        let status = tonic::Status::resource_exhausted(message);
+        let http_resp: axum::http::Response<axum::body::Body> = status.into_http();
+        return http_resp.into_response();
     }
     next.run(req).await
 }
