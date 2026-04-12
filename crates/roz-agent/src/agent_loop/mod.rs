@@ -1,5 +1,19 @@
 #![allow(clippy::too_many_lines)]
 
+mod input;
+mod retry;
+mod spatial;
+
+pub use self::input::{
+    ActivityState, AgentInput, AgentInputSeed, AgentOutput, PresenceLevel, PresenceSignal, RESPOND_TOOL_NAME,
+};
+pub use self::retry::RetryConfig;
+
+#[doc(hidden)]
+pub use self::spatial::{build_spatial_observation, format_spatial_context};
+
+use self::retry::check_circuit_breaker;
+
 use crate::context::ContextManager;
 use crate::dispatch::{ToolContext, ToolDispatcher};
 use crate::error::AgentError;
@@ -12,244 +26,14 @@ use crate::safety::{SafetyResult, SafetyStack};
 use crate::spatial_provider::WorldStateProvider;
 pub use roz_core::session::control::CognitionMode;
 use roz_core::spatial::WorldState;
+#[cfg(test)]
 use serde_json::Value;
 use tokio::sync::mpsc;
-
-/// UI presence level for the agent overlay.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PresenceLevel {
-    Full,
-    Mini,
-    Hidden,
-}
-
-impl PresenceLevel {
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Full => "full",
-            Self::Mini => "mini",
-            Self::Hidden => "hidden",
-        }
-    }
-}
-
-/// Agent activity state for presence indicators.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActivityState {
-    Thinking,
-    CallingTool,
-    Idle,
-    WaitingApproval,
-}
-
-impl ActivityState {
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Thinking => "thinking",
-            Self::CallingTool => "calling_tool",
-            Self::Idle => "idle",
-            Self::WaitingApproval => "waiting_approval",
-        }
-    }
-}
-
-/// Presence signal emitted by the agent loop to drive UI presence indicators.
-///
-/// Sent via a dedicated `presence_tx` side-channel, mirroring the existing
-/// `chunk_tx` (streaming deltas) and `tool_request_tx` (remote tool calls)
-/// patterns.
-#[derive(Debug, Clone)]
-pub enum PresenceSignal {
-    /// Suggest a UI presence level change.
-    PresenceHint {
-        level: PresenceLevel,
-        /// Human-readable reason for the hint.
-        reason: String,
-    },
-    /// Report the agent's current activity state.
-    ActivityUpdate {
-        state: ActivityState,
-        /// Brief description, e.g. tool name.
-        detail: String,
-        /// Optional progress (0.0–1.0).
-        progress: Option<f32>,
-    },
-    /// Canonical approval-request lifecycle signal.
-    ApprovalRequested {
-        approval_id: String,
-        action: String,
-        reason: String,
-        timeout_secs: u64,
-    },
-    /// Canonical approval-resolution lifecycle signal.
-    ApprovalResolved {
-        approval_id: String,
-        outcome: roz_core::session::feedback::ApprovalOutcome,
-    },
-}
-
-/// Number of consecutive all-error tool turns before the circuit breaker trips.
-const CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
-
-/// Configuration for retry with exponential backoff on transient model errors.
-#[derive(Debug, Clone)]
-pub struct RetryConfig {
-    /// Maximum number of retry attempts before giving up.
-    pub max_retries: u32,
-    /// Initial delay before the first retry, in milliseconds.
-    pub initial_delay_ms: u64,
-    /// Maximum delay between retries, in milliseconds (caps exponential growth).
-    pub max_delay_ms: u64,
-    /// Multiplier applied to the delay after each retry.
-    pub backoff_factor: f64,
-}
-
-impl Default for RetryConfig {
-    fn default() -> Self {
-        Self {
-            max_retries: 3,
-            initial_delay_ms: 500,
-            max_delay_ms: 30_000,
-            backoff_factor: 2.0,
-        }
-    }
-}
 
 /// Compatibility alias retained while downstream crates converge on
 /// cognition-mode terminology.
 #[doc(hidden)]
 pub type AgentLoopMode = CognitionMode;
-
-/// The name of the hidden tool injected when structured output is requested.
-pub const RESPOND_TOOL_NAME: &str = "__respond";
-
-/// Input to an agent loop run.
-#[derive(Debug, Clone)]
-pub struct AgentInput {
-    pub task_id: String,
-    pub tenant_id: String,
-    /// Model name used for this run (e.g. `"claude-sonnet-4-6"`).
-    /// Included in `UsageRecord` for per-model billing breakdowns.
-    pub model_name: String,
-    /// Direct-caller prompt/history/current-turn seed.
-    ///
-    /// Runtime-driven surfaces should keep this empty and use
-    /// [`AgentInput::runtime_shell`] together with [`AgentInputSeed`] passed
-    /// into [`AgentLoop::run_seeded`] / [`AgentLoop::run_streaming_seeded`].
-    pub seed: AgentInputSeed,
-    pub max_cycles: u32,
-    pub max_tokens: u32,
-    /// Total context window size used as the denominator for
-    /// compaction thresholds. Distinct from `max_tokens` which is
-    /// the per-call output generation budget.
-    pub max_context_tokens: u32,
-    pub mode: CognitionMode,
-    /// Ordered phase specs. Empty = single phase using `mode` with all tools (default behaviour).
-    pub phases: Vec<roz_core::phases::PhaseSpec>,
-    /// Tool choice strategy for model calls. `None` means the provider
-    /// uses its default behavior (typically `Auto`).
-    pub tool_choice: Option<ToolChoiceStrategy>,
-    /// Optional JSON Schema for structured output. When set, the agent loop
-    /// injects a hidden `__respond` tool with this schema and forces the model
-    /// to call it. The tool call's input becomes the structured response.
-    pub response_schema: Option<Value>,
-    /// When `true`, use `model.stream()` instead of `model.complete()` to get
-    /// the model response as incremental chunks. The assembled result is
-    /// functionally identical to what `complete()` returns, but enables future
-    /// early-dispatch optimisations and real-time SSE forwarding.
-    pub streaming: bool,
-    /// Cooperative cancellation token. When cancelled, the agent loop exits
-    /// cleanly at the next cycle boundary with `AgentError::Cancelled`.
-    pub cancellation_token: Option<tokio_util::sync::CancellationToken>,
-    /// Control mode for this session. Supervised requires human monitoring
-    /// for physical actions. Default: Autonomous.
-    pub control_mode: roz_core::safety::ControlMode,
-}
-
-/// Runtime-owned compatibility seed for prompt/history/current-turn input.
-#[derive(Debug, Clone, Default)]
-pub struct AgentInputSeed {
-    pub system_prompt: Vec<String>,
-    pub history: Vec<Message>,
-    pub user_message: String,
-}
-
-impl AgentInputSeed {
-    #[must_use]
-    pub fn new(system_prompt: Vec<String>, history: Vec<Message>, user_message: impl Into<String>) -> Self {
-        Self {
-            system_prompt,
-            history,
-            user_message: user_message.into(),
-        }
-    }
-}
-
-impl AgentInput {
-    /// Build a runtime-driven shell input with compatibility fields intentionally empty.
-    #[must_use]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "runtime-driven callers need to set execution limits explicitly"
-    )]
-    pub fn runtime_shell(
-        task_id: impl Into<String>,
-        tenant_id: impl Into<String>,
-        model_name: impl Into<String>,
-        mode: CognitionMode,
-        max_cycles: u32,
-        max_tokens: u32,
-        max_context_tokens: u32,
-        streaming: bool,
-        cancellation_token: Option<tokio_util::sync::CancellationToken>,
-        control_mode: roz_core::safety::ControlMode,
-    ) -> Self {
-        Self {
-            task_id: task_id.into(),
-            tenant_id: tenant_id.into(),
-            model_name: model_name.into(),
-            seed: AgentInputSeed::default(),
-            max_cycles,
-            max_tokens,
-            max_context_tokens,
-            mode,
-            phases: Vec::new(),
-            tool_choice: None,
-            response_schema: None,
-            streaming,
-            cancellation_token,
-            control_mode,
-        }
-    }
-}
-
-impl std::ops::Deref for AgentInput {
-    type Target = AgentInputSeed;
-
-    fn deref(&self) -> &Self::Target {
-        &self.seed
-    }
-}
-
-impl std::ops::DerefMut for AgentInput {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.seed
-    }
-}
-
-/// Output from a completed agent loop run.
-#[derive(Debug, Clone)]
-pub struct AgentOutput {
-    /// Number of model invocations performed.
-    pub cycles: u32,
-    /// The final text response from the model (if any).
-    pub final_response: Option<String>,
-    /// Accumulated token usage across all cycles.
-    pub total_usage: TokenUsage,
-    /// The accumulated conversation messages from this turn (excluding system prompt).
-    /// Includes history, user message, assistant responses, and tool results.
-    pub messages: Vec<Message>,
-}
 
 /// The agent loop: mode-adaptive reasoning and action cycle.
 ///
@@ -492,55 +276,6 @@ impl AgentLoop {
         let user_message = self.user_message_seed.as_deref().unwrap_or(&input.seed.user_message);
         messages.push(Message::user(user_message.to_string()));
         (messages, has_system)
-    }
-
-    /// Call the model with retry + exponential backoff on transient errors.
-    async fn complete_with_retry(
-        &self,
-        req: &CompletionRequest,
-    ) -> Result<crate::model::types::CompletionResponse, AgentError> {
-        let mut last_err = None;
-        let mut delay_ms = self.retry_config.initial_delay_ms;
-
-        for attempt in 0..=self.retry_config.max_retries {
-            match self.model.complete(req).await {
-                Ok(resp) => return Ok(resp),
-                Err(e) => {
-                    let agent_err = AgentError::Model(e);
-                    if !agent_err.is_retryable() || attempt == self.retry_config.max_retries {
-                        return Err(agent_err);
-                    }
-                    tracing::warn!(
-                        attempt = attempt + 1,
-                        max_retries = self.retry_config.max_retries,
-                        delay_ms = delay_ms,
-                        error = %agent_err,
-                        "transient model error, retrying"
-                    );
-                    // Use retry-after header if present, but clamp to [delay_ms, max_delay_ms]
-                    let retry_after_ms = AgentError::extract_retry_after_secs(&agent_err.to_string())
-                        .map(|secs| secs.saturating_mul(1000));
-                    let actual_delay = retry_after_ms
-                        .unwrap_or(delay_ms)
-                        .max(delay_ms)
-                        .min(self.retry_config.max_delay_ms);
-                    tokio::time::sleep(tokio::time::Duration::from_millis(actual_delay)).await;
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        clippy::cast_sign_loss,
-                        clippy::cast_precision_loss,
-                        reason = "delay is clamped to max_delay_ms which fits in u64; precision loss is acceptable for backoff timing"
-                    )]
-                    {
-                        delay_ms = (f64::from(delay_ms as u32) * self.retry_config.backoff_factor)
-                            .min(self.retry_config.max_delay_ms as f64) as u64;
-                    }
-                    last_err = Some(agent_err);
-                }
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| AgentError::Model("retry exhausted with no error".into())))
     }
 
     /// Consume a streaming response and assemble a `CompletionResponse`.
@@ -1107,7 +842,7 @@ impl AgentLoop {
             .await;
 
             // Circuit breaker: abort if all tool calls have failed in several consecutive turns.
-            consecutive_error_turns = Self::check_circuit_breaker(&messages, consecutive_error_turns)?;
+            consecutive_error_turns = check_circuit_breaker(&messages, consecutive_error_turns)?;
 
             // Signal: tools done, back to thinking
             let _ = presence_tx
@@ -1580,42 +1315,6 @@ impl AgentLoop {
         }
     }
 
-    /// Check the circuit breaker after a tool dispatch turn.
-    ///
-    /// Returns the updated consecutive-error-turn count. If all tool results in
-    /// `messages.last()` are errors and the count reaches [`CIRCUIT_BREAKER_THRESHOLD`],
-    /// returns [`AgentError::CircuitBreakerTripped`] so both `run()` and
-    /// `run_streaming()` can use the same logic.
-    fn check_circuit_breaker(messages: &[Message], consecutive_error_turns: u32) -> Result<u32, AgentError> {
-        let last_msg = messages.last().expect("dispatch_tool_calls always pushes a message");
-        let n_results = last_msg
-            .parts
-            .iter()
-            .filter(|p| matches!(p, ContentPart::ToolResult { .. }))
-            .count();
-        let n_errors = last_msg
-            .parts
-            .iter()
-            .filter(|p| matches!(p, ContentPart::ToolResult { is_error: true, .. }))
-            .count();
-        if n_results > 0 && n_errors == n_results {
-            let updated = consecutive_error_turns + 1;
-            tracing::warn!(
-                consecutive_error_turns = updated,
-                n_errors,
-                "all tool calls in this turn failed"
-            );
-            if updated >= CIRCUIT_BREAKER_THRESHOLD {
-                return Err(AgentError::CircuitBreakerTripped {
-                    consecutive_error_turns: updated,
-                });
-            }
-            Ok(updated)
-        } else {
-            Ok(0)
-        }
-    }
-
     /// Run the agent loop until the model emits `EndTurn` or max cycles reached.
     #[allow(clippy::too_many_lines)]
     #[tracing::instrument(
@@ -1920,7 +1619,7 @@ impl AgentLoop {
 
             // Circuit breaker: abort if all tool calls have failed in several consecutive turns.
             // One failing tool is a transient glitch; N consecutive all-error turns is systemic.
-            consecutive_error_turns = Self::check_circuit_breaker(&messages, consecutive_error_turns)?;
+            consecutive_error_turns = check_circuit_breaker(&messages, consecutive_error_turns)?;
         }
 
         // Return messages minus system prompt (move, not clone).
@@ -1933,63 +1632,6 @@ impl AgentLoop {
             total_usage,
             messages: turn_messages,
         })
-    }
-}
-
-/// Format spatial context as a human-readable string for injection into model messages.
-fn format_spatial_context(ctx: &WorldState) -> String {
-    use std::fmt::Write;
-
-    let mut lines = Vec::new();
-
-    for entity in &ctx.entities {
-        let mut desc = format!("Entity '{}' ({})", entity.id, entity.kind);
-        if let Some([x, y, z, ..]) = entity.position {
-            let _ = write!(desc, " at [{x:.2}, {y:.2}, {z:.2}]");
-        }
-        if let Some([vx, vy, vz, ..]) = entity.velocity {
-            let _ = write!(desc, " vel=[{vx:.2}, {vy:.2}, {vz:.2}]");
-        }
-        lines.push(desc);
-    }
-
-    for alert in &ctx.alerts {
-        lines.push(format!(
-            "ALERT [{:?}]: {} ({})",
-            alert.severity, alert.message, alert.source
-        ));
-    }
-
-    for constraint in &ctx.constraints {
-        if constraint.active {
-            lines.push(format!("Constraint [{}]: {}", constraint.name, constraint.description));
-        }
-    }
-
-    if lines.is_empty() {
-        "No spatial observations.".to_string()
-    } else {
-        lines.join("\n")
-    }
-}
-
-/// Build the observation message for spatial context injection.
-///
-/// When screenshots are present, returns a user message with both text and
-/// image content blocks (Anthropic requires images in user messages).
-/// Otherwise returns a system message with text-only observation.
-fn build_spatial_observation(ctx: &WorldState) -> Message {
-    let formatted = format_spatial_context(ctx);
-    let observation_text = format!("[Spatial Observation]\n{formatted}");
-    if ctx.screenshots.is_empty() {
-        Message::system(observation_text)
-    } else {
-        let images: Vec<(String, String)> = ctx
-            .screenshots
-            .iter()
-            .map(|s| (s.media_type.clone(), s.data.clone()))
-            .collect();
-        Message::user_with_images(observation_text, images)
     }
 }
 
