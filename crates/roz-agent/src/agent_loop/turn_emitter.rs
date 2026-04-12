@@ -124,13 +124,26 @@ pub async fn run_flush_task(mut rx: Receiver<TurnEnvelope>, pool: sqlx::PgPool, 
                 // Drain remaining envelopes before exiting.
                 while let Ok(env) = rx.try_recv() {
                     if let Err(e) = flush_one(&pool, &mut base_offsets, &env).await {
-                        tracing::warn!(
-                            session_id = %env.session_id,
-                            turn_index = env.turn_index,
-                            role = env.role,
-                            error = ?e,
-                            "failed to flush session turn during drain"
-                        );
+                        if is_unique_violation(&e) {
+                            // Reseed + retry once during drain as well.
+                            if let Err(e2) = flush_one(&pool, &mut base_offsets, &env).await {
+                                tracing::warn!(
+                                    session_id = %env.session_id,
+                                    turn_index = env.turn_index,
+                                    role = env.role,
+                                    error = %e2,
+                                    "failed to flush session turn during drain after reseed retry"
+                                );
+                            }
+                        } else {
+                            tracing::warn!(
+                                session_id = %env.session_id,
+                                turn_index = env.turn_index,
+                                role = env.role,
+                                error = %e,
+                                "failed to flush session turn during drain"
+                            );
+                        }
                     }
                 }
                 break;
@@ -139,13 +152,36 @@ pub async fn run_flush_task(mut rx: Receiver<TurnEnvelope>, pool: sqlx::PgPool, 
                 match maybe_env {
                     Some(env) => {
                         if let Err(e) = flush_one(&pool, &mut base_offsets, &env).await {
-                            tracing::warn!(
-                                session_id = %env.session_id,
-                                turn_index = env.turn_index,
-                                role = env.role,
-                                error = ?e,
-                                "failed to flush session turn"
-                            );
+                            // On UNIQUE(session_id, turn_index) violation (23505) the
+                            // cached base offset is stale (concurrent writer, or TOCTOU
+                            // between seed and first INSERT). `flush_one` has already
+                            // invalidated the entry before returning; retry once so the
+                            // next call re-reads MAX+1 and self-heals.
+                            if is_unique_violation(&e) {
+                                tracing::warn!(
+                                    session_id = %env.session_id,
+                                    turn_index = env.turn_index,
+                                    role = env.role,
+                                    "retrying session turn after unique-violation; base offset reseed"
+                                );
+                                if let Err(e2) = flush_one(&pool, &mut base_offsets, &env).await {
+                                    tracing::warn!(
+                                        session_id = %env.session_id,
+                                        turn_index = env.turn_index,
+                                        role = env.role,
+                                        error = %e2,
+                                        "failed to flush session turn after reseed retry"
+                                    );
+                                }
+                            } else {
+                                tracing::warn!(
+                                    session_id = %env.session_id,
+                                    turn_index = env.turn_index,
+                                    role = env.role,
+                                    error = %e,
+                                    "failed to flush session turn"
+                                );
+                            }
                         }
                     }
                     None => break, // All senders dropped.
@@ -189,7 +225,7 @@ async fn flush_one(
     let base = base_offsets.get(&key).copied().unwrap_or(0);
     let absolute_index = env.turn_index.saturating_add(base);
 
-    roz_db::session_turns::insert_turn(
+    match roz_db::session_turns::insert_turn(
         &mut *tx,
         env.session_id,
         absolute_index,
@@ -197,10 +233,32 @@ async fn flush_one(
         &env.content,
         env.token_usage.as_ref(),
     )
-    .await?;
+    .await
+    {
+        Ok(()) => {}
+        Err(e) => {
+            if is_unique_violation(&e) {
+                // Base offset is stale. Invalidate the cache entry so the next
+                // attempt for this session re-reads MAX(turn_index)+1 from the
+                // DB. The caller ([`run_flush_task`]) handles the retry so the
+                // pool tx drop here is intentional.
+                base_offsets.remove(&key);
+            }
+            return Err(e);
+        }
+    }
 
     tx.commit().await?;
     Ok(())
+}
+
+/// Returns `true` if the given `sqlx::Error` is a `PostgreSQL` unique-violation
+/// (SQLSTATE `23505`).
+fn is_unique_violation(e: &sqlx::Error) -> bool {
+    matches!(
+        e,
+        sqlx::Error::Database(db) if db.code().as_deref() == Some("23505")
+    )
 }
 
 #[cfg(test)]
