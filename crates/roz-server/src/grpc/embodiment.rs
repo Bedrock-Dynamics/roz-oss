@@ -383,6 +383,11 @@ impl EmbodimentService for EmbodimentServiceImpl {
 
         let pool = self.pool.clone();
         tokio::spawn(async move {
+            // WR-04: bail out after this many consecutive deserialize failures.
+            // A poisoned/legacy payload on the subject would otherwise keep
+            // tripping the same bug forever.
+            const MAX_CONSECUTIVE_DESERIALIZE_FAILURES: u32 = 10;
+            let mut consecutive_deserialize_failures: u32 = 0;
             let mut last_digest = initial_digest;
             let mut last_tree = model.frame_tree;
             let mut keepalive_interval = tokio::time::interval(Duration::from_secs(15));
@@ -394,9 +399,23 @@ impl EmbodimentService for EmbodimentServiceImpl {
                         if let Some(nats_msg) = msg {
                             let event: roz_nats::dispatch::EmbodimentChangedEvent =
                                 match serde_json::from_slice(&nats_msg.payload) {
-                                    Ok(e) => e,
+                                    Ok(e) => {
+                                        consecutive_deserialize_failures = 0;
+                                        e
+                                    }
                                     Err(e) => {
                                         tracing::warn!(error = %e, "failed to deserialize EmbodimentChangedEvent");
+                                        consecutive_deserialize_failures += 1;
+                                        if consecutive_deserialize_failures >= MAX_CONSECUTIVE_DESERIALIZE_FAILURES {
+                                            tracing::error!(
+                                                failures = consecutive_deserialize_failures,
+                                                "too many consecutive deserialize failures; closing frame tree stream"
+                                            );
+                                            let _ = tx
+                                                .send(Err(Status::internal("event stream corrupted")))
+                                                .await;
+                                            break;
+                                        }
                                         continue;
                                     }
                                 };
@@ -523,6 +542,11 @@ impl EmbodimentService for EmbodimentServiceImpl {
 
         let pool = self.pool.clone();
         tokio::spawn(async move {
+            // WR-04: bail out after this many consecutive deserialize failures.
+            // A poisoned/legacy payload on the subject would otherwise keep
+            // tripping the same bug forever.
+            const MAX_CONSECUTIVE_DESERIALIZE_FAILURES: u32 = 10;
+            let mut consecutive_deserialize_failures: u32 = 0;
             let mut last_digest = initial_digest;
             let mut keepalive_interval = tokio::time::interval(Duration::from_secs(15));
             keepalive_interval.tick().await; // consume immediate first tick
@@ -533,9 +557,23 @@ impl EmbodimentService for EmbodimentServiceImpl {
                         if let Some(nats_msg) = msg {
                             let event: roz_nats::dispatch::EmbodimentChangedEvent =
                                 match serde_json::from_slice(&nats_msg.payload) {
-                                    Ok(e) => e,
+                                    Ok(e) => {
+                                        consecutive_deserialize_failures = 0;
+                                        e
+                                    }
                                     Err(e) => {
                                         tracing::warn!(error = %e, "failed to deserialize EmbodimentChangedEvent");
+                                        consecutive_deserialize_failures += 1;
+                                        if consecutive_deserialize_failures >= MAX_CONSECUTIVE_DESERIALIZE_FAILURES {
+                                            tracing::error!(
+                                                failures = consecutive_deserialize_failures,
+                                                "too many consecutive deserialize failures; closing calibration stream"
+                                            );
+                                            let _ = tx
+                                                .send(Err(Status::internal("event stream corrupted")))
+                                                .await;
+                                            break;
+                                        }
                                         continue;
                                     }
                                 };
