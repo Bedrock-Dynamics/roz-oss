@@ -1,12 +1,12 @@
 //! Integration tests for the device-trust gate (ENF-01).
 //!
-//! Covers Task 1 DB tests (check_host_trust semantics) + Task 3 wire-level
-//! parity (REST 409 + gRPC FailedPrecondition) against an Untrusted host,
+//! Covers Task 1 DB tests (`check_host_trust` semantics) + Task 3 wire-level
+//! parity (REST 409 + gRPC `FailedPrecondition`) against an Untrusted host,
 //! plus Trusted happy path and exact-shape assertions.
 //!
 //! Run: `cargo test -p roz-server --test trust_gate_integration -- --ignored --test-threads=1`
 
-#![allow(clippy::too_many_lines)]
+#![allow(clippy::too_many_lines, clippy::missing_const_for_fn)]
 
 use chrono::{DateTime, TimeDelta, Utc};
 use roz_core::auth::{AuthIdentity, TenantId};
@@ -266,7 +266,7 @@ async fn seed_api_key(pool: &PgPool, tenant_id: Uuid) -> String {
 }
 
 async fn seed_environment(pool: &PgPool, tenant_id: Uuid) -> Uuid {
-    let env = roz_db::environments::create(pool, tenant_id, "trust-env", "", None, None)
+    let env = roz_db::environments::create(pool, tenant_id, "trust-env", "simulation", &json!({}))
         .await
         .expect("create env");
     env.id

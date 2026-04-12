@@ -105,15 +105,34 @@ pub async fn create(
         .host_id
         .as_deref()
         .ok_or_else(|| AppError::bad_request("host_id is required until deferred assignment is implemented"))?;
-    let nats = state
-        .nats_client
-        .as_ref()
-        .ok_or_else(|| AppError::internal("task dispatch unavailable: NATS is not configured"))?;
     let host_uuid = Uuid::parse_str(host_id_str).map_err(|_| AppError::bad_request("host_id is not a valid UUID"))?;
     let host = roz_db::hosts::get_by_id(&mut **tx, host_uuid)
         .await
         .map_err(|e| AppError::internal(format!("failed to look up host: {e}")))?
         .ok_or_else(|| AppError::not_found(format!("host {host_id_str} not found")))?;
+
+    // ENF-01: device trust gate — MUST run BEFORE task row creation / Restate
+    // workflow / NATS publish so untrusted requests never touch durable state.
+    // Also runs BEFORE the NATS-availability check: trust rejection is a
+    // first-class wire response (409) and must not be masked by a 500 from
+    // downstream infrastructure being unconfigured.
+    // Detailed reason stays server-side via tracing::warn!; wire response is
+    // opaque 409 per CONTEXT D-04.
+    if let Err(rejection) = crate::trust::check_host_trust(&state.pool, tenant_id, host_uuid, &state.trust_policy).await
+    {
+        tracing::warn!(
+            %tenant_id,
+            %host_uuid,
+            reason = %rejection.reason,
+            "task dispatch rejected: host trust posture not satisfied"
+        );
+        return Err(AppError::trust_rejected());
+    }
+
+    let nats = state
+        .nats_client
+        .as_ref()
+        .ok_or_else(|| AppError::internal("task dispatch unavailable: NATS is not configured"))?;
 
     // Serialise phases to JSONB. An empty array is a valid default (single React phase).
     let phases_json = serde_json::to_value(&body.phases)

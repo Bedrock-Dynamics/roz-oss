@@ -150,14 +150,18 @@ pub fn load_trust_policy_from_env() -> TrustPolicy {
     }
 }
 
-/// Permissive trust policy for tests — accepts any device with a firmware
-/// manifest and attestation, regardless of age or signature. NEVER use in
-/// production; callers must use `load_trust_policy_from_env` at startup.
+/// Permissive trust policy for tests.
+///
+/// Accepts any device with a firmware manifest and attestation, regardless of
+/// age or signature. NEVER use in production; callers must use
+/// `load_trust_policy_from_env` at startup.
 #[cfg(test)]
 #[must_use]
 pub const fn permissive_test_policy() -> TrustPolicy {
     TrustPolicy {
-        max_attestation_age_secs: u64::MAX,
+        // 10 years in seconds — large enough to make any reasonable attestation
+        // fresh, but small enough that chrono::TimeDelta::seconds does not panic.
+        max_attestation_age_secs: 315_360_000,
         require_firmware_signature: false,
         allowed_firmware_versions: vec![],
     }
@@ -172,7 +176,9 @@ pub const fn permissive_test_policy() -> TrustPolicy {
 #[must_use]
 pub const fn permissive_policy_for_integration_tests() -> TrustPolicy {
     TrustPolicy {
-        max_attestation_age_secs: u64::MAX,
+        // 10 years in seconds — large enough to make any reasonable attestation
+        // fresh, but small enough that chrono::TimeDelta::seconds does not panic.
+        max_attestation_age_secs: 315_360_000,
         require_firmware_signature: false,
         allowed_firmware_versions: vec![],
     }
@@ -297,7 +303,9 @@ mod tests {
     #[test]
     fn permissive_test_policy_accepts_anything() {
         let p = permissive_test_policy();
-        assert_eq!(p.max_attestation_age_secs, u64::MAX);
+        // Very large (10 years) — not u64::MAX because chrono::TimeDelta panics
+        // on that.
+        assert!(p.max_attestation_age_secs >= 315_360_000);
         assert!(!p.require_firmware_signature);
         assert!(p.allowed_firmware_versions.is_empty());
     }

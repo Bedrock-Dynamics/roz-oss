@@ -1,5 +1,8 @@
 #![allow(clippy::result_large_err)]
 
+use std::sync::Arc;
+
+use roz_core::device_trust::evaluator::TrustPolicy;
 use sqlx::PgPool;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
@@ -26,6 +29,9 @@ pub struct TaskServiceImpl {
     http_client: reqwest::Client,
     restate_ingress_url: String,
     nats_client: Option<async_nats::Client>,
+    /// Device trust policy — enforced by `check_host_trust` in `create_task`
+    /// BEFORE Restate / NATS dispatch (ENF-01).
+    trust_policy: Arc<TrustPolicy>,
 }
 
 impl TaskServiceImpl {
@@ -34,12 +40,14 @@ impl TaskServiceImpl {
         http_client: reqwest::Client,
         restate_ingress_url: String,
         nats_client: Option<async_nats::Client>,
+        trust_policy: Arc<TrustPolicy>,
     ) -> Self {
         Self {
             pool,
             http_client,
             restate_ingress_url,
             nats_client,
+            trust_policy,
         }
     }
 }
@@ -262,10 +270,6 @@ impl TaskService for TaskServiceImpl {
                 "host_id is required until deferred assignment is implemented",
             ));
         }
-        let nats = self
-            .nats_client
-            .as_ref()
-            .ok_or_else(|| Status::internal("task dispatch unavailable: NATS is not configured"))?;
         let host_uuid =
             Uuid::parse_str(host_id_str).map_err(|_| Status::invalid_argument("host_id is not a valid UUID"))?;
         let host = roz_db::hosts::get_by_id(&self.pool, host_uuid)
@@ -275,6 +279,30 @@ impl TaskService for TaskServiceImpl {
                 Status::internal(format!("failed to look up host: {e}"))
             })?
             .ok_or_else(|| Status::not_found(format!("host {host_id_str} not found")))?;
+
+        // ENF-01: device trust gate — MUST run BEFORE task row creation /
+        // Restate workflow / NATS publish so untrusted requests never touch
+        // durable state. Also runs BEFORE the NATS-availability check so the
+        // trust rejection (FailedPrecondition) is not masked by a 500/Internal
+        // from downstream infrastructure being unconfigured. Detailed reason
+        // stays server-side via tracing::warn!; wire response is fixed
+        // `FailedPrecondition("host trust posture not satisfied")` per CONTEXT D-04.
+        if let Err(rejection) =
+            crate::trust::check_host_trust(&self.pool, tenant_id, host_uuid, &self.trust_policy).await
+        {
+            tracing::warn!(
+                %tenant_id,
+                %host_uuid,
+                reason = %rejection.reason,
+                "task dispatch rejected: host trust posture not satisfied"
+            );
+            return Err(Status::failed_precondition("host trust posture not satisfied"));
+        }
+
+        let nats = self
+            .nats_client
+            .as_ref()
+            .ok_or_else(|| Status::internal("task dispatch unavailable: NATS is not configured"))?;
 
         let task = roz_db::tasks::create(
             &self.pool,

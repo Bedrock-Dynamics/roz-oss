@@ -55,6 +55,7 @@ fn grpc_router(state: &AppState) -> Router {
         state.http_client.clone(),
         state.restate_ingress_url.clone(),
         state.nats_client.clone(),
+        state.trust_policy.clone(),
     );
     let agent_svc = roz_server::grpc::agent::AgentServiceImpl::new(
         state.pool.clone(),
@@ -1959,6 +1960,7 @@ mod tests {
             state.http_client.clone(),
             state.restate_ingress_url.clone(),
             state.nats_client.clone(),
+            state.trust_policy.clone(),
         );
         let agent_svc = grpc::agent::AgentServiceImpl::new(
             state.pool.clone(),
