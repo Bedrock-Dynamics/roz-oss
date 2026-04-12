@@ -98,6 +98,12 @@ fn grpc_router(state: &AppState) -> Router {
     )
     .prepare()
     .into_axum_router()
+    // Rate limit middleware (runs after auth in request order; AuthIdentity must be in extensions).
+    .layer(axum::middleware::from_fn_with_state(
+        state.rate_limiter.clone(),
+        roz_server::middleware::rate_limit::grpc_rate_limit_middleware,
+    ))
+    // Auth middleware (outermost = runs first on request).
     .layer(axum::middleware::from_fn_with_state(
         grpc_auth_state,
         roz_server::middleware::grpc_auth::grpc_auth_middleware,
