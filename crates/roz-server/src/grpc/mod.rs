@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod auth_ext;
 pub mod convert;
 pub mod embodiment;
 pub mod embodiment_convert;

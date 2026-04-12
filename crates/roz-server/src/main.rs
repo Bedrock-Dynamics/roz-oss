@@ -131,6 +131,11 @@ fn grpc_router(state: &AppState) -> Router {
         state.nats_client.clone(),
     );
 
+    let grpc_auth_state = roz_server::middleware::grpc_auth::GrpcAuthState {
+        auth: state.auth.clone(),
+        pool: state.pool.clone(),
+    };
+
     // Use tonic::service::Routes directly (bypasses tonic::transport::Server
     // since axum manages TCP/TLS). into_axum_router() extracts the inner Router.
     tonic::service::Routes::new(roz_server::grpc::roz_v1::task_service_server::TaskServiceServer::new(
@@ -148,6 +153,10 @@ fn grpc_router(state: &AppState) -> Router {
     )
     .prepare()
     .into_axum_router()
+    .layer(axum::middleware::from_fn_with_state(
+        grpc_auth_state,
+        roz_server::middleware::grpc_auth::grpc_auth_middleware,
+    ))
 }
 
 /// Initialize tracing via Logfire, falling back to stdout if unavailable.
