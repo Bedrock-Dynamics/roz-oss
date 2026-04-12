@@ -44,75 +44,23 @@ fn app(state: AppState) -> Router {
     roz_server::build_router(state)
 }
 
-// ---------------------------------------------------------------------------
-// GrpcAuth implementation — bridges the binary crate's auth to the library.
-// ---------------------------------------------------------------------------
-
-/// Concrete auth provider that delegates API key validation to the database.
-struct AppGrpcAuth;
-
-#[tonic::async_trait]
-impl roz_server::grpc::agent::GrpcAuth for AppGrpcAuth {
-    async fn authenticate(
-        &self,
-        pool: &sqlx::PgPool,
-        auth_header: Option<&str>,
-    ) -> Result<roz_core::auth::AuthIdentity, String> {
-        let header = auth_header.ok_or_else(|| "missing authorization header".to_string())?;
-
-        let token = header
-            .strip_prefix("Bearer ")
-            .ok_or_else(|| "invalid authorization format".to_string())?;
-
-        if !token.starts_with("roz_sk_") {
-            return Err("only API key auth is supported — use Bearer roz_sk_...".to_string());
-        }
-
-        let api_key = roz_db::api_keys::verify_api_key(pool, token)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "API key verification failed");
-                "authentication failed".to_string()
-            })?
-            .ok_or_else(|| "invalid or revoked API key".to_string())?;
-
-        let scopes = api_key
-            .scopes
-            .iter()
-            .filter_map(
-                |s| match serde_json::from_value::<roz_core::auth::ApiKeyScope>(serde_json::json!(s)) {
-                    Ok(scope) => Some(scope),
-                    Err(e) => {
-                        tracing::warn!(scope = ?s, error = %e, "ignoring unparseable API key scope");
-                        None
-                    }
-                },
-            )
-            .collect();
-
-        Ok(roz_core::auth::AuthIdentity::ApiKey {
-            key_id: api_key.id,
-            tenant_id: roz_core::auth::TenantId::new(api_key.tenant_id),
-            scopes,
-        })
-    }
-}
-
 /// Build the gRPC services as an axum Router for multiplexing on the same port.
+///
+/// Authentication is performed structurally by `grpc_auth_middleware` (applied
+/// as the outer-most layer below). Each service reads `AuthIdentity` from
+/// request extensions via `crate::grpc::auth_ext::tenant_from_extensions`.
 fn grpc_router(state: &AppState) -> Router {
     let task_svc = roz_server::grpc::tasks::TaskServiceImpl::new(
         state.pool.clone(),
         state.http_client.clone(),
         state.restate_ingress_url.clone(),
         state.nats_client.clone(),
-        Arc::new(AppGrpcAuth) as Arc<dyn roz_server::grpc::agent::GrpcAuth>,
     );
     let agent_svc = roz_server::grpc::agent::AgentServiceImpl::new(
         state.pool.clone(),
         state.http_client.clone(),
         state.restate_ingress_url.clone(),
         state.nats_client.clone(),
-        Arc::new(AppGrpcAuth) as Arc<dyn roz_server::grpc::agent::GrpcAuth>,
         state.model_config.default_model.clone(),
         state.model_config.gateway_url.clone(),
         state.model_config.api_key.clone(),
@@ -125,11 +73,8 @@ fn grpc_router(state: &AppState) -> Router {
         state.meter.clone(),
     );
 
-    let embodiment_svc = roz_server::grpc::embodiment::EmbodimentServiceImpl::new(
-        state.pool.clone(),
-        Arc::new(AppGrpcAuth) as Arc<dyn roz_server::grpc::agent::GrpcAuth>,
-        state.nats_client.clone(),
-    );
+    let embodiment_svc =
+        roz_server::grpc::embodiment::EmbodimentServiceImpl::new(state.pool.clone(), state.nats_client.clone());
 
     let grpc_auth_state = roz_server::middleware::grpc_auth::GrpcAuthState {
         auth: state.auth.clone(),
@@ -1971,18 +1916,6 @@ mod tests {
     async fn grpc_stream_session_connects() {
         use roz_server::grpc;
 
-        struct NoopAuth;
-        #[tonic::async_trait]
-        impl grpc::agent::GrpcAuth for NoopAuth {
-            async fn authenticate(
-                &self,
-                _pool: &sqlx::PgPool,
-                _auth_header: Option<&str>,
-            ) -> Result<roz_core::auth::AuthIdentity, String> {
-                Err("not implemented in test".into())
-            }
-        }
-
         let url = roz_test::pg_url().await;
         let pool = roz_db::create_pool(url).await.expect("pool");
         roz_db::run_migrations(&pool).await.expect("migrations");
@@ -1996,14 +1929,12 @@ mod tests {
             state.http_client.clone(),
             state.restate_ingress_url.clone(),
             state.nats_client.clone(),
-            Arc::new(AppGrpcAuth),
         );
         let agent_svc = grpc::agent::AgentServiceImpl::new(
             state.pool.clone(),
             state.http_client.clone(),
             state.restate_ingress_url.clone(),
             state.nats_client.clone(),
-            std::sync::Arc::new(NoopAuth),
             state.model_config.default_model.clone(),
             state.model_config.gateway_url.clone(),
             state.model_config.api_key.clone(),

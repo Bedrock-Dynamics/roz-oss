@@ -1,7 +1,7 @@
 //! gRPC `AgentService` implementation — bidirectional streaming session state machine.
 //!
 //! The first message from the client must be `StartSession`. This triggers:
-//! 1. Auth validation (API key via the injected `GrpcAuth` trait).
+//! 1. Auth validation (via `grpc_auth_middleware` -- see `middleware/grpc_auth.rs`).
 //! 2. Session metadata written to Postgres (`roz_agent_sessions`).
 //! 3. `SessionStarted` acknowledgement sent back with session ID, resolved model, and permissions.
 //!
@@ -48,27 +48,13 @@ use roz_nats::team::{TEAM_STREAM, team_subject_pattern};
 use super::convert::value_to_struct;
 use super::roz_v1::agent_service_server::AgentService;
 use super::roz_v1::{self, SessionRequest, SessionResponse, WatchTeamRequest, session_request, session_response};
+use crate::grpc::auth_ext;
 
 /// Keepalive interval while an agent turn is in progress.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Default tool timeout for remote tool execution.
 const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
-
-// ---------------------------------------------------------------------------
-// Auth trait — allows the binary crate to inject its own auth implementation
-// ---------------------------------------------------------------------------
-
-/// Trait for authenticating gRPC requests.
-///
-/// The binary crate implements this by delegating to its `extract_auth`
-/// function, which has access to `AppState` (DB pool for API key lookup).
-/// This indirection keeps the library crate independent of the binary's
-/// auth wiring.
-#[tonic::async_trait]
-pub trait GrpcAuth: Send + Sync + 'static {
-    async fn authenticate(&self, pool: &PgPool, auth_header: Option<&str>) -> Result<AuthIdentity, String>;
-}
 
 // ---------------------------------------------------------------------------
 // Session state
@@ -172,7 +158,6 @@ pub struct AgentServiceImpl {
     #[allow(dead_code)]
     restate_ingress_url: String,
     nats_client: Option<async_nats::Client>,
-    auth: Arc<dyn GrpcAuth>,
     default_model: String,
     gateway_url: String,
     api_key: String,
@@ -191,7 +176,6 @@ impl AgentServiceImpl {
         http_client: reqwest::Client,
         restate_ingress_url: String,
         nats_client: Option<async_nats::Client>,
-        auth: Arc<dyn GrpcAuth>,
         default_model: String,
         gateway_url: String,
         api_key: String,
@@ -206,7 +190,6 @@ impl AgentServiceImpl {
             http_client,
             restate_ingress_url,
             nats_client,
-            auth,
             default_model,
             gateway_url,
             api_key,
@@ -231,7 +214,6 @@ impl AgentService for AgentServiceImpl {
 
         // Clone deps for the spawned task.
         let pool = self.pool.clone();
-        let auth = self.auth.clone();
         let default_model = self.default_model.clone();
         let gateway_url = self.gateway_url.clone();
         let api_key = self.api_key.clone();
@@ -242,12 +224,13 @@ impl AgentService for AgentServiceImpl {
         let nats_client = self.nats_client.clone();
         let meter = self.meter.clone();
 
-        // Extract auth header from gRPC metadata before consuming the request.
-        let auth_header = request
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
+        // Extract AuthIdentity from request extensions (set by grpc_auth_middleware)
+        // BEFORE consuming the request via into_inner().
+        let auth_identity = request
+            .extensions()
+            .get::<AuthIdentity>()
+            .cloned()
+            .ok_or_else(|| Status::internal("auth identity missing from extensions"))?;
 
         let mut inbound = request.into_inner();
 
@@ -263,10 +246,9 @@ impl AgentService for AgentServiceImpl {
             run_session_loop(
                 &tx,
                 &pool,
-                &auth,
                 &default_model,
                 &model_config,
-                auth_header.as_deref(),
+                auth_identity,
                 &mut inbound,
                 nats_client.as_ref(),
                 meter,
@@ -286,20 +268,8 @@ impl AgentService for AgentServiceImpl {
         fields(task_id = tracing::field::Empty, tenant_id = tracing::field::Empty)
     )]
     async fn watch_team(&self, request: Request<WatchTeamRequest>) -> Result<Response<Self::WatchTeamStream>, Status> {
-        // --- Auth ---
-        let auth_header = request
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-
-        let auth_identity = self
-            .auth
-            .authenticate(&self.pool, auth_header.as_deref())
-            .await
-            .map_err(Status::unauthenticated)?;
-
-        let tenant_id = auth_identity.tenant_id().0;
+        // --- Auth (extracted from request extensions by grpc_auth_middleware) ---
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         tracing::Span::current().record("tenant_id", tracing::field::display(tenant_id));
 
         // --- Parse task_id ---
@@ -475,7 +445,7 @@ impl StreamingTurnExecutor for ServerStreamingExecutor {
 
 #[tracing::instrument(
     name = "agent_session.stream",
-    skip(tx, pool, auth, model_config, inbound, nats_client, meter),
+    skip(tx, pool, model_config, inbound, nats_client, meter, auth_identity),
     fields(session_id = tracing::field::Empty, tenant_id = tracing::field::Empty, environment_id = tracing::field::Empty, model = %default_model)
 )]
 #[expect(
@@ -489,10 +459,9 @@ impl StreamingTurnExecutor for ServerStreamingExecutor {
 async fn run_session_loop(
     tx: &mpsc::Sender<Result<SessionResponse, Status>>,
     pool: &PgPool,
-    auth: &Arc<dyn GrpcAuth>,
     default_model: &str,
     model_config: &ModelConfig,
-    auth_header: Option<&str>,
+    auth_identity: AuthIdentity,
     inbound: &mut Streaming<SessionRequest>,
     nats_client: Option<&async_nats::Client>,
     meter: Arc<dyn roz_agent::meter::UsageMeter>,
@@ -602,7 +571,7 @@ async fn run_session_loop(
 
         match req.request {
             Some(session_request::Request::Start(start)) => {
-                if !handle_start(tx, pool, auth, default_model, auth_header, start, &mut session).await {
+                if !handle_start(tx, pool, default_model, &auth_identity, start, &mut session).await {
                     break;
                 }
                 if let Some(ref sess) = session {
@@ -1653,9 +1622,8 @@ async fn spawn_webrtc_signaling_relay(
 async fn handle_start(
     tx: &mpsc::Sender<Result<SessionResponse, Status>>,
     pool: &PgPool,
-    auth: &Arc<dyn GrpcAuth>,
     default_model: &str,
-    auth_header: Option<&str>,
+    auth_identity: &AuthIdentity,
     start: roz_v1::StartSession,
     session: &mut Option<Session>,
 ) -> bool {
@@ -1664,15 +1632,7 @@ async fn handle_start(
         return true; // non-fatal, just ignore
     }
 
-    // Auth: validate the authorization header.
-    let auth_identity = match auth.authenticate(pool, auth_header).await {
-        Ok(id) => id,
-        Err(err_msg) => {
-            send_error(tx, "unauthenticated", &err_msg, false).await;
-            return false; // fatal
-        }
-    };
-
+    // Auth was performed by grpc_auth_middleware before this handler runs.
     let tenant_id = auth_identity.tenant_id().0;
 
     // Auto-resolve environment: if empty, use tenant's first environment or create "default".

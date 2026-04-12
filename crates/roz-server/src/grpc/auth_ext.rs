@@ -27,7 +27,7 @@ pub fn tenant_from_extensions<T>(request: &Request<T>) -> Result<Uuid, Status> {
 /// Extract the full `AuthIdentity` from request extensions.
 ///
 /// Used when the handler needs more than just the tenant ID (e.g.,
-/// scopes, key_id for audit logging).
+/// scopes, `key_id` for audit logging).
 pub fn identity_from_extensions<T>(request: &Request<T>) -> Result<&AuthIdentity, Status> {
     request
         .extensions()

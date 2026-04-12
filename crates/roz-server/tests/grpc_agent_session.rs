@@ -7,12 +7,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use roz_core::auth::{AuthIdentity, TenantId};
-use roz_server::grpc::agent::{AgentServiceImpl, GrpcAuth};
+use roz_server::auth::ApiKeyAuth;
+use roz_server::grpc::agent::AgentServiceImpl;
 use roz_server::grpc::convert::value_to_struct;
 use roz_server::grpc::roz_v1::agent_service_client::AgentServiceClient;
 use roz_server::grpc::roz_v1::agent_service_server::AgentServiceServer;
 use roz_server::grpc::roz_v1::{self, SessionRequest, SessionResponse, session_request, session_response};
+use roz_server::middleware::grpc_auth::{GrpcAuthState, grpc_auth_middleware};
 
 // ---------------------------------------------------------------------------
 // SSE response builders
@@ -120,26 +121,29 @@ async fn mock_gateway_capturing(responses: Arc<Mutex<Vec<String>>>, captured: Ca
 }
 
 // ---------------------------------------------------------------------------
-// Test auth
+// Test server helper — wraps AgentServiceImpl with grpc_auth_middleware.
+//
+// Mirrors production wiring: the gRPC router is built via
+// `tonic::service::Routes::into_axum_router()` and the auth middleware is
+// applied as an axum layer that reads the `authorization` header, validates
+// it via `ApiKeyAuth`, and inserts `AuthIdentity` into request extensions.
 // ---------------------------------------------------------------------------
 
-struct TestAuth;
-
-#[tonic::async_trait]
-impl GrpcAuth for TestAuth {
-    async fn authenticate(&self, pool: &sqlx::PgPool, auth_header: Option<&str>) -> Result<AuthIdentity, String> {
-        let header = auth_header.ok_or("missing authorization")?;
-        let token = header.strip_prefix("Bearer ").ok_or("invalid format")?;
-        let api_key = roz_db::api_keys::verify_api_key(pool, token)
-            .await
-            .map_err(|e| format!("db error: {e}"))?
-            .ok_or("invalid key")?;
-        Ok(AuthIdentity::ApiKey {
-            key_id: api_key.id,
-            tenant_id: TenantId::new(api_key.tenant_id),
-            scopes: vec![],
-        })
-    }
+fn spawn_grpc_server_with_auth(pool: sqlx::PgPool, agent_svc: AgentServiceImpl, listener: tokio::net::TcpListener) {
+    let grpc_auth_state = GrpcAuthState {
+        auth: Arc::new(ApiKeyAuth),
+        pool,
+    };
+    let router = tonic::service::Routes::new(AgentServiceServer::new(agent_svc))
+        .prepare()
+        .into_axum_router()
+        .layer(axum::middleware::from_fn_with_state(
+            grpc_auth_state,
+            grpc_auth_middleware,
+        ));
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("grpc server");
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -321,7 +325,6 @@ async fn full_agent_session_lifecycle() {
         reqwest::Client::new(),
         "http://localhost:9080".into(), // restate URL (unused in this test)
         None,                           // nats client
-        Arc::new(TestAuth),
         "claude-sonnet-4-6".into(),
         gateway_url,
         "test-api-key".into(),
@@ -331,13 +334,7 @@ async fn full_agent_session_lifecycle() {
         None, // fallback_model_name
         Arc::new(roz_agent::meter::NoOpMeter),
     );
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(AgentServiceServer::new(agent_svc))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await
-            .expect("grpc server");
-    });
+    spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);
     // Brief wait for the gRPC server to start accepting connections.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -614,7 +611,6 @@ async fn register_tools_hot_swap_updates_subsequent_model_requests() {
         reqwest::Client::new(),
         "http://localhost:9080".into(),
         None,
-        Arc::new(TestAuth),
         "claude-sonnet-4-6".into(),
         gateway_url,
         "test-api-key".into(),
@@ -624,13 +620,7 @@ async fn register_tools_hot_swap_updates_subsequent_model_requests() {
         None,
         Arc::new(roz_agent::meter::NoOpMeter),
     );
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(AgentServiceServer::new(agent_svc))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await
-            .expect("grpc server");
-    });
+    spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
@@ -869,7 +859,6 @@ async fn project_context_included_in_system_prompt() {
         reqwest::Client::new(),
         "http://localhost:9080".into(),
         None,
-        Arc::new(TestAuth),
         "claude-sonnet-4-6".into(),
         gateway_url,
         "test-api-key".into(),
@@ -879,13 +868,7 @@ async fn project_context_included_in_system_prompt() {
         None, // fallback_model_name
         Arc::new(roz_agent::meter::NoOpMeter),
     );
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(AgentServiceServer::new(agent_svc))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await
-            .expect("grpc server");
-    });
+    spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // 5. Connect client.
@@ -1080,7 +1063,6 @@ async fn start_session_with_host_id_stores_in_session() {
         reqwest::Client::new(),
         "http://localhost:9080".into(),
         None,
-        Arc::new(TestAuth),
         "claude-sonnet-4-6".into(),
         gateway_url,
         "test-api-key".into(),
@@ -1090,13 +1072,7 @@ async fn start_session_with_host_id_stores_in_session() {
         None, // fallback_model_name
         Arc::new(roz_agent::meter::NoOpMeter),
     );
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(AgentServiceServer::new(agent_svc))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await
-            .expect("grpc server");
-    });
+    spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // 5. Connect client.
@@ -1204,7 +1180,6 @@ async fn model_tier_names_resolve_to_actual_models() {
         reqwest::Client::new(),
         "http://localhost:9080".into(),
         None,
-        Arc::new(TestAuth),
         "claude-sonnet-4-6".into(),
         gateway_url,
         "test-api-key".into(),
@@ -1214,13 +1189,7 @@ async fn model_tier_names_resolve_to_actual_models() {
         None, // fallback_model_name
         Arc::new(roz_agent::meter::NoOpMeter),
     );
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(AgentServiceServer::new(agent_svc))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await
-            .expect("grpc server");
-    });
+    spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
@@ -1330,7 +1299,6 @@ async fn session_with_host_receives_telemetry() {
         reqwest::Client::new(),
         "http://localhost:9080".into(),
         Some(nats.clone()), // real NATS client
-        Arc::new(TestAuth),
         "claude-sonnet-4-6".into(),
         gateway_url,
         "test-api-key".into(),
@@ -1340,13 +1308,7 @@ async fn session_with_host_receives_telemetry() {
         None,
         Arc::new(roz_agent::meter::NoOpMeter),
     );
-    tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(AgentServiceServer::new(agent_svc))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await
-            .expect("grpc server");
-    });
+    spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // 6. Connect gRPC client.

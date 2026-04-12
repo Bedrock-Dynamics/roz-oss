@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
-use crate::grpc::agent::GrpcAuth;
+use crate::grpc::auth_ext;
 use crate::grpc::roz_v1::task_service_server::TaskService;
 use crate::grpc::roz_v1::{
     ApproveToolUseRequest, CancelTaskRequest, CancelTaskResponse, CreateTaskRequest, GetTaskRequest, ListTasksRequest,
@@ -26,7 +26,6 @@ pub struct TaskServiceImpl {
     http_client: reqwest::Client,
     restate_ingress_url: String,
     nats_client: Option<async_nats::Client>,
-    auth: std::sync::Arc<dyn GrpcAuth>,
 }
 
 impl TaskServiceImpl {
@@ -35,31 +34,13 @@ impl TaskServiceImpl {
         http_client: reqwest::Client,
         restate_ingress_url: String,
         nats_client: Option<async_nats::Client>,
-        auth: std::sync::Arc<dyn GrpcAuth>,
     ) -> Self {
         Self {
             pool,
             http_client,
             restate_ingress_url,
             nats_client,
-            auth,
         }
-    }
-
-    async fn authenticated_tenant_id<T: Sync>(&self, request: &Request<T>) -> Result<Uuid, Status> {
-        let auth_header = request
-            .metadata()
-            .get("authorization")
-            .ok_or_else(|| Status::unauthenticated("missing authorization metadata"))?
-            .to_str()
-            .map_err(|_| Status::invalid_argument("invalid authorization metadata"))?;
-
-        let identity = self
-            .auth
-            .authenticate(&self.pool, Some(auth_header))
-            .await
-            .map_err(Status::unauthenticated)?;
-        Ok(identity.tenant_id().0)
     }
 }
 
@@ -222,7 +203,7 @@ async fn publish_parent_approval_event(
 #[tonic::async_trait]
 impl TaskService for TaskServiceImpl {
     async fn create_task(&self, request: Request<CreateTaskRequest>) -> Result<Response<Task>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let body = request.into_inner();
         let CreateTaskRequest {
             prompt,
@@ -355,7 +336,7 @@ impl TaskService for TaskServiceImpl {
     }
 
     async fn get_task(&self, request: Request<GetTaskRequest>) -> Result<Response<Task>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let body = request.into_inner();
 
         let task_id = Uuid::parse_str(&body.id).map_err(|_| Status::invalid_argument("id is not a valid UUID"))?;
@@ -373,7 +354,7 @@ impl TaskService for TaskServiceImpl {
     }
 
     async fn list_tasks(&self, request: Request<ListTasksRequest>) -> Result<Response<ListTasksResponse>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let body = request.into_inner();
 
         let limit = if body.limit > 0 { body.limit } else { 50 };
@@ -388,7 +369,7 @@ impl TaskService for TaskServiceImpl {
     }
 
     async fn cancel_task(&self, request: Request<CancelTaskRequest>) -> Result<Response<CancelTaskResponse>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let body = request.into_inner();
 
         let task_id = Uuid::parse_str(&body.id).map_err(|_| Status::invalid_argument("id is not a valid UUID"))?;
@@ -410,7 +391,7 @@ impl TaskService for TaskServiceImpl {
     }
 
     async fn approve_tool_use(&self, request: Request<ApproveToolUseRequest>) -> Result<Response<Task>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let body = request.into_inner();
 
         let task_id =
@@ -482,7 +463,7 @@ impl TaskService for TaskServiceImpl {
         &self,
         request: Request<StreamTaskStatusRequest>,
     ) -> Result<Response<Self::StreamTaskStatusStream>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let body = request.into_inner();
         let task_id =
             Uuid::parse_str(&body.task_id).map_err(|_| Status::invalid_argument("task_id is not a valid UUID"))?;
@@ -539,39 +520,10 @@ impl TaskService for TaskServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grpc::agent::GrpcAuth;
-    use roz_core::auth::{ApiKeyScope, AuthIdentity, TenantId};
     use roz_core::phases::{PhaseMode, PhaseSpec, PhaseTrigger, ToolSetFilter};
     use roz_core::tasks::DelegationScope;
     use roz_core::trust::{TrustLevel, TrustPosture};
     use std::collections::BTreeMap;
-    use std::sync::Arc;
-
-    async fn test_pool() -> PgPool {
-        let url = roz_test::pg_url().await;
-        let pool = roz_db::create_pool(url).await.expect("create test pool");
-        roz_db::run_migrations(&pool).await.expect("run test migrations");
-        pool
-    }
-
-    struct TestGrpcAuth {
-        tenant_id: Uuid,
-    }
-
-    #[tonic::async_trait]
-    impl GrpcAuth for TestGrpcAuth {
-        async fn authenticate(&self, _pool: &PgPool, auth_header: Option<&str>) -> Result<AuthIdentity, String> {
-            match auth_header {
-                Some("Bearer roz_sk_test") => Ok(AuthIdentity::ApiKey {
-                    key_id: Uuid::nil(),
-                    tenant_id: TenantId::new(self.tenant_id),
-                    scopes: vec![ApiKeyScope::ReadTasks],
-                }),
-                Some(other) => Err(format!("unexpected auth header: {other}")),
-                None => Err("missing authorization header".into()),
-            }
-        }
-    }
 
     fn json_to_prost_struct(value: serde_json::Value) -> prost_types::Struct {
         let serde_json::Value::Object(map) = value else {
@@ -649,40 +601,6 @@ mod tests {
         };
         let proto = task_row_to_proto(row);
         assert!(proto.host_id.is_none());
-    }
-
-    #[tokio::test]
-    async fn authenticated_tenant_id_rejects_missing_header() {
-        let tenant = Uuid::new_v4();
-        let service = TaskServiceImpl::new(
-            test_pool().await,
-            reqwest::Client::new(),
-            "http://localhost:9080".into(),
-            None,
-            Arc::new(TestGrpcAuth { tenant_id: tenant }),
-        );
-        let req = Request::new(());
-        let result = service.authenticated_tenant_id(&req).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::Unauthenticated);
-    }
-
-    #[tokio::test]
-    async fn authenticated_tenant_id_accepts_bearer_authorization_metadata() {
-        let tenant = Uuid::new_v4();
-        let service = TaskServiceImpl::new(
-            test_pool().await,
-            reqwest::Client::new(),
-            "http://localhost:9080".into(),
-            None,
-            Arc::new(TestGrpcAuth { tenant_id: tenant }),
-        );
-        let mut req = Request::new(());
-        req.metadata_mut()
-            .insert("authorization", "Bearer roz_sk_test".parse().unwrap());
-        let result = service.authenticated_tenant_id(&req).await;
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), tenant);
     }
 
     #[test]

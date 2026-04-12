@@ -15,7 +15,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
-use crate::grpc::agent::GrpcAuth;
+use crate::grpc::auth_ext;
 use crate::grpc::embodiment_convert::domain_binding_type_to_proto;
 use crate::grpc::roz_v1::embodiment_service_server::EmbodimentService;
 use crate::grpc::roz_v1::{
@@ -48,36 +48,17 @@ type WatchCalibrationStream = tokio_stream::wrappers::ReceiverStream<Result<Watc
 
 /// gRPC implementation of the `EmbodimentService` trait.
 ///
-/// Holds a database pool, auth injector, and optional NATS client for streaming RPCs.
+/// Holds a database pool and optional NATS client for streaming RPCs.
+/// Authentication is provided structurally by the `grpc_auth_middleware`
+/// layer; this service reads `AuthIdentity` from request extensions.
 pub struct EmbodimentServiceImpl {
     pool: PgPool,
-    auth: std::sync::Arc<dyn GrpcAuth>,
     nats_client: Option<async_nats::Client>,
 }
 
 impl EmbodimentServiceImpl {
-    pub fn new(pool: PgPool, auth: std::sync::Arc<dyn GrpcAuth>, nats_client: Option<async_nats::Client>) -> Self {
-        Self {
-            pool,
-            auth,
-            nats_client,
-        }
-    }
-
-    async fn authenticated_tenant_id<T: Sync>(&self, request: &Request<T>) -> Result<Uuid, Status> {
-        let auth_header = request
-            .metadata()
-            .get("authorization")
-            .ok_or_else(|| Status::unauthenticated("missing authorization metadata"))?
-            .to_str()
-            .map_err(|_| Status::invalid_argument("invalid authorization metadata"))?;
-
-        let identity = self
-            .auth
-            .authenticate(&self.pool, Some(auth_header))
-            .await
-            .map_err(Status::unauthenticated)?;
-        Ok(identity.tenant_id().0)
+    pub const fn new(pool: PgPool, nats_client: Option<async_nats::Client>) -> Self {
+        Self { pool, nats_client }
     }
 }
 
@@ -171,7 +152,7 @@ const fn binding_type_to_command_interface(bt: &BindingType) -> CommandInterface
 #[tonic::async_trait]
 impl EmbodimentService for EmbodimentServiceImpl {
     async fn get_model(&self, request: Request<GetModelRequest>) -> Result<Response<ProtoModel>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let host_id = parse_host_id(&request.get_ref().host_id)?;
 
         let row = fetch_embodiment_row(&self.pool, host_id, tenant_id).await?;
@@ -190,7 +171,7 @@ impl EmbodimentService for EmbodimentServiceImpl {
     }
 
     async fn get_runtime(&self, request: Request<GetRuntimeRequest>) -> Result<Response<ProtoRuntime>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let host_id = parse_host_id(&request.get_ref().host_id)?;
 
         let row = fetch_embodiment_row(&self.pool, host_id, tenant_id).await?;
@@ -212,7 +193,7 @@ impl EmbodimentService for EmbodimentServiceImpl {
         &self,
         request: Request<ListBindingsRequest>,
     ) -> Result<Response<ListBindingsResponse>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let host_id = parse_host_id(&request.get_ref().host_id)?;
 
         let row = fetch_embodiment_row(&self.pool, host_id, tenant_id).await?;
@@ -240,7 +221,7 @@ impl EmbodimentService for EmbodimentServiceImpl {
         &self,
         request: Request<ValidateBindingsRequest>,
     ) -> Result<Response<ValidateBindingsResponse>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let host_id = parse_host_id(&request.get_ref().host_id)?;
 
         let row = fetch_embodiment_row(&self.pool, host_id, tenant_id).await?;
@@ -292,7 +273,7 @@ impl EmbodimentService for EmbodimentServiceImpl {
         &self,
         request: Request<GetRetargetingMapRequest>,
     ) -> Result<Response<GetRetargetingMapResponse>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let host_id = parse_host_id(&request.get_ref().host_id)?;
 
         let row = fetch_embodiment_row(&self.pool, host_id, tenant_id).await?;
@@ -326,7 +307,7 @@ impl EmbodimentService for EmbodimentServiceImpl {
         &self,
         request: Request<GetManifestRequest>,
     ) -> Result<Response<GetManifestResponse>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let host_id = parse_host_id(&request.get_ref().host_id)?;
 
         let row = fetch_embodiment_row(&self.pool, host_id, tenant_id).await?;
@@ -355,7 +336,7 @@ impl EmbodimentService for EmbodimentServiceImpl {
         &self,
         request: Request<StreamFrameTreeRequest>,
     ) -> Result<Response<Self::StreamFrameTreeStream>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let host_id = parse_host_id(&request.get_ref().host_id)?;
 
         // D-02: NATS required for streaming RPCs.
@@ -485,7 +466,7 @@ impl EmbodimentService for EmbodimentServiceImpl {
         &self,
         request: Request<WatchCalibrationRequest>,
     ) -> Result<Response<Self::WatchCalibrationStream>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let host_id = parse_host_id(&request.get_ref().host_id)?;
 
         // D-02: NATS required.
