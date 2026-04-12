@@ -81,9 +81,13 @@ fn task_row_to_proto(row: roz_db::tasks::TaskRow) -> Task {
 }
 
 /// Map a `sqlx::Error` into a `tonic::Status`.
+///
+/// The raw error is logged via `tracing::error!` (includes table/column/constraint
+/// names from sqlx), while the client-visible message is an opaque "database error"
+/// to avoid leaking schema details across tenants.
 fn db_err_to_status(e: &sqlx::Error) -> Status {
     tracing::error!(error = %e, "database error");
-    Status::internal(format!("database error: {e}"))
+    Status::internal("database error")
 }
 
 /// Convert a protobuf `Struct` into a `serde_json::Value`.
