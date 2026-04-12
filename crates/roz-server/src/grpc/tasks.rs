@@ -437,24 +437,16 @@ impl TaskService for TaskServiceImpl {
             Status::internal("workflow signal error")
         })?;
 
+        // Publish the approval event best-effort. Publish failures are logged
+        // inside publish_parent_approval_event; the approval has already been
+        // durably signaled to Restate above, so we do not fail the RPC on a
+        // NATS fanout error. For tasks without a parent, we publish under the
+        // child's own task_id so worker-local subscribers still receive the
+        // event.
         if let Some(nats) = &self.nats_client {
-            if let Some(parent_task_id) = task.parent_task_id {
-                let js = async_nats::jetstream::new(nats.clone());
-                if publish_parent_approval_event(&js, parent_task_id, task_id, &approval_id, approved, modifier.clone())
-                    .await
-                    .is_err()
-                {
-                    return Ok(Response::new(task_row_to_proto(task)));
-                }
-            } else {
-                let js = async_nats::jetstream::new(nats.clone());
-                if publish_parent_approval_event(&js, task_id, task_id, &approval_id, approved, modifier.clone())
-                    .await
-                    .is_err()
-                {
-                    return Ok(Response::new(task_row_to_proto(task)));
-                }
-            }
+            let js = async_nats::jetstream::new(nats.clone());
+            let parent_task_id = task.parent_task_id.unwrap_or(task_id);
+            let _ = publish_parent_approval_event(&js, parent_task_id, task_id, &approval_id, approved, modifier).await;
         }
 
         // Return the task as it was before approval (approval is async)
