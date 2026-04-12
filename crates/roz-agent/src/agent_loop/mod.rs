@@ -7,11 +7,13 @@ mod input;
 mod retry;
 mod spatial;
 mod streaming;
+pub mod turn_emitter;
 
 pub use self::input::{
     ActivityState, AgentInput, AgentInputSeed, AgentOutput, PresenceLevel, PresenceSignal, RESPOND_TOOL_NAME,
 };
 pub use self::retry::RetryConfig;
+pub use self::turn_emitter::{TURN_BUFFER_CAPACITY, TurnEmitter, TurnEnvelope, run_flush_task};
 
 #[doc(hidden)]
 pub use self::spatial::{build_spatial_observation, format_spatial_context};
@@ -58,6 +60,11 @@ pub struct AgentLoop {
     extensions: crate::dispatch::Extensions,
     /// Usage metering — check budget before LLM calls, record usage after.
     meter: std::sync::Arc<dyn crate::meter::UsageMeter>,
+    /// Optional write-behind emitter for `roz_session_turns` persistence
+    /// (DEBT-03). When `Some`, `run_streaming_core` emits a `TurnEnvelope`
+    /// per role-tagged message (user/assistant/tool); otherwise emission
+    /// is a no-op and no DB is touched.
+    turn_emitter: Option<turn_emitter::TurnEmitter>,
 }
 
 impl AgentLoop {
@@ -82,6 +89,7 @@ impl AgentLoop {
             approval_runtime: None,
             extensions: crate::dispatch::Extensions::default(),
             meter: std::sync::Arc::new(crate::meter::NoOpMeter),
+            turn_emitter: None,
         }
     }
 
@@ -89,6 +97,24 @@ impl AgentLoop {
     #[must_use]
     pub fn with_meter(mut self, meter: std::sync::Arc<dyn crate::meter::UsageMeter>) -> Self {
         self.meter = meter;
+        self
+    }
+
+    /// Attach a turn emitter for write-behind persistence of session turns
+    /// (DEBT-03). The caller is responsible for spawning
+    /// [`turn_emitter::run_flush_task`] on the paired receiver.
+    #[must_use]
+    pub fn with_turn_emitter(mut self, emitter: turn_emitter::TurnEmitter) -> Self {
+        self.turn_emitter = Some(emitter);
+        self
+    }
+
+    /// Optional form of [`with_turn_emitter`](Self::with_turn_emitter) that
+    /// keeps callers branch-free when the emitter itself is conditional
+    /// (e.g. worker-side opt-in on `ROZ_DATABASE_URL`).
+    #[must_use]
+    pub fn with_turn_emitter_opt(mut self, emitter: Option<turn_emitter::TurnEmitter>) -> Self {
+        self.turn_emitter = emitter;
         self
     }
 

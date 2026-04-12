@@ -9,7 +9,9 @@ authors.workspace      = true
 [dependencies]
 roz-core = { path = "../roz-core" }
 roz-copper = { path = "../roz-copper", default-features = false }
+roz-db = { path = "../roz-db" }
 roz-nats = { path = "../roz-nats" }
+sqlx = { workspace = true }
 async-trait.workspace = true
 async-nats.workspace = true
 tokio = { workspace = true, features = ["full"] }
