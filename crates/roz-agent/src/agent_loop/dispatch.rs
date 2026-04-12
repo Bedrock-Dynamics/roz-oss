@@ -1,4 +1,4 @@
-//! Tool-call dispatch loop for AgentLoop turns.
+//! Tool-call dispatch loop for `AgentLoop` turns.
 //!
 //! NOTE: This module is `crate::agent_loop::dispatch`, distinct from the
 //! crate-level `crate::dispatch` module that defines `ToolExecutor`,
@@ -8,8 +8,8 @@
 use roz_core::spatial::WorldState;
 use tokio::sync::mpsc;
 
-use super::input::PresenceSignal;
 use super::AgentLoop;
+use super::input::PresenceSignal;
 use crate::dispatch::ToolContext;
 use crate::model::types::Message;
 use crate::safety::SafetyResult;

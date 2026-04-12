@@ -2,8 +2,8 @@
 
 use tokio::sync::mpsc;
 
-use super::input::{ActivityState, PresenceSignal};
 use super::AgentLoop;
+use super::input::{ActivityState, PresenceSignal};
 use crate::dispatch::ToolContext;
 
 impl AgentLoop {
