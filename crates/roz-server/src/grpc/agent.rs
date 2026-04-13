@@ -369,6 +369,21 @@ impl AgentService for AgentServiceImpl {
 
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
+
+    type AnalyzeMediaStream = Pin<Box<dyn Stream<Item = Result<roz_v1::AnalyzeMediaChunk, Status>> + Send>>;
+
+    // Phase 16.1 placeholder. Downstream plans (MED-02..MED-04) wire in the
+    // MediaBackend trait, SSRF-guarded fetcher, and Gemini routing. This stub
+    // exists only so the generated tonic trait is satisfied and roz-server
+    // continues to compile after MED-01 proto additions.
+    async fn analyze_media(
+        &self,
+        _request: Request<roz_v1::AnalyzeMediaRequest>,
+    ) -> Result<Response<Self::AnalyzeMediaStream>, Status> {
+        Err(Status::unimplemented(
+            "AnalyzeMedia not yet implemented (Phase 16.1 — MED-02/03/04)",
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -13,6 +13,12 @@ service AgentService {
 
   // WatchTeam streams TeamEvent messages for all workers under a parent task.
   rpc WatchTeam(WatchTeamRequest) returns (stream TeamEvent);
+
+  // Unified media analysis. Unary request, server-streaming response (D-02).
+  // Client sends a MediaPart + prompt, server fetches (if file_uri), routes
+  // to a backend (v1: Gemini 2.5 Pro for video/image/audio), streams text
+  // deltas, then emits Usage and Done (D-06).
+  rpc AnalyzeMedia(AnalyzeMediaRequest) returns (stream AnalyzeMediaChunk);
 }
 
 // --- Client → Server ---
@@ -668,3 +674,73 @@ message WorkerExited {
   string worker_id = 1;
   string parent_task_id = 2;
 }
+
+// --- AnalyzeMedia (Phase 16.1) ---
+
+message AnalyzeMediaRequest {
+  MediaPart media = 1;
+  string prompt = 2;
+  optional string model_hint = 3;
+}
+
+// Hybrid-typed media payload (D-04).
+// `inline_bytes` is capped at 10 MB server-side; larger payloads must use
+// an `https://` `file_uri` which the server fetches with SSRF guards.
+message MediaPart {
+  string mime_type = 1;
+  oneof source {
+    bytes inline_bytes = 2;
+    string file_uri = 3;
+  }
+  optional ModalityHints hints = 4;
+}
+
+// Per-modality tuning (D-05).
+// v1 implements video/image/audio arms. Arms 10..=14 are reserved for v2+
+// (point cloud, lidar scene, gaussian splat, depth, thermal) — declared
+// as reserved here so adding them later is backwards-compatible.
+message ModalityHints {
+  oneof hint {
+    VideoHints video = 1;
+    ImageHints image = 2;
+    AudioHints audio = 3;
+  }
+  reserved 10 to 14;
+  reserved "point_cloud", "lidar_scene", "gaussian_splat", "depth", "thermal";
+}
+
+message VideoHints {
+  uint32 fps_sample = 1;
+  uint32 max_frames = 2;
+}
+
+message ImageHints {}
+
+message AudioHints {
+  uint32 sample_rate = 1;
+  string language_hint = 2;
+}
+
+// Streaming response envelope (D-06). Per RESEARCH.md Open Question #2 resolution,
+// `MediaTextDelta` is a NEW message scoped under AnalyzeMediaChunk (not a reuse of
+// TextDeltaPayload) — this decouples media-analysis evolution from session-event
+// evolution even though the shape is currently identical.
+message AnalyzeMediaChunk {
+  message MediaTextDelta {
+    string text = 1;
+  }
+  oneof payload {
+    MediaTextDelta text_delta = 1;
+    Usage usage = 2;
+    Done done = 3;
+  }
+}
+
+// Top-level so future RPCs can reuse (Open Question #3 resolved in favor of top-level).
+message Usage {
+  uint64 input_tokens = 1;
+  uint64 output_tokens = 2;
+  uint64 duration_ms = 3;
+}
+
+message Done {}
