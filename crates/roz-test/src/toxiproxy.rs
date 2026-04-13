@@ -96,3 +96,59 @@ pub async fn toxiproxy_container() -> ToxiproxyGuard {
         proxy_listener_host_port,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use noxious_client::{StreamDirection, Toxic, ToxicKind};
+
+    /// Docker-required live smoke: boots toxiproxy, creates a proxy, adds and
+    /// removes a latency toxic. Not `#[ignore]`-tagged because the roz-test
+    /// crate already requires Docker for its existing testcontainer smokes
+    /// (see `nats::nats_container`); this is consistent with that policy.
+    ///
+    /// `flavor = "multi_thread"` is used for parity with the zenoh harness
+    /// smoke tests (15-03), even though toxiproxy itself does not require it.
+    ///
+    /// Implementation note (A2 from 16-RESEARCH): we use `create_proxy`
+    /// instead of `populate`. The shopify/toxiproxy 2.12.0 server returns a
+    /// `GET /populate`-like object shape that noxious-client 1.0.4's
+    /// `populate` decoder rejects (expects a sequence). `create_proxy` hits
+    /// `POST /proxies` directly, which both servers agree on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn toxiproxy_container_boot_and_toxic_roundtrip() {
+        let guard = toxiproxy_container().await;
+        assert!(!guard.host().is_empty(), "host must be populated");
+        assert!(
+            guard.proxy_listener_host_port > 0,
+            "proxy listener host port must be mapped"
+        );
+        assert!(
+            guard.admin_url().starts_with("http://"),
+            "admin URL must be an http URL, got {}",
+            guard.admin_url()
+        );
+
+        // Create a proxy forwarding 0.0.0.0:8666 -> 127.0.0.1:1 (dummy
+        // upstream). We do not connect through the proxy here; we only
+        // exercise the admin-API lifecycle (create_proxy + add_toxic +
+        // remove_toxic) to prove the ToxiproxyGuard gives tests the full
+        // chaos-injection surface they need.
+        let proxy = guard
+            .client
+            .create_proxy("smoke", "0.0.0.0:8666", "127.0.0.1:1")
+            .await
+            .expect("create_proxy failed");
+
+        proxy
+            .add_toxic(&Toxic {
+                name: "latency".to_owned(),
+                kind: ToxicKind::Latency { latency: 10, jitter: 0 },
+                toxicity: 1.0,
+                direction: StreamDirection::Downstream,
+            })
+            .await
+            .expect("add_toxic failed");
+        proxy.remove_toxic("latency").await.expect("remove_toxic failed");
+    }
+}
