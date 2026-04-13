@@ -1126,18 +1126,19 @@ async fn main() -> Result<()> {
     // Otherwise the inline Phase 13 NATS path runs verbatim (D-18 byte-stable).
     let nats_event_transport = roz_worker::transport_nats::NatsSessionTransport::new(nats.clone());
     #[cfg(feature = "zenoh")]
-    let event_transport: Option<Box<dyn roz_core::transport::SessionTransport>> = match zenoh_transport {
+    let event_transport: Option<std::sync::Arc<dyn roz_core::transport::SessionTransport>> = match zenoh_transport {
         Some(zt) => {
             tracing::info!("session relay using DualPublishTransport (NATS primary + Zenoh secondary)");
-            Some(Box::new(roz_core::transport::DualPublishTransport::new(
+            Some(std::sync::Arc::new(roz_core::transport::DualPublishTransport::new(
                 nats_event_transport,
                 zt,
             )))
         }
-        None => Some(Box::new(nats_event_transport)),
+        None => Some(std::sync::Arc::new(nats_event_transport)),
     };
     #[cfg(not(feature = "zenoh"))]
-    let event_transport: Option<Box<dyn roz_core::transport::SessionTransport>> = Some(Box::new(nats_event_transport));
+    let event_transport: Option<std::sync::Arc<dyn roz_core::transport::SessionTransport>> =
+        Some(std::sync::Arc::new(nats_event_transport));
     tokio::spawn(async move {
         if let Err(e) = roz_worker::session_relay::spawn_session_relay(
             relay_nats,
