@@ -78,23 +78,37 @@ async fn worker_startup_publishes_transport_health_ready_and_zero_pose() {
     .await
     .expect("spawn worker");
 
-    // 5. Assert TRANSPORT_HEALTH startup sample within 30s. Worker startup
-    //    (NATS connect + zenoh session open + edge-state-bus pre-declare) is
-    //    observed at ~2-3s; 30s is ≥10× the budget.
-    let health_sample = tokio::time::timeout(Duration::from_secs(30), health_sub.recv_async())
-        .await
-        .expect("TRANSPORT_HEALTH startup sample timed out — worker did not publish within 30s")
-        .expect("health subscriber channel closed");
-    let health_bytes = health_sample.payload().to_bytes();
-    let health_json: serde_json::Value =
-        serde_json::from_slice(&health_bytes).expect("transport/health payload is not JSON");
+    // 5. Assert TRANSPORT_HEALTH startup sample within 30s. The worker
+    //    publishes BOTH the 15-10 startup rollup (`{status:"ready", source:
+    //    "edge_state_bus_runner::startup", worker_id}`) and the 15-06
+    //    continuous heartbeat (`EdgeTransportHealth::Healthy` serialized as
+    //    `{status:"healthy"}`). Order is not guaranteed on a fresh zenoh
+    //    session — consume until we see the startup rollup identified by its
+    //    `source` field, then assert its shape.
+    let health_json = {
+        let mut found: Option<serde_json::Value> = None;
+        let loop_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while tokio::time::Instant::now() < loop_deadline {
+            let remaining = loop_deadline - tokio::time::Instant::now();
+            let sample = tokio::time::timeout(remaining, health_sub.recv_async())
+                .await
+                .expect("TRANSPORT_HEALTH startup sample timed out — worker did not publish within 30s")
+                .expect("health subscriber channel closed");
+            let bytes = sample.payload().to_bytes();
+            let json: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("transport/health payload is not JSON");
+            if json["source"] == "edge_state_bus_runner::startup" {
+                found = Some(json);
+                break;
+            }
+            // Otherwise it's the 15-06 continuous heartbeat — keep waiting
+            // for the 15-10 startup rollup.
+        }
+        found.expect("never observed 15-10 startup rollup (source=edge_state_bus_runner::startup) within 30s")
+    };
     assert_eq!(
         health_json["status"], "ready",
         "expected status=ready in startup rollup, got {health_json}"
-    );
-    assert_eq!(
-        health_json["source"], "edge_state_bus_runner::startup",
-        "expected source=edge_state_bus_runner::startup per 15-10 SUMMARY, got {health_json}",
     );
     assert_eq!(
         health_json["worker_id"], worker_id,

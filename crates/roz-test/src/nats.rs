@@ -35,10 +35,26 @@ pub async fn nats_container() -> NatsGuard {
         .expect("failed to start NATS testcontainer");
 
     let host = container.get_host().await.expect("failed to get host");
-    let port = container
-        .get_host_port_ipv4(4222)
-        .await
-        .expect("failed to get host port");
+    // Docker port-table publish intermittently races with testcontainers-rs
+    // 0.27's `get_host_port_ipv4` check — retry a few times before giving up.
+    // See also `toxiproxy.rs` where the same pattern applies to port 8666.
+    let port = {
+        let mut last_err: Option<testcontainers_modules::testcontainers::TestcontainersError> = None;
+        let mut found: Option<u16> = None;
+        for _ in 0..10 {
+            match container.get_host_port_ipv4(4222).await {
+                Ok(p) => {
+                    found = Some(p);
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            }
+        }
+        found.unwrap_or_else(|| panic!("failed to get host port after retries: {last_err:?}"))
+    };
 
     let url = format!("nats://{host}:{port}");
 

@@ -16,6 +16,10 @@ use tokio::process::{Child, Command};
 pub struct Worker {
     pub id: String,
     pub child: Child,
+    /// Holds the tempdir containing the generated zenoh config JSON5 alive
+    /// for the child's lifetime — dropping it would remove the file the
+    /// worker's `ROZ_ZENOH_CONFIG` reader is mmap'ing.
+    _zenoh_cfg_dir: tempfile::TempDir,
 }
 
 /// Resolve the path to a cargo-built binary.
@@ -61,16 +65,40 @@ pub async fn spawn_worker(
     nats_url: &str,
     signing_key_path: &str,
 ) -> anyhow::Result<Worker> {
+    // Multicast doesn't traverse the Docker bridge, so the default peer config
+    // (from `load_zenoh_config(None)`) never finds the testcontainer router.
+    // Write a JSON5 config pointing at the mapped TCP endpoint with multicast
+    // disabled, then set `ROZ_ZENOH_CONFIG` so the worker loads it. Keep the
+    // tempdir alive for the child's lifetime via the Worker struct.
+    let cfg_dir = tempfile::tempdir()?;
+    let cfg_path = cfg_dir.path().join("zenoh.json5");
+    let cfg_json5 = format!(
+        r#"{{
+  mode: "peer",
+  scouting: {{ multicast: {{ enabled: false }} }},
+  connect: {{ endpoints: ["{zenoh_endpoint}"] }},
+  listen: {{ endpoints: [] }},
+}}"#
+    );
+    std::fs::write(&cfg_path, cfg_json5)?;
+
     let mut cmd = Command::new(cargo_bin("roz-worker"));
     cmd.env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
+        // Worker calls `logfire::configure()` at main.rs:720 and .expect()s its
+        // result. Without a token, it panics with `TokenRequired`. Tests don't
+        // want telemetry egress — disable it via the logfire-sanctioned env.
+        .env("LOGFIRE_SEND_TO_LOGFIRE", "no")
         .env("ROZ_WORKER_ID", id)
         .env("ROZ_API_URL", "http://localhost:0")
         .env("ROZ_NATS_URL", nats_url)
         .env("ROZ_RESTATE_URL", "http://localhost:0")
         .env("ROZ_API_KEY", "test-key")
         .env("ROZ_GATEWAY_API_KEY", "test-gateway-key")
-        .env("ZENOH_ROUTER_ENDPOINT", zenoh_endpoint)
+        // Worker's config loader reads `ROZ_ZENOH_CONFIG` (no `_PATH` suffix,
+        // per `WorkerConfig::load` figment alias). Pointed at a peer config
+        // that hard-codes the testcontainer TCP endpoint + disables multicast.
+        .env("ROZ_ZENOH_CONFIG", &cfg_path)
         // `load_signing_key` (roz_zenoh::envelope) accepts either `base64:<seed>`
         // or a raw path — no `file:` prefix. Pass the raw absolute path.
         .env("ROZ_DEVICE_SIGNING_KEY", signing_key_path)
@@ -103,6 +131,7 @@ pub async fn spawn_worker(
     Ok(Worker {
         id: id.to_owned(),
         child,
+        _zenoh_cfg_dir: cfg_dir,
     })
 }
 

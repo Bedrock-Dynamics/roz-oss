@@ -80,10 +80,28 @@ pub async fn toxiproxy_container() -> ToxiproxyGuard {
         .get_host_port_ipv4(8474)
         .await
         .expect("failed to get mapped 8474");
-    let proxy_listener_host_port = container
-        .get_host_port_ipv4(8666)
-        .await
-        .expect("failed to get mapped 8666");
+    // toxiproxy 2.12.0's base image only has `EXPOSE 8474`. Port 8666 is
+    // Docker-published via `with_exposed_port` above, but some testcontainers
+    // 0.27 call paths race with Docker's port-table refresh and intermittently
+    // report `PortNotExposed`. Retry a few times — the mapping is there, we
+    // just need Docker to surface it.
+    let proxy_listener_host_port = {
+        let mut last_err: Option<testcontainers::TestcontainersError> = None;
+        let mut port: Option<u16> = None;
+        for _ in 0..10 {
+            match container.get_host_port_ipv4(8666).await {
+                Ok(p) => {
+                    port = Some(p);
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            }
+        }
+        port.unwrap_or_else(|| panic!("failed to get mapped 8666 after retries: {last_err:?}"))
+    };
 
     let admin_url = format!("http://{host}:{admin_port}");
     let client = Client::new(&admin_url);
