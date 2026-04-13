@@ -1,0 +1,41 @@
+[package]
+name = "roz-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+roz-zenoh = { path = "../roz-zenoh" }
+roz-core = { path = "../roz-core" }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+tokio = { workspace = true, features = ["full"] }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+zenoh = { workspace = true }
+flume = { workspace = true }
+serde_json = { workspace = true }
+async-nats = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+roz-test = { path = "../roz-test" }
+roz-worker = { path = "../roz-worker" }
+
+[[bench]]
+name = "signed_envelope"
+harness = false
+
+[[bench]]
+name = "zenoh_local_pubsub"
+harness = false
+
+[[bench]]
+name = "dual_publish_fanout"
+harness = false
+
+[lints]
+workspace = true

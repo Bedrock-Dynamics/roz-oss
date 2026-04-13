@@ -7,6 +7,7 @@ members = [
     "crates/roz-server",
     "crates/roz-worker",
     "crates/roz-agent",
+    "crates/roz-bench",
     "crates/roz-safety",
     "crates/roz-cli",
     "crates/roz-test",
