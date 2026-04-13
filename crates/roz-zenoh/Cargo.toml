@@ -8,7 +8,14 @@ authors.workspace = true
 
 [dependencies]
 roz-core = { path = "../roz-core" }
-zenoh = "1"
+zenoh = { workspace = true }
+flume = { workspace = true }
+parking_lot = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = "0.4"
+base64 = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+async-trait = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["full"] }
@@ -17,6 +24,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+rand = { workspace = true }
 
 [lints]
 workspace = true

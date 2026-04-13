@@ -12,6 +12,9 @@ chrono = { workspace = true }
 testcontainers = { workspace = true, features = ["http_wait"] }
 testcontainers-modules = { workspace = true }
 tokio = { workspace = true }
+zenoh = { workspace = true }
+flume = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

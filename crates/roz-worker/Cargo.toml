@@ -11,6 +11,10 @@ default = []
 # Enables the signed-AOT WASM load path (wasm_trust module). Passes the
 # feature through to roz-copper so Module::deserialize compiles.
 aot = ["roz-copper/aot"]
+# Enables the Zenoh edge-horizontal transport (Phase 15). Links roz-zenoh and
+# the zenoh crate so worker main can call roz_zenoh::session::open_session and
+# name zenoh::Session at the capture site.
+zenoh = ["dep:roz-zenoh", "dep:zenoh"]
 
 [dependencies]
 roz-core = { path = "../roz-core" }
@@ -43,6 +47,8 @@ ed25519-dalek.workspace = true
 reqwest.workspace = true
 roz-copper = { path = "../roz-copper", default-features = false }
 roz-local = { path = "../roz-local" }
+roz-zenoh = { path = "../roz-zenoh", optional = true }
+zenoh = { workspace = true, optional = true }
 tokio-util.workspace = true
 futures = "0.3"
 bytes = "1"

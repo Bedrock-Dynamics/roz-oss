@@ -5818,6 +5818,7 @@ name = "roz-core"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "crc32fast",
  "ed25519-dalek",
@@ -5831,6 +5832,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "toml 0.8.23",
  "tracing",
  "uuid",
@@ -5983,10 +5985,13 @@ name = "roz-test"
 version = "0.2.0"
 dependencies = [
  "chrono",
+ "flume",
  "roz-core",
+ "serde_json",
  "testcontainers",
  "testcontainers-modules",
  "tokio",
+ "zenoh",
 ]
 
 [[package]]
@@ -6020,6 +6025,7 @@ dependencies = [
  "roz-local",
  "roz-nats",
  "roz-test",
+ "roz-zenoh",
  "rusqlite",
  "schemars 1.2.1",
  "serde",
@@ -6034,6 +6040,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "v4l",
+ "zenoh",
 ]
 
 [[package]]
@@ -6041,6 +6048,14 @@ name = "roz-zenoh"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "chrono",
+ "ed25519-dalek",
+ "flume",
+ "hex",
+ "parking_lot",
+ "rand 0.8.5",
  "roz-core",
  "serde",
  "serde_json",
