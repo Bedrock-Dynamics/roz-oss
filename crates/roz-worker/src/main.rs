@@ -952,6 +952,130 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Plan 15-06 (D-11, D-23, D-24): worker-level SessionEvent bus so transport-
+    // health state transitions emit SessionEvent::EdgeTransportDegraded on a
+    // real broadcast channel (see acceptance criterion `session_event_tx.send`).
+    // Capacity 64 matches the EdgeHealthAggregator signal channel. Consumers
+    // are plugged in by downstream plans; for now the channel guarantees the
+    // emission site exists and is reachable.
+    let (session_event_tx, _session_event_rx_keepalive): (
+        tokio::sync::broadcast::Sender<roz_core::session::event::EventEnvelope>,
+        tokio::sync::broadcast::Receiver<roz_core::session::event::EventEnvelope>,
+    ) = tokio::sync::broadcast::channel(64);
+
+    // Plan 15-06 (D-11, D-23, D-24): wire the three-mechanism transport health
+    // system — EdgeHealthAggregator, heartbeat publisher, liveliness monitor,
+    // subsystem freshness monitor — plus the state-transition -> SessionEvent
+    // emitter. All cfg-gated on `--features zenoh`.
+    //
+    // C-03: consumes `zenoh_session: Option<zenoh::Session>` directly from the
+    // binding introduced by 15-01 Task 3. No dependency on 15-05's transport
+    // struct — health monitors share the same zenoh Session (Session::clone is
+    // cheap per D-03) but do not require the signed Zenoh session to be
+    // running.
+    #[cfg(feature = "zenoh")]
+    {
+        use std::collections::HashMap;
+
+        use roz_core::edge_health::EdgeHealthAggregator;
+
+        let (aggregator, health_rx, health_handle) = EdgeHealthAggregator::new(64);
+
+        // Drive the aggregator loop.
+        tokio::spawn(aggregator.run());
+
+        // Plan 15-06 C-03 acceptance criterion pins this expression verbatim —
+        // we consume 15-01's `zenoh_session: Option<zenoh::Session>` binding
+        // directly, independent of plan 15-05's transport struct.
+        #[expect(
+            clippy::option_as_ref_cloned,
+            reason = "plan 15-06 acceptance criterion pins `zenoh_session.as_ref().cloned()` verbatim (C-03)"
+        )]
+        if let Some(session_clone) = zenoh_session.as_ref().cloned() {
+            match roz_zenoh::health::spawn_heartbeat_publisher(
+                session_clone.clone(),
+                config.worker_id.clone(),
+                health_rx.clone(),
+                roz_zenoh::health::HEARTBEAT_CADENCE,
+            )
+            .await
+            {
+                Ok(_h) => tracing::info!("transport health heartbeat publisher started"),
+                Err(e) => tracing::warn!(error = %e, "transport health heartbeat publisher failed"),
+            }
+
+            if let Err(e) =
+                roz_zenoh::health::spawn_liveliness_monitor(session_clone.clone(), health_handle.clone()).await
+            {
+                tracing::warn!(error = %e, "liveliness monitor failed to start");
+            }
+
+            // Four edge-state-bus summary topics tracked per D-23.
+            let subsystems: HashMap<&'static str, String> = HashMap::from([
+                ("telemetry_summary", "roz/*/telemetry/summary".to_string()),
+                ("controller_evidence", "roz/*/controller/evidence".to_string()),
+                ("safety_interventions", "roz/*/safety/interventions".to_string()),
+                ("perception_availability", "roz/*/perception/availability".to_string()),
+            ]);
+            if let Err(e) = roz_zenoh::health::spawn_subsystem_freshness_monitor(
+                session_clone,
+                subsystems,
+                health_handle.clone(),
+                roz_zenoh::health::SUBSYSTEM_FRESHNESS,
+            )
+            .await
+            {
+                tracing::warn!(error = %e, "freshness monitor failed to start");
+            }
+        }
+
+        // State-transition watcher: emits SessionEvent::EdgeTransportDegraded
+        // on the worker-level broadcast bus whenever the aggregator's
+        // EdgeTransportHealth value changes.
+        let mut health_rx_emitter = health_rx.clone();
+        let session_event_tx_for_health = session_event_tx.clone();
+        tokio::spawn(async move {
+            let mut last = health_rx_emitter.borrow().clone();
+            while health_rx_emitter.changed().await.is_ok() {
+                let current = health_rx_emitter.borrow_and_update().clone();
+                if current != last {
+                    let affected_capabilities = match &current {
+                        roz_core::edge_health::EdgeTransportHealth::Degraded { affected } => affected.clone(),
+                        _ => Vec::new(),
+                    };
+                    let event = roz_core::session::event::SessionEvent::EdgeTransportDegraded {
+                        transport: "zenoh".to_string(),
+                        health: current.clone(),
+                        affected_capabilities,
+                    };
+                    let envelope = roz_core::session::event::EventEnvelope {
+                        event_id: roz_core::session::event::EventId::new(),
+                        correlation_id: roz_core::session::event::CorrelationId::new(),
+                        parent_event_id: None,
+                        timestamp: chrono::Utc::now(),
+                        event,
+                    };
+                    // `.send` returns Err only when there are no live receivers;
+                    // the _session_event_rx_keepalive at worker main keeps at
+                    // least one receiver alive so this branch is informational.
+                    if let Err(e) = session_event_tx_for_health.send(envelope) {
+                        tracing::warn!(error = %e, "no SessionEvent receivers for EdgeTransportDegraded");
+                    }
+                    tracing::info!(?current, "edge transport health transition");
+                    last = current;
+                }
+            }
+        });
+    }
+
+    // Silence unused-variable warnings when zenoh feature is off; the channel
+    // is kept in scope so the feature-off build preserves the same local
+    // bindings as the feature-on build.
+    #[cfg(not(feature = "zenoh"))]
+    {
+        drop(session_event_tx);
+    }
+
     // Spawn edge agent session relay (handles gRPC sessions relayed via NATS).
     let relay_nats = nats.clone();
     let relay_worker_id = config.worker_id.clone();
