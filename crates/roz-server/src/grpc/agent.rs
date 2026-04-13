@@ -49,6 +49,8 @@ use super::convert::value_to_struct;
 use super::roz_v1::agent_service_server::AgentService;
 use super::roz_v1::{self, SessionRequest, SessionResponse, WatchTeamRequest, session_request, session_response};
 use crate::grpc::auth_ext;
+use crate::grpc::media::{MediaBackend, resolve_backend_name};
+use crate::grpc::media_fetch::MediaFetcher;
 
 /// Keepalive interval while an agent turn is in progress.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -167,6 +169,11 @@ pub struct AgentServiceImpl {
     fallback_model_name: Option<String>,
     /// Usage metering — passed to each `AgentLoop` for budget checks and recording.
     meter: Arc<dyn roz_agent::meter::UsageMeter>,
+    /// Media-analysis backend (Phase 16.1 / MED-02). Dispatches `AnalyzeMedia`
+    /// requests after input validation + SSRF fetch.
+    media_backend: Arc<dyn MediaBackend>,
+    /// SSRF-guarded fetcher for `MediaPart::file_uri` (Phase 16.1 / MED-03).
+    media_fetcher: Arc<MediaFetcher>,
 }
 
 impl AgentServiceImpl {
@@ -184,6 +191,8 @@ impl AgentServiceImpl {
         direct_api_key: Option<String>,
         fallback_model_name: Option<String>,
         meter: Arc<dyn roz_agent::meter::UsageMeter>,
+        media_backend: Arc<dyn MediaBackend>,
+        media_fetcher: Arc<MediaFetcher>,
     ) -> Self {
         Self {
             pool,
@@ -198,6 +207,8 @@ impl AgentServiceImpl {
             direct_api_key,
             fallback_model_name,
             meter,
+            media_backend,
+            media_fetcher,
         }
     }
 }
@@ -372,17 +383,90 @@ impl AgentService for AgentServiceImpl {
 
     type AnalyzeMediaStream = Pin<Box<dyn Stream<Item = Result<roz_v1::AnalyzeMediaChunk, Status>> + Send>>;
 
-    // Phase 16.1 placeholder. Downstream plans (MED-02..MED-04) wire in the
-    // MediaBackend trait, SSRF-guarded fetcher, and Gemini routing. This stub
-    // exists only so the generated tonic trait is satisfied and roz-server
-    // continues to compile after MED-01 proto additions.
+    /// `AnalyzeMedia` RPC (Phase 16.1 / MED-01).
+    ///
+    /// Pipeline:
+    /// 1. Auth — reuse `AuthIdentity` populated by `grpc_auth_middleware` (D-03).
+    /// 2. Validate `MediaPart` — `mime_type`, source arm, 10 MB inline cap (D-16).
+    /// 3. Resolve backend name from `model_hint` + mime (D-08/D-09).
+    /// 4. Resolve source: inline bytes (cap-checked) OR `file_uri` via SSRF
+    ///    fetcher (D-14 — fetcher enforces https, SSRF IP block, 100 MB cap).
+    /// 5. Dispatch to the routed `MediaBackend` with inline bytes.
+    /// 6. Relay the backend's chunk stream back to the client verbatim.
+    ///
+    /// Tracing: wrapped in `info_span!("analyze_media", mime, bytes_in, model,
+    /// tenant)` (D-17). Bytes themselves are NEVER logged.
+    #[tracing::instrument(
+        name = "analyze_media",
+        skip(self, request),
+        fields(
+            mime = tracing::field::Empty,
+            bytes_in = tracing::field::Empty,
+            model = tracing::field::Empty,
+            tenant = tracing::field::Empty,
+        ),
+    )]
     async fn analyze_media(
         &self,
-        _request: Request<roz_v1::AnalyzeMediaRequest>,
+        request: Request<roz_v1::AnalyzeMediaRequest>,
     ) -> Result<Response<Self::AnalyzeMediaStream>, Status> {
-        Err(Status::unimplemented(
-            "AnalyzeMedia not yet implemented (Phase 16.1 — MED-02/03/04)",
-        ))
+        // --- Tenant context (D-03) ---
+        // Inline pattern verbatim from stream_session above (same-file
+        // convention; there is no shared `require_identity` helper).
+        let auth_identity = request
+            .extensions()
+            .get::<AuthIdentity>()
+            .cloned()
+            .ok_or_else(|| Status::internal("auth identity missing from extensions"))?;
+        let tenant = auth_identity.tenant_id().0.to_string();
+        tracing::Span::current().record("tenant", tracing::field::display(&tenant));
+
+        // --- Validate request ---
+        let req = request.into_inner();
+        let media = req
+            .media
+            .ok_or_else(|| Status::invalid_argument("media field required"))?;
+        if media.mime_type.is_empty() {
+            return Err(Status::invalid_argument("mime_type required"));
+        }
+        let mime = media.mime_type.clone();
+        tracing::Span::current().record("mime", tracing::field::display(&mime));
+
+        // Mime family (video|image|audio) — used by the fetcher to match the
+        // response Content-Type family.
+        let mime_family = mime.split('/').next().unwrap_or("").to_string();
+
+        // --- Resolve backend (D-08/D-09) ---
+        // Runs BEFORE fetching so we fail fast on unsupported mime / unknown hint.
+        let backend_name = resolve_backend_name(req.model_hint.as_deref(), &mime)?;
+        tracing::Span::current().record("model", tracing::field::display(&backend_name));
+
+        // --- Resolve source to bytes ---
+        let source = media
+            .source
+            .ok_or_else(|| Status::invalid_argument("MediaPart.source is required"))?;
+        let bytes: Vec<u8> = match source {
+            roz_v1::media_part::Source::InlineBytes(b) => {
+                if b.len() > 10 * 1024 * 1024 {
+                    return Err(Status::resource_exhausted("inline_bytes exceeds 10 MB"));
+                }
+                b
+            }
+            roz_v1::media_part::Source::FileUri(uri) => self.media_fetcher.fetch(&uri, &mime_family).await?,
+        };
+        tracing::Span::current().record("bytes_in", tracing::field::display(bytes.len()));
+
+        // --- Repack MediaPart with inline bytes for backend dispatch (D-14) ---
+        let resolved = roz_v1::MediaPart {
+            mime_type: mime,
+            hints: media.hints.clone(),
+            source: Some(roz_v1::media_part::Source::InlineBytes(bytes)),
+        };
+
+        // --- Dispatch ---
+        let stream = self.media_backend.analyze(resolved, req.prompt, media.hints).await?;
+
+        Ok(Response::new(stream))
     }
 }
 

@@ -57,6 +57,17 @@ fn grpc_router(state: &AppState) -> Router {
         state.nats_client.clone(),
         state.trust_policy.clone(),
     );
+    let media_backend: Arc<dyn roz_server::grpc::media::MediaBackend> = Arc::new(
+        roz_server::grpc::media::GeminiBackend::new(roz_server::grpc::media::GeminiMediaConfig {
+            gateway_url: state.model_config.gateway_url.clone(),
+            gateway_api_key: state.model_config.api_key.clone(),
+            provider: state.model_config.gemini_provider.clone(),
+            direct_api_key: state.model_config.gemini_direct_api_key.clone(),
+            model: "gemini-2.5-pro".into(),
+            timeout: std::time::Duration::from_secs(state.model_config.timeout_secs),
+        }),
+    );
+    let media_fetcher = Arc::new(roz_server::grpc::media_fetch::MediaFetcher::new());
     let agent_svc = roz_server::grpc::agent::AgentServiceImpl::new(
         state.pool.clone(),
         state.http_client.clone(),
@@ -72,6 +83,8 @@ fn grpc_router(state: &AppState) -> Router {
             .ok()
             .filter(|k| !k.trim().is_empty()),
         state.meter.clone(),
+        media_backend,
+        media_fetcher,
     );
 
     let embodiment_svc =
@@ -1970,6 +1983,16 @@ mod tests {
             state.nats_client.clone(),
             state.trust_policy.clone(),
         );
+        let test_media_backend: Arc<dyn grpc::media::MediaBackend> =
+            Arc::new(grpc::media::GeminiBackend::new(grpc::media::GeminiMediaConfig {
+                gateway_url: state.model_config.gateway_url.clone(),
+                gateway_api_key: state.model_config.api_key.clone(),
+                provider: state.model_config.gemini_provider.clone(),
+                direct_api_key: state.model_config.gemini_direct_api_key.clone(),
+                model: "gemini-2.5-pro".into(),
+                timeout: std::time::Duration::from_secs(state.model_config.timeout_secs),
+            }));
+        let test_media_fetcher = Arc::new(grpc::media_fetch::MediaFetcher::new());
         let agent_svc = grpc::agent::AgentServiceImpl::new(
             state.pool.clone(),
             state.http_client.clone(),
@@ -1983,6 +2006,8 @@ mod tests {
             state.model_config.direct_api_key.clone(),
             None, // fallback_model_name
             state.meter.clone(),
+            test_media_backend,
+            test_media_fetcher,
         );
 
         tokio::spawn(async move {

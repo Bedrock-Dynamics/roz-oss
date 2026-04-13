@@ -129,6 +129,29 @@ async fn mock_gateway_capturing(responses: Arc<Mutex<Vec<String>>>, captured: Ca
 // it via `ApiKeyAuth`, and inserts `AuthIdentity` into request extensions.
 // ---------------------------------------------------------------------------
 
+/// Default media-analysis deps for tests that don't exercise the AnalyzeMedia path.
+/// The backend is wired with the provided gateway URL but is never invoked by
+/// session-lifecycle tests.
+fn default_media_deps(
+    gateway_url: &str,
+) -> (
+    Arc<dyn roz_server::grpc::media::MediaBackend>,
+    Arc<roz_server::grpc::media_fetch::MediaFetcher>,
+) {
+    let backend: Arc<dyn roz_server::grpc::media::MediaBackend> = Arc::new(
+        roz_server::grpc::media::GeminiBackend::new(roz_server::grpc::media::GeminiMediaConfig {
+            gateway_url: gateway_url.to_string(),
+            gateway_api_key: "test-api-key".into(),
+            provider: "google-vertex".into(),
+            direct_api_key: None,
+            model: "gemini-2.5-pro".into(),
+            timeout: Duration::from_secs(30),
+        }),
+    );
+    let fetcher = Arc::new(roz_server::grpc::media_fetch::MediaFetcher::new());
+    (backend, fetcher)
+}
+
 fn spawn_grpc_server_with_auth(pool: sqlx::PgPool, agent_svc: AgentServiceImpl, listener: tokio::net::TcpListener) {
     let grpc_auth_state = GrpcAuthState {
         auth: Arc::new(ApiKeyAuth),
@@ -320,6 +343,17 @@ async fn full_agent_session_lifecycle() {
         .await
         .expect("bind grpc server");
     let addr = listener.local_addr().expect("grpc server addr");
+    let media_backend: Arc<dyn roz_server::grpc::media::MediaBackend> = Arc::new(
+        roz_server::grpc::media::GeminiBackend::new(roz_server::grpc::media::GeminiMediaConfig {
+            gateway_url: gateway_url.clone(),
+            gateway_api_key: "test-api-key".into(),
+            provider: "google-vertex".into(),
+            direct_api_key: None,
+            model: "gemini-2.5-pro".into(),
+            timeout: Duration::from_secs(30),
+        }),
+    );
+    let media_fetcher = Arc::new(roz_server::grpc::media_fetch::MediaFetcher::new());
     let agent_svc = AgentServiceImpl::new(
         pool.clone(),
         reqwest::Client::new(),
@@ -333,6 +367,8 @@ async fn full_agent_session_lifecycle() {
         None, // direct_api_key
         None, // fallback_model_name
         Arc::new(roz_agent::meter::NoOpMeter),
+        media_backend,
+        media_fetcher,
     );
     spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);
     // Brief wait for the gRPC server to start accepting connections.
@@ -606,6 +642,7 @@ async fn register_tools_hot_swap_updates_subsequent_model_requests() {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind grpc");
     let addr = listener.local_addr().expect("addr");
+    let (media_backend, media_fetcher) = default_media_deps(&gateway_url);
     let agent_svc = AgentServiceImpl::new(
         pool.clone(),
         reqwest::Client::new(),
@@ -619,6 +656,8 @@ async fn register_tools_hot_swap_updates_subsequent_model_requests() {
         None,
         None,
         Arc::new(roz_agent::meter::NoOpMeter),
+        media_backend,
+        media_fetcher,
     );
     spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -854,6 +893,7 @@ async fn project_context_included_in_system_prompt() {
     // 4. Start gRPC server.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind grpc");
     let addr = listener.local_addr().expect("addr");
+    let (media_backend, media_fetcher) = default_media_deps(&gateway_url);
     let agent_svc = AgentServiceImpl::new(
         pool.clone(),
         reqwest::Client::new(),
@@ -867,6 +907,8 @@ async fn project_context_included_in_system_prompt() {
         None, // direct_api_key
         None, // fallback_model_name
         Arc::new(roz_agent::meter::NoOpMeter),
+        media_backend,
+        media_fetcher,
     );
     spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1058,6 +1100,7 @@ async fn start_session_with_host_id_stores_in_session() {
     // 4. Start gRPC server.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind grpc");
     let addr = listener.local_addr().expect("addr");
+    let (media_backend, media_fetcher) = default_media_deps(&gateway_url);
     let agent_svc = AgentServiceImpl::new(
         pool.clone(),
         reqwest::Client::new(),
@@ -1071,6 +1114,8 @@ async fn start_session_with_host_id_stores_in_session() {
         None, // direct_api_key
         None, // fallback_model_name
         Arc::new(roz_agent::meter::NoOpMeter),
+        media_backend,
+        media_fetcher,
     );
     spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1175,6 +1220,7 @@ async fn model_tier_names_resolve_to_actual_models() {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
+    let (media_backend, media_fetcher) = default_media_deps(&gateway_url);
     let agent_svc = AgentServiceImpl::new(
         pool.clone(),
         reqwest::Client::new(),
@@ -1188,6 +1234,8 @@ async fn model_tier_names_resolve_to_actual_models() {
         None, // direct_api_key
         None, // fallback_model_name
         Arc::new(roz_agent::meter::NoOpMeter),
+        media_backend,
+        media_fetcher,
     );
     spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1294,6 +1342,7 @@ async fn session_with_host_receives_telemetry() {
         .await
         .expect("bind grpc server");
     let addr = listener.local_addr().expect("grpc server addr");
+    let (media_backend, media_fetcher) = default_media_deps(&gateway_url);
     let agent_svc = AgentServiceImpl::new(
         pool.clone(),
         reqwest::Client::new(),
@@ -1307,6 +1356,8 @@ async fn session_with_host_receives_telemetry() {
         None,
         None,
         Arc::new(roz_agent::meter::NoOpMeter),
+        media_backend,
+        media_fetcher,
     );
     spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);
     tokio::time::sleep(Duration::from_millis(50)).await;
