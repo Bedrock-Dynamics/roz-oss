@@ -67,5 +67,14 @@ required-features = ["gazebo"]
 name = "gazebo_grpc_integration"
 required-features = ["gazebo"]
 
+# Signed-AOT integration tests (ENF-02) — only compile with --features aot.
+[[test]]
+name = "wasm_signature_integration"
+required-features = ["aot"]
+
+# SEC-05 scope-boundary meta-test — MUST run in every build (no features).
+[[test]]
+name = "sec05_scope_boundary"
+
 [lints]
 workspace = true

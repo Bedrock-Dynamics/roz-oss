@@ -6011,6 +6011,7 @@ dependencies = [
  "mcap",
  "openh264",
  "parking_lot",
+ "rand 0.8.5",
  "reqwest 0.12.28",
  "roz-agent",
  "roz-copper",
