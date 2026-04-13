@@ -73,3 +73,43 @@ default-filter = """
 # JUnit reporter — read by nightly workflow to summarize failures.
 [profile.ci-integration.junit]
 path = "junit.xml"
+
+# CI-only nextest profile for Phase 16 chaos + multi-worker + backpressure tests.
+# Locked by Phase 16 CONTEXT D-06 (tiered CI — push fast, nightly expensive)
+# mirroring Phase 14-03 ci-integration pattern.
+#
+# Invoked by .github/workflows/nightly.yml zenoh-chaos job:
+#   cargo nextest run --profile ci-chaos --run-ignored ignored-only \
+#     -p roz-worker -p roz-zenoh --features zenoh
+#
+# Allowlist below MUST be kept in sync as Phase 16 Wave 2 plans land the
+# test binaries. Each listed binary corresponds to one Phase 16 ZEN-TEST-*
+# gap-closure test (see .planning/phases/16-zenoh-test-hardening/16-CONTEXT.md).
+
+[profile.ci-chaos]
+# D-01 chaos + D-02 multi-worker-binary spawn bind ports + hold containers —
+# strictly serial. Same rationale as ci-integration.
+test-threads = 1
+
+# Chaos scenarios include 12s partition (2× HEARTBEAT_STALENESS per D-24) +
+# 60s sustained-load + recovery assertions. Budget 5× worst-case = 900s per
+# test. terminate-after=2 mirrors ci-integration pattern.
+slow-timeout = { period = "900s", terminate-after = 2 }
+
+# D-12 convention: never retry. Flake-hiding masks real regressions.
+retries = 0
+
+# Allowlist of Phase 16 test binaries. Each binary is #[ignore]-tagged at
+# the test level so `--run-ignored ignored-only` selects only the
+# expensive scenarios within each.
+default-filter = """
+    (   binary(dual_publish_fullstack_chaos)
+     |  binary(multi_worker_fleet)
+     |  binary(chaos_partition_recovery)
+     |  binary(worker_startup_sanity)
+     |  binary(concurrent_publisher_backpressure)
+    )
+"""
+
+[profile.ci-chaos.junit]
+path = "junit.xml"
