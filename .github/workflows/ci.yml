@@ -17,12 +17,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@master
+      # Pinned to commit SHA per Phase 14 REVIEWS.md MEDIUM (was @master).
+      - uses: dtolnay/rust-toolchain@e18b497796c12c097a38f9edb9d0641fb99eee32
         with:
           toolchain: "1.92.0"
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      # Pinned to commit SHA per Phase 14 REVIEWS.md MEDIUM (was @v2).
+      - uses: Swatinem/rust-cache@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
 
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -38,3 +40,41 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  # Phase 14 REVIEWS.md HIGH: the wasm_signature_integration tests added by
+  # Plan 14-02 require --features aot to compile. Without this job, those
+  # tests are orphaned from PR CI — they'd only run in the nightly workflow.
+  # This job closes that gap so every PR exercises the AOT signature path.
+  aot-tests:
+    name: roz-copper --features aot
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          toolchain: "1.92.0"
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # Compiles + runs ALL roz-copper tests that require the `aot`
+      # feature, including `wasm_signature_integration` (Phase 14 /
+      # 14-02). Non-#[ignore] tests here run every PR — they MUST
+      # pass in under a few seconds each.
+      #
+      # The #[ignore]-tagged NATS emission test inside that file is
+      # skipped here (it requires a NATS testcontainer) and runs in
+      # the nightly integration-aot job.
+      - name: Run aot-feature tests
+        run: cargo test -p roz-copper --features aot
+
+      # Clippy on the aot code path too — the #[cfg(feature="aot")]
+      # branch of from_precompiled must lint clean on every PR.
+      - name: Clippy (aot feature)
+        run: cargo clippy -p roz-copper --features aot --tests -- -D warnings
