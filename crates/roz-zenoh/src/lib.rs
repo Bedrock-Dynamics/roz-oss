@@ -5,6 +5,7 @@
 
 pub mod coordination;
 pub mod edge_state_bus;
+pub mod envelope;
 pub mod health;
 pub mod pubsub;
 pub mod session;
