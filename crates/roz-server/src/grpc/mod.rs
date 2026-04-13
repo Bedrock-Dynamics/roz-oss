@@ -4,6 +4,7 @@ pub mod convert;
 pub mod embodiment;
 pub mod embodiment_convert;
 pub mod event_mapper;
+pub mod media;
 pub mod tasks;
 
 /// Generated protobuf types and gRPC service stubs for roz API v1.

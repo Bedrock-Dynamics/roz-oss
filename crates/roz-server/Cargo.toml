@@ -43,6 +43,8 @@ tonic-reflection = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }
+async-trait = { workspace = true }
+eventsource-stream = "0.2"
 
 [build-dependencies]
 tonic-build = { workspace = true }
