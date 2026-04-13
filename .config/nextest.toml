@@ -1,0 +1,75 @@
+# CI-only nextest profile for the nightly Docker-dependent integration suite.
+# Locked by Phase 14 CONTEXT.md D-11 (CI-only; local cargo test unchanged),
+# D-12 (isolation), D-08 (curated Docker-dependent subset).
+#
+# Invoked by .github/workflows/nightly.yml across three parallel jobs:
+#   Job A (base):   cargo nextest run --profile ci-integration \
+#                     --run-ignored ignored-only --workspace
+#   Job B (aot):    cargo nextest run --profile ci-integration \
+#                     --run-ignored ignored-only -p roz-copper --features aot
+#   Job C (gazebo): cargo nextest run --profile ci-integration \
+#                     --run-ignored ignored-only -p roz-copper --features gazebo
+#
+# NOTE: The ignored-only selector is a CLI flag (--run-ignored ignored-only),
+# not a profile key. Do not add one here.
+#
+# Filter strategy (per Phase 14 REVIEWS.md HIGH):
+#   nextest's `test(...)` matches test NAMES. `binary(...)` matches the
+#   test binary name (the file stem under tests/). We use binary() to
+#   scope to known integration test files, and the --run-ignored CLI
+#   flag to narrow to the #[ignore]-tagged set. This avoids the
+#   filename/test-name confusion in the previous revision.
+
+[profile.ci-integration]
+# D-12: single-threaded. Containers bind fixed ports; parallel runs conflict.
+test-threads = 1
+
+# D-12: 600s per test, SIGTERM up to 2 times before giving up.
+slow-timeout = { period = "600s", terminate-after = 2 }
+
+# D-12: never retry. Flake-hiding masks real regressions.
+retries = 0
+
+# D-08: allowlist of INTEGRATION TEST BINARIES. The binary name is the
+# stem of the file under crates/*/tests/. The --run-ignored CLI flag
+# further narrows to #[ignore]-tagged tests within these binaries.
+#
+# Keep this list in sync with CONTEXT.md §Ignored-test inventory.
+# Tests excluded from nightly: paig_integration, e2e_vertical,
+# mcp_live_integration, mcp_move_arm, e2e_live, smoke, live_claude_*.
+default-filter = """
+    (   binary(gazebo_docker_integration)
+     |  binary(gazebo_grpc_integration)
+     |  binary(ur5_joint_command)
+     |  binary(e2e_wasm_to_gazebo)
+     |  binary(e2e_wasm_actuator_bridge)
+     |  binary(send_joint_command_test)
+     |  binary(docker_sim_integration)
+     |  binary(dispatch_integration)
+     |  binary(estop_integration)
+     |  binary(nats_integration)
+     |  binary(camera_integration)
+     |  binary(turn_persistence_integration)
+     |  binary(copper_integration)
+     |  binary(trust_gate_integration)
+     |  binary(safety_pipeline)
+     |  binary(restate_integration)
+     |  binary(grpc_agent_session)
+     |  binary(embodiment_upload_e2e)
+     |  binary(embodiment_streaming_e2e)
+     |  binary(wasm_signature_integration)
+    )
+    and not (
+        binary(paig_integration)
+     |  binary(e2e_vertical)
+     |  binary(mcp_live_integration)
+     |  binary(mcp_move_arm)
+     |  binary(e2e_live)
+     |  binary(smoke)
+     |  binary(live_claude_wasm)
+    )
+"""
+
+# JUnit reporter — read by nightly workflow to summarize failures.
+[profile.ci-integration.junit]
+path = "junit.xml"
