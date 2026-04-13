@@ -890,14 +890,10 @@ async fn main() -> Result<()> {
 
     // D-03 + D-04 + C-03 + C-07: open the Zenoh edge-transport session after
     // NATS connect and host registration. Failure is non-fatal — worker falls
-    // back to NATS-only. The binding stays named (not underscored) because
-    // plans 15-05 (ZenohSessionTransport) and 15-06 (health monitors) will
-    // `zenoh_session.clone()` into their subsystems without re-plumbing.
+    // back to NATS-only. Plan 15-05 consumes `zenoh_session.clone()` below to
+    // construct the ZenohSessionTransport; plan 15-06 will consume the same
+    // binding for health monitors without re-plumbing.
     #[cfg(feature = "zenoh")]
-    #[expect(
-        unused_variables,
-        reason = "Bound now to anchor Session lifetime; consumed by plans 15-05/15-06 without re-plumbing (C-03)."
-    )]
     let zenoh_session: Option<zenoh::Session> =
         match roz_zenoh::session::open_session(config.zenoh_config_path.as_deref()).await {
             Ok(sess) => {
@@ -917,20 +913,70 @@ async fn main() -> Result<()> {
             }
         };
 
+    // Plan 15-05 (D-19, D-22): compose ZenohSessionTransport when --features zenoh
+    // AND ROZ_DEVICE_SIGNING_KEY resolves. All other branches log a warn! and
+    // fall back to NATS-only event publish (graceful degradation).
+    #[cfg(feature = "zenoh")]
+    let zenoh_transport: Option<roz_zenoh::session::ZenohSessionTransport> = match (
+        zenoh_session.clone(),
+        config
+            .device_signing_key
+            .as_deref()
+            .map(roz_zenoh::envelope::load_signing_key),
+    ) {
+        (Some(session), Some(Ok(key))) => {
+            let signing_key = std::sync::Arc::new(key);
+            match roz_zenoh::session::ZenohSessionTransport::open(session, signing_key, config.worker_id.clone()).await
+            {
+                Ok(t) => {
+                    tracing::info!(robot_id = %config.worker_id, "zenoh edge transport ready (signed)");
+                    Some(t)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "ZenohSessionTransport open failed; NATS only");
+                    None
+                }
+            }
+        }
+        (Some(_), None) => {
+            tracing::warn!("ROZ_DEVICE_SIGNING_KEY unset; signed Zenoh relay disabled, NATS only (D-22)");
+            None
+        }
+        (Some(_), Some(Err(e))) => {
+            tracing::warn!(error = %e, "ROZ_DEVICE_SIGNING_KEY invalid; NATS only");
+            None
+        }
+        (None, _) => {
+            // zenoh_session was None (15-01 failed to open) — already warned there.
+            None
+        }
+    };
+
     // Spawn edge agent session relay (handles gRPC sessions relayed via NATS).
     let relay_nats = nats.clone();
     let relay_worker_id = config.worker_id.clone();
     let relay_config = config.clone();
     let relay_estop_rx = estop_rx.clone();
     let relay_camera_mgr = camera_manager.clone();
-    // C-01 narrowed (plan 15-04): `event_transport` is the dual-publish seam
-    // reserved for plan 15-05. By passing `None`, the Phase 13 NATS
-    // `event_subject(...)` publish path runs unchanged (D-18 byte-stable).
-    // Plan 15-05 will wrap this with
-    // `Some(Box::new(DualPublishTransport::new(nats_transport, zenoh_transport)))`
-    // under `--features zenoh`. Note: `NatsSessionTransport::new(nats.clone())`
-    // is the type that plan 15-05 will compose here.
-    let event_transport: Option<Box<dyn roz_core::transport::SessionTransport>> = None;
+    // C-01 narrowed (plan 15-04 + 15-05): `event_transport` is the single
+    // abstracted publish seam. When `--features zenoh` AND the device signing
+    // key resolves, we wrap NatsSessionTransport + ZenohSessionTransport in a
+    // DualPublishTransport (NATS primary, Zenoh best-effort secondary per D-19).
+    // Otherwise the inline Phase 13 NATS path runs verbatim (D-18 byte-stable).
+    let nats_event_transport = roz_worker::transport_nats::NatsSessionTransport::new(nats.clone());
+    #[cfg(feature = "zenoh")]
+    let event_transport: Option<Box<dyn roz_core::transport::SessionTransport>> = match zenoh_transport {
+        Some(zt) => {
+            tracing::info!("session relay using DualPublishTransport (NATS primary + Zenoh secondary)");
+            Some(Box::new(roz_core::transport::DualPublishTransport::new(
+                nats_event_transport,
+                zt,
+            )))
+        }
+        None => Some(Box::new(nats_event_transport)),
+    };
+    #[cfg(not(feature = "zenoh"))]
+    let event_transport: Option<Box<dyn roz_core::transport::SessionTransport>> = Some(Box::new(nats_event_transport));
     tokio::spawn(async move {
         if let Err(e) = roz_worker::session_relay::spawn_session_relay(
             relay_nats,
