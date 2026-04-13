@@ -13,15 +13,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WasmTrustFailure {
     pub worker_id: String,
-    /// Empty or "<unknown>" when the failure happened before `key_id`
+    /// Empty or `"<unknown>"` when the failure happened before `key_id`
     /// parsing (e.g. envelope decode failure).
     pub key_id: String,
-    /// "<unknown>" when `module_id` was not successfully parsed.
+    /// `"<unknown>"` when `module_id` was not successfully parsed.
     pub module_id: String,
-    /// "<unknown>" when `version` was not successfully parsed.
+    /// `"<unknown>"` when `version` was not successfully parsed.
     pub version: String,
-    /// Short static reason string (e.g. "ed25519 verify failed",
-    /// "cwasm sha256 mismatch with signed manifest").
+    /// Short reason string (e.g. `"ed25519 verify failed"`,
+    /// `"cwasm sha256 mismatch with signed manifest"`).
     pub reason: String,
     /// RFC3339 UTC timestamp of the failure.
     pub occurred_at: String,
