@@ -4,6 +4,7 @@ members = [
     "crates/roz-core",
     "crates/roz-db",
     "crates/roz-nats",
+    "crates/roz-proto",
     "crates/roz-server",
     "crates/roz-worker",
     "crates/roz-agent",

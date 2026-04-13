@@ -6356,6 +6356,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "roz-proto"
+version = "0.2.0"
+dependencies = [
+ "futures",
+ "prost 0.13.5",
+ "prost-types 0.13.5",
+ "tokio-stream",
+ "tonic 0.13.1",
+ "tonic-build",
+]
+
+[[package]]
 name = "roz-safety"
 version = "0.2.0"
 dependencies = [
