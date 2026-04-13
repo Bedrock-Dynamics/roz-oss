@@ -22,6 +22,17 @@ pub struct ModelConfig {
     ///
     /// Set via `ROZ_ANTHROPIC_API_KEY`.
     pub direct_api_key: Option<String>,
+    /// PAIG proxy provider name for Gemini models (D-10).
+    ///
+    /// Set via `ROZ_GEMINI_PROVIDER` (default: `"google-vertex"` per D-10 — matches the
+    /// verified PAIG path at `/proxy/google-vertex/v1beta1/...` in
+    /// `crates/roz-agent/src/model/gemini.rs`).
+    pub gemini_provider: String,
+    /// Direct Gemini API key. When set, `MediaBackend`s bypass the PAIG gateway
+    /// (D-11 degradation path).
+    ///
+    /// Set via `ROZ_GEMINI_API_KEY`.
+    pub gemini_direct_api_key: Option<String>,
 }
 
 /// Shared application state threaded through every axum handler.

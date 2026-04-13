@@ -236,6 +236,12 @@ async fn main() {
         direct_api_key: std::env::var("ROZ_ANTHROPIC_API_KEY")
             .ok()
             .filter(|k| !k.trim().is_empty()),
+        // D-10: default provider is "google-vertex" — matches the verified PAIG path at
+        // /proxy/google-vertex/v1beta1/... already used by crates/roz-agent/src/model/gemini.rs.
+        gemini_provider: std::env::var("ROZ_GEMINI_PROVIDER").unwrap_or_else(|_| "google-vertex".into()),
+        gemini_direct_api_key: std::env::var("ROZ_GEMINI_API_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty()),
     };
 
     if model_config.api_key.is_empty() {
@@ -363,6 +369,8 @@ mod tests {
                 timeout_secs: 10,
                 anthropic_provider: "anthropic".to_string(),
                 direct_api_key: None,
+                gemini_provider: "google-vertex".to_string(),
+                gemini_direct_api_key: None,
             },
             auth: Arc::new(roz_server::auth::ApiKeyAuth),
             meter: Arc::new(roz_agent::meter::NoOpMeter),
@@ -2027,6 +2035,8 @@ mod tests {
                 timeout_secs: 10,
                 anthropic_provider: "anthropic".to_string(),
                 direct_api_key: None,
+                gemini_provider: "google-vertex".to_string(),
+                gemini_direct_api_key: None,
             },
             auth: Arc::new(roz_server::auth::ApiKeyAuth),
             meter: Arc::new(roz_agent::meter::NoOpMeter),

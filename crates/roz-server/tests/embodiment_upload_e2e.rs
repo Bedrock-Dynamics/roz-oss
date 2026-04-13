@@ -56,6 +56,8 @@ async fn start_server() -> (String, String, uuid::Uuid, sqlx::PgPool) {
             timeout_secs: 30,
             anthropic_provider: "anthropic".into(),
             direct_api_key: None,
+            gemini_provider: "google-vertex".into(),
+            gemini_direct_api_key: None,
         },
         auth: Arc::new(roz_server::auth::ApiKeyAuth),
         meter: Arc::new(roz_agent::meter::NoOpMeter),
