@@ -1076,6 +1076,43 @@ async fn main() -> Result<()> {
         drop(session_event_tx);
     }
 
+    // Plan 15-10 (ZEN-05 gap closure): instantiate EdgeStateBusRunner and
+    // ZenohCoordinator so the edge-horizontal subsystems have live worker
+    // call sites. Per VERIFICATION.md gap report: SC-5 names "sensor sharing"
+    // (EdgeStateBusRunner) and "pose coordination" (ZenohCoordinator) — both
+    // primitives existed in roz-zenoh but had zero references from this
+    // crate. This block closes that gap.
+    //
+    // Handles are retained in a local binding so publishers and liveliness
+    // tokens live for the worker lifetime. Downstream plans will wire live
+    // producers (spatial bridge -> publish_pose loop; telemetry aggregator
+    // -> publish(&TELEMETRY_SUMMARY, ...)) into these handles.
+    #[cfg(feature = "zenoh")]
+    #[expect(
+        clippy::option_as_ref_cloned,
+        reason = "plan 15-10 reuses the 15-06 C-03 convention for consuming zenoh_session"
+    )]
+    let _edge_transport_handles: Option<roz_worker::zenoh_edge::EdgeTransportHandles> =
+        match zenoh_session.as_ref().cloned() {
+            Some(session) => match roz_worker::zenoh_edge::start_edge_subsystems(session, &config.worker_id).await {
+                Ok(handles) => {
+                    tracing::info!(
+                        robot_id = %config.worker_id,
+                        "edge state bus + coordinator wired",
+                    );
+                    Some(handles)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "edge state bus / coordinator startup failed; continuing without",
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+
     // Spawn edge agent session relay (handles gRPC sessions relayed via NATS).
     let relay_nats = nats.clone();
     let relay_worker_id = config.worker_id.clone();
