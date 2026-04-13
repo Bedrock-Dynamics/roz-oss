@@ -888,6 +888,35 @@ async fn main() -> Result<()> {
         }
     }
 
+    // D-03 + D-04 + C-03 + C-07: open the Zenoh edge-transport session after
+    // NATS connect and host registration. Failure is non-fatal — worker falls
+    // back to NATS-only. The binding stays named (not underscored) because
+    // plans 15-05 (ZenohSessionTransport) and 15-06 (health monitors) will
+    // `zenoh_session.clone()` into their subsystems without re-plumbing.
+    #[cfg(feature = "zenoh")]
+    #[expect(
+        unused_variables,
+        reason = "Bound now to anchor Session lifetime; consumed by plans 15-05/15-06 without re-plumbing (C-03)."
+    )]
+    let zenoh_session: Option<zenoh::Session> =
+        match roz_zenoh::session::open_session(config.zenoh_config_path.as_deref()).await {
+            Ok(sess) => {
+                tracing::info!(
+                    mode = "peer",
+                    robot_id = %config.worker_id,
+                    "zenoh edge transport ready",
+                );
+                Some(sess)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "zenoh edge transport unavailable; continuing without it",
+                );
+                None
+            }
+        };
+
     // Spawn edge agent session relay (handles gRPC sessions relayed via NATS).
     let relay_nats = nats.clone();
     let relay_worker_id = config.worker_id.clone();
