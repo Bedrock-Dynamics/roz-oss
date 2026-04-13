@@ -6216,6 +6216,7 @@ dependencies = [
  "inotify",
  "logfire",
  "mcap",
+ "nix 0.29.0",
  "openh264",
  "parking_lot",
  "rand 0.8.5",
