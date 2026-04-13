@@ -1,4 +1,4 @@
-//! Ed25519 sign/verify benchmark for SignedSessionEnvelope.
+//! Ed25519 sign/verify benchmark for `SignedSessionEnvelope`.
 //!
 //! Targets per 16-RESEARCH §6:
 //!   `SignedSessionEnvelope::seal` (sign path):             < 50µs mean
@@ -8,8 +8,8 @@
 //! hard regression gate lives in plan 16-09 via critcmp). Do not rename the
 //! `bench_function` labels without also updating the critcmp baseline matcher.
 //!
-//! Run:  cargo bench -p roz-bench --bench signed_envelope
-//! Save: cargo bench -p roz-bench --bench signed_envelope -- --save-baseline <name>
+//! Run:  `cargo bench -p roz-bench --bench signed_envelope`
+//! Save: `cargo bench -p roz-bench --bench signed_envelope -- --save-baseline <name>`
 
 use std::time::Duration;
 
@@ -60,10 +60,7 @@ fn bench_open(c: &mut Criterion) {
     // Build a PeerKeyCache with the verifying key inserted so the lookup
     // portion is exercised end-to-end (HashMap read + signature verify + JSON decode).
     let cache = PeerKeyCache::new();
-    cache.insert(
-        hex::encode(key.verifying_key().to_bytes()),
-        key.verifying_key(),
-    );
+    cache.insert(hex::encode(key.verifying_key().to_bytes()), key.verifying_key());
 
     c.bench_function("SignedSessionEnvelope::open", |b| {
         b.iter(|| {

@@ -7,8 +7,8 @@
 //! benchmark cannot pick up stray peers on dev machines / CI runners and
 //! pollute measurements.
 //!
-//! Run:  cargo bench -p roz-bench --bench zenoh_local_pubsub
-//! Save: cargo bench -p roz-bench --bench zenoh_local_pubsub -- --save-baseline <name>
+//! Run:  `cargo bench -p roz-bench --bench zenoh_local_pubsub`
+//! Save: `cargo bench -p roz-bench --bench zenoh_local_pubsub -- --save-baseline <name>`
 
 use std::time::Duration;
 
@@ -56,21 +56,21 @@ fn bench_local_pubsub(c: &mut Criterion) {
     let endpoint = ephemeral_tcp_endpoint();
 
     // Set up two linked peer sessions + declare pub/sub on a shared key.
-    let (s_pub, s_sub, publisher, subscriber) = rt.block_on(async {
-        let s_pub = zenoh::open(peer_only_config_listen(&endpoint))
+    let (publisher_session, subscriber_session, publisher, subscriber) = rt.block_on(async {
+        let publisher_session = zenoh::open(peer_only_config_listen(&endpoint))
             .await
             .expect("listen peer open");
         // Give the listen socket a beat to bind.
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let s_sub = zenoh::open(peer_only_config(&endpoint))
+        let subscriber_session = zenoh::open(peer_only_config(&endpoint))
             .await
             .expect("connect peer open");
 
-        let publisher = s_pub
+        let publisher = publisher_session
             .declare_publisher("bench/pubsub")
             .await
             .expect("declare_publisher");
-        let subscriber = s_sub
+        let subscriber = subscriber_session
             .declare_subscriber("bench/pubsub")
             .with(flume::bounded::<Sample>(64))
             .await
@@ -79,15 +79,12 @@ fn bench_local_pubsub(c: &mut Criterion) {
         // Warm-up handshake so the first measured iteration is not paying
         // the session-establishment cost.
         tokio::time::sleep(Duration::from_millis(500)).await;
-        (s_pub, s_sub, publisher, subscriber)
+        (publisher_session, subscriber_session, publisher, subscriber)
     });
 
     c.bench_function("zenoh_local_pubsub_rtt", |b| {
         b.to_async(&rt).iter(|| async {
-            publisher
-                .put(black_box(b"ping".to_vec()))
-                .await
-                .expect("put ok");
+            publisher.put(black_box(b"ping".to_vec())).await.expect("put ok");
             let sample = subscriber.recv_async().await.expect("recv ok");
             let _ = black_box(sample);
         });
@@ -96,7 +93,7 @@ fn bench_local_pubsub(c: &mut Criterion) {
     // Keep both sessions alive until the bench ends; dropping a session
     // closes it and invalidates the publisher/subscriber (see pubsub.rs
     // keepalive note).
-    drop((s_pub, s_sub));
+    drop((publisher_session, subscriber_session));
 }
 
 criterion_group! {
