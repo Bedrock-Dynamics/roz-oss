@@ -20,6 +20,9 @@ use serde::Deserialize;
 /// - `ROZ_ANTHROPIC_PROVIDER` — PAIG proxy provider for Claude models (default: `anthropic`)
 /// - `ROZ_ANTHROPIC_API_KEY` — Direct Anthropic API key; bypasses the PAIG gateway when set
 /// - `ROZ_FALLBACK_MODEL` — Secondary model to use when the primary is rate-limited or overloaded
+/// - `ROZ_WASM_PUBKEYS` — Comma-separated `<key_id>:<base64 Ed25519 pubkey>`
+///   entries trusted to sign `.cwasm` modules. Empty/unset = no trusted
+///   keys, all AOT loads will fail (fail-closed).
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkerConfig {
     pub api_url: String,
@@ -61,6 +64,12 @@ pub struct WorkerConfig {
     /// Camera subsystem configuration.
     #[serde(default)]
     pub camera: CameraConfig,
+    /// Trusted signing keys for `.cwasm` modules. Set via `ROZ_WASM_PUBKEYS`.
+    ///
+    /// Format: `"<key_id>:<base64 Ed25519 pubkey>,..."`. Empty/unset yields
+    /// an empty keyset (fail-closed — AOT loads will fail `UnknownKeyId`).
+    #[serde(default)]
+    pub wasm_pubkeys: Option<String>,
     /// Optional Postgres URL for worker-side session turn persistence (DEBT-03).
     ///
     /// When `Some`, the worker connects directly to Postgres and spawns a
@@ -170,6 +179,23 @@ impl WorkerConfig {
     /// Load configuration from a specific figment (for testing).
     pub fn from_figment(figment: &Figment) -> Result<Self, Box<figment::Error>> {
         figment.extract().map_err(Box::new)
+    }
+
+    /// Parse `wasm_pubkeys` (from `ROZ_WASM_PUBKEYS`) into a
+    /// [`roz_copper::wasm_signature::TrustedKeys`]. Returns an empty keyset
+    /// when unset.
+    ///
+    /// # Errors
+    /// Returns [`roz_copper::wasm_signature::WasmLoadError::KeysetConfig`]
+    /// on malformed entries, bad base64, wrong-length pubkeys, invalid
+    /// Ed25519 points, or duplicate `key_id`s (fail-closed).
+    pub fn trusted_keys(
+        &self,
+    ) -> Result<roz_copper::wasm_signature::TrustedKeys, roz_copper::wasm_signature::WasmLoadError> {
+        self.wasm_pubkeys.as_ref().map_or_else(
+            || Ok(roz_copper::wasm_signature::TrustedKeys::new()),
+            |raw| roz_copper::wasm_signature::TrustedKeys::from_env_str(raw),
+        )
     }
 }
 
@@ -360,5 +386,55 @@ mod tests {
         let figment = Figment::new().merge(Serialized::defaults(vals));
         let config = WorkerConfig::from_figment(&figment).unwrap();
         assert_eq!(config.robot_toml.as_deref(), Some("/etc/roz/robot.toml"));
+    }
+
+    #[test]
+    fn wasm_pubkeys_defaults_to_none() {
+        let figment = Figment::new().merge(Serialized::defaults(base_config()));
+        let config = WorkerConfig::from_figment(&figment).unwrap();
+        assert!(config.wasm_pubkeys.is_none());
+    }
+
+    #[test]
+    fn wasm_pubkeys_reads_env_string() {
+        let mut vals = base_config();
+        vals["wasm_pubkeys"] = serde_json::json!("alpha:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        let figment = Figment::new().merge(Serialized::defaults(vals));
+        let config = WorkerConfig::from_figment(&figment).unwrap();
+        assert!(config.wasm_pubkeys.is_some());
+    }
+
+    #[test]
+    fn trusted_keys_empty_when_unset() {
+        let figment = Figment::new().merge(Serialized::defaults(base_config()));
+        let config = WorkerConfig::from_figment(&figment).unwrap();
+        let keys = config.trusted_keys().expect("empty is ok");
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn trusted_keys_parses_set_value() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        let sk = SigningKey::generate(&mut OsRng);
+        let pubkey_b64 = STANDARD.encode(sk.verifying_key().to_bytes());
+        let mut vals = base_config();
+        vals["wasm_pubkeys"] = serde_json::json!(format!("alpha:{pubkey_b64}"));
+        let figment = Figment::new().merge(Serialized::defaults(vals));
+        let config = WorkerConfig::from_figment(&figment).unwrap();
+        let keys = config.trusted_keys().expect("valid parse");
+        assert_eq!(keys.len(), 1);
+    }
+
+    #[test]
+    fn trusted_keys_returns_err_on_malformed() {
+        let mut vals = base_config();
+        vals["wasm_pubkeys"] = serde_json::json!("no-colon-at-all");
+        let figment = Figment::new().merge(Serialized::defaults(vals));
+        let config = WorkerConfig::from_figment(&figment).unwrap();
+        let err = config.trusted_keys().expect_err("should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("no-colon-at-all") || msg.contains("missing"), "got: {msg}");
     }
 }
