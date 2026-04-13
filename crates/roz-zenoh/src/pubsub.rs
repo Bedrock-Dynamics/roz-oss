@@ -51,7 +51,12 @@ where
         .with(flume::bounded::<Sample>(64))
         .await
         .map_err(|e| anyhow::anyhow!("declare_subscriber({key_expr}) failed: {e}"))?;
+    // Move `session` into the task alongside the subscriber. Dropping a zenoh
+    // `Session` closes it and cancels its subscribers — callers that pass an
+    // owned `Session` (e.g. `ZenohCoordinator::subscribe_poses`) rely on the
+    // fanout task keeping the session alive for the subscription lifetime.
     tokio::spawn(async move {
+        let _session_keepalive = session;
         loop {
             match sub.recv_async().await {
                 Ok(sample) => {

@@ -161,7 +161,12 @@ impl ZenohCoordinator {
             .map_err(|e| anyhow::anyhow!("observe_barrier declare_subscriber failed: {e}"))?;
         let participants_task = participants.clone();
         let name_task = name.clone();
+        // Move `session` into the task so the liveliness subscriber's owning
+        // session stays alive for the subscription lifetime (dropping the last
+        // Session clone closes zenoh resources; see the matching fix in
+        // `spawn_topic_fanout`).
         let task = tokio::spawn(async move {
+            let _session_keepalive = session;
             loop {
                 match sub.recv_async().await {
                     Ok(sample) => {
@@ -207,7 +212,10 @@ impl ZenohCoordinator {
             .await
             .map_err(|e| anyhow::anyhow!("declare_queryable({key}) failed: {e}"))?;
         let key_for_task = key.clone();
+        // Move `session` into the task so the queryable's owning session stays
+        // alive for the queryable lifetime (see `spawn_topic_fanout` note).
         Ok(tokio::spawn(async move {
+            let _session_keepalive = session;
             loop {
                 match queryable.recv_async().await {
                     Ok(query) => {
