@@ -38,6 +38,10 @@ tokio-tungstenite.workspace = true
 futures.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
+ciborium = { workspace = true }
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
+thiserror = { workspace = true }
 hex.workspace = true
 sha2.workspace = true
 tracing.workspace = true
@@ -48,6 +52,7 @@ wit-parser = "0.244.0"
 
 [dev-dependencies]
 tempfile = "3"
+rand = { workspace = true }
 wasmprinter = "0.245.1"
 
 [build-dependencies]

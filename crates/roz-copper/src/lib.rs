@@ -40,5 +40,6 @@ pub mod tick_builder;
 pub mod tick_contract;
 pub mod tick_dispatch;
 pub mod wasm;
+pub mod wasm_signature;
 pub mod wit_bindings;
 pub mod wit_host;
