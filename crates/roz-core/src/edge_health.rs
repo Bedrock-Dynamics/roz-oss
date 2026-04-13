@@ -1,7 +1,10 @@
 //! Edge health monitoring and degradation tracking.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::time::Duration;
+
+use tokio::sync::{mpsc, watch};
 
 /// Health of an edge transport (Zenoh, NATS, etc.).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +39,71 @@ impl TopicContract {
     #[must_use]
     pub const fn max_staleness(&self) -> Duration {
         Duration::from_millis(self.max_staleness_ms)
+    }
+}
+
+#[cfg(test)]
+mod aggregator_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn starts_healthy() {
+        let (_agg, rx, _h) = EdgeHealthAggregator::new(16);
+        assert!(matches!(*rx.borrow(), EdgeTransportHealth::Healthy));
+    }
+
+    #[tokio::test]
+    async fn peer_lost_then_recovered_roundtrip() {
+        let (agg, mut rx, h) = EdgeHealthAggregator::new(16);
+        let _task = tokio::spawn(agg.run());
+
+        h.send(EdgeHealthSignal::PeerLost {
+            robot_id: "r1".into(),
+        })
+        .await;
+        rx.changed().await.unwrap();
+        match &*rx.borrow_and_update() {
+            EdgeTransportHealth::Degraded { affected } => assert!(affected.iter().any(|a| a == "peer:r1")),
+            other => panic!("expected Degraded, got {other:?}"),
+        }
+
+        h.send(EdgeHealthSignal::PeerRecovered {
+            robot_id: "r1".into(),
+        })
+        .await;
+        rx.changed().await.unwrap();
+        assert!(matches!(*rx.borrow(), EdgeTransportHealth::Healthy));
+    }
+
+    #[tokio::test]
+    async fn subsystem_stale_appears_in_affected() {
+        let (agg, mut rx, h) = EdgeHealthAggregator::new(16);
+        let _task = tokio::spawn(agg.run());
+        h.send(EdgeHealthSignal::SubsystemStale {
+            name: "telemetry_summary".into(),
+        })
+        .await;
+        rx.changed().await.unwrap();
+        match &*rx.borrow() {
+            EdgeTransportHealth::Degraded { affected } => {
+                assert!(affected.iter().any(|a| a == "subsystem:telemetry_summary"));
+            }
+            other => panic!("expected Degraded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_down_wins_over_degraded() {
+        let (agg, mut rx, h) = EdgeHealthAggregator::new(16);
+        let _task = tokio::spawn(agg.run());
+        h.send(EdgeHealthSignal::PeerLost {
+            robot_id: "r1".into(),
+        })
+        .await;
+        rx.changed().await.unwrap();
+        h.send(EdgeHealthSignal::TransportDown).await;
+        rx.changed().await.unwrap();
+        assert!(matches!(*rx.borrow(), EdgeTransportHealth::Disconnected));
     }
 }
 
