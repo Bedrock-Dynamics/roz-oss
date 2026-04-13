@@ -70,6 +70,33 @@ pub struct WorkerConfig {
     /// an empty keyset (fail-closed — AOT loads will fail `UnknownKeyId`).
     #[serde(default)]
     pub wasm_pubkeys: Option<String>,
+    /// Path to a Zenoh JSON5 config file (D-02). When unset, the in-code
+    /// default is used (peer mode, multicast scout enabled). Set via
+    /// `ROZ_ZENOH_CONFIG` (no `_PATH` suffix — mapped through an explicit env
+    /// alias in [`WorkerConfig::load`]).
+    ///
+    /// Per D-02: env-only this phase; TOML overlay deferred.
+    #[serde(default)]
+    pub zenoh_config_path: Option<std::path::PathBuf>,
+
+    /// Path to (or `base64:<seed>` form of) an Ed25519 32-byte signing seed
+    /// used to sign `SessionEvent` envelopes published over Zenoh (D-22). When
+    /// unset, signed Zenoh session relay is skipped.
+    ///
+    /// Doc guidance (T-15-02 partial mitigation): prefer the file-path form
+    /// (`ROZ_DEVICE_SIGNING_KEY=/etc/roz/device.key`) over inline `base64:...`
+    /// to keep seed material out of `ps`/`/proc/<pid>/environ`. Filesystem
+    /// permissions on the key file remain operator responsibility.
+    ///
+    /// Generate with:
+    ///   `openssl genpkey -algorithm ed25519 -out roz-device.key`
+    /// then extract raw seed:
+    ///   `openssl pkey -in roz-device.key -outform DER | tail -c 32 | base64`
+    ///
+    /// Parsed but unused until plan 15-05.
+    #[serde(default)]
+    pub device_signing_key: Option<String>,
+
     /// Optional Postgres URL for worker-side session turn persistence (DEBT-03).
     ///
     /// When `Some`, the worker connects directly to Postgres and spawns a
@@ -168,10 +195,20 @@ fn default_anthropic_provider() -> String {
 impl WorkerConfig {
     /// Load configuration from environment variables (prefixed `ROZ_`) and
     /// an optional `roz-worker.toml` file.
+    ///
+    /// Per D-02, the locked env var name for the zenoh config path is
+    /// `ROZ_ZENOH_CONFIG` (no `_PATH` suffix). The default `ROZ_`-prefix
+    /// provider would map it to field `zenoh_config`, so we layer an explicit
+    /// alias merge that rewrites `ROZ_ZENOH_CONFIG` into `zenoh_config_path`.
     pub fn load() -> Result<Self, Box<figment::Error>> {
         Figment::new()
             .merge(Toml::file("roz-worker.toml"))
             .merge(Env::prefixed("ROZ_"))
+            .merge(
+                Env::raw()
+                    .only(&["ROZ_ZENOH_CONFIG"])
+                    .map(|_| "zenoh_config_path".into()),
+            )
             .extract()
             .map_err(Box::new)
     }
@@ -425,6 +462,28 @@ mod tests {
         let config = WorkerConfig::from_figment(&figment).unwrap();
         let keys = config.trusted_keys().expect("valid parse");
         assert_eq!(keys.len(), 1);
+    }
+
+    #[test]
+    fn config_zenoh_fields_default_to_none() {
+        let figment = Figment::new().merge(Serialized::defaults(base_config()));
+        let config = WorkerConfig::from_figment(&figment).unwrap();
+        assert!(config.zenoh_config_path.is_none());
+        assert!(config.device_signing_key.is_none());
+    }
+
+    #[test]
+    fn config_loads_zenoh_config_from_env() {
+        let mut vals = base_config();
+        vals["zenoh_config_path"] = serde_json::json!("/tmp/zenoh.json5");
+        vals["device_signing_key"] = serde_json::json!("base64:AAAA");
+        let figment = Figment::new().merge(Serialized::defaults(vals));
+        let config = WorkerConfig::from_figment(&figment).unwrap();
+        assert_eq!(
+            config.zenoh_config_path.as_deref(),
+            Some(std::path::Path::new("/tmp/zenoh.json5"))
+        );
+        assert_eq!(config.device_signing_key.as_deref(), Some("base64:AAAA"));
     }
 
     #[test]
