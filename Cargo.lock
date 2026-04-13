@@ -6267,6 +6267,7 @@ dependencies = [
  "flume",
  "futures",
  "hex",
+ "noxious-client",
  "parking_lot",
  "rand 0.8.5",
  "roz-core",

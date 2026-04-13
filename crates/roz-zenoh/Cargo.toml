@@ -28,6 +28,10 @@ rand = { workspace = true }
 roz-test = { path = "../roz-test" }
 futures = { workspace = true }
 sysinfo = "0.32"
+# Plan 16-06 chaos tests reach for `Toxic` / `ToxicKind` / `StreamDirection`
+# directly — these re-exports live in `noxious-client`, which the roz-test
+# toxiproxy helper already depends on for its own admin-API client.
+noxious-client = "1.0.4"
 
 [lints]
 workspace = true
