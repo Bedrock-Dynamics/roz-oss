@@ -50,7 +50,7 @@ pub fn cargo_bin(name: &str) -> PathBuf {
 /// # Errors
 /// Returns any `std::io::Error` from `tokio::process::Command::spawn`,
 /// wrapped in `anyhow::Error`.
-#[expect(
+#[allow(
     clippy::unused_async,
     reason = "async is required so callers can .await in a tokio runtime context; \
               body may not directly .await but spawn's child-wait hooks must run on a runtime"
@@ -71,7 +71,9 @@ pub async fn spawn_worker(
         .env("ROZ_API_KEY", "test-key")
         .env("ROZ_GATEWAY_API_KEY", "test-gateway-key")
         .env("ZENOH_ROUTER_ENDPOINT", zenoh_endpoint)
-        .env("ROZ_DEVICE_SIGNING_KEY", format!("file:{signing_key_path}"))
+        // `load_signing_key` (roz_zenoh::envelope) accepts either `base64:<seed>`
+        // or a raw path — no `file:` prefix. Pass the raw absolute path.
+        .env("ROZ_DEVICE_SIGNING_KEY", signing_key_path)
         .env("RUST_LOG", "info,roz_worker=debug,roz_zenoh=debug")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -114,10 +116,7 @@ pub async fn shutdown_worker(mut worker: Worker) {
             reason = "pid from tokio always fits in i32 on supported unix platforms"
         )]
         let raw_pid = pid as i32;
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(raw_pid),
-            nix::sys::signal::Signal::SIGTERM,
-        );
+        let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw_pid), nix::sys::signal::Signal::SIGTERM);
     }
     let _ = tokio::time::timeout(Duration::from_secs(5), worker.child.wait()).await;
     let _ = worker.child.kill().await;
