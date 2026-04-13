@@ -49,8 +49,11 @@ impl ZenohGuard {
     /// [`zenoh_router_with_endpoint`] with `Some(endpoint)`).
     ///
     /// Used by chaos integration tests that need to `docker pause`/`unpause`
-    /// the router to simulate hard network partitions (Phase 16 plan 16-04
-    /// ZEN-TEST-02). The returned value is suitable for passing directly to
+    /// the router to simulate hard network partitions — the D-01 sanctioned
+    /// mechanism for hard network failure (plans 16-04 ZEN-TEST-02 and 16-06
+    /// ZEN-TEST-04). Tests that cannot obtain a container ID should skip the
+    /// hard-partition scenario rather than fall back to `iptables`/`tc`.
+    /// The returned value is suitable for passing directly to
     /// `tokio::process::Command::new("docker").args(["pause", &id])`.
     #[must_use]
     #[expect(
