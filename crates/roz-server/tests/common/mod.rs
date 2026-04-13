@@ -7,12 +7,17 @@
 //! via a tonic interceptor on every request.
 //!
 //! The harness is a distillation of the pattern in
-//! `tests/grpc_agent_session.rs` (mock_gateway + spawn_grpc_server_with_auth +
-//! tenant/API-key creation). It is reused by `media_rpc_integration` (Plan
-//! 16.1-05 Task 2) and `media_live` (Plan 16.1-06) to avoid copy-pasting the
-//! in-process server boilerplate.
+//! `tests/grpc_agent_session.rs` and consolidates `mock_gateway`,
+//! `spawn_grpc_server_with_auth`, and tenant plus API-key creation in one
+//! place. It is reused by `media_rpc_integration` (Plan 16.1-05 Task 2) and
+//! `media_live` (Plan 16.1-06) to avoid copy-pasting the in-process server
+//! boilerplate.
 
 #![allow(dead_code)]
+#![allow(
+    clippy::type_complexity,
+    reason = "interceptor boxing requires a complex client type"
+)]
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -45,11 +50,7 @@ async fn mock_gateway(responses: Arc<Mutex<Vec<String>>>) -> String {
                 async move {
                     let sse_body = {
                         let mut lock = responses.lock().expect("mock responses lock poisoned");
-                        if lock.is_empty() {
-                            String::new()
-                        } else {
-                            lock.remove(0)
-                        }
+                        if lock.is_empty() { String::new() } else { lock.remove(0) }
                     };
                     axum::response::Response::builder()
                         .header("content-type", "text/event-stream")
@@ -76,13 +77,20 @@ fn spawn_grpc_server_with_auth(pool: sqlx::PgPool, agent_svc: AgentServiceImpl, 
         auth: Arc::new(ApiKeyAuth),
         pool,
     };
-    let router = tonic::service::Routes::new(AgentServiceServer::new(agent_svc))
-        .prepare()
-        .into_axum_router()
-        .layer(axum::middleware::from_fn_with_state(
-            grpc_auth_state,
-            grpc_auth_middleware,
-        ));
+    // Raise the default tonic decode cap (4 MiB) so the handler's own
+    // 10 MiB inline_bytes cap (D-16 ResourceExhausted) is what the test
+    // exercises — not the transport-level OutOfRange.
+    let server = AgentServiceServer::new(agent_svc)
+        .max_decoding_message_size(16 * 1024 * 1024)
+        .max_encoding_message_size(16 * 1024 * 1024);
+    let router =
+        tonic::service::Routes::new(server)
+            .prepare()
+            .into_axum_router()
+            .layer(axum::middleware::from_fn_with_state(
+                grpc_auth_state,
+                grpc_auth_middleware,
+            ));
     tokio::spawn(async move {
         axum::serve(listener, router).await.expect("grpc server");
     });
@@ -97,9 +105,11 @@ fn spawn_grpc_server_with_auth(pool: sqlx::PgPool, agent_svc: AgentServiceImpl, 
 ///
 /// Returns `(client, addr, server_handle)`. The server handle can be dropped
 /// immediately; the spawned server lives until the test function returns.
-pub async fn start_server(media_backend: Arc<dyn MediaBackend>) -> (AuthedClient, SocketAddr, tokio::task::JoinHandle<()>) {
+pub async fn start_server(
+    media_backend: Arc<dyn MediaBackend>,
+) -> (AuthedClient, SocketAddr, tokio::task::JoinHandle<()>) {
     let pg_url = roz_test::pg_url().await;
-    let pool = roz_db::create_pool(&pg_url).await.expect("create pool");
+    let pool = roz_db::create_pool(pg_url).await.expect("create pool");
     roz_db::run_migrations(&pool).await.expect("run migrations");
 
     let slug = format!("media-test-{}", uuid::Uuid::new_v4());
@@ -154,16 +164,17 @@ pub async fn start_server(media_backend: Arc<dyn MediaBackend>) -> (AuthedClient
     // Attach Bearer auth metadata via interceptor so every RPC carries the
     // API-key bearer token. Callers do not need to add it per-request.
     let bearer = api_key.full_key.clone();
-    let interceptor: Box<
-        dyn Fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + Send + Sync,
-    > = Box::new(move |mut req: tonic::Request<()>| {
-        req.metadata_mut().insert(
-            "authorization",
-            format!("Bearer {bearer}").parse().expect("auth metadata"),
-        );
-        Ok(req)
-    });
-    let client = AgentServiceClient::with_interceptor(channel, interceptor);
+    let interceptor: Box<dyn Fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + Send + Sync> =
+        Box::new(move |mut req: tonic::Request<()>| {
+            req.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {bearer}").parse().expect("auth metadata"),
+            );
+            Ok(req)
+        });
+    let client = AgentServiceClient::with_interceptor(channel, interceptor)
+        .max_decoding_message_size(16 * 1024 * 1024)
+        .max_encoding_message_size(16 * 1024 * 1024);
 
     // The spawn_grpc_server_with_auth task is fire-and-forget; callers
     // don't need to join it. Return a dummy handle for API symmetry.

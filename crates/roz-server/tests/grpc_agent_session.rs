@@ -129,7 +129,7 @@ async fn mock_gateway_capturing(responses: Arc<Mutex<Vec<String>>>, captured: Ca
 // it via `ApiKeyAuth`, and inserts `AuthIdentity` into request extensions.
 // ---------------------------------------------------------------------------
 
-/// Default media-analysis deps for tests that don't exercise the AnalyzeMedia path.
+/// Default media-analysis deps for tests that don't exercise the `AnalyzeMedia` path.
 /// The backend is wired with the provided gateway URL but is never invoked by
 /// session-lifecycle tests.
 fn default_media_deps(
