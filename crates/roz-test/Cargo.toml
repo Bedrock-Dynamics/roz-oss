@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 roz-core = { path = "../roz-core" }
 chrono = { workspace = true }
+noxious-client = "1.0.4"
 testcontainers = { workspace = true, features = ["http_wait"] }
 testcontainers-modules = { workspace = true }
 tokio = { workspace = true }
