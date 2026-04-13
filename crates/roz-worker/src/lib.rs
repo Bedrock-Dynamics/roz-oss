@@ -20,4 +20,6 @@ pub mod telemetry;
 pub mod trust;
 pub mod turn_flush;
 pub mod wal;
+#[cfg(feature = "aot")]
+pub mod wasm_trust;
 pub mod webrtc;

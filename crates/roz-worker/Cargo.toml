@@ -6,6 +6,12 @@ rust-version.workspace = true
 license.workspace      = true
 authors.workspace      = true
 
+[features]
+default = []
+# Enables the signed-AOT WASM load path (wasm_trust module). Passes the
+# feature through to roz-copper so Module::deserialize compiles.
+aot = ["roz-copper/aot"]
+
 [dependencies]
 roz-core = { path = "../roz-core" }
 roz-db = { path = "../roz-db" }
