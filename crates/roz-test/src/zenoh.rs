@@ -44,6 +44,23 @@ impl ZenohGuard {
         &self.tcp_endpoint
     }
 
+    /// Underlying Docker container ID, or `None` if this guard points at an
+    /// externally-managed router (i.e. constructed via
+    /// [`zenoh_router_with_endpoint`] with `Some(endpoint)`).
+    ///
+    /// Used by chaos integration tests that need to `docker pause`/`unpause`
+    /// the router to simulate hard network partitions (Phase 16 plan 16-04
+    /// ZEN-TEST-02). The returned value is suitable for passing directly to
+    /// `tokio::process::Command::new("docker").args(["pause", &id])`.
+    #[must_use]
+    #[expect(
+        clippy::used_underscore_binding,
+        reason = "field is `_container` to signal RAII-drop intent; accessor exposes id only"
+    )]
+    pub fn container_id(&self) -> Option<String> {
+        self._container.as_ref().map(|c| c.id().to_string())
+    }
+
     /// Build a [`zenoh::Config`] configured to connect to this router (no
     /// multicast scout — Docker bridge constraint).
     ///
