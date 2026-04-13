@@ -78,3 +78,48 @@ jobs:
       # branch of from_precompiled must lint clean on every PR.
       - name: Clippy (aot feature)
         run: cargo clippy -p roz-copper --features aot --tests -- -D warnings
+
+  # Phase 15 (zenoh-edge-transport) D-29: the `--features zenoh` build path
+  # on roz-worker and the integration tests in roz-zenoh/tests (which require
+  # a zenohd testcontainer) are NOT exercised by the default `cargo build
+  # --workspace` / `cargo test --workspace` steps. This job closes that gap so
+  # every PR compiles + lints + runs the zenoh path alongside the default.
+  zenoh-tests:
+    name: roz-worker --features zenoh + roz-zenoh integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          toolchain: "1.92.0"
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # Docker is required for the roz-zenoh integration tests (zenohd
+      # testcontainer, see crates/roz-test/src/zenoh.rs). ubuntu-latest
+      # GitHub runners ship Docker; this step fails fast with a clear
+      # message if that ever changes.
+      - name: Docker available
+        run: docker info
+
+      - name: Build roz-worker with --features zenoh
+        run: cargo build -p roz-worker --features zenoh
+
+      - name: Clippy roz-worker with --features zenoh
+        run: cargo clippy -p roz-worker --all-targets --features zenoh -- -D warnings
+
+      - name: Test roz-worker with --features zenoh
+        run: cargo test -p roz-worker --features zenoh
+
+      # ZEN-01/02/03/04 + T-01 end-to-end coverage lives in
+      # crates/roz-zenoh/tests/*_integration.rs and runs in the default
+      # cargo test matrix per D-29 (no `#[ignore]`).
+      - name: Test roz-zenoh (integration tests require Docker)
+        run: cargo test -p roz-zenoh --all-targets
