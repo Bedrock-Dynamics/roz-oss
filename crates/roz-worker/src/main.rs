@@ -923,6 +923,14 @@ async fn main() -> Result<()> {
     let relay_config = config.clone();
     let relay_estop_rx = estop_rx.clone();
     let relay_camera_mgr = camera_manager.clone();
+    // C-01 narrowed (plan 15-04): `event_transport` is the dual-publish seam
+    // reserved for plan 15-05. By passing `None`, the Phase 13 NATS
+    // `event_subject(...)` publish path runs unchanged (D-18 byte-stable).
+    // Plan 15-05 will wrap this with
+    // `Some(Box::new(DualPublishTransport::new(nats_transport, zenoh_transport)))`
+    // under `--features zenoh`. Note: `NatsSessionTransport::new(nats.clone())`
+    // is the type that plan 15-05 will compose here.
+    let event_transport: Option<Box<dyn roz_core::transport::SessionTransport>> = None;
     tokio::spawn(async move {
         if let Err(e) = roz_worker::session_relay::spawn_session_relay(
             relay_nats,
@@ -930,6 +938,7 @@ async fn main() -> Result<()> {
             relay_config,
             relay_estop_rx,
             relay_camera_mgr,
+            event_transport,
         )
         .await
         {

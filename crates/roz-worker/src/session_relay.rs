@@ -54,7 +54,7 @@ use roz_nats::subjects::Subjects;
 use crate::camera::CameraManager;
 use crate::config::WorkerConfig;
 
-const SESSION_EVENT_PREFIX: &str = "roz.v1";
+pub(crate) const SESSION_EVENT_PREFIX: &str = "roz.v1";
 const EDGE_MAX_CYCLES: u32 = 20;
 const EDGE_MAX_TOKENS: u32 = 8192;
 const EDGE_MAX_CONTEXT_TOKENS: u32 = 200_000;
@@ -571,13 +571,29 @@ impl StreamingTurnExecutor for EdgeTurnExecutor {
 /// Subscribes to `session.{worker_id}.*.request` (wildcard for `session_id`).
 /// On the first `start_session` message for a new `session_id`, spawns a
 /// dedicated per-session task that manages the `AgentLoop` lifecycle.
+///
+/// `event_transport` is the C-01 narrowed dual-publish seam. When `Some`, plan
+/// 15-05 will use it to route worker-originated `EventEnvelope`s to Zenoh in
+/// addition to the existing INLINE NATS publish on `event_subject(...)`. For
+/// this plan it is always passed as `None` by `main.rs`, preserving the
+/// Phase 13 NATS path byte-for-byte (D-18 BLOCKING regression contract). All
+/// five session relay NATS ops (wildcard subscribe, per-session subscribe,
+/// `runtime_checkpoint` publish, canonical response publish, `event_subject`
+/// publish) stay INLINE here using the raw `async_nats::Client`.
 pub async fn spawn_session_relay(
     nats: async_nats::Client,
     worker_id: String,
     config: WorkerConfig,
     estop_rx: tokio::sync::watch::Receiver<bool>,
     camera_manager: Option<Arc<CameraManager>>,
+    event_transport: Option<Box<dyn roz_core::transport::SessionTransport>>,
 ) -> anyhow::Result<()> {
+    // C-01 narrowed: event_transport is reserved for plan 15-05 to wrap with
+    // `Some(DualPublishTransport(nats, zenoh))`. For this plan it is always
+    // `None`; the inline NATS `event_subject(...)` publish at the bottom of
+    // this file runs unchanged, which is what Phase 13 regression tests assert.
+    let _ = event_transport;
+
     let subject = format!("session.{worker_id}.*.request");
     let mut sub = nats.subscribe(subject.clone()).await?;
     tracing::info!(subject, "session relay listening");
@@ -1043,6 +1059,28 @@ async fn publish_runtime_checkpoint(
     nats: &async_nats::Client,
     response_subject: &str,
     bootstrap: &SessionRuntimeBootstrap,
+) -> anyhow::Result<()> {
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "type": "runtime_checkpoint",
+        "bootstrap": bootstrap,
+    }))?;
+    nats.publish(response_subject.to_string(), payload.into()).await?;
+    Ok(())
+}
+
+/// Test-only wrapper exposing the byte-stable `runtime_checkpoint` publish path.
+///
+/// C-10 regression hook for the Phase 15-04 regression suite: asserts that the
+/// payload shape `{"type":"runtime_checkpoint","bootstrap":<value>}` is emitted
+/// on the response subject. `bootstrap` is accepted as an opaque
+/// `serde_json::Value` so tests do not need to construct a full
+/// `SessionRuntimeBootstrap`. The serialized shape matches
+/// `publish_runtime_checkpoint` above byte-for-byte (same JSON keys in same
+/// order).
+pub async fn publish_runtime_checkpoint_for_test(
+    nats: &async_nats::Client,
+    response_subject: &str,
+    bootstrap: &serde_json::Value,
 ) -> anyhow::Result<()> {
     let payload = serde_json::to_vec(&serde_json::json!({
         "type": "runtime_checkpoint",

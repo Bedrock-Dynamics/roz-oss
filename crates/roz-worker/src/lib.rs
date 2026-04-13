@@ -16,6 +16,7 @@ pub mod registration;
 pub mod safety_guards;
 pub mod session_relay;
 pub mod spatial_bridge;
+pub mod transport_nats;
 pub mod telemetry;
 pub mod trust;
 pub mod turn_flush;

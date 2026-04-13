@@ -96,6 +96,13 @@ impl Subjects {
         Ok(format!("capabilities.{worker_id}"))
     }
 
+    // Pinned from pre-refactor source: subjects are D-18 BLOCKING. Any change to
+    // these literals requires coordinated worker + server migration. Format is
+    // "session.{worker_id}.{session_id}.{request|response|control}".
+    //
+    // Workers subscribe via `format!("session.{worker_id}.*.request")` (wildcard
+    // hoisted inline in `crates/roz-worker/src/session_relay.rs:spawn_session_relay`).
+
     /// Build a session request subject: `session.{worker_id}.{session_id}.request`.
     pub fn session_request(worker_id: &str, session_id: &str) -> Result<String, RozError> {
         validate_token("worker_id", worker_id)?;
