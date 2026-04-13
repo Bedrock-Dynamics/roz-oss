@@ -24,3 +24,5 @@ pub mod wal;
 #[cfg(feature = "aot")]
 pub mod wasm_trust;
 pub mod webrtc;
+#[cfg(feature = "zenoh")]
+pub mod zenoh_edge;
