@@ -26,6 +26,8 @@ tracing.workspace = true
 tempfile = "3"
 rand = { workspace = true }
 roz-test = { path = "../roz-test" }
+futures = { workspace = true }
+sysinfo = "0.32"
 
 [lints]
 workspace = true
