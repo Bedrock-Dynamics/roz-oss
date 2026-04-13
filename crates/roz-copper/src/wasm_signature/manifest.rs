@@ -29,11 +29,7 @@ impl SignedManifest {
     ///
     /// # Errors
     /// Returns `IdentityMismatch` if either field differs from expected.
-    pub fn expect(
-        &self,
-        expected_module_id: &str,
-        expected_version: &str,
-    ) -> Result<(), IdentityMismatch> {
+    pub fn expect(&self, expected_module_id: &str, expected_version: &str) -> Result<(), IdentityMismatch> {
         if self.module_id != expected_module_id || self.version != expected_version {
             return Err(IdentityMismatch {
                 expected_module_id: expected_module_id.to_string(),

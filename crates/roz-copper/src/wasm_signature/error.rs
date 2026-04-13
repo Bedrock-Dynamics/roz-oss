@@ -93,9 +93,7 @@ mod tests {
 
     #[test]
     fn duplicate_key_id_display_contains_key_id() {
-        let err = WasmLoadError::KeysetConfig(KeysetConfigError::DuplicateKeyId {
-            key_id: "alpha".into(),
-        });
+        let err = WasmLoadError::KeysetConfig(KeysetConfigError::DuplicateKeyId { key_id: "alpha".into() });
         let msg = err.to_string();
         assert!(msg.contains("alpha"));
         assert!(msg.contains("duplicate"));
