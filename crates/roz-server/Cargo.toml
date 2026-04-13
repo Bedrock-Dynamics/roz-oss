@@ -45,6 +45,7 @@ tokio-util = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 eventsource-stream = "0.2"
+hickory-resolver = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }
