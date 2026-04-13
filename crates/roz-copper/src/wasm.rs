@@ -334,18 +334,114 @@ impl CuWasmTask {
 
     /// Load a pre-compiled `.cwasm` module for fast startup on edge devices.
     ///
-    /// # Safety
+    /// Signature verification (ENF-02) runs BEFORE any native-code
+    /// deserialization. An Ed25519 signature over the signed manifest
+    /// `{module_id, version, sha256(cwasm)}` is verified against the
+    /// provided [`crate::wasm_signature::TrustedKeys`]; the manifest's
+    /// sha256 is then checked against the actual `cwasm_bytes`.
     ///
-    /// [`Module::deserialize`] loads native code. The `.cwasm` file must be
-    /// from a trusted source (signed via OTA pipeline).
+    /// The sidecar `sig_bytes` is the CBOR-encoded
+    /// [`crate::wasm_signature::SignatureEnvelope`] read from the
+    /// companion `.cwasm.sig` file by the caller.
+    ///
+    /// On failure, emits a STRUCTURED `tracing::error!` with separate
+    /// fields (`key_id`, `module_id`, `version`, `reason`) — callers
+    /// (e.g. `roz-worker`) can layer NATS telemetry on top by catching
+    /// [`crate::wasm_signature::WasmLoadError::SignatureInvalid`] and
+    /// publishing a `roz_nats::WasmTrustFailure` event.
+    ///
+    /// # Errors
+    /// Returns `anyhow::Error` wrapping a
+    /// [`crate::wasm_signature::WasmLoadError`] on signature failure, or
+    /// a wasmtime error on deserialization failure.
+    ///
+    /// # Safety
+    /// [`Module::deserialize`] loads native code. It is only invoked
+    /// AFTER [`crate::wasm_signature::verify_detached`] confirms an
+    /// in-keyset Ed25519 signature over a manifest whose SHA-256 matches
+    /// `cwasm_bytes`. The code provenance is therefore enforced.
     #[cfg(feature = "aot")]
     #[allow(unsafe_code)]
-    pub fn from_precompiled(cwasm_bytes: &[u8]) -> anyhow::Result<Self> {
+    pub fn from_precompiled(
+        cwasm_bytes: &[u8],
+        sig_bytes: &[u8],
+        keyset: &crate::wasm_signature::TrustedKeys,
+    ) -> anyhow::Result<Self> {
+        use crate::wasm_signature::WasmLoadError;
+
+        // --- ENF-02 gate. Runs BEFORE any native-code deserialization. ---
+        let manifest = match crate::wasm_signature::verify_detached(cwasm_bytes, sig_bytes, keyset) {
+            Ok(m) => m,
+            Err(err) => {
+                // STRUCTURED tracing per D-07 / REVIEWS.md HIGH — emit each
+                // field as its own key so operators can filter by key_id,
+                // module_id, version, or reason in logfire/loki/etc.
+                match &err {
+                    WasmLoadError::SignatureInvalid {
+                        key_id,
+                        module_id,
+                        version,
+                        reason,
+                    } => {
+                        tracing::error!(
+                            key_id = %key_id,
+                            module_id = %module_id,
+                            version = %version,
+                            reason = %reason,
+                            error_variant = "SignatureInvalid",
+                            "WASM signature verification failed"
+                        );
+                    }
+                    WasmLoadError::UnknownKeyId(kid) => {
+                        tracing::error!(
+                            key_id = %kid,
+                            error_variant = "UnknownKeyId",
+                            "WASM signature envelope references key_id not in trust store"
+                        );
+                    }
+                    WasmLoadError::EnvelopeDecode(msg) => {
+                        tracing::error!(
+                            decode_error = %msg,
+                            error_variant = "EnvelopeDecode",
+                            "WASM signature envelope failed to decode"
+                        );
+                    }
+                    WasmLoadError::KeysetConfig(kc) => {
+                        tracing::error!(
+                            keyset_error = %kc,
+                            error_variant = "KeysetConfig",
+                            "WASM signature keyset config invalid"
+                        );
+                    }
+                    WasmLoadError::IdentityMismatch(m) => {
+                        tracing::error!(
+                            expected_module_id = %m.expected_module_id,
+                            expected_version = %m.expected_version,
+                            actual_module_id = %m.actual_module_id,
+                            actual_version = %m.actual_version,
+                            error_variant = "IdentityMismatch",
+                            "WASM signed manifest identity mismatch"
+                        );
+                    }
+                }
+                return Err(anyhow::Error::from(err));
+            }
+        };
+        tracing::info!(
+            module_id = %manifest.module_id,
+            version = %manifest.version,
+            "wasm signature verified — loading precompiled module"
+        );
+
         let mut config = Config::new();
         config.epoch_interruption(true);
         let engine = Engine::new(&config)?;
-        // SAFETY: Caller guarantees cwasm_bytes originate from a trusted,
-        // signed OTA pipeline. Module::deserialize loads native code.
+        // SAFETY: `verify_detached` above has confirmed an in-keyset Ed25519
+        // signature over a manifest whose SHA-256 equals the hash of
+        // `cwasm_bytes`. The `.cwasm` therefore originates from a holder of
+        // a signing key we accept, and its bytes have not been tampered
+        // with since signing. `Module::deserialize` still loads native
+        // code, but code provenance is now enforced.
         let module = unsafe { Module::deserialize(&engine, cwasm_bytes)? };
         Self::build_from_module(engine, &module, HostContext::default())
     }
