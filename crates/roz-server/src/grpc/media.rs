@@ -458,4 +458,190 @@ mod tests {
             "https://gw.example/proxy/google-vertex/v1beta1/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // SSE parser integration tests
+    //
+    // These spin up a local axum server that returns canned `text/event-stream`
+    // bytes in the Gemini :streamGenerateContent?alt=sse wire format, then
+    // drive `GeminiBackend::analyze()` end-to-end against it. Exercises:
+    // request serialization, HTTP pipeline, SSE framing, JSON deserialization,
+    // text-delta emission, usage aggregation, terminal Done chunk, mid-stream
+    // error surfacing.
+    //
+    // Uses plain HTTP (not HTTPS) — GeminiBackend is not scheme-restricted
+    // like MediaFetcher.
+    // -----------------------------------------------------------------------
+
+    use axum::Router;
+    use axum::http::header;
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use super::media_part;
+
+    async fn spawn_gemini_test_server(sse_body: &'static str) -> std::net::SocketAddr {
+        async fn handler(sse: axum::extract::State<&'static str>) -> impl IntoResponse {
+            ([(header::CONTENT_TYPE, "text/event-stream")], sse.0)
+        }
+        let app = Router::new()
+            .route(
+                "/proxy/google-vertex/v1beta1/models/gemini-2.5-pro:streamGenerateContent",
+                post(handler),
+            )
+            .with_state(sse_body);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        addr
+    }
+
+    fn png_part() -> MediaPart {
+        MediaPart {
+            mime_type: "image/png".into(),
+            hints: None,
+            source: Some(media_part::Source::InlineBytes(b"fake-png".to_vec())),
+        }
+    }
+
+    fn test_backend(addr: std::net::SocketAddr) -> GeminiBackend {
+        let cfg = GeminiMediaConfig {
+            gateway_url: format!("http://{addr}"),
+            gateway_api_key: "test".into(),
+            provider: "google-vertex".into(),
+            direct_api_key: None,
+            model: "gemini-2.5-pro".into(),
+            timeout: Duration::from_secs(5),
+        };
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("reqwest build");
+        GeminiBackend::with_client(cfg, client)
+    }
+
+    #[tokio::test]
+    async fn sse_streams_text_deltas_usage_and_done() {
+        // Two text deltas split across two SSE events, followed by a
+        // usage-metadata-only event. The `data:` payloads are the exact
+        // shape Gemini :streamGenerateContent?alt=sse emits.
+        let sse = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello \"}]}}]}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"world\"}]}}]}\n\n",
+            "data: {\"candidates\":[],\"usageMetadata\":{\"promptTokenCount\":42,\"candidatesTokenCount\":7}}\n\n",
+        );
+        let addr = spawn_gemini_test_server(sse).await;
+        let backend = test_backend(addr);
+
+        let mut stream = backend
+            .analyze(png_part(), "describe".into())
+            .await
+            .expect("analyze ok");
+
+        let mut text = String::new();
+        let mut usage: Option<Usage> = None;
+        let mut saw_done = false;
+        while let Some(item) = stream.next().await {
+            let chunk = item.expect("chunk ok");
+            match chunk.payload.expect("payload present") {
+                analyze_media_chunk::Payload::TextDelta(d) => text.push_str(&d.text),
+                analyze_media_chunk::Payload::Usage(u) => usage = Some(u),
+                analyze_media_chunk::Payload::Done(_) => saw_done = true,
+            }
+        }
+
+        assert_eq!(text, "hello world");
+        let u = usage.expect("Usage emitted");
+        assert_eq!(u.input_tokens, 42);
+        assert_eq!(u.output_tokens, 7);
+        // duration_ms is timing-dependent but must be set
+        assert!(saw_done, "Done terminal chunk must be emitted on clean stream");
+    }
+
+    #[tokio::test]
+    async fn sse_malformed_json_surfaces_internal_without_done() {
+        // A malformed JSON payload mid-stream must surface as Internal and
+        // MUST NOT emit a terminal Done (IN: clean-stream invariant).
+        let sse = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}\n\n",
+            "data: {not valid json\n\n",
+        );
+        let addr = spawn_gemini_test_server(sse).await;
+        let backend = test_backend(addr);
+
+        let mut stream = backend
+            .analyze(png_part(), "x".into())
+            .await
+            .expect("analyze ok");
+
+        let mut text = String::new();
+        let mut saw_done = false;
+        let mut saw_error: Option<Status> = None;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(chunk) => match chunk.payload.expect("payload") {
+                    analyze_media_chunk::Payload::TextDelta(d) => text.push_str(&d.text),
+                    analyze_media_chunk::Payload::Done(_) => saw_done = true,
+                    analyze_media_chunk::Payload::Usage(_) => {}
+                },
+                Err(status) => saw_error = Some(status),
+            }
+        }
+        assert_eq!(text, "partial", "partial text before the error must be delivered");
+        let err = saw_error.expect("malformed JSON must surface as Err item");
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(!saw_done, "Done MUST NOT be emitted when stream errors");
+    }
+
+    #[tokio::test]
+    async fn sse_ignores_empty_and_done_sentinels() {
+        // Gemini sometimes emits empty `data:` lines as keep-alives. The
+        // parser must skip them silently. `[DONE]` is an OpenAI sentinel the
+        // parser also skips defensively.
+        let sse = concat!(
+            "data: \n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let addr = spawn_gemini_test_server(sse).await;
+        let backend = test_backend(addr);
+
+        let mut stream = backend.analyze(png_part(), "x".into()).await.expect("ok");
+        let mut text = String::new();
+        while let Some(item) = stream.next().await {
+            if let Ok(chunk) = item
+                && let Some(analyze_media_chunk::Payload::TextDelta(d)) = chunk.payload
+            {
+                text.push_str(&d.text);
+            }
+        }
+        assert_eq!(text, "ok");
+    }
+
+    #[tokio::test]
+    async fn sse_upstream_5xx_surfaces_unavailable() {
+        async fn handler() -> impl IntoResponse {
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "broken")
+        }
+        let app = Router::new().route(
+            "/proxy/google-vertex/v1beta1/models/gemini-2.5-pro:streamGenerateContent",
+            post(handler),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let backend = test_backend(addr);
+        // `analyze` returns Result<ChunkStream, Status>; the stream itself is
+        // not Debug so we match rather than `.expect_err()`.
+        let err = match backend.analyze(png_part(), "x".into()).await {
+            Ok(_) => panic!("expected Err from upstream 5xx"),
+            Err(s) => s,
+        };
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(err.message().contains("HTTP 500"), "msg: {}", err.message());
+    }
 }
