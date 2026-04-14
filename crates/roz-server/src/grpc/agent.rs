@@ -403,6 +403,7 @@ impl AgentService for AgentServiceImpl {
             mime = tracing::field::Empty,
             bytes_in = tracing::field::Empty,
             model = tracing::field::Empty,
+            backend = tracing::field::Empty,
             tenant = tracing::field::Empty,
         ),
     )]
