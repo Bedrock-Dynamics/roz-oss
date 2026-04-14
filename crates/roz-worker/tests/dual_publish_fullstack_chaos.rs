@@ -1,3 +1,9 @@
+// This integration test pulls in `zenoh` and `roz_zenoh` which are only
+// compiled when the `zenoh` feature is active on roz-worker. Without the
+// feature-gate the file fails `cargo test --workspace` (CI's Check+Test
+// step) with E0433 "unresolved crate `zenoh`".
+#![cfg(feature = "zenoh")]
+
 //! Full-stack `DualPublishTransport` fanout test (ZEN-TEST-02 / gap #2).
 //!
 //! Composes NATS + Zenoh testcontainers, builds a `DualPublishTransport`
