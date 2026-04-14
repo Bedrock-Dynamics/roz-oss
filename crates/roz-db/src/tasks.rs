@@ -193,19 +193,45 @@ where
 
 /// Ensure a task has an active run record once execution actually starts.
 ///
-/// Uses `&mut PgConnection` because it executes two queries (check + insert)
-/// that must run within the same connection. The mutable borrow can be
-/// reborrowed for each query.
+/// Uses `&mut PgConnection` because the insert-then-retry-select flow must run
+/// within the same connection. The mutable borrow can be reborrowed for each
+/// query.
+///
+/// This is race-safe: the partial unique index `idx_task_runs_one_open_per_task`
+/// enforces at most one unfinished run per task at the SQL layer. If two
+/// concurrent callers both observe "no open run" and race to insert, exactly
+/// one INSERT succeeds; the loser's `ON CONFLICT DO NOTHING` yields no row
+/// and we fall through to a SELECT for the winning row.
 pub async fn ensure_active_run(
     conn: &mut sqlx::PgConnection,
     task_id: Uuid,
     host_id: Option<Uuid>,
 ) -> Result<TaskRunRow, sqlx::Error> {
-    if let Some(run) = active_run_for_task(&mut *conn, task_id).await? {
+    // Attempt atomic insert. The partial unique index covers only rows with
+    // completed_at IS NULL, so this conflicts exactly when an open run exists.
+    // ON CONFLICT DO NOTHING suppresses the constraint violation and returns
+    // zero rows; we then fetch the winning row with a SELECT.
+    let inserted = sqlx::query_as::<_, TaskRunRow>(
+        "INSERT INTO roz_task_runs (task_id, tenant_id, host_id) \
+         SELECT $1, tenant_id, $2 FROM roz_tasks WHERE id = $1 \
+         ON CONFLICT (task_id) WHERE completed_at IS NULL DO NOTHING \
+         RETURNING *",
+    )
+    .bind(task_id)
+    .bind(host_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+
+    if let Some(run) = inserted {
         return Ok(run);
     }
 
-    create_run(&mut *conn, task_id, host_id).await
+    // Either the parent task does not exist, or a concurrent caller won the
+    // insert race. Re-select the open run; if still none, surface RowNotFound
+    // consistent with create_run's contract for a missing parent.
+    active_run_for_task(&mut *conn, task_id)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)
 }
 
 /// Mark a run complete with final status and optional error message.
@@ -526,6 +552,91 @@ mod tests {
             .await
             .expect("reuse run");
         assert_eq!(first.id, second.id);
+    }
+
+    #[tokio::test]
+    async fn ensure_active_run_concurrent_callers_yield_single_open_row() {
+        // Regression for CodeRabbit fix #9: two concurrent callers on separate
+        // connections must not produce two open runs. The partial unique index
+        // idx_task_runs_one_open_per_task enforces this; ON CONFLICT DO NOTHING
+        // in ensure_active_run makes the loser fall back to SELECTing the winner.
+        let pool = setup().await;
+        let tenant_id = create_test_tenant(&pool).await;
+        let env_id = create_test_environment(&pool, tenant_id).await;
+        let host_id = create_test_host(&pool, tenant_id).await;
+
+        let task = create(
+            &pool,
+            tenant_id,
+            "concurrent-ensure",
+            env_id,
+            None,
+            serde_json::json!([]),
+            None,
+        )
+        .await
+        .expect("Failed to create task");
+
+        let mut conn_a = pool.acquire().await.expect("acquire conn a");
+        let mut conn_b = pool.acquire().await.expect("acquire conn b");
+
+        let task_id = task.id;
+        let (first, second) = tokio::join!(
+            async { ensure_active_run(&mut conn_a, task_id, Some(host_id)).await },
+            async { ensure_active_run(&mut conn_b, task_id, Some(host_id)).await },
+        );
+        let first = first.expect("first ensure_active_run failed");
+        let second = second.expect("second ensure_active_run failed");
+        assert_eq!(
+            first.id, second.id,
+            "concurrent ensure_active_run calls must observe the same run row"
+        );
+
+        // Exactly one unfinished run should exist for this task.
+        let open_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*)::bigint FROM roz_task_runs WHERE task_id = $1 AND completed_at IS NULL")
+                .bind(task.id)
+                .fetch_one(&pool)
+                .await
+                .expect("count open runs");
+        assert_eq!(open_count.0, 1, "expected exactly one open run, got {}", open_count.0);
+    }
+
+    #[tokio::test]
+    async fn ensure_active_run_after_completion_creates_new_run() {
+        // After the previous run is completed, ensure_active_run should insert
+        // a fresh row rather than returning the completed one.
+        let pool = setup().await;
+        let tenant_id = create_test_tenant(&pool).await;
+        let env_id = create_test_environment(&pool, tenant_id).await;
+        let host_id = create_test_host(&pool, tenant_id).await;
+
+        let task = create(
+            &pool,
+            tenant_id,
+            "rerun-after-complete",
+            env_id,
+            None,
+            serde_json::json!([]),
+            None,
+        )
+        .await
+        .expect("Failed to create task");
+
+        let mut conn = pool.acquire().await.expect("acquire conn");
+        let first = ensure_active_run(&mut conn, task.id, Some(host_id))
+            .await
+            .expect("first ensure_active_run");
+        complete_run(&pool, first.id, "succeeded", None)
+            .await
+            .expect("complete first run")
+            .expect("row should exist");
+
+        let second = ensure_active_run(&mut conn, task.id, Some(host_id))
+            .await
+            .expect("second ensure_active_run");
+        assert_ne!(first.id, second.id, "new run must be created after prior completes");
+        assert!(second.completed_at.is_none());
     }
 
     #[tokio::test]
