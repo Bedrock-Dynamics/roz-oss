@@ -87,6 +87,14 @@ jobs:
           path: target/nextest/ci-integration/junit.xml
           if-no-files-found: ignore
 
+      - name: Fail job if nextest failed
+        # `continue-on-error: true` on the nextest step keeps the job alive
+        # long enough to upload JUnit. Propagate the step outcome to the job
+        # result so `needs.<job>.result` accurately signals failure to the
+        # summarize-and-issue / fail-if-any-job-failed jobs.
+        if: steps.nextest.outcome == 'failure'
+        run: exit 1
+
   integration-aot:
     name: Integration (roz-copper aot)
     runs-on: ubuntu-latest
@@ -131,6 +139,10 @@ jobs:
           path: target/nextest/ci-integration/junit.xml
           if-no-files-found: ignore
 
+      - name: Fail job if nextest failed
+        if: steps.nextest.outcome == 'failure'
+        run: exit 1
+
   integration-gazebo:
     name: Integration (roz-copper gazebo)
     runs-on: ubuntu-latest
@@ -174,6 +186,10 @@ jobs:
           name: junit-gazebo
           path: target/nextest/ci-integration/junit.xml
           if-no-files-found: ignore
+
+      - name: Fail job if nextest failed
+        if: steps.nextest.outcome == 'failure'
+        run: exit 1
 
   zenoh-chaos:
     name: Integration (zenoh chaos + multi-worker, phase 16)
@@ -221,6 +237,10 @@ jobs:
           path: target/nextest/ci-chaos/junit.xml
           if-no-files-found: ignore
 
+      - name: Fail job if nextest failed
+        if: steps.nextest.outcome == 'failure'
+        run: exit 1
+
   zenoh-bench:
     name: Zenoh benches (regression-gated)
     runs-on: ubuntu-latest
@@ -245,7 +265,13 @@ jobs:
       - name: Install critcmp
         run: cargo install --locked critcmp@0.1.8
       - name: Restore main baseline
-        uses: actions/cache@v4
+        # Split cache into restore + save (CodeRabbit fix #1): a fixed-key
+        # `actions/cache@v4` entry is immutable once written, so the
+        # "Promote nightly-head to main baseline" mutation below was never
+        # being persisted. Use restore here with a prefix in `restore-keys`
+        # so subsequent runs pick up the newest saved baseline, and save
+        # with a unique key after the promote step.
+        uses: actions/cache/restore@v4
         with:
           path: target/criterion
           key: bench-main-baseline-${{ runner.os }}-v1
@@ -271,12 +297,25 @@ jobs:
             rm -rf "$main_dir"
             cp -r "$d" "$main_dir"
           done
+      - name: Save promoted main baseline (scheduled only)
+        # Unique key per run ensures the cache entry is actually written;
+        # the restore step above falls back to the newest entry via the
+        # `bench-main-baseline-${{ runner.os }}-` prefix in restore-keys.
+        if: github.event_name == 'schedule'
+        uses: actions/cache/save@v4
+        with:
+          path: target/criterion
+          key: bench-main-baseline-${{ runner.os }}-${{ github.run_id }}
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: criterion-reports
           path: target/criterion/**/report/index.html
           if-no-files-found: ignore
+
+      - name: Fail job if bench failed
+        if: steps.bench.outcome == 'failure'
+        run: exit 1
 
   summarize-and-issue:
     name: Open/update failure issue
@@ -287,11 +326,11 @@ jobs:
       contents: read
     if: |
       always() &&
-      (needs.integration-base.outputs.outcome == 'failure' ||
-       needs.integration-aot.outputs.outcome == 'failure' ||
-       needs.integration-gazebo.outputs.outcome == 'failure' ||
-       needs.zenoh-chaos.outputs.outcome == 'failure' ||
-       needs.zenoh-bench.outputs.outcome == 'failure')
+      (needs.integration-base.result == 'failure' ||
+       needs.integration-aot.result == 'failure' ||
+       needs.integration-gazebo.result == 'failure' ||
+       needs.zenoh-chaos.result == 'failure' ||
+       needs.zenoh-bench.result == 'failure')
 
     steps:
       - name: Compute ISO date
@@ -311,11 +350,11 @@ jobs:
             echo "Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo
             echo "## Job outcomes"
-            echo "- integration-base:   ${{ needs.integration-base.outputs.outcome }}"
-            echo "- integration-aot:    ${{ needs.integration-aot.outputs.outcome }}"
-            echo "- integration-gazebo: ${{ needs.integration-gazebo.outputs.outcome }}"
-            echo "- zenoh-chaos:        ${{ needs.zenoh-chaos.outputs.outcome }}"
-            echo "- zenoh-bench:        ${{ needs.zenoh-bench.outputs.outcome }}"
+            echo "- integration-base:   ${{ needs.integration-base.result }}"
+            echo "- integration-aot:    ${{ needs.integration-aot.result }}"
+            echo "- integration-gazebo: ${{ needs.integration-gazebo.result }}"
+            echo "- zenoh-chaos:        ${{ needs.zenoh-chaos.result }}"
+            echo "- zenoh-bench:        ${{ needs.zenoh-bench.result }}"
             echo
             echo "## JUnit summaries"
             for j in junits/junit-*/junit.xml; do
@@ -342,17 +381,17 @@ jobs:
     needs: [integration-base, integration-aot, integration-gazebo, zenoh-chaos, zenoh-bench]
     if: |
       always() &&
-      (needs.integration-base.outputs.outcome == 'failure' ||
-       needs.integration-aot.outputs.outcome == 'failure' ||
-       needs.integration-gazebo.outputs.outcome == 'failure' ||
-       needs.zenoh-chaos.outputs.outcome == 'failure' ||
-       needs.zenoh-bench.outputs.outcome == 'failure')
+      (needs.integration-base.result == 'failure' ||
+       needs.integration-aot.result == 'failure' ||
+       needs.integration-gazebo.result == 'failure' ||
+       needs.zenoh-chaos.result == 'failure' ||
+       needs.zenoh-bench.result == 'failure')
     steps:
       - run: |
           echo "At least one integration job failed:"
-          echo "  base=${{ needs.integration-base.outputs.outcome }}"
-          echo "  aot=${{ needs.integration-aot.outputs.outcome }}"
-          echo "  gazebo=${{ needs.integration-gazebo.outputs.outcome }}"
-          echo "  zenoh-chaos=${{ needs.zenoh-chaos.outputs.outcome }}"
-          echo "  zenoh-bench=${{ needs.zenoh-bench.outputs.outcome }}"
+          echo "  base=${{ needs.integration-base.result }}"
+          echo "  aot=${{ needs.integration-aot.result }}"
+          echo "  gazebo=${{ needs.integration-gazebo.result }}"
+          echo "  zenoh-chaos=${{ needs.zenoh-chaos.result }}"
+          echo "  zenoh-bench=${{ needs.zenoh-bench.result }}"
           exit 1

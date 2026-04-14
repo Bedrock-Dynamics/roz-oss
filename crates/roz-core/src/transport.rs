@@ -47,8 +47,10 @@ pub trait SessionTransport: Send + Sync + 'static {
 
 /// Compose two `SessionTransport`s as primary + best-effort secondary (D-19).
 ///
-/// `publish_event_envelope` calls secondary first (best-effort, log-on-error),
-/// then primary; only primary failure propagates.
+/// `publish_event_envelope` drives primary and secondary publishes concurrently
+/// via `tokio::join!`. A slow or hung secondary does NOT block the primary's
+/// progress, and only primary failure propagates; secondary errors are logged
+/// at `warn` level.
 pub struct DualPublishTransport<P: SessionTransport, S: SessionTransport> {
     primary: P,
     secondary: S,
@@ -63,16 +65,22 @@ impl<P: SessionTransport, S: SessionTransport> DualPublishTransport<P, S> {
 #[async_trait]
 impl<P: SessionTransport, S: SessionTransport> SessionTransport for DualPublishTransport<P, S> {
     async fn publish_event_envelope(&self, envelope: &EventEnvelope) -> anyhow::Result<()> {
-        // Secondary first: best-effort, log on error, never propagate.
-        if let Err(e) = self.secondary.publish_event_envelope(envelope).await {
+        // Drive both publishes concurrently so a slow/hung secondary cannot
+        // block or delay the primary. Only the primary's result propagates;
+        // secondary errors are logged and dropped.
+        let primary_fut = self.primary.publish_event_envelope(envelope);
+        let secondary_fut = self.secondary.publish_event_envelope(envelope);
+        let (primary_res, secondary_res) = tokio::join!(primary_fut, secondary_fut);
+
+        if let Err(e) = secondary_res {
             tracing::warn!(
                 event_id = %envelope.event_id.0,
                 error = %e,
-                "secondary session transport publish failed; continuing with primary",
+                "secondary session transport publish failed; primary result unaffected",
             );
             // Counter increment for EdgeHealthAggregator wiring lands in plan 15-06.
         }
-        self.primary.publish_event_envelope(envelope).await
+        primary_res
     }
 }
 

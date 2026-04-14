@@ -191,6 +191,50 @@ async fn zenoh_degraded_leaves_nats_path_functional() {
         .expect("docker pause spawn");
     assert!(pause_status.success(), "docker pause exited non-zero: {pause_status}");
 
+    // Probe-and-retry: `docker pause` returns as soon as the container is
+    // SIGSTOPped, but the worker-side zenoh peer session may still have an
+    // open TCP connection and not yet realize the router is unresponsive.
+    // Publishing before the peer notices the pause would exercise the
+    // happy-path leg rather than the D-19 degraded branch this test targets.
+    //
+    // Confirm degradation by attempting a cheap zenoh handshake against the
+    // paused router: a fresh `zenoh::open()` requires a full session-open
+    // round-trip with the router and hangs while the router is stopped.
+    // A healthy router completes the open well under 250ms locally; a paused
+    // router will exceed that budget, which is our degradation signal.
+    //
+    // We tolerate up to ~5s of "still responsive" before asserting a test
+    // failure — below that, we retry with small delays; above that, we
+    // `panic!` so the test visibly fails rather than silently passing on
+    // the happy-path leg (which would defeat the purpose of D-19 coverage).
+    let probe_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut zenoh_degraded = false;
+    while tokio::time::Instant::now() < probe_deadline {
+        let probe = tokio::time::timeout(Duration::from_millis(250), zenoh::open(h.zenoh_guard.peer_config())).await;
+        match probe {
+            // Open hung past the probe budget OR returned an error: router is
+            // not responding, which is the degradation signal we want.
+            Err(_) | Ok(Err(_)) => {
+                zenoh_degraded = true;
+                break;
+            }
+            // Open completed quickly: router is still reachable. The pause
+            // may not have propagated yet — back off briefly and retry.
+            Ok(Ok(session)) => {
+                // Close the probe session eagerly to avoid leaking sessions
+                // while we keep polling; ignore close errors (best-effort).
+                let _ = session.close().await;
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+    }
+    assert!(
+        zenoh_degraded,
+        "zenoh leg never reported degraded within 5s of docker pause — test would exercise the \
+         healthy branch rather than the D-19 degraded branch; increase the budget or investigate \
+         why the paused router is still answering session-open RTTs"
+    );
+
     // With zenohd frozen, the secondary transport's `put` will block or fail.
     // Per D-19 non-fatal secondary semantics, the dual-publish call must
     // still return Ok — primary (NATS) succeeds and the secondary failure is
