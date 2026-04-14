@@ -26,7 +26,7 @@ use tonic::Status;
 
 use roz_server::grpc::roz_v1::analyze_media_chunk::MediaTextDelta;
 use roz_server::grpc::roz_v1::{
-    AnalyzeMediaChunk, AnalyzeMediaRequest, Done, MediaPart, ModalityHints, Usage, analyze_media_chunk, media_part,
+    AnalyzeMediaChunk, AnalyzeMediaRequest, Done, MediaPart, Usage, analyze_media_chunk, media_part,
 };
 
 mod common;
@@ -49,12 +49,7 @@ impl roz_server::grpc::media::MediaBackend for MockBackend {
         "mock"
     }
 
-    async fn analyze(
-        &self,
-        _media: MediaPart,
-        _prompt: String,
-        _hints: Option<ModalityHints>,
-    ) -> Result<ChunkStream, Status> {
+    async fn analyze(&self, _media: MediaPart, _prompt: String) -> Result<ChunkStream, Status> {
         let (tx, rx) = mpsc::channel(8);
         tokio::spawn(async move {
             for text in ["hello ", "world"] {

@@ -432,14 +432,29 @@ impl AgentService for AgentServiceImpl {
         let mime = media.mime_type.clone();
         tracing::Span::current().record("mime", tracing::field::display(&mime));
 
-        // Mime family (video|image|audio) — used by the fetcher to match the
-        // response Content-Type family.
-        let mime_family = mime.split('/').next().unwrap_or("").to_string();
-
         // --- Resolve backend (D-08/D-09) ---
         // Runs BEFORE fetching so we fail fast on unsupported mime / unknown hint.
         let backend_name = resolve_backend_name(req.model_hint.as_deref(), &mime)?;
-        tracing::Span::current().record("model", tracing::field::display(&backend_name));
+        // IN-05: Record both the hint-derived name AND the active backend impl
+        // identifier. `backend_name` reflects the requested model (audit trail
+        // for the routing decision); `backend` reflects the impl that actually
+        // served the request. If a future operator swaps in a different
+        // MediaBackend, the observability surface remains accurate.
+        tracing::Span::current()
+            .record("model", tracing::field::display(&backend_name))
+            .record("backend", tracing::field::display(self.media_backend.name()));
+
+        // Mime family (video|image|audio) — used by the fetcher to match the
+        // response Content-Type family. `resolve_backend_name` above has
+        // already rejected any mime that does not start with
+        // `video/`|`image/`|`audio/`, so `split_once('/')` must succeed. The
+        // explicit check below is defense-in-depth (IN-03): if a future change
+        // to `resolve_backend_name` admits a malformed mime, fail with a clear
+        // InvalidArgument rather than silently feeding `""` into the fetcher.
+        let mime_family = mime
+            .split_once('/')
+            .map(|(family, _)| family.to_string())
+            .ok_or_else(|| Status::invalid_argument("mime_type missing '/' family delimiter"))?;
 
         // --- Resolve source to bytes ---
         let source = media
@@ -457,14 +472,16 @@ impl AgentService for AgentServiceImpl {
         tracing::Span::current().record("bytes_in", tracing::field::display(bytes.len()));
 
         // --- Repack MediaPart with inline bytes for backend dispatch (D-14) ---
+        // IN-04: hints travel INSIDE MediaPart per the proto — do NOT also
+        // pass them as a separate arg to `analyze`. One source of truth.
         let resolved = roz_v1::MediaPart {
             mime_type: mime,
-            hints: media.hints.clone(),
+            hints: media.hints,
             source: Some(roz_v1::media_part::Source::InlineBytes(bytes)),
         };
 
         // --- Dispatch ---
-        let stream = self.media_backend.analyze(resolved, req.prompt, media.hints).await?;
+        let stream = self.media_backend.analyze(resolved, req.prompt).await?;
 
         Ok(Response::new(stream))
     }

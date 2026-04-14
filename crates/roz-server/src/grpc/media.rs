@@ -24,7 +24,7 @@ use tonic::Status;
 
 // Generated types from the server crate's own protobuf build (D-01..D-06).
 use super::roz_v1::{
-    AnalyzeMediaChunk, Done, MediaPart, ModalityHints, Usage, analyze_media_chunk,
+    AnalyzeMediaChunk, Done, MediaPart, Usage, analyze_media_chunk,
     analyze_media_chunk::MediaTextDelta, media_part,
 };
 
@@ -85,12 +85,10 @@ pub trait MediaBackend: Send + Sync {
     /// Callers pass already-downloaded bytes via `MediaPart::source =
     /// Some(media_part::Source::InlineBytes(bytes))` — `file_uri` is resolved
     /// upstream by the SSRF fetcher (D-14).
-    async fn analyze(
-        &self,
-        media: MediaPart,
-        prompt: String,
-        hints: Option<ModalityHints>,
-    ) -> Result<ChunkStream, Status>;
+    ///
+    /// `ModalityHints` travel on `media.hints` per the proto. Do NOT add a
+    /// separate `hints` parameter — one source of truth (IN-04).
+    async fn analyze(&self, media: MediaPart, prompt: String) -> Result<ChunkStream, Status>;
 }
 
 // ---------------------------------------------------------------------------
@@ -250,12 +248,10 @@ impl MediaBackend for GeminiBackend {
         clippy::too_many_lines,
         reason = "Single cohesive streaming impl: request build + HTTP + SSE parse + chunk emit"
     )]
-    async fn analyze(
-        &self,
-        media: MediaPart,
-        prompt: String,
-        _hints: Option<ModalityHints>,
-    ) -> Result<ChunkStream, Status> {
+    async fn analyze(&self, media: MediaPart, prompt: String) -> Result<ChunkStream, Status> {
+        // ModalityHints are available on `media.hints` per the proto; v1 Gemini
+        // backend does not consume them yet (IN-04).
+        let _hints = media.hints.clone();
         let bytes = match media.source {
             Some(media_part::Source::InlineBytes(b)) => b,
             Some(media_part::Source::FileUri(_)) => {
