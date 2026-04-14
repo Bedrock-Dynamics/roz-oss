@@ -209,7 +209,11 @@ async fn agent_deploys_wasm_to_copper_and_reads_state() {
 
     assert_eq!(controller.properties.get("running"), Some(&serde_json::json!(true)));
 
-    let last_tick = controller.properties.get("last_tick").and_then(|v| v.as_u64()).unwrap();
+    let last_tick = controller
+        .properties
+        .get("last_tick")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap();
     assert!(last_tick > 10, "should have ticked many times: {last_tick}");
 
     // Agent halts the controller.

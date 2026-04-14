@@ -1,0 +1,667 @@
+//! SSRF-guarded HTTPS fetcher for `MediaPart::file_uri` (Phase 16.1 / MED-03).
+//!
+//! Design:
+//! * Only `https://` is accepted (D-13).
+//! * Hostname is pre-resolved via `hickory-resolver`; any resolved IP in a
+//!   private / loopback / link-local / CGNAT / IPv6-ULA / IPv4-mapped range
+//!   is rejected with `FailedPrecondition` (D-15).
+//! * The reqwest connection is pinned to the validated IPs via
+//!   `ClientBuilder::resolve_to_addrs` — closes the TOCTOU window where a
+//!   second DNS lookup inside reqwest could return a different IP.
+//! * Redirects are disabled (`redirect::Policy::none`) to prevent SSRF via
+//!   redirect hop to a private IP.
+//! * Content-Length > 100 MB fails fast. Stream-read enforces the cap with a
+//!   running tally; on overflow we abort with `ResourceExhausted`.
+//! * 30 s total timeout on the HTTP client.
+//! * Response Content-Type family must match the requested mime family
+//!   (`video|image|audio`).
+
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use futures::StreamExt as _;
+use hickory_resolver::TokioAsyncResolver;
+use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use tonic::Status;
+
+const MAX_BYTES: u64 = 100 * 1024 * 1024;
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Trait-erased fetcher interface so the RPC handler can be driven by a mock
+/// in tests. Production code uses [`MediaFetcher`]; integration tests inject
+/// a mock implementation to exercise the `file_uri` → backend data flow
+/// without needing self-signed HTTPS infrastructure (which the SSRF-pinned
+/// production fetcher requires).
+#[async_trait]
+pub trait MediaFetch: Send + Sync {
+    /// Fetch `uri` into memory, validating against `expected_mime_family`
+    /// (the left-hand side of the request `mime_type`, e.g. `"image"`).
+    async fn fetch(&self, uri: &str, expected_mime_family: &str) -> Result<Vec<u8>, Status>;
+}
+
+pub struct MediaFetcher {
+    resolver: TokioAsyncResolver,
+}
+
+impl Default for MediaFetcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MediaFetcher {
+    #[must_use]
+    pub fn new() -> Self {
+        // NOTE (hickory 0.24): `TokioAsyncResolver::tokio(..)` returns `Self`
+        // directly, so `MediaFetcher::new` is infallible. Bumping hickory to
+        // 0.25+ will change this to `Result<Self, ResolveError>` (silent API
+        // break at dependency bump time) — update both this constructor and
+        // `MediaFetcher::default` accordingly (IN-02).
+        let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
+        Self { resolver }
+    }
+}
+
+#[async_trait]
+impl MediaFetch for MediaFetcher {
+    /// Fetch `uri` into memory, enforcing SSRF / size / timeout / mime guards.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Single cohesive fetch pipeline: URL parse + DNS + SSRF check + HTTP + stream cap"
+    )]
+    async fn fetch(&self, uri: &str, expected_mime_family: &str) -> Result<Vec<u8>, Status> {
+        let url = reqwest::Url::parse(uri).map_err(|e| Status::invalid_argument(format!("invalid file_uri: {e}")))?;
+        if url.scheme() != "https" {
+            return Err(Status::invalid_argument("file_uri scheme must be https (D-13)"));
+        }
+        let host = url
+            .host_str()
+            .ok_or_else(|| Status::invalid_argument("file_uri missing hostname"))?
+            .to_string();
+        if host.is_empty() {
+            return Err(Status::invalid_argument("file_uri missing hostname"));
+        }
+        let port = url.port_or_known_default().unwrap_or(443);
+
+        let lookup = self
+            .resolver
+            .lookup_ip(host.as_str())
+            .await
+            .map_err(|e| Status::unavailable(format!("dns resolution failed: {e}")))?;
+
+        let mut safe_addrs: Vec<SocketAddr> = Vec::new();
+        for ip in lookup.iter() {
+            if is_blocked_ip(&ip) {
+                return Err(Status::failed_precondition(format!(
+                    "file_uri resolves to blocked IP: {ip}"
+                )));
+            }
+            safe_addrs.push(SocketAddr::new(ip, port));
+        }
+        if safe_addrs.is_empty() {
+            return Err(Status::failed_precondition(
+                "file_uri hostname has no resolvable public IPs",
+            ));
+        }
+
+        // INVARIANT (IN-01): `reqwest::ClientBuilder::resolve_to_addrs` expects
+        // the un-bracketed hostname form. `url::Url::host_str()` returns
+        // `"2001:db8::1"` (no brackets) for `https://[2001:db8::1]/x`, which is
+        // exactly what `resolve_to_addrs` wants. Do NOT wrap `host` in brackets
+        // here — a future refactor that does so will silently break IPv6 SSRF
+        // pinning by failing to match the connection target.
+        let client = reqwest::Client::builder()
+            .timeout(FETCH_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .resolve_to_addrs(host.as_str(), &safe_addrs)
+            .build()
+            .map_err(|e| Status::internal(format!("reqwest build: {e}")))?;
+
+        execute_fetch(&client, url, expected_mime_family).await
+    }
+}
+
+/// Pure Content-Length cap check (Pitfall 4). Extracted so the fail-fast
+/// branch is directly unit-testable without trying to lie to hyper about
+/// response body size (which it normalizes away).
+///
+/// Returns `Err(ResourceExhausted)` if `len` is `Some(n)` with `n > MAX_BYTES`.
+/// `None` (no Content-Length header) and `Some(n <= MAX_BYTES)` return `Ok`.
+#[allow(clippy::result_large_err, reason = "tonic::Status is the RPC-boundary error type")]
+pub(crate) fn check_content_length_cap(len: Option<u64>) -> Result<(), Status> {
+    if let Some(n) = len
+        && n > MAX_BYTES
+    {
+        return Err(Status::resource_exhausted(format!(
+            "file_uri body {n} bytes exceeds 100 MB cap"
+        )));
+    }
+    Ok(())
+}
+
+/// Pure HTTP pipeline: GET → status → Content-Type family → Content-Length cap →
+/// streaming body read with running cap. Extracted from [`MediaFetcher::fetch`]
+/// so integration tests can exercise the response-handling logic against a
+/// local test server without needing to satisfy the SSRF guard (which blocks
+/// loopback by design).
+///
+/// The caller is responsible for building a `reqwest::Client` with the
+/// appropriate SSRF pinning, timeout, and redirect policy.
+pub(crate) async fn execute_fetch(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    expected_mime_family: &str,
+) -> Result<Vec<u8>, Status> {
+    let resp = client.get(url).send().await.map_err(|e| {
+        if e.is_timeout() {
+            Status::deadline_exceeded("file_uri fetch timeout (30s)")
+        } else {
+            Status::unavailable(format!("file_uri fetch failed: {e}"))
+        }
+    })?;
+
+    if !resp.status().is_success() {
+        return Err(Status::unavailable(format!("file_uri HTTP {}", resp.status())));
+    }
+
+    // Content-Type family check (on FINAL response — Pitfall 3).
+    // RFC 7231 §3.1.1.1: media type tokens are case-insensitive, so compare
+    // via eq_ignore_ascii_case after trimming whitespace (some servers emit
+    // `image /png` or `IMAGE/PNG`).
+    let ct = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let ct_family = ct.split('/').next().unwrap_or("").trim();
+    if !ct_family.eq_ignore_ascii_case(expected_mime_family) {
+        return Err(Status::invalid_argument(format!(
+            "fetched Content-Type '{ct}' does not match expected family '{expected_mime_family}/*'"
+        )));
+    }
+
+    // Fail-fast on Content-Length over cap (Pitfall 4).
+    check_content_length_cap(resp.content_length())?;
+
+    let cap_hint = usize::try_from(resp.content_length().map_or(0, |n| n.min(MAX_BYTES))).unwrap_or(0);
+    let mut bytes: Vec<u8> = Vec::with_capacity(cap_hint);
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            if e.is_timeout() {
+                Status::deadline_exceeded("file_uri body timeout")
+            } else {
+                Status::unavailable(format!("body read failed: {e}"))
+            }
+        })?;
+        if bytes.len() as u64 + chunk.len() as u64 > MAX_BYTES {
+            return Err(Status::resource_exhausted("file_uri body exceeds 100 MB cap"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+/// Reject private / loopback / link-local / CGNAT / IPv6 ULA / IPv4-mapped.
+pub(crate) const fn is_blocked_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_blocked_v4(*v4),
+        IpAddr::V6(v6) => is_blocked_v6(*v6),
+    }
+}
+
+const fn is_blocked_v4(v4: Ipv4Addr) -> bool {
+    if v4.is_private()
+        || v4.is_loopback()
+        || v4.is_link_local()
+        || v4.is_broadcast()
+        || v4.is_unspecified()
+        || v4.is_documentation()
+        || v4.is_multicast()
+    {
+        return true;
+    }
+    let oct = v4.octets();
+    // 0.0.0.0/8 "this network"
+    if oct[0] == 0 {
+        return true;
+    }
+    // CGNAT 100.64.0.0/10 (RFC 6598)
+    if oct[0] == 100 && (oct[1] & 0xC0) == 0x40 {
+        return true;
+    }
+    // 192.0.0.0/24 IETF protocol assignments (RFC 6890)
+    if oct[0] == 192 && oct[1] == 0 && oct[2] == 0 {
+        return true;
+    }
+    // 198.18.0.0/15 IETF benchmarking (RFC 2544) — spans 198.18.0.0–198.19.255.255
+    if oct[0] == 198 && (oct[1] & 0xfe) == 18 {
+        return true;
+    }
+    // 240.0.0.0/4 Class E reserved — first octet ≥ 240 (255.255.255.255 already
+    // covered by is_broadcast above).
+    if oct[0] >= 240 {
+        return true;
+    }
+    false
+}
+
+const fn is_blocked_v6(v6: Ipv6Addr) -> bool {
+    if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+        return true;
+    }
+    if is_ipv6_link_local(v6) || is_ipv6_unique_local(v6) || is_ipv6_site_local(v6) {
+        return true;
+    }
+    let seg = v6.segments();
+    // IPv6 documentation 2001:db8::/32 (RFC 3849)
+    if seg[0] == 0x2001 && seg[1] == 0x0db8 {
+        return true;
+    }
+    // 6to4 (2002::/16) — embedded IPv4 in segments[1..=2] must not be private.
+    if seg[0] == 0x2002 {
+        let embedded = Ipv4Addr::new(
+            (seg[1] >> 8) as u8,
+            (seg[1] & 0xff) as u8,
+            (seg[2] >> 8) as u8,
+            (seg[2] & 0xff) as u8,
+        );
+        if is_blocked_v4(embedded) {
+            return true;
+        }
+    }
+    if let Some(mapped) = v6.to_ipv4_mapped() {
+        return is_blocked_v4(mapped);
+    }
+    false
+}
+
+const fn is_ipv6_link_local(v6: Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xffc0) == 0xfe80
+}
+
+const fn is_ipv6_unique_local(v6: Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xfe00) == 0xfc00
+}
+
+// Deprecated IPv6 site-local (fec0::/10). Still routable on some legacy
+// internal networks — reject defensively.
+const fn is_ipv6_site_local(v6: Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xffc0) == 0xfec0
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn v4(s: &str) -> IpAddr {
+        IpAddr::V4(s.parse::<Ipv4Addr>().unwrap())
+    }
+    fn v6(s: &str) -> IpAddr {
+        IpAddr::V6(s.parse::<Ipv6Addr>().unwrap())
+    }
+
+    #[test]
+    fn blocks_ipv4_private_ranges() {
+        assert!(is_blocked_ip(&v4("10.0.0.1")));
+        assert!(is_blocked_ip(&v4("172.16.0.1")));
+        assert!(is_blocked_ip(&v4("192.168.1.1")));
+    }
+
+    #[test]
+    fn blocks_ipv4_loopback_linklocal_unspec_bcast() {
+        assert!(is_blocked_ip(&v4("127.0.0.1")));
+        assert!(is_blocked_ip(&v4("169.254.1.1")));
+        assert!(is_blocked_ip(&v4("0.0.0.0")));
+        assert!(is_blocked_ip(&v4("255.255.255.255")));
+    }
+
+    #[test]
+    fn blocks_ipv4_cgnat() {
+        assert!(is_blocked_ip(&v4("100.64.0.1")));
+        assert!(is_blocked_ip(&v4("100.127.255.254")));
+    }
+
+    #[test]
+    fn does_not_block_ipv4_public() {
+        assert!(!is_blocked_ip(&v4("8.8.8.8")));
+        assert!(!is_blocked_ip(&v4("1.1.1.1")));
+        assert!(!is_blocked_ip(&v4("100.63.255.255"))); // just outside CGNAT
+        assert!(!is_blocked_ip(&v4("100.128.0.0"))); // just outside CGNAT
+    }
+
+    #[test]
+    fn blocks_ipv6_loopback_unspec_linklocal_ula() {
+        assert!(is_blocked_ip(&v6("::1")));
+        assert!(is_blocked_ip(&v6("::")));
+        assert!(is_blocked_ip(&v6("fe80::1")));
+        assert!(is_blocked_ip(&v6("fc00::1")));
+        assert!(is_blocked_ip(&v6("fd00::1")));
+    }
+
+    #[test]
+    fn blocks_ipv6_mapped_to_private_v4() {
+        assert!(is_blocked_ip(&v6("::ffff:10.0.0.1")));
+        assert!(is_blocked_ip(&v6("::ffff:127.0.0.1")));
+    }
+
+    #[test]
+    fn blocks_ipv6_site_local() {
+        // fec0::/10 (deprecated but still routable on some networks)
+        assert!(is_blocked_ip(&v6("fec0::1")));
+        assert!(is_blocked_ip(&v6("fecf::ffff")));
+        assert!(is_blocked_ip(&v6("feff::1")));
+    }
+
+    #[test]
+    fn blocks_ipv6_multicast() {
+        assert!(is_blocked_ip(&v6("ff00::1")));
+        assert!(is_blocked_ip(&v6("ff02::1")));
+    }
+
+    #[test]
+    fn blocks_ipv6_documentation() {
+        // 2001:db8::/32
+        assert!(is_blocked_ip(&v6("2001:db8::1")));
+        assert!(is_blocked_ip(&v6("2001:db8:dead:beef::1")));
+    }
+
+    #[test]
+    fn blocks_ipv6_6to4_with_embedded_private_v4() {
+        // 2002:<v4-hex>::/48 — embedded v4 is 10.0.0.1
+        assert!(is_blocked_ip(&v6("2002:0a00:0001::1")));
+        // 2002:<v4-hex>::/48 — embedded v4 is 192.168.1.1
+        assert!(is_blocked_ip(&v6("2002:c0a8:0101::1")));
+        // 2002:<v4-hex>::/48 — embedded v4 is 127.0.0.1
+        assert!(is_blocked_ip(&v6("2002:7f00:0001::1")));
+    }
+
+    #[test]
+    fn does_not_block_ipv6_6to4_with_embedded_public_v4() {
+        // 2002:0808:0808::/48 — embedded v4 is 8.8.8.8 (public)
+        assert!(!is_blocked_ip(&v6("2002:0808:0808::1")));
+    }
+
+    #[test]
+    fn blocks_ipv4_multicast() {
+        assert!(is_blocked_ip(&v4("224.0.0.1")));
+        assert!(is_blocked_ip(&v4("239.255.255.250")));
+    }
+
+    #[test]
+    fn blocks_ipv4_ietf_protocol_assignments() {
+        // 192.0.0.0/24 (RFC 6890)
+        assert!(is_blocked_ip(&v4("192.0.0.0")));
+        assert!(is_blocked_ip(&v4("192.0.0.170"))); // DNS64
+        assert!(is_blocked_ip(&v4("192.0.0.255")));
+        // Boundary — just outside the /24
+        assert!(!is_blocked_ip(&v4("192.0.1.1")));
+    }
+
+    #[test]
+    fn blocks_ipv4_benchmarking() {
+        // 198.18.0.0/15 (RFC 2544)
+        assert!(is_blocked_ip(&v4("198.18.0.0")));
+        assert!(is_blocked_ip(&v4("198.18.5.10")));
+        assert!(is_blocked_ip(&v4("198.19.255.255")));
+        // Boundary — just outside the /15
+        assert!(!is_blocked_ip(&v4("198.20.0.0")));
+    }
+
+    #[test]
+    fn blocks_ipv4_class_e_reserved() {
+        // 240.0.0.0/4 Class E reserved
+        assert!(is_blocked_ip(&v4("240.0.0.0")));
+        assert!(is_blocked_ip(&v4("250.1.2.3")));
+        assert!(is_blocked_ip(&v4("254.254.254.254")));
+        // 255.255.255.255 already blocked via is_broadcast()
+        assert!(is_blocked_ip(&v4("255.255.255.255")));
+    }
+
+    #[test]
+    fn does_not_block_ipv6_public() {
+        assert!(!is_blocked_ip(&v6("2001:4860:4860::8888"))); // Google DNS
+        assert!(!is_blocked_ip(&v6("2606:4700:4700::1111"))); // Cloudflare DNS
+    }
+
+    // -----------------------------------------------------------------------
+    // check_content_length_cap — unit-tests the Pitfall 4 fail-fast branch
+    // directly because hyper overrides caller-supplied Content-Length on
+    // responses with empty/real bodies, so testing through a live server is
+    // not possible without raw TCP.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn content_length_cap_none_ok() {
+        assert!(check_content_length_cap(None).is_ok());
+    }
+
+    #[test]
+    fn content_length_cap_zero_ok() {
+        assert!(check_content_length_cap(Some(0)).is_ok());
+    }
+
+    #[test]
+    fn content_length_cap_under_cap_ok() {
+        assert!(check_content_length_cap(Some(1)).is_ok());
+        assert!(check_content_length_cap(Some(MAX_BYTES - 1)).is_ok());
+    }
+
+    #[test]
+    fn content_length_cap_exactly_at_cap_ok() {
+        // Equal is OK — only strictly greater is rejected.
+        assert!(check_content_length_cap(Some(MAX_BYTES)).is_ok());
+    }
+
+    #[test]
+    fn content_length_cap_over_cap_rejected() {
+        let err = check_content_length_cap(Some(MAX_BYTES + 1)).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(err.message().contains("100 MB"), "message: {}", err.message());
+        assert!(
+            err.message().contains(&(MAX_BYTES + 1).to_string()),
+            "message should include actual byte count: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn content_length_cap_u64_max_rejected() {
+        // Adversarial Content-Length header: u64::MAX must be cleanly rejected.
+        let err = check_content_length_cap(Some(u64::MAX)).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn rejects_non_https_scheme() {
+        let f = MediaFetcher::new();
+        let err = f.fetch("http://example.com/x.png", "image").await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("https"));
+    }
+
+    #[tokio::test]
+    async fn rejects_file_scheme() {
+        let f = MediaFetcher::new();
+        let err = f.fetch("file:///etc/passwd", "image").await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn rejects_gs_scheme() {
+        let f = MediaFetcher::new();
+        let err = f.fetch("gs://bucket/obj", "image").await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_url() {
+        let f = MediaFetcher::new();
+        // Malformed URL — reqwest::Url::parse fails outright, surfacing InvalidArgument.
+        let err = f.fetch("https://", "image").await.unwrap_err();
+        assert!(
+            matches!(err.code(), tonic::Code::InvalidArgument),
+            "got {:?}",
+            err.code()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // HTTP-pipeline integration tests (via `execute_fetch`)
+    //
+    // These exercise the actual GET + response handling against a local axum
+    // server: happy path, oversize body, Content-Type family mismatch, redirect
+    // rejection. The SSRF IP-block + TOCTOU pin are unit-tested above against
+    // `is_blocked_ip` directly — they block loopback by design, so happy-path
+    // integration must bypass the IP check via the extracted helper.
+    // -----------------------------------------------------------------------
+
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{StatusCode, header};
+    use axum::response::{IntoResponse, Redirect, Response};
+    use axum::routing::get;
+
+    async fn spawn_test_server(app: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        (addr, handle)
+    }
+
+    fn test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("test client")
+    }
+
+    #[tokio::test]
+    async fn execute_fetch_returns_body_on_happy_path() {
+        async fn handler() -> impl IntoResponse {
+            ([(header::CONTENT_TYPE, "image/png")], b"fake-png-bytes".to_vec())
+        }
+        let app = Router::new().route("/x.png", get(handler));
+        let (addr, _srv) = spawn_test_server(app).await;
+        let url = reqwest::Url::parse(&format!("http://{addr}/x.png")).unwrap();
+
+        let bytes = execute_fetch(&test_client(), url, "image").await.expect("happy path");
+        assert_eq!(bytes, b"fake-png-bytes");
+    }
+
+    #[tokio::test]
+    async fn execute_fetch_rejects_content_type_family_mismatch() {
+        async fn handler() -> impl IntoResponse {
+            ([(header::CONTENT_TYPE, "text/html")], b"<html></html>".to_vec())
+        }
+        let app = Router::new().route("/x.png", get(handler));
+        let (addr, _srv) = spawn_test_server(app).await;
+        let url = reqwest::Url::parse(&format!("http://{addr}/x.png")).unwrap();
+
+        let err = execute_fetch(&test_client(), url, "image").await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("Content-Type"), "message: {}", err.message());
+    }
+
+    #[tokio::test]
+    async fn execute_fetch_accepts_content_type_case_insensitive() {
+        // RFC 7231: media types are case-insensitive. WR-02 fix regression guard.
+        async fn handler() -> impl IntoResponse {
+            ([(header::CONTENT_TYPE, "IMAGE/PNG")], b"png".to_vec())
+        }
+        let app = Router::new().route("/x.png", get(handler));
+        let (addr, _srv) = spawn_test_server(app).await;
+        let url = reqwest::Url::parse(&format!("http://{addr}/x.png")).unwrap();
+
+        let bytes = execute_fetch(&test_client(), url, "image")
+            .await
+            .expect("uppercase content-type accepted");
+        assert_eq!(bytes, b"png");
+    }
+
+    // NOTE: the `content_length() > MAX_BYTES` fail-fast branch is NOT
+    // covered at integration level because hyper overrides caller-specified
+    // Content-Length on responses with empty/real-sized bodies, making a
+    // "lying Content-Length" server server-side impossible without dropping
+    // below hyper to raw TCP. The defense-in-depth running-tally guard IS
+    // covered by `execute_fetch_streams_body_and_aborts_on_overflow` below.
+
+    #[tokio::test]
+    async fn execute_fetch_streams_body_and_aborts_on_overflow() {
+        // Server declares Content-Length just under the cap (passes fail-fast)
+        // but streams more bytes than it advertised. Client-side running tally
+        // must still abort the read when it crosses MAX_BYTES.
+        //
+        // Uses a smaller bogus cap by redeclaring locally — we stream ~200 KiB
+        // but advertise `None` so the client enters streaming mode and enforces
+        // the running-tally guard. We exercise the guard path with a smaller
+        // MAX via direct assertion: stream exactly MAX_BYTES + 1 bytes as 1 MiB
+        // chunks. This test is a proof of guard, not a memory stress test.
+        //
+        // To keep the test fast, we use `http::Response` streaming of a repeated
+        // byte-pattern.
+        use futures::stream;
+        async fn handler() -> impl IntoResponse {
+            let chunk: Vec<u8> = vec![0u8; 1024 * 1024]; // 1 MiB
+            // 101 chunks → 101 MiB (over the 100 MiB cap). Chunked encoding —
+            // no Content-Length, so fail-fast doesn't trigger; the running
+            // tally must.
+            let stream =
+                stream::iter((0..101).map(move |_| Ok::<_, std::io::Error>(bytes::Bytes::from(chunk.clone()))));
+            let body = Body::from_stream(stream);
+            let mut resp = Response::new(body);
+            resp.headers_mut()
+                .insert(header::CONTENT_TYPE, "image/png".parse().unwrap());
+            resp
+        }
+        let app = Router::new().route("/huge.png", get(handler));
+        let (addr, _srv) = spawn_test_server(app).await;
+        let url = reqwest::Url::parse(&format!("http://{addr}/huge.png")).unwrap();
+
+        let err = execute_fetch(&test_client(), url, "image").await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn execute_fetch_rejects_redirect_with_no_policy_client() {
+        // The production `fetch()` builds the reqwest client with
+        // `redirect::Policy::none()`, so a 3xx surfaces as a non-success status.
+        async fn redirect_handler() -> impl IntoResponse {
+            Redirect::temporary("/elsewhere")
+        }
+        let app = Router::new().route("/x.png", get(redirect_handler));
+        let (addr, _srv) = spawn_test_server(app).await;
+        let url = reqwest::Url::parse(&format!("http://{addr}/x.png")).unwrap();
+
+        // test_client() above also uses Policy::none — same semantics as prod.
+        let err = execute_fetch(&test_client(), url, "image").await.unwrap_err();
+        // 307 is not a success code → fetch surfaces it as Unavailable.
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(err.message().contains("HTTP 307"), "message: {}", err.message());
+    }
+
+    #[tokio::test]
+    async fn execute_fetch_surfaces_upstream_5xx_as_unavailable() {
+        async fn handler() -> impl IntoResponse {
+            (StatusCode::INTERNAL_SERVER_ERROR, "oops")
+        }
+        let app = Router::new().route("/broken.png", get(handler));
+        let (addr, _srv) = spawn_test_server(app).await;
+        let url = reqwest::Url::parse(&format!("http://{addr}/broken.png")).unwrap();
+
+        let err = execute_fetch(&test_client(), url, "image").await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(err.message().contains("HTTP 500"), "message: {}", err.message());
+    }
+}

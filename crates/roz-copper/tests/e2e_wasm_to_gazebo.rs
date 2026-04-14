@@ -1,3 +1,20 @@
+#![allow(
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::approx_constant,
+    clippy::doc_markdown,
+    clippy::ignore_without_reason,
+    clippy::large_enum_variant,
+    clippy::missing_const_for_fn,
+    clippy::or_fun_call,
+    clippy::struct_excessive_bools,
+    clippy::type_complexity,
+    clippy::derive_partial_eq_without_eq,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::format_collect,
+    reason = "test-only style/complexity lints; tech-debt follow-up"
+)]
 //! E2E test: WASM controller output + live Gazebo sensor feedback.
 //!
 //! Proves the live feedback loop through the IO traits against a real Gazebo
@@ -26,8 +43,8 @@ use roz_copper::io_log::LogActuatorSink;
 
 /// Full pipeline: WASM controller ticks → sensor reads Gazebo poses → motor commands captured.
 ///
-/// Proves: GrpcSensorSource delivers real EntityState from Gazebo,
-/// tick contract delivers sensor data, TickOutput commands go through safety filter,
+/// Proves: `GrpcSensorSource` delivers real `EntityState` from Gazebo,
+/// tick contract delivers sensor data, `TickOutput` commands go through safety filter,
 /// and actuator sink receives the output.
 #[tokio::test]
 #[ignore]
@@ -134,8 +151,7 @@ async fn wasm_controller_with_live_gazebo_sensor() {
     for e in &current.entities {
         let pos = e
             .position
-            .map(|[x, y, z]| format!("({x:.3}, {y:.3}, {z:.3})"))
-            .unwrap_or("N/A".to_string());
+            .map_or("N/A".to_string(), |[x, y, z]| format!("({x:.3}, {y:.3}, {z:.3})"));
         println!("  {} @ {pos}", e.id);
     }
     assert!(

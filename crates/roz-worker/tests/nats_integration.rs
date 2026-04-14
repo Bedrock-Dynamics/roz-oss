@@ -241,7 +241,7 @@ async fn approval_team_events_flow_through_nats_with_approval_id() {
     }
 }
 
-/// Verifies the worker's real JetStream publish helper uses the canonical team
+/// Verifies the worker's real `JetStream` publish helper uses the canonical team
 /// subject, wraps events in `SequencedTeamEvent`, and preserves `approval_id`.
 #[tokio::test]
 async fn publish_team_event_uses_worker_subject_with_approval_id() {

@@ -1,10 +1,27 @@
+#![allow(
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::approx_constant,
+    clippy::doc_markdown,
+    clippy::ignore_without_reason,
+    clippy::large_enum_variant,
+    clippy::missing_const_for_fn,
+    clippy::or_fun_call,
+    clippy::struct_excessive_bools,
+    clippy::type_complexity,
+    clippy::derive_partial_eq_without_eq,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::format_collect,
+    reason = "test-only style/complexity lints; tech-debt follow-up"
+)]
 //! Drone WASM velocity through bridge: arm, offboard, verify movement.
 //!
 //! Proves the full drone pipeline: WASM controller outputs body velocity →
-//! GrpcActuatorSink → bridge → MAVLink SET_POSITION_TARGET_LOCAL_NED → PX4 SITL.
+//! `GrpcActuatorSink` → bridge → `MAVLink` `SET_POSITION_TARGET_LOCAL_NED` → PX4 SITL.
 //! The drone must actually move — not just accept commands silently.
 //!
-//! Sequence: start streaming setpoints → SET_MODE OFFBOARD → ARM → verify z-position changed.
+//! Sequence: start streaming setpoints → `SET_MODE` OFFBOARD → ARM → verify z-position changed.
 //!
 //! Requires: PX4 container on port 9090
 //! ```bash
@@ -42,14 +59,13 @@ fn load_quadcopter_control_manifest() -> (ControlInterfaceManifest, String) {
         robot
             .channels
             .as_ref()
-            .map(|channels| channels.robot_class.clone())
-            .unwrap_or_else(|| "generic".into()),
+            .map_or_else(|| "generic".into(), |channels| channels.robot_class.clone()),
     )
 }
 
 const BRIDGE_URL: &str = "http://127.0.0.1:9090";
 
-/// Build live-controller WAT that sets channel 2 (velocity_z) to 0.5 m/s.
+/// Build live-controller WAT that sets channel 2 (`velocity_z`) to 0.5 m/s.
 fn drone_vz_wat(control_manifest: &ControlInterfaceManifest) -> String {
     let mut values = vec![0.0_f64; control_manifest.channels.len()];
     if values.len() > 2 {
@@ -244,8 +260,7 @@ async fn drone_wasm_velocity_through_bridge() {
     for e in &current.entities {
         let pos = e
             .position
-            .map(|[x, y, z]| format!("({x:.3}, {y:.3}, {z:.3})"))
-            .unwrap_or("N/A".into());
+            .map_or("N/A".into(), |[x, y, z]| format!("({x:.3}, {y:.3}, {z:.3})"));
         println!("  {} @ {pos}", e.id);
     }
 

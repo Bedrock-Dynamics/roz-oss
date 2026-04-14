@@ -1,7 +1,24 @@
+#![allow(
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::approx_constant,
+    clippy::doc_markdown,
+    clippy::ignore_without_reason,
+    clippy::large_enum_variant,
+    clippy::missing_const_for_fn,
+    clippy::or_fun_call,
+    clippy::struct_excessive_bools,
+    clippy::type_complexity,
+    clippy::derive_partial_eq_without_eq,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::format_collect,
+    reason = "test-only style/complexity lints; tech-debt follow-up"
+)]
 //! Mobile WASM velocity through bridge: verify real `/cmd_vel` motion.
 //!
 //! Proves the full mobile pipeline: live-controller component -> Copper ->
-//! GrpcActuatorSink -> bridge -> `/cmd_vel` -> Gazebo/Nav2 mobile robot motion.
+//! `GrpcActuatorSink` -> bridge -> `/cmd_vel` -> Gazebo/Nav2 mobile robot motion.
 //!
 //! Requires: ros2-nav2 container on port 9096
 //! ```bash
@@ -41,8 +58,7 @@ fn load_diff_drive_control_manifest() -> (ControlInterfaceManifest, String) {
         robot
             .channels
             .as_ref()
-            .map(|channels| channels.robot_class.clone())
-            .unwrap_or_else(|| "mobile".into()),
+            .map_or_else(|| "mobile".into(), |channels| channels.robot_class.clone()),
     )
 }
 
@@ -98,7 +114,7 @@ fn max_position_delta(
             let dx = after_pos[0] - before_pos[0];
             let dy = after_pos[1] - before_pos[1];
             let dz = after_pos[2] - before_pos[2];
-            let delta = (dx * dx + dy * dy + dz * dz).sqrt();
+            let delta = dz.mul_add(dz, dx.mul_add(dx, dy * dy)).sqrt();
             Some((id.clone(), delta, *before_pos, *after_pos))
         })
         .max_by(|left, right| left.1.partial_cmp(&right.1).unwrap_or(std::cmp::Ordering::Equal))

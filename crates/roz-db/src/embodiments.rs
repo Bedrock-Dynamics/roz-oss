@@ -67,7 +67,7 @@ where
     let result = sqlx::query(
         "UPDATE roz_hosts \
          SET embodiment_model = $2, \
-             embodiment_runtime = COALESCE($3, embodiment_runtime), \
+             embodiment_runtime = $3, \
              updated_at = now() \
          WHERE id = $1 \
            AND (embodiment_model IS NULL \
@@ -110,7 +110,12 @@ where
                THEN $2 \
                ELSE embodiment_model \
              END, \
-             embodiment_runtime = COALESCE($3, embodiment_runtime), \
+             embodiment_runtime = CASE \
+               WHEN (embodiment_model IS NULL \
+                     OR embodiment_model->>'model_digest' IS DISTINCT FROM $2->>'model_digest') \
+               THEN $3 \
+               ELSE COALESCE($3, embodiment_runtime) \
+             END, \
              updated_at = now() \
          WHERE id = $1 \
            AND ( \
@@ -292,6 +297,121 @@ mod tests {
             row.embodiment_runtime.as_ref().unwrap()["combined_digest"],
             "rt-v2",
             "DB must store the new runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_upsert_clears_runtime_when_model_changes_and_runtime_is_none() {
+        let pool = setup().await;
+        let tenant_id = create_test_tenant(&pool).await;
+        let host = crate::hosts::create(
+            &pool,
+            tenant_id,
+            "cond-host-clear-1",
+            "edge",
+            &[],
+            &serde_json::json!({}),
+        )
+        .await
+        .expect("create host");
+
+        // Seed: model v1 with an existing runtime attached.
+        let model_v1 = serde_json::json!({"model_digest": "abc123", "joints": []});
+        let runtime_v1 = serde_json::json!({"combined_digest": "rt-v1", "calibration": {}});
+        let wrote = conditional_upsert(&pool, host.id, &model_v1, Some(&runtime_v1))
+            .await
+            .expect("conditional_upsert");
+        assert!(wrote);
+
+        // New model digest, no runtime supplied -- runtime must be cleared
+        // because the stale runtime belongs to the old model.
+        let model_v2 = serde_json::json!({"model_digest": "def456", "joints": [{"name": "j1"}]});
+        let wrote = conditional_upsert(&pool, host.id, &model_v2, None)
+            .await
+            .expect("conditional_upsert");
+        assert!(wrote, "changed digest should write");
+
+        let row = get_by_host_id(&pool, host.id).await.unwrap().unwrap();
+        assert_eq!(row.embodiment_model.as_ref().unwrap()["model_digest"], "def456");
+        assert!(
+            row.embodiment_runtime.is_none(),
+            "runtime must be cleared when model changes and no new runtime is provided, got {:?}",
+            row.embodiment_runtime
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_upsert_or_runtime_clears_runtime_when_model_changes_and_runtime_is_none() {
+        let pool = setup().await;
+        let tenant_id = create_test_tenant(&pool).await;
+        let host = crate::hosts::create(
+            &pool,
+            tenant_id,
+            "cond-host-clear-2",
+            "edge",
+            &[],
+            &serde_json::json!({}),
+        )
+        .await
+        .expect("create host");
+
+        // Seed: model v1 with an existing runtime attached.
+        let model_v1 = serde_json::json!({"model_digest": "abc123", "joints": []});
+        let runtime_v1 = serde_json::json!({"combined_digest": "rt-v1", "calibration": {}});
+        let wrote = conditional_upsert_or_runtime(&pool, host.id, &model_v1, Some(&runtime_v1))
+            .await
+            .expect("conditional_upsert_or_runtime");
+        assert!(wrote);
+
+        // New model digest, no runtime supplied -- runtime must be cleared.
+        let model_v2 = serde_json::json!({"model_digest": "def456", "joints": [{"name": "j1"}]});
+        let wrote = conditional_upsert_or_runtime(&pool, host.id, &model_v2, None)
+            .await
+            .expect("conditional_upsert_or_runtime");
+        assert!(wrote, "changed digest should write");
+
+        let row = get_by_host_id(&pool, host.id).await.unwrap().unwrap();
+        assert_eq!(row.embodiment_model.as_ref().unwrap()["model_digest"], "def456");
+        assert!(
+            row.embodiment_runtime.is_none(),
+            "runtime must be cleared when model changes and no new runtime is provided, got {:?}",
+            row.embodiment_runtime
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_upsert_or_runtime_preserves_runtime_when_model_unchanged_and_runtime_is_none() {
+        let pool = setup().await;
+        let tenant_id = create_test_tenant(&pool).await;
+        let host = crate::hosts::create(
+            &pool,
+            tenant_id,
+            "cond-host-clear-3",
+            "edge",
+            &[],
+            &serde_json::json!({}),
+        )
+        .await
+        .expect("create host");
+
+        // Seed: model + runtime
+        let model = serde_json::json!({"model_digest": "abc123", "joints": []});
+        let runtime = serde_json::json!({"combined_digest": "rt-v1", "calibration": {}});
+        conditional_upsert_or_runtime(&pool, host.id, &model, Some(&runtime))
+            .await
+            .unwrap();
+
+        // Same model, no runtime -- should skip (and therefore preserve runtime).
+        let wrote = conditional_upsert_or_runtime(&pool, host.id, &model, None)
+            .await
+            .expect("conditional_upsert_or_runtime");
+        assert!(!wrote, "unchanged model + None runtime should skip");
+
+        let row = get_by_host_id(&pool, host.id).await.unwrap().unwrap();
+        assert_eq!(
+            row.embodiment_runtime.as_ref().unwrap()["combined_digest"],
+            "rt-v1",
+            "runtime must be preserved when model is unchanged and no new runtime is provided"
         );
     }
 

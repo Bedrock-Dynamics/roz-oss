@@ -15,7 +15,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
-use crate::grpc::agent::GrpcAuth;
+use crate::grpc::auth_ext;
 use crate::grpc::embodiment_convert::domain_binding_type_to_proto;
 use crate::grpc::roz_v1::embodiment_service_server::EmbodimentService;
 use crate::grpc::roz_v1::{
@@ -48,36 +48,17 @@ type WatchCalibrationStream = tokio_stream::wrappers::ReceiverStream<Result<Watc
 
 /// gRPC implementation of the `EmbodimentService` trait.
 ///
-/// Holds a database pool, auth injector, and optional NATS client for streaming RPCs.
+/// Holds a database pool and optional NATS client for streaming RPCs.
+/// Authentication is provided structurally by the `grpc_auth_middleware`
+/// layer; this service reads `AuthIdentity` from request extensions.
 pub struct EmbodimentServiceImpl {
     pool: PgPool,
-    auth: std::sync::Arc<dyn GrpcAuth>,
     nats_client: Option<async_nats::Client>,
 }
 
 impl EmbodimentServiceImpl {
-    pub fn new(pool: PgPool, auth: std::sync::Arc<dyn GrpcAuth>, nats_client: Option<async_nats::Client>) -> Self {
-        Self {
-            pool,
-            auth,
-            nats_client,
-        }
-    }
-
-    async fn authenticated_tenant_id<T: Sync>(&self, request: &Request<T>) -> Result<Uuid, Status> {
-        let auth_header = request
-            .metadata()
-            .get("authorization")
-            .ok_or_else(|| Status::unauthenticated("missing authorization metadata"))?
-            .to_str()
-            .map_err(|_| Status::invalid_argument("invalid authorization metadata"))?;
-
-        let identity = self
-            .auth
-            .authenticate(&self.pool, Some(auth_header))
-            .await
-            .map_err(Status::unauthenticated)?;
-        Ok(identity.tenant_id().0)
+    pub const fn new(pool: PgPool, nats_client: Option<async_nats::Client>) -> Self {
+        Self { pool, nats_client }
     }
 }
 
@@ -171,7 +152,7 @@ const fn binding_type_to_command_interface(bt: &BindingType) -> CommandInterface
 #[tonic::async_trait]
 impl EmbodimentService for EmbodimentServiceImpl {
     async fn get_model(&self, request: Request<GetModelRequest>) -> Result<Response<ProtoModel>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let host_id = parse_host_id(&request.get_ref().host_id)?;
 
         let row = fetch_embodiment_row(&self.pool, host_id, tenant_id).await?;
@@ -190,7 +171,7 @@ impl EmbodimentService for EmbodimentServiceImpl {
     }
 
     async fn get_runtime(&self, request: Request<GetRuntimeRequest>) -> Result<Response<ProtoRuntime>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let host_id = parse_host_id(&request.get_ref().host_id)?;
 
         let row = fetch_embodiment_row(&self.pool, host_id, tenant_id).await?;
@@ -212,7 +193,7 @@ impl EmbodimentService for EmbodimentServiceImpl {
         &self,
         request: Request<ListBindingsRequest>,
     ) -> Result<Response<ListBindingsResponse>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let host_id = parse_host_id(&request.get_ref().host_id)?;
 
         let row = fetch_embodiment_row(&self.pool, host_id, tenant_id).await?;
@@ -240,7 +221,7 @@ impl EmbodimentService for EmbodimentServiceImpl {
         &self,
         request: Request<ValidateBindingsRequest>,
     ) -> Result<Response<ValidateBindingsResponse>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let host_id = parse_host_id(&request.get_ref().host_id)?;
 
         let row = fetch_embodiment_row(&self.pool, host_id, tenant_id).await?;
@@ -292,7 +273,7 @@ impl EmbodimentService for EmbodimentServiceImpl {
         &self,
         request: Request<GetRetargetingMapRequest>,
     ) -> Result<Response<GetRetargetingMapResponse>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let host_id = parse_host_id(&request.get_ref().host_id)?;
 
         let row = fetch_embodiment_row(&self.pool, host_id, tenant_id).await?;
@@ -326,7 +307,7 @@ impl EmbodimentService for EmbodimentServiceImpl {
         &self,
         request: Request<GetManifestRequest>,
     ) -> Result<Response<GetManifestResponse>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let host_id = parse_host_id(&request.get_ref().host_id)?;
 
         let row = fetch_embodiment_row(&self.pool, host_id, tenant_id).await?;
@@ -355,7 +336,7 @@ impl EmbodimentService for EmbodimentServiceImpl {
         &self,
         request: Request<StreamFrameTreeRequest>,
     ) -> Result<Response<Self::StreamFrameTreeStream>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let host_id = parse_host_id(&request.get_ref().host_id)?;
 
         // D-02: NATS required for streaming RPCs.
@@ -368,10 +349,10 @@ impl EmbodimentService for EmbodimentServiceImpl {
         // Subscribe BEFORE reading initial state to avoid losing events that arrive
         // between the DB read and subscribe call (subscribe-before-read race avoidance).
         let subject = roz_nats::dispatch::embodiment_changed_subject(host_id);
-        let mut sub = nats
-            .subscribe(subject)
-            .await
-            .map_err(|e| Status::internal(format!("NATS subscribe failed: {e}")))?;
+        let mut sub = nats.subscribe(subject).await.map_err(|e| {
+            tracing::error!(error = %e, "NATS subscribe failed");
+            Status::internal("NATS subscribe failed")
+        })?;
 
         // D-04: Send initial full snapshot.
         let row = fetch_embodiment_row(&self.pool, host_id, tenant_id).await?;
@@ -379,7 +360,10 @@ impl EmbodimentService for EmbodimentServiceImpl {
             row.embodiment_model
                 .ok_or_else(|| Status::not_found("host has no embodiment model"))?,
         )
-        .map_err(|e| Status::internal(format!("deserialize model: {e}")))?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to deserialize embodiment model");
+            Status::internal("failed to deserialize embodiment data")
+        })?;
 
         let initial_digest = compute_frame_tree_digest(&model.frame_tree);
 
@@ -396,6 +380,11 @@ impl EmbodimentService for EmbodimentServiceImpl {
 
         let pool = self.pool.clone();
         tokio::spawn(async move {
+            // WR-04: bail out after this many consecutive deserialize failures.
+            // A poisoned/legacy payload on the subject would otherwise keep
+            // tripping the same bug forever.
+            const MAX_CONSECUTIVE_DESERIALIZE_FAILURES: u32 = 10;
+            let mut consecutive_deserialize_failures: u32 = 0;
             let mut last_digest = initial_digest;
             let mut last_tree = model.frame_tree;
             let mut keepalive_interval = tokio::time::interval(Duration::from_secs(15));
@@ -407,9 +396,23 @@ impl EmbodimentService for EmbodimentServiceImpl {
                         if let Some(nats_msg) = msg {
                             let event: roz_nats::dispatch::EmbodimentChangedEvent =
                                 match serde_json::from_slice(&nats_msg.payload) {
-                                    Ok(e) => e,
+                                    Ok(e) => {
+                                        consecutive_deserialize_failures = 0;
+                                        e
+                                    }
                                     Err(e) => {
                                         tracing::warn!(error = %e, "failed to deserialize EmbodimentChangedEvent");
+                                        consecutive_deserialize_failures += 1;
+                                        if consecutive_deserialize_failures >= MAX_CONSECUTIVE_DESERIALIZE_FAILURES {
+                                            tracing::error!(
+                                                failures = consecutive_deserialize_failures,
+                                                "too many consecutive deserialize failures; closing frame tree stream"
+                                            );
+                                            let _ = tx
+                                                .send(Err(Status::internal("event stream corrupted")))
+                                                .await;
+                                            break;
+                                        }
                                         continue;
                                     }
                                 };
@@ -424,6 +427,17 @@ impl EmbodimentService for EmbodimentServiceImpl {
                                 Ok(None) => { tracing::warn!(%host_id, "host disappeared"); continue; }
                                 Err(e) => { tracing::warn!(error = %e, "DB read error"); continue; }
                             };
+                            // Multi-tenant safety: revalidate row ownership against caller's tenant.
+                            // Guards against stale/forged events or host reassignment leaking data.
+                            if row.tenant_id != tenant_id {
+                                tracing::warn!(
+                                    %host_id,
+                                    event_tenant = %tenant_id,
+                                    row_tenant = %row.tenant_id,
+                                    "tenant mismatch on re-read; skipping frame tree emission"
+                                );
+                                continue;
+                            }
                             let new_model: roz_core::embodiment::model::EmbodimentModel =
                                 match serde_json::from_value(match row.embodiment_model {
                                     Some(v) => v,
@@ -485,7 +499,7 @@ impl EmbodimentService for EmbodimentServiceImpl {
         &self,
         request: Request<WatchCalibrationRequest>,
     ) -> Result<Response<Self::WatchCalibrationStream>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let host_id = parse_host_id(&request.get_ref().host_id)?;
 
         // D-02: NATS required.
@@ -497,10 +511,10 @@ impl EmbodimentService for EmbodimentServiceImpl {
 
         // Subscribe before DB read (subscribe-before-read race avoidance).
         let subject = roz_nats::dispatch::embodiment_changed_subject(host_id);
-        let mut sub = nats
-            .subscribe(subject)
-            .await
-            .map_err(|e| Status::internal(format!("NATS subscribe failed: {e}")))?;
+        let mut sub = nats.subscribe(subject).await.map_err(|e| {
+            tracing::error!(error = %e, "NATS subscribe failed");
+            Status::internal("NATS subscribe failed")
+        })?;
 
         // D-04: Send initial full calibration snapshot.
         let row = fetch_embodiment_row(&self.pool, host_id, tenant_id).await?;
@@ -508,7 +522,10 @@ impl EmbodimentService for EmbodimentServiceImpl {
             row.embodiment_runtime
                 .ok_or_else(|| Status::not_found("host has no embodiment runtime"))?,
         )
-        .map_err(|e| Status::internal(format!("deserialize runtime: {e}")))?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "failed to deserialize embodiment runtime");
+            Status::internal("failed to deserialize embodiment data")
+        })?;
 
         let calibration = runtime
             .calibration
@@ -530,6 +547,11 @@ impl EmbodimentService for EmbodimentServiceImpl {
 
         let pool = self.pool.clone();
         tokio::spawn(async move {
+            // WR-04: bail out after this many consecutive deserialize failures.
+            // A poisoned/legacy payload on the subject would otherwise keep
+            // tripping the same bug forever.
+            const MAX_CONSECUTIVE_DESERIALIZE_FAILURES: u32 = 10;
+            let mut consecutive_deserialize_failures: u32 = 0;
             let mut last_digest = initial_digest;
             let mut keepalive_interval = tokio::time::interval(Duration::from_secs(15));
             keepalive_interval.tick().await; // consume immediate first tick
@@ -540,9 +562,23 @@ impl EmbodimentService for EmbodimentServiceImpl {
                         if let Some(nats_msg) = msg {
                             let event: roz_nats::dispatch::EmbodimentChangedEvent =
                                 match serde_json::from_slice(&nats_msg.payload) {
-                                    Ok(e) => e,
+                                    Ok(e) => {
+                                        consecutive_deserialize_failures = 0;
+                                        e
+                                    }
                                     Err(e) => {
                                         tracing::warn!(error = %e, "failed to deserialize EmbodimentChangedEvent");
+                                        consecutive_deserialize_failures += 1;
+                                        if consecutive_deserialize_failures >= MAX_CONSECUTIVE_DESERIALIZE_FAILURES {
+                                            tracing::error!(
+                                                failures = consecutive_deserialize_failures,
+                                                "too many consecutive deserialize failures; closing calibration stream"
+                                            );
+                                            let _ = tx
+                                                .send(Err(Status::internal("event stream corrupted")))
+                                                .await;
+                                            break;
+                                        }
                                         continue;
                                     }
                                 };
@@ -555,6 +591,17 @@ impl EmbodimentService for EmbodimentServiceImpl {
                                 Ok(None) => { tracing::warn!(%host_id, "host disappeared"); continue; }
                                 Err(e) => { tracing::warn!(error = %e, "DB read error"); continue; }
                             };
+                            // Multi-tenant safety: revalidate row ownership against caller's tenant.
+                            // Guards against stale/forged events or host reassignment leaking data.
+                            if row.tenant_id != tenant_id {
+                                tracing::warn!(
+                                    %host_id,
+                                    event_tenant = %tenant_id,
+                                    row_tenant = %row.tenant_id,
+                                    "tenant mismatch on re-read; skipping calibration emission"
+                                );
+                                continue;
+                            }
 
                             let runtime: roz_core::embodiment::embodiment_runtime::EmbodimentRuntime =
                                 match serde_json::from_value(match row.embodiment_runtime {

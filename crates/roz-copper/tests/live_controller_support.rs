@@ -1,3 +1,20 @@
+#![allow(
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::approx_constant,
+    clippy::doc_markdown,
+    clippy::ignore_without_reason,
+    clippy::large_enum_variant,
+    clippy::missing_const_for_fn,
+    clippy::or_fun_call,
+    clippy::struct_excessive_bools,
+    clippy::type_complexity,
+    clippy::derive_partial_eq_without_eq,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::format_collect,
+    reason = "test-only style/complexity lints; tech-debt follow-up"
+)]
 use roz_core::controller::artifact::{ControllerArtifact, ControllerClass, ExecutionMode, SourceKind, VerificationKey};
 use roz_core::controller::verification::VerifierVerdict;
 use roz_core::embodiment::binding::ControlInterfaceManifest;

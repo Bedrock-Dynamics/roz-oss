@@ -6,10 +6,22 @@ rust-version.workspace = true
 license.workspace      = true
 authors.workspace      = true
 
+[features]
+default = []
+# Enables the signed-AOT WASM load path (wasm_trust module). Passes the
+# feature through to roz-copper so Module::deserialize compiles.
+aot = ["roz-copper/aot"]
+# Enables the Zenoh edge-horizontal transport (Phase 15). Links roz-zenoh and
+# the zenoh crate so worker main can call roz_zenoh::session::open_session and
+# name zenoh::Session at the capture site.
+zenoh = ["dep:roz-zenoh", "dep:zenoh"]
+
 [dependencies]
 roz-core = { path = "../roz-core" }
+roz-db = { path = "../roz-db" }
 roz-nats = { path = "../roz-nats" }
 roz-agent = { path = "../roz-agent" }
+sqlx = { workspace = true }
 async-nats.workspace = true
 tokio = { workspace = true, features = ["full"] }
 figment.workspace = true
@@ -35,6 +47,8 @@ ed25519-dalek.workspace = true
 reqwest.workspace = true
 roz-copper = { path = "../roz-copper", default-features = false }
 roz-local = { path = "../roz-local" }
+roz-zenoh = { path = "../roz-zenoh", optional = true }
+zenoh = { workspace = true, optional = true }
 tokio-util.workspace = true
 futures = "0.3"
 bytes = "1"
@@ -49,6 +63,8 @@ inotify = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 roz-test = { path = "../roz-test" }
+rand = { workspace = true }
+nix = { version = "0.29", features = ["signal"] }
 
 [lints]
 workspace = true

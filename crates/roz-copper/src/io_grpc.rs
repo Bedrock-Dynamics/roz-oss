@@ -33,7 +33,13 @@ use crate::io::{ActuatorSink, SensorFrame, SensorSource};
     clippy::large_enum_variant,
     clippy::struct_excessive_bools,
     clippy::missing_const_for_fn,
-    clippy::trivially_copy_pass_by_ref
+    clippy::trivially_copy_pass_by_ref,
+    // Generated proto code — allow all pedantic/nursery/style that tonic-build
+    // may emit. Additional lints seen in CI: or_fun_call, type_complexity.
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::or_fun_call,
+    clippy::type_complexity
 )]
 pub mod proto {
     tonic::include_proto!("substrate.sim");

@@ -34,12 +34,36 @@ pub const TRANSPORT_HEALTH: TopicDef = TopicDef {
     description: "EdgeTransportHealth heartbeat",
 };
 
+/// DEPRECATED for `EdgeStateBus` use.
+///
+/// Per CONTEXT D-25 + review C-05, coordination uses GLOBAL namespace
+/// `roz/coordination/pose/<robot_id>` (not robot-scoped
+/// `roz/<robot_id>/coordination/pose`). Use `ZenohCoordinator::publish_pose` /
+/// `subscribe_poses` in `coordination.rs` instead. This constant is retained
+/// only for backwards compatibility of any external callers; it must NOT be
+/// passed to `EdgeStateBus::topic_key()`.
+#[deprecated(
+    since = "0.2.0",
+    note = "Use ZenohCoordinator::{publish_pose, subscribe_poses} — coordination is global-namespaced per D-25."
+)]
 pub const COORDINATION_POSE: TopicDef = TopicDef {
     suffix: "coordination/pose",
-    description: "Robot pose broadcasts",
+    description: "Robot pose broadcasts (DEPRECATED: use ZenohCoordinator)",
 };
 
+/// DEPRECATED for `EdgeStateBus` use.
+///
+/// Per CONTEXT D-25 + review C-05, coordination uses GLOBAL namespace
+/// `roz/coordination/barrier/<name>` (not robot-scoped). Use
+/// `ZenohCoordinator::{join_barrier, observe_barrier, declare_barrier_queryable}`
+/// in `coordination.rs` instead. This constant is retained only for backwards
+/// compatibility of any external callers; it must NOT be passed to
+/// `EdgeStateBus::topic_key()`.
+#[deprecated(
+    since = "0.2.0",
+    note = "Use ZenohCoordinator::{join_barrier, observe_barrier, declare_barrier_queryable} — coordination is global-namespaced per D-25."
+)]
 pub const COORDINATION_BARRIER: TopicDef = TopicDef {
     suffix: "coordination/barrier",
-    description: "Synchronization barriers",
+    description: "Synchronization barriers (DEPRECATED: use ZenohCoordinator)",
 };

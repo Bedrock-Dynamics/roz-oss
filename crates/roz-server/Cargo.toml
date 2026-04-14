@@ -43,17 +43,23 @@ tonic-reflection = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }
+async-trait = { workspace = true }
+eventsource-stream = "0.2"
+hickory-resolver = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 roz-test = { path = "../roz-test" }
 roz-worker = { path = "../roz-worker" }
 roz-copper = { path = "../roz-copper", default-features = false }
 roz-local = { path = "../roz-local" }
+roz-proto = { path = "../roz-proto" }
 nkeys = { workspace = true }
 proptest = "1.6"
+image = { workspace = true }
 
 [lints]
 workspace = true

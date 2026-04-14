@@ -3,6 +3,7 @@ pub mod agent_sessions;
 pub mod api_keys;
 pub mod commands;
 pub mod device_codes;
+pub mod device_trust;
 pub mod embodiments;
 pub mod environments;
 pub mod hosts;
@@ -11,11 +12,15 @@ pub mod message_feedback;
 pub mod provenance;
 pub mod safety_audit;
 pub mod safety_policies;
+pub mod session_turns;
 pub mod skills;
 pub mod streams;
 pub mod tasks;
 pub mod tenant;
 pub mod triggers;
+pub mod usage;
+
+use std::time::Duration;
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
@@ -30,9 +35,34 @@ fn database_max_connections() -> u32 {
     parse_database_max_connections(std::env::var("ROZ_DB_MAX_CONNECTIONS").ok().as_deref())
 }
 
+fn parse_env_duration_secs(var: &str, default: u64) -> Duration {
+    Duration::from_secs(
+        std::env::var(var)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(default),
+    )
+}
+
 pub async fn create_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
+    let max_connections = database_max_connections();
+    let acquire_timeout = parse_env_duration_secs("ROZ_DB_ACQUIRE_TIMEOUT_SECS", 5);
+    let idle_timeout = parse_env_duration_secs("ROZ_DB_IDLE_TIMEOUT_SECS", 300);
+    let max_lifetime = parse_env_duration_secs("ROZ_DB_MAX_LIFETIME_SECS", 1800);
+
+    tracing::info!(
+        max_connections,
+        acquire_timeout_secs = acquire_timeout.as_secs(),
+        idle_timeout_secs = idle_timeout.as_secs(),
+        max_lifetime_secs = max_lifetime.as_secs(),
+        "configuring database pool"
+    );
+
     PgPoolOptions::new()
-        .max_connections(database_max_connections())
+        .max_connections(max_connections)
+        .acquire_timeout(acquire_timeout)
+        .idle_timeout(idle_timeout)
+        .max_lifetime(max_lifetime)
         .connect(database_url)
         .await
 }

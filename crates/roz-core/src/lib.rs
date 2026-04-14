@@ -40,5 +40,6 @@ pub mod team;
 pub mod template;
 pub mod timebase;
 pub mod tools;
+pub mod transport;
 pub mod trust;
 pub mod wal;

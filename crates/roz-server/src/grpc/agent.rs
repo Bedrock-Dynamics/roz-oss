@@ -1,7 +1,7 @@
 //! gRPC `AgentService` implementation — bidirectional streaming session state machine.
 //!
 //! The first message from the client must be `StartSession`. This triggers:
-//! 1. Auth validation (API key via the injected `GrpcAuth` trait).
+//! 1. Auth validation (via `grpc_auth_middleware` -- see `middleware/grpc_auth.rs`).
 //! 2. Session metadata written to Postgres (`roz_agent_sessions`).
 //! 3. `SessionStarted` acknowledgement sent back with session ID, resolved model, and permissions.
 //!
@@ -48,27 +48,15 @@ use roz_nats::team::{TEAM_STREAM, team_subject_pattern};
 use super::convert::value_to_struct;
 use super::roz_v1::agent_service_server::AgentService;
 use super::roz_v1::{self, SessionRequest, SessionResponse, WatchTeamRequest, session_request, session_response};
+use crate::grpc::auth_ext;
+use crate::grpc::media::{MediaBackend, resolve_backend_name};
+use crate::grpc::media_fetch::MediaFetch;
 
 /// Keepalive interval while an agent turn is in progress.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Default tool timeout for remote tool execution.
 const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
-
-// ---------------------------------------------------------------------------
-// Auth trait — allows the binary crate to inject its own auth implementation
-// ---------------------------------------------------------------------------
-
-/// Trait for authenticating gRPC requests.
-///
-/// The binary crate implements this by delegating to its `extract_auth`
-/// function, which has access to `AppState` (DB pool for API key lookup).
-/// This indirection keeps the library crate independent of the binary's
-/// auth wiring.
-#[tonic::async_trait]
-pub trait GrpcAuth: Send + Sync + 'static {
-    async fn authenticate(&self, pool: &PgPool, auth_header: Option<&str>) -> Result<AuthIdentity, String>;
-}
 
 // ---------------------------------------------------------------------------
 // Session state
@@ -172,7 +160,6 @@ pub struct AgentServiceImpl {
     #[allow(dead_code)]
     restate_ingress_url: String,
     nats_client: Option<async_nats::Client>,
-    auth: Arc<dyn GrpcAuth>,
     default_model: String,
     gateway_url: String,
     api_key: String,
@@ -182,6 +169,11 @@ pub struct AgentServiceImpl {
     fallback_model_name: Option<String>,
     /// Usage metering — passed to each `AgentLoop` for budget checks and recording.
     meter: Arc<dyn roz_agent::meter::UsageMeter>,
+    /// Media-analysis backend (Phase 16.1 / MED-02). Dispatches `AnalyzeMedia`
+    /// requests after input validation + SSRF fetch.
+    media_backend: Arc<dyn MediaBackend>,
+    /// SSRF-guarded fetcher for `MediaPart::file_uri` (Phase 16.1 / MED-03).
+    media_fetcher: Arc<dyn MediaFetch>,
 }
 
 impl AgentServiceImpl {
@@ -191,7 +183,6 @@ impl AgentServiceImpl {
         http_client: reqwest::Client,
         restate_ingress_url: String,
         nats_client: Option<async_nats::Client>,
-        auth: Arc<dyn GrpcAuth>,
         default_model: String,
         gateway_url: String,
         api_key: String,
@@ -200,13 +191,14 @@ impl AgentServiceImpl {
         direct_api_key: Option<String>,
         fallback_model_name: Option<String>,
         meter: Arc<dyn roz_agent::meter::UsageMeter>,
+        media_backend: Arc<dyn MediaBackend>,
+        media_fetcher: Arc<dyn MediaFetch>,
     ) -> Self {
         Self {
             pool,
             http_client,
             restate_ingress_url,
             nats_client,
-            auth,
             default_model,
             gateway_url,
             api_key,
@@ -215,6 +207,8 @@ impl AgentServiceImpl {
             direct_api_key,
             fallback_model_name,
             meter,
+            media_backend,
+            media_fetcher,
         }
     }
 }
@@ -231,7 +225,6 @@ impl AgentService for AgentServiceImpl {
 
         // Clone deps for the spawned task.
         let pool = self.pool.clone();
-        let auth = self.auth.clone();
         let default_model = self.default_model.clone();
         let gateway_url = self.gateway_url.clone();
         let api_key = self.api_key.clone();
@@ -242,12 +235,13 @@ impl AgentService for AgentServiceImpl {
         let nats_client = self.nats_client.clone();
         let meter = self.meter.clone();
 
-        // Extract auth header from gRPC metadata before consuming the request.
-        let auth_header = request
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
+        // Extract AuthIdentity from request extensions (set by grpc_auth_middleware)
+        // BEFORE consuming the request via into_inner().
+        let auth_identity = request
+            .extensions()
+            .get::<AuthIdentity>()
+            .cloned()
+            .ok_or_else(|| Status::internal("auth identity missing from extensions"))?;
 
         let mut inbound = request.into_inner();
 
@@ -263,10 +257,9 @@ impl AgentService for AgentServiceImpl {
             run_session_loop(
                 &tx,
                 &pool,
-                &auth,
                 &default_model,
                 &model_config,
-                auth_header.as_deref(),
+                auth_identity,
                 &mut inbound,
                 nats_client.as_ref(),
                 meter,
@@ -286,20 +279,8 @@ impl AgentService for AgentServiceImpl {
         fields(task_id = tracing::field::Empty, tenant_id = tracing::field::Empty)
     )]
     async fn watch_team(&self, request: Request<WatchTeamRequest>) -> Result<Response<Self::WatchTeamStream>, Status> {
-        // --- Auth ---
-        let auth_header = request
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-
-        let auth_identity = self
-            .auth
-            .authenticate(&self.pool, auth_header.as_deref())
-            .await
-            .map_err(Status::unauthenticated)?;
-
-        let tenant_id = auth_identity.tenant_id().0;
+        // --- Auth (extracted from request extensions by grpc_auth_middleware) ---
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         tracing::Span::current().record("tenant_id", tracing::field::display(tenant_id));
 
         // --- Parse task_id ---
@@ -399,6 +380,213 @@ impl AgentService for AgentServiceImpl {
 
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
+
+    type AnalyzeMediaStream = Pin<Box<dyn Stream<Item = Result<roz_v1::AnalyzeMediaChunk, Status>> + Send>>;
+
+    /// `AnalyzeMedia` RPC (Phase 16.1 / MED-01).
+    ///
+    /// Pipeline:
+    /// 1. Auth — reuse `AuthIdentity` populated by `grpc_auth_middleware` (D-03).
+    /// 2. Validate `MediaPart` — `mime_type`, source arm, 10 MB inline cap (D-16).
+    /// 3. Resolve backend name from `model_hint` + mime (D-08/D-09).
+    /// 4. Resolve source: inline bytes (cap-checked) OR `file_uri` via SSRF
+    ///    fetcher (D-14 — fetcher enforces https, SSRF IP block, 100 MB cap).
+    /// 5. Dispatch to the routed `MediaBackend` with inline bytes.
+    /// 6. Relay the backend's chunk stream back to the client verbatim.
+    ///
+    /// Tracing: wrapped in `info_span!("analyze_media", mime, bytes_in, model,
+    /// tenant)` (D-17). Bytes themselves are NEVER logged.
+    #[tracing::instrument(
+        name = "analyze_media",
+        skip(self, request),
+        fields(
+            mime = tracing::field::Empty,
+            bytes_in = tracing::field::Empty,
+            model = tracing::field::Empty,
+            backend = tracing::field::Empty,
+            tenant = tracing::field::Empty,
+        ),
+    )]
+    async fn analyze_media(
+        &self,
+        request: Request<roz_v1::AnalyzeMediaRequest>,
+    ) -> Result<Response<Self::AnalyzeMediaStream>, Status> {
+        // --- Tenant context (D-03) ---
+        // Inline pattern verbatim from stream_session above (same-file
+        // convention; there is no shared `require_identity` helper).
+        let auth_identity = request
+            .extensions()
+            .get::<AuthIdentity>()
+            .cloned()
+            .ok_or_else(|| Status::internal("auth identity missing from extensions"))?;
+        let tenant = auth_identity.tenant_id().0.to_string();
+        tracing::Span::current().record("tenant", tracing::field::display(&tenant));
+
+        // --- Resolve retry-stable idempotency key (CodeRabbit #10) ---
+        // The usage row written after the terminal Done chunk must collide on
+        // retry so ambiguous stream failures do not double-bill. We take the
+        // key from the `idempotency-key` gRPC metadata header (a
+        // metadata-level contract — no proto change). If the caller does not
+        // supply one we fall back to a freshly generated UUID and log a warn,
+        // which matches pre-fix behavior for callers that have not adopted
+        // the contract yet. Validation: non-empty, ASCII printable, max 256
+        // chars — reject anything else with InvalidArgument so we never feed
+        // hostile input into the DB key.
+        #[expect(
+            clippy::single_match_else,
+            reason = "Symmetric match keeps the metadata-present validation and metadata-absent fallback visually parallel"
+        )]
+        let idempotency_key = match request.metadata().get("idempotency-key") {
+            Some(raw) => {
+                let s = raw
+                    .to_str()
+                    .map_err(|_| Status::invalid_argument("idempotency-key metadata must be valid UTF-8"))?;
+                if s.is_empty() {
+                    return Err(Status::invalid_argument("idempotency-key metadata must be non-empty"));
+                }
+                if s.len() > 256 {
+                    return Err(Status::invalid_argument("idempotency-key metadata exceeds 256 chars"));
+                }
+                if !s.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+                    return Err(Status::invalid_argument(
+                        "idempotency-key metadata must be ASCII printable",
+                    ));
+                }
+                s.to_owned()
+            }
+            None => {
+                let k = uuid::Uuid::new_v4().to_string();
+                tracing::warn!(
+                    tenant = %tenant,
+                    "analyze_media called without `idempotency-key` metadata; generated a non-stable key — retries will double-bill"
+                );
+                k
+            }
+        };
+
+        // --- Validate request ---
+        let req = request.into_inner();
+        let media = req
+            .media
+            .ok_or_else(|| Status::invalid_argument("media field required"))?;
+        if media.mime_type.is_empty() {
+            return Err(Status::invalid_argument("mime_type required"));
+        }
+        let mime = media.mime_type.clone();
+        tracing::Span::current().record("mime", tracing::field::display(&mime));
+
+        // --- Resolve backend (D-08/D-09) ---
+        // Runs BEFORE fetching so we fail fast on unsupported mime / unknown hint.
+        let backend_name = resolve_backend_name(req.model_hint.as_deref(), &mime)?;
+        // IN-05: Record both the hint-derived name AND the active backend impl
+        // identifier. `backend_name` reflects the requested model (audit trail
+        // for the routing decision); `backend` reflects the impl that actually
+        // served the request. If a future operator swaps in a different
+        // MediaBackend, the observability surface remains accurate.
+        tracing::Span::current()
+            .record("model", tracing::field::display(&backend_name))
+            .record("backend", tracing::field::display(self.media_backend.name()));
+
+        // Mime family (video|image|audio) — used by the fetcher to match the
+        // response Content-Type family. `resolve_backend_name` above has
+        // already rejected any mime that does not start with
+        // `video/`|`image/`|`audio/`, so `split_once('/')` must succeed. The
+        // explicit check below is defense-in-depth (IN-03): if a future change
+        // to `resolve_backend_name` admits a malformed mime, fail with a clear
+        // InvalidArgument rather than silently feeding `""` into the fetcher.
+        let mime_family = mime
+            .split_once('/')
+            .map(|(family, _)| family.to_string())
+            .ok_or_else(|| Status::invalid_argument("mime_type missing '/' family delimiter"))?;
+
+        // --- Resolve source to bytes ---
+        let source = media
+            .source
+            .ok_or_else(|| Status::invalid_argument("MediaPart.source is required"))?;
+        let bytes: Vec<u8> = match source {
+            roz_v1::media_part::Source::InlineBytes(b) => {
+                if b.len() > 10 * 1024 * 1024 {
+                    return Err(Status::resource_exhausted("inline_bytes exceeds 10 MB"));
+                }
+                b
+            }
+            roz_v1::media_part::Source::FileUri(uri) => self.media_fetcher.fetch(&uri, &mime_family).await?,
+        };
+        tracing::Span::current().record("bytes_in", tracing::field::display(bytes.len()));
+
+        // --- Repack MediaPart with inline bytes for backend dispatch (D-14) ---
+        // IN-04: hints travel INSIDE MediaPart per the proto — do NOT also
+        // pass them as a separate arg to `analyze`. One source of truth.
+        let resolved = roz_v1::MediaPart {
+            mime_type: mime,
+            hints: media.hints,
+            source: Some(roz_v1::media_part::Source::InlineBytes(bytes)),
+        };
+
+        // --- Dispatch ---
+        let raw_stream = self.media_backend.analyze(resolved, req.prompt).await?;
+
+        // --- Wrap stream for usage metering ---
+        // Forward each chunk to the client; on the terminal Done chunk,
+        // invoke `record_media_usage` with the input/output token counts
+        // captured from the Usage chunk. Never block the client stream on
+        // the DB call — it runs after the last chunk is forwarded. Usage is
+        // NOT recorded on mid-stream errors (prevents double-billing when a
+        // retry happens). Record-failure is logged at warn! and does not
+        // fail the request — usage metering must not affect user-facing RPC
+        // success.
+        let pool = self.pool.clone();
+        let tenant_uuid = auth_identity.tenant_id().0;
+        let backend_for_usage = backend_name.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<roz_v1::AnalyzeMediaChunk, Status>>(16);
+        tokio::spawn(async move {
+            let mut input_tokens: Option<i64> = None;
+            let mut output_tokens: Option<i64> = None;
+            let mut saw_done = false;
+            let mut stream = raw_stream;
+            while let Some(item) = stream.next().await {
+                if let Ok(chunk) = &item
+                    && let Some(roz_v1::analyze_media_chunk::Payload::Usage(u)) = &chunk.payload
+                {
+                    input_tokens = i64::try_from(u.input_tokens).ok();
+                    output_tokens = i64::try_from(u.output_tokens).ok();
+                }
+                let is_done = matches!(
+                    &item,
+                    Ok(c) if matches!(c.payload, Some(roz_v1::analyze_media_chunk::Payload::Done(_)))
+                );
+                if tx.send(item).await.is_err() {
+                    return; // client dropped — no usage row recorded
+                }
+                if is_done {
+                    saw_done = true;
+                }
+            }
+            if saw_done
+                && let Err(e) = roz_db::usage::record_media_usage(
+                    &pool,
+                    tenant_uuid,
+                    None,
+                    "media_analysis",
+                    Some(&backend_for_usage),
+                    1,
+                    input_tokens,
+                    output_tokens,
+                    &idempotency_key,
+                )
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    tenant = %tenant_uuid,
+                    backend = %backend_for_usage,
+                    "record_media_usage failed (usage row not inserted)"
+                );
+            }
+        });
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -475,7 +663,7 @@ impl StreamingTurnExecutor for ServerStreamingExecutor {
 
 #[tracing::instrument(
     name = "agent_session.stream",
-    skip(tx, pool, auth, model_config, inbound, nats_client, meter),
+    skip(tx, pool, model_config, inbound, nats_client, meter, auth_identity),
     fields(session_id = tracing::field::Empty, tenant_id = tracing::field::Empty, environment_id = tracing::field::Empty, model = %default_model)
 )]
 #[expect(
@@ -489,10 +677,9 @@ impl StreamingTurnExecutor for ServerStreamingExecutor {
 async fn run_session_loop(
     tx: &mpsc::Sender<Result<SessionResponse, Status>>,
     pool: &PgPool,
-    auth: &Arc<dyn GrpcAuth>,
     default_model: &str,
     model_config: &ModelConfig,
-    auth_header: Option<&str>,
+    auth_identity: AuthIdentity,
     inbound: &mut Streaming<SessionRequest>,
     nats_client: Option<&async_nats::Client>,
     meter: Arc<dyn roz_agent::meter::UsageMeter>,
@@ -506,6 +693,12 @@ async fn run_session_loop(
     // Cancellation token for telemetry and WebRTC signaling relay tasks.
     // Cancelled when the session loop exits to stop the infinite relay loops.
     let relay_cancel = tokio_util::sync::CancellationToken::new();
+
+    // DEBT-03: session-scoped write-behind persistence.
+    // The emitter is spawned when the session is established (post `handle_start`)
+    // and cancelled alongside other relay tasks via `relay_cancel`.
+    // Edge sessions (is_edge == true) are deferred — see TODO below.
+    let mut turn_emitter: Option<roz_agent::agent_loop::TurnEmitter> = None;
 
     loop {
         // Wait for either the next inbound message or a turn-done signal.
@@ -536,16 +729,31 @@ async fn run_session_loop(
                                 tool_calls = output.tool_calls_made,
                                 "agent_session.turn_complete"
                             );
-                            if let Err(e) = roz_db::agent_sessions::update_session_usage(
-                                pool,
-                                sess.id,
-                                i64::try_from(output.input_tokens).unwrap_or(i64::MAX),
-                                i64::try_from(output.output_tokens).unwrap_or(i64::MAX),
-                                1,
-                            )
-                            .await
-                            {
-                                tracing::warn!(session_id = %sess.id, error = %e, "failed to update session usage");
+                            // Wrap the RLS-sensitive update in a transaction so
+                            // `set_tenant_context` persists across the UPDATE query.
+                            match pool.begin().await {
+                                Ok(mut tx) => {
+                                    if let Err(e) =
+                                        roz_db::set_tenant_context(&mut *tx, &sess.tenant_id).await
+                                    {
+                                        tracing::warn!(session_id = %sess.id, error = %e, "failed to set tenant context for session usage update");
+                                    } else if let Err(e) = roz_db::agent_sessions::update_session_usage(
+                                        &mut *tx,
+                                        sess.id,
+                                        i64::try_from(output.input_tokens).unwrap_or(i64::MAX),
+                                        i64::try_from(output.output_tokens).unwrap_or(i64::MAX),
+                                        1,
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(session_id = %sess.id, error = %e, "failed to update session usage");
+                                    } else if let Err(e) = tx.commit().await {
+                                        tracing::warn!(session_id = %sess.id, error = %e, "failed to commit session usage update");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(session_id = %sess.id, error = %e, "failed to begin tx for session usage update");
+                                }
                             }
                             let runtime = sess
                                 .runtime
@@ -602,7 +810,7 @@ async fn run_session_loop(
 
         match req.request {
             Some(session_request::Request::Start(start)) => {
-                if !handle_start(tx, pool, auth, default_model, auth_header, start, &mut session).await {
+                if !handle_start(tx, pool, default_model, &auth_identity, start, &mut session).await {
                     break;
                 }
                 if let Some(ref sess) = session {
@@ -642,6 +850,19 @@ async fn run_session_loop(
                         let host_id_for_telem = sess.host_id.clone().unwrap_or_else(|| worker_name.clone());
                         spawn_telemetry_relay(nats, worker_name, &host_id_for_telem, tx, relay_cancel.clone()).await;
                         spawn_webrtc_signaling_relay(nats, worker_name, tx, relay_cancel.clone()).await;
+                    }
+
+                    // DEBT-03: spawn write-behind flush task for cloud (non-edge) sessions.
+                    // TODO(phase 13+): edge session turn persistence deferred — the server
+                    // would double-persist if the worker also emitted. See 13-01 plan.
+                    if !sess.is_edge && turn_emitter.is_none() {
+                        let (emitter, rx) = roz_agent::agent_loop::TurnEmitter::new();
+                        turn_emitter = Some(emitter);
+                        let flush_cancel = relay_cancel.child_token();
+                        let flush_pool = pool.clone();
+                        tokio::spawn(async move {
+                            roz_agent::agent_loop::run_flush_task(rx, flush_pool, flush_cancel).await;
+                        });
                     }
 
                     // Edge mode: relay the entire session to the worker via NATS
@@ -878,7 +1099,8 @@ async fn run_session_loop(
                 let spatial = spatial_bootstrap.provider;
                 let agent_loop = AgentLoop::new(model, dispatcher, safety, spatial)
                     .with_approval_runtime(approval_runtime.clone())
-                    .with_meter(meter.clone());
+                    .with_meter(meter.clone())
+                    .with_turn_emitter_opt(turn_emitter.clone());
 
                 let turn_cancel = tokio_util::sync::CancellationToken::new();
                 let message_id = msg
@@ -1332,10 +1554,23 @@ async fn run_session_loop(
             "agent_session.ended"
         );
     }
-    if let Some(ref s) = session
-        && let Err(e) = roz_db::agent_sessions::complete_session(pool, s.id, status).await
-    {
-        tracing::warn!(session_id = %s.id, error = %e, "failed to complete session");
+    if let Some(ref s) = session {
+        // Wrap the RLS-sensitive update in a transaction so `set_tenant_context`
+        // persists across the UPDATE query.
+        match pool.begin().await {
+            Ok(mut tx) => {
+                if let Err(e) = roz_db::set_tenant_context(&mut *tx, &s.tenant_id).await {
+                    tracing::warn!(session_id = %s.id, error = %e, "failed to set tenant context for session completion");
+                } else if let Err(e) = roz_db::agent_sessions::complete_session(&mut *tx, s.id, status).await {
+                    tracing::warn!(session_id = %s.id, error = %e, "failed to complete session");
+                } else if let Err(e) = tx.commit().await {
+                    tracing::warn!(session_id = %s.id, error = %e, "failed to commit session completion");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(session_id = %s.id, error = %e, "failed to begin tx for session completion");
+            }
+        }
     }
 }
 
@@ -1653,9 +1888,8 @@ async fn spawn_webrtc_signaling_relay(
 async fn handle_start(
     tx: &mpsc::Sender<Result<SessionResponse, Status>>,
     pool: &PgPool,
-    auth: &Arc<dyn GrpcAuth>,
     default_model: &str,
-    auth_header: Option<&str>,
+    auth_identity: &AuthIdentity,
     start: roz_v1::StartSession,
     session: &mut Option<Session>,
 ) -> bool {
@@ -1664,15 +1898,7 @@ async fn handle_start(
         return true; // non-fatal, just ignore
     }
 
-    // Auth: validate the authorization header.
-    let auth_identity = match auth.authenticate(pool, auth_header).await {
-        Ok(id) => id,
-        Err(err_msg) => {
-            send_error(tx, "unauthenticated", &err_msg, false).await;
-            return false; // fatal
-        }
-    };
-
+    // Auth was performed by grpc_auth_middleware before this handler runs.
     let tenant_id = auth_identity.tenant_id().0;
 
     // Auto-resolve environment: if empty, use tenant's first environment or create "default".
@@ -1714,13 +1940,36 @@ async fn handle_start(
     };
 
     // Write session metadata to Postgres.
-    let session_row = match roz_db::agent_sessions::create_session(pool, tenant_id, env_id, &model_name).await {
-        Ok(row) => row,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to create agent session");
+    // Wrap the RLS-sensitive insert in a transaction so `set_tenant_context`
+    // persists across the INSERT query.
+    let session_row = {
+        let mut db_tx = match pool.begin().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to begin tx for agent session creation");
+                send_error(tx, "internal", "failed to create session", true).await;
+                return false;
+            }
+        };
+        if let Err(e) = roz_db::set_tenant_context(&mut *db_tx, &tenant_id).await {
+            tracing::error!(error = %e, "failed to set tenant context for agent session creation");
             send_error(tx, "internal", "failed to create session", true).await;
             return false;
         }
+        let row = match roz_db::agent_sessions::create_session(&mut *db_tx, tenant_id, env_id, &model_name).await {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to create agent session");
+                send_error(tx, "internal", "failed to create session", true).await;
+                return false;
+            }
+        };
+        if let Err(e) = db_tx.commit().await {
+            tracing::error!(error = %e, "failed to commit agent session creation");
+            send_error(tx, "internal", "failed to create session", true).await;
+            return false;
+        }
+        row
     };
 
     let session_id = session_row.id;

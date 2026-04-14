@@ -1,0 +1,21 @@
+[package]
+name = "roz-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Client-only generated tonic stubs + helpers for the roz.v1 gRPC surface"
+
+[dependencies]
+tonic = { workspace = true, features = ["tls-native-roots", "tls-ring"] }
+prost = { workspace = true }
+prost-types = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+
+[lints]
+workspace = true

@@ -16,6 +16,8 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+async-trait = { workspace = true }
 
 # Phase 4 — Skills, Sim-to-Real, DeviceTrust
 regex = { workspace = true }

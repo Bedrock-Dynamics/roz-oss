@@ -96,6 +96,13 @@ impl Subjects {
         Ok(format!("capabilities.{worker_id}"))
     }
 
+    // Pinned from pre-refactor source: subjects are D-18 BLOCKING. Any change to
+    // these literals requires coordinated worker + server migration. Format is
+    // "session.{worker_id}.{session_id}.{request|response|control}".
+    //
+    // Workers subscribe via `format!("session.{worker_id}.*.request")` (wildcard
+    // hoisted inline in `crates/roz-worker/src/session_relay.rs:spawn_session_relay`).
+
     /// Build a session request subject: `session.{worker_id}.{session_id}.request`.
     pub fn session_request(worker_id: &str, session_id: &str) -> Result<String, RozError> {
         validate_token("worker_id", worker_id)?;
@@ -121,6 +128,17 @@ impl Subjects {
     pub fn estop(worker_id: &str) -> Result<String, RozError> {
         validate_token("worker_id", worker_id)?;
         Ok(format!("safety.estop.{worker_id}"))
+    }
+
+    /// WASM signature verification failure subject:
+    /// `safety.trust_failure.{worker_id}`.
+    ///
+    /// Emitted by `roz-worker` (at the caller boundary) when a `.cwasm`
+    /// signature fails verification via `roz-copper::wasm_signature`.
+    /// Complements `tracing::error!` at the failure site (Phase 14 / ENF-02).
+    pub fn wasm_trust_failure(worker_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        Ok(format!("safety.trust_failure.{worker_id}"))
     }
 
     /// Build a WebRTC offer subject: `webrtc.{worker_id}.{peer_id}.offer`.
@@ -270,6 +288,21 @@ mod tests {
         );
         assert!(Subjects::estop("").is_err(), "empty worker_id is invalid");
         assert!(Subjects::estop("worker>greater").is_err(), "> is NATS full-wildcard");
+    }
+
+    #[test]
+    fn wasm_trust_failure_subject() {
+        let subject = Subjects::wasm_trust_failure("robot-1").unwrap();
+        assert_eq!(subject, "safety.trust_failure.robot-1");
+    }
+
+    #[test]
+    fn wasm_trust_failure_validates_worker_id() {
+        assert!(Subjects::wasm_trust_failure("").is_err(), "empty rejected");
+        assert!(Subjects::wasm_trust_failure("a.b").is_err(), "dots break hierarchy");
+        assert!(Subjects::wasm_trust_failure("a*b").is_err(), "wildcards");
+        assert!(Subjects::wasm_trust_failure("a>b").is_err(), "> is full-wildcard");
+        assert!(Subjects::wasm_trust_failure("robot-1").is_ok());
     }
 
     #[test]

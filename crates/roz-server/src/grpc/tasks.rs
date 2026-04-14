@@ -1,10 +1,13 @@
 #![allow(clippy::result_large_err)]
 
+use std::sync::Arc;
+
+use roz_core::device_trust::evaluator::TrustPolicy;
 use sqlx::PgPool;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
-use crate::grpc::agent::GrpcAuth;
+use crate::grpc::auth_ext;
 use crate::grpc::roz_v1::task_service_server::TaskService;
 use crate::grpc::roz_v1::{
     ApproveToolUseRequest, CancelTaskRequest, CancelTaskResponse, CreateTaskRequest, GetTaskRequest, ListTasksRequest,
@@ -26,7 +29,9 @@ pub struct TaskServiceImpl {
     http_client: reqwest::Client,
     restate_ingress_url: String,
     nats_client: Option<async_nats::Client>,
-    auth: std::sync::Arc<dyn GrpcAuth>,
+    /// Device trust policy — enforced by `check_host_trust` in `create_task`
+    /// BEFORE Restate / NATS dispatch (ENF-01).
+    trust_policy: Arc<TrustPolicy>,
 }
 
 impl TaskServiceImpl {
@@ -35,31 +40,15 @@ impl TaskServiceImpl {
         http_client: reqwest::Client,
         restate_ingress_url: String,
         nats_client: Option<async_nats::Client>,
-        auth: std::sync::Arc<dyn GrpcAuth>,
+        trust_policy: Arc<TrustPolicy>,
     ) -> Self {
         Self {
             pool,
             http_client,
             restate_ingress_url,
             nats_client,
-            auth,
+            trust_policy,
         }
-    }
-
-    async fn authenticated_tenant_id<T: Sync>(&self, request: &Request<T>) -> Result<Uuid, Status> {
-        let auth_header = request
-            .metadata()
-            .get("authorization")
-            .ok_or_else(|| Status::unauthenticated("missing authorization metadata"))?
-            .to_str()
-            .map_err(|_| Status::invalid_argument("invalid authorization metadata"))?;
-
-        let identity = self
-            .auth
-            .authenticate(&self.pool, Some(auth_header))
-            .await
-            .map_err(Status::unauthenticated)?;
-        Ok(identity.tenant_id().0)
     }
 }
 
@@ -100,9 +89,13 @@ fn task_row_to_proto(row: roz_db::tasks::TaskRow) -> Task {
 }
 
 /// Map a `sqlx::Error` into a `tonic::Status`.
+///
+/// The raw error is logged via `tracing::error!` (includes table/column/constraint
+/// names from sqlx), while the client-visible message is an opaque "database error"
+/// to avoid leaking schema details across tenants.
 fn db_err_to_status(e: &sqlx::Error) -> Status {
     tracing::error!(error = %e, "database error");
-    Status::internal(format!("database error: {e}"))
+    Status::internal("database error")
 }
 
 /// Convert a protobuf `Struct` into a `serde_json::Value`.
@@ -222,7 +215,7 @@ async fn publish_parent_approval_event(
 #[tonic::async_trait]
 impl TaskService for TaskServiceImpl {
     async fn create_task(&self, request: Request<CreateTaskRequest>) -> Result<Response<Task>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let body = request.into_inner();
         let CreateTaskRequest {
             prompt,
@@ -256,16 +249,27 @@ impl TaskService for TaskServiceImpl {
 
         validate_child_task_delegation_scope(parent_task_id, delegation_scope.as_ref())?;
 
+        // WR-06: when parent_task_id is provided, verify the parent exists and
+        // belongs to the same tenant. Without this check, a caller could forge
+        // a parent_task_id pointing at another tenant's task, which would
+        // later cause approve_tool_use to publish team events onto that
+        // foreign tenant's team subject.
+        if let Some(parent_id) = parent_task_id {
+            let parent = roz_db::tasks::get_by_id(&self.pool, parent_id)
+                .await
+                .map_err(|e| db_err_to_status(&e))?
+                .ok_or_else(|| Status::invalid_argument("parent_task_id not found"))?;
+            if parent.tenant_id != tenant_id {
+                return Err(Status::invalid_argument("parent_task_id not found"));
+            }
+        }
+
         let host_id_str = host_id.trim();
         if host_id_str.is_empty() {
             return Err(Status::invalid_argument(
                 "host_id is required until deferred assignment is implemented",
             ));
         }
-        let nats = self
-            .nats_client
-            .as_ref()
-            .ok_or_else(|| Status::internal("task dispatch unavailable: NATS is not configured"))?;
         let host_uuid =
             Uuid::parse_str(host_id_str).map_err(|_| Status::invalid_argument("host_id is not a valid UUID"))?;
         let host = roz_db::hosts::get_by_id(&self.pool, host_uuid)
@@ -275,6 +279,30 @@ impl TaskService for TaskServiceImpl {
                 Status::internal(format!("failed to look up host: {e}"))
             })?
             .ok_or_else(|| Status::not_found(format!("host {host_id_str} not found")))?;
+
+        // ENF-01: device trust gate — MUST run BEFORE task row creation /
+        // Restate workflow / NATS publish so untrusted requests never touch
+        // durable state. Also runs BEFORE the NATS-availability check so the
+        // trust rejection (FailedPrecondition) is not masked by a 500/Internal
+        // from downstream infrastructure being unconfigured. Detailed reason
+        // stays server-side via tracing::warn!; wire response is fixed
+        // `FailedPrecondition("host trust posture not satisfied")` per CONTEXT D-04.
+        if let Err(rejection) =
+            crate::trust::check_host_trust(&self.pool, tenant_id, host_uuid, &self.trust_policy).await
+        {
+            tracing::warn!(
+                %tenant_id,
+                %host_uuid,
+                reason = %rejection.reason,
+                "task dispatch rejected: host trust posture not satisfied"
+            );
+            return Err(Status::failed_precondition("host trust posture not satisfied"));
+        }
+
+        let nats = self
+            .nats_client
+            .as_ref()
+            .ok_or_else(|| Status::internal("task dispatch unavailable: NATS is not configured"))?;
 
         let task = roz_db::tasks::create(
             &self.pool,
@@ -355,7 +383,7 @@ impl TaskService for TaskServiceImpl {
     }
 
     async fn get_task(&self, request: Request<GetTaskRequest>) -> Result<Response<Task>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let body = request.into_inner();
 
         let task_id = Uuid::parse_str(&body.id).map_err(|_| Status::invalid_argument("id is not a valid UUID"))?;
@@ -373,7 +401,7 @@ impl TaskService for TaskServiceImpl {
     }
 
     async fn list_tasks(&self, request: Request<ListTasksRequest>) -> Result<Response<ListTasksResponse>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let body = request.into_inner();
 
         let limit = if body.limit > 0 { body.limit } else { 50 };
@@ -388,7 +416,7 @@ impl TaskService for TaskServiceImpl {
     }
 
     async fn cancel_task(&self, request: Request<CancelTaskRequest>) -> Result<Response<CancelTaskResponse>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let body = request.into_inner();
 
         let task_id = Uuid::parse_str(&body.id).map_err(|_| Status::invalid_argument("id is not a valid UUID"))?;
@@ -410,7 +438,7 @@ impl TaskService for TaskServiceImpl {
     }
 
     async fn approve_tool_use(&self, request: Request<ApproveToolUseRequest>) -> Result<Response<Task>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let body = request.into_inner();
 
         let task_id =
@@ -452,24 +480,16 @@ impl TaskService for TaskServiceImpl {
             Status::internal("workflow signal error")
         })?;
 
+        // Publish the approval event best-effort. Publish failures are logged
+        // inside publish_parent_approval_event; the approval has already been
+        // durably signaled to Restate above, so we do not fail the RPC on a
+        // NATS fanout error. For tasks without a parent, we publish under the
+        // child's own task_id so worker-local subscribers still receive the
+        // event.
         if let Some(nats) = &self.nats_client {
-            if let Some(parent_task_id) = task.parent_task_id {
-                let js = async_nats::jetstream::new(nats.clone());
-                if publish_parent_approval_event(&js, parent_task_id, task_id, &approval_id, approved, modifier.clone())
-                    .await
-                    .is_err()
-                {
-                    return Ok(Response::new(task_row_to_proto(task)));
-                }
-            } else {
-                let js = async_nats::jetstream::new(nats.clone());
-                if publish_parent_approval_event(&js, task_id, task_id, &approval_id, approved, modifier.clone())
-                    .await
-                    .is_err()
-                {
-                    return Ok(Response::new(task_row_to_proto(task)));
-                }
-            }
+            let js = async_nats::jetstream::new(nats.clone());
+            let parent_task_id = task.parent_task_id.unwrap_or(task_id);
+            let _ = publish_parent_approval_event(&js, parent_task_id, task_id, &approval_id, approved, modifier).await;
         }
 
         // Return the task as it was before approval (approval is async)
@@ -482,7 +502,7 @@ impl TaskService for TaskServiceImpl {
         &self,
         request: Request<StreamTaskStatusRequest>,
     ) -> Result<Response<Self::StreamTaskStatusStream>, Status> {
-        let tenant_id = self.authenticated_tenant_id(&request).await?;
+        let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let body = request.into_inner();
         let task_id =
             Uuid::parse_str(&body.task_id).map_err(|_| Status::invalid_argument("task_id is not a valid UUID"))?;
@@ -539,39 +559,10 @@ impl TaskService for TaskServiceImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grpc::agent::GrpcAuth;
-    use roz_core::auth::{ApiKeyScope, AuthIdentity, TenantId};
     use roz_core::phases::{PhaseMode, PhaseSpec, PhaseTrigger, ToolSetFilter};
     use roz_core::tasks::DelegationScope;
     use roz_core::trust::{TrustLevel, TrustPosture};
     use std::collections::BTreeMap;
-    use std::sync::Arc;
-
-    async fn test_pool() -> PgPool {
-        let url = roz_test::pg_url().await;
-        let pool = roz_db::create_pool(url).await.expect("create test pool");
-        roz_db::run_migrations(&pool).await.expect("run test migrations");
-        pool
-    }
-
-    struct TestGrpcAuth {
-        tenant_id: Uuid,
-    }
-
-    #[tonic::async_trait]
-    impl GrpcAuth for TestGrpcAuth {
-        async fn authenticate(&self, _pool: &PgPool, auth_header: Option<&str>) -> Result<AuthIdentity, String> {
-            match auth_header {
-                Some("Bearer roz_sk_test") => Ok(AuthIdentity::ApiKey {
-                    key_id: Uuid::nil(),
-                    tenant_id: TenantId::new(self.tenant_id),
-                    scopes: vec![ApiKeyScope::ReadTasks],
-                }),
-                Some(other) => Err(format!("unexpected auth header: {other}")),
-                None => Err("missing authorization header".into()),
-            }
-        }
-    }
 
     fn json_to_prost_struct(value: serde_json::Value) -> prost_types::Struct {
         let serde_json::Value::Object(map) = value else {
@@ -649,40 +640,6 @@ mod tests {
         };
         let proto = task_row_to_proto(row);
         assert!(proto.host_id.is_none());
-    }
-
-    #[tokio::test]
-    async fn authenticated_tenant_id_rejects_missing_header() {
-        let tenant = Uuid::new_v4();
-        let service = TaskServiceImpl::new(
-            test_pool().await,
-            reqwest::Client::new(),
-            "http://localhost:9080".into(),
-            None,
-            Arc::new(TestGrpcAuth { tenant_id: tenant }),
-        );
-        let req = Request::new(());
-        let result = service.authenticated_tenant_id(&req).await;
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().code(), tonic::Code::Unauthenticated);
-    }
-
-    #[tokio::test]
-    async fn authenticated_tenant_id_accepts_bearer_authorization_metadata() {
-        let tenant = Uuid::new_v4();
-        let service = TaskServiceImpl::new(
-            test_pool().await,
-            reqwest::Client::new(),
-            "http://localhost:9080".into(),
-            None,
-            Arc::new(TestGrpcAuth { tenant_id: tenant }),
-        );
-        let mut req = Request::new(());
-        req.metadata_mut()
-            .insert("authorization", "Bearer roz_sk_test".parse().unwrap());
-        let result = service.authenticated_tenant_id(&req).await;
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), tenant);
     }
 
     #[test]

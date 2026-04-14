@@ -45,6 +45,9 @@ pub enum RozError {
     #[error("trust verification error: {0}")]
     TrustVerification(String),
 
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(String),
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

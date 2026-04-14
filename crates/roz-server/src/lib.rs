@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod extractors;
 pub mod grpc;
 pub mod middleware;
 pub mod nats_handlers;
@@ -9,6 +10,7 @@ pub mod restate;
 pub mod routes;
 pub mod state;
 pub mod triggers;
+pub mod trust;
 pub mod ws;
 
 use axum::Router;
@@ -113,8 +115,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/ws", get(ws::handler::ws_upgrade))
         // Device auth completion (requires auth)
         .route("/v1/auth/device/complete", post(routes::device_auth::complete_auth))
-        // Tx middleware (innermost = runs after auth but before handler)
+        // Tx middleware (innermost = runs after auth + rate limit)
         .layer(axum::middleware::from_fn(middleware::tx::tx_layer))
+        // Rate limit middleware (middle = runs after auth, before tx_layer)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::rate_limit::rate_limit_middleware,
+        ))
         // Auth middleware (outermost = runs first)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

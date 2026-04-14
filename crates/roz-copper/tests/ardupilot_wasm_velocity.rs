@@ -1,11 +1,28 @@
-//! ArduPilot WASM velocity through bridge: arm, GUIDED takeoff, verify movement.
+#![allow(
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::approx_constant,
+    clippy::doc_markdown,
+    clippy::ignore_without_reason,
+    clippy::large_enum_variant,
+    clippy::missing_const_for_fn,
+    clippy::or_fun_call,
+    clippy::struct_excessive_bools,
+    clippy::type_complexity,
+    clippy::derive_partial_eq_without_eq,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::format_collect,
+    reason = "test-only style/complexity lints; tech-debt follow-up"
+)]
+//! `ArduPilot` WASM velocity through bridge: arm, GUIDED takeoff, verify movement.
 //!
-//! Proves the full drone pipeline on the ArduPilot stack:
+//! Proves the full drone pipeline on the `ArduPilot` stack:
 //! WASM controller outputs body velocity ->
-//! GrpcActuatorSink -> bridge -> MAVLink SET_POSITION_TARGET_LOCAL_NED.
+//! `GrpcActuatorSink` -> bridge -> `MAVLink` `SET_POSITION_TARGET_LOCAL_NED`.
 //! The drone must actually move, not just accept commands silently.
 //!
-//! Requires: ArduPilot Gazebo container on port 9097
+//! Requires: `ArduPilot` Gazebo container on port 9097
 //! ```bash
 //! docker run -d --name roz-test-ardu -p 9097:9090 -p 14550:14550/udp \
 //!     bedrockdynamics/substrate-sim:ardupilot-gazebo
@@ -43,8 +60,7 @@ fn load_quadcopter_control_manifest() -> (ControlInterfaceManifest, String) {
         robot
             .channels
             .as_ref()
-            .map(|channels| channels.robot_class.clone())
-            .unwrap_or_else(|| "generic".into()),
+            .map_or_else(|| "generic".into(), |channels| channels.robot_class.clone()),
     )
 }
 
@@ -61,7 +77,7 @@ async fn send_flight_cmd(channel: tonic::transport::Channel, cmd: FlightCommand,
     let req = FlightCommandRequest {
         command: cmd.into(),
         mode: mode.into(),
-        altitude_m: altitude_m as f64,
+        altitude_m: f64::from(altitude_m),
         ..Default::default()
     };
     let label = format!("{cmd:?}");
@@ -252,8 +268,7 @@ async fn ardupilot_wasm_velocity_through_bridge() {
     for e in &current.entities {
         let pos = e
             .position
-            .map(|[x, y, z]| format!("({x:.3}, {y:.3}, {z:.3})"))
-            .unwrap_or_else(|| "N/A".into());
+            .map_or_else(|| "N/A".into(), |[x, y, z]| format!("({x:.3}, {y:.3}, {z:.3})"));
         println!("  {} @ {pos}", e.id);
     }
 

@@ -38,6 +38,10 @@ tokio-tungstenite.workspace = true
 futures.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
+ciborium = { workspace = true }
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
+thiserror = { workspace = true }
 hex.workspace = true
 sha2.workspace = true
 tracing.workspace = true
@@ -48,6 +52,7 @@ wit-parser = "0.244.0"
 
 [dev-dependencies]
 tempfile = "3"
+rand = { workspace = true }
 wasmprinter = "0.245.1"
 
 [build-dependencies]
@@ -61,6 +66,15 @@ required-features = ["gazebo"]
 [[test]]
 name = "gazebo_grpc_integration"
 required-features = ["gazebo"]
+
+# Signed-AOT integration tests (ENF-02) — only compile with --features aot.
+[[test]]
+name = "wasm_signature_integration"
+required-features = ["aot"]
+
+# SEC-05 scope-boundary meta-test — MUST run in every build (no features).
+[[test]]
+name = "sec05_scope_boundary"
 
 [lints]
 workspace = true

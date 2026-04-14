@@ -2988,7 +2988,7 @@ mod tests {
         assert_eq!(period, Duration::from_millis(2));
     }
 
-    /// Helper: spawn controller loop, return (tx, state, shutdown, join_handle, estop_rx).
+    /// Helper: spawn controller loop, return (tx, state, shutdown, `join_handle`, `estop_rx`).
     fn spawn_controller(
         max_velocity: f64,
     ) -> (
@@ -3727,14 +3727,15 @@ mod tests {
         assert_eq!(current.candidate_controller_id.as_deref(), Some("candidate-ctrl"));
         assert!(current.candidate_stage_ticks_required >= 1);
         assert_eq!(current.candidate_stage_ticks_completed, 0);
-        assert_eq!(current.candidate_canary_bounded, true);
+        assert!(current.candidate_canary_bounded);
         assert!(current.candidate_last_normalized_delta.is_some());
         assert!(current.candidate_last_max_abs_delta.is_some());
         let output = current.last_output.clone().expect("canary output should be published");
         assert_eq!(output["canary_bounded"], true);
         let bounded_value = output["values"][0].as_f64().expect("bounded value should be numeric");
-        let expected_bounded_value = 0.2
-            + deployment_manager.canary_max_command_delta() * fallback_limit_span(&CommandInterfaceType::JointVelocity);
+        let expected_bounded_value = deployment_manager
+            .canary_max_command_delta()
+            .mul_add(fallback_limit_span(&CommandInterfaceType::JointVelocity), 0.2);
         assert!(
             (bounded_value - expected_bounded_value).abs() < f64::EPSILON,
             "unexpected bounded canary value: {bounded_value}"

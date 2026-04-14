@@ -194,10 +194,14 @@ impl WorldStateProvider for PrimedWorldStateProvider {
 
 /// A spatial provider that panics if `snapshot()` is called.
 /// Used in tests to verify that React mode never observes spatial context.
-#[cfg(test)]
+///
+/// Visibility is `#[doc(hidden)] pub` so the integration test crate
+/// `tests/agent_loop.rs` can reach it (per Plan 12-02 test hoist). The
+/// `#[cfg(test)]` attribute previously used here did not transfer to
+/// integration-test binary builds — see Plan 12-RESEARCH Pitfall 2.
+#[doc(hidden)]
 pub struct PanicWorldStateProvider;
 
-#[cfg(test)]
 #[async_trait]
 impl WorldStateProvider for PanicWorldStateProvider {
     async fn snapshot(&self, _task_id: &str) -> WorldState {
@@ -209,7 +213,6 @@ impl WorldStateProvider for PanicWorldStateProvider {
 pub use MockWorldStateProvider as MockSpatialContextProvider;
 #[doc(hidden)]
 pub use NullWorldStateProvider as NullSpatialContextProvider;
-#[cfg(test)]
 #[doc(hidden)]
 pub use PanicWorldStateProvider as PanicSpatialProvider;
 #[doc(hidden)]

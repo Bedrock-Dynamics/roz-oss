@@ -1,0 +1,397 @@
+# Nightly integration test workflow — Phase 14 TEST-01.
+# Runs the Docker-dependent #[ignore]-tagged integration suite daily via
+# the `ci-integration` nextest profile (see .config/nextest.toml).
+#
+# Three-job capability split per REVIEWS.md HIGH:
+#   - integration-base:   base Docker suite (no special features)
+#   - integration-aot:    roz-copper --features aot (signature integration tests)
+#   - integration-gazebo: roz-copper --features gazebo (Gazebo sim tests)
+# Each job fails independently; the summary job opens/updates a single issue.
+#
+# Cron: "0 8 * * *" UTC (REVIEWS.md MEDIUM — DST-consistent).
+#   - PST (winter): 00:00 (midnight) Pacific
+#   - PDT (summer): 01:00 AM Pacific
+# Both windows are overnight in PT; the cron string itself does not drift.
+#
+# Third-party action pins (REVIEWS.md MEDIUM):
+#   Pinned to commit SHAs resolved at plan execution time:
+#     dtolnay/rust-toolchain              @ e18b497796c12c097a38f9edb9d0641fb99eee32
+#     Swatinem/rust-cache                 @ 3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+#     taiki-e/install-action              @ 0abfcd587b70a713fdaa7fb502c885e2112acb15
+#     peter-evans/create-issue-from-file  @ e8ef132d6df98ed982188e460ebb3b5d4ef3a9cd
+
+name: Nightly Integration
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  integration-base:
+    name: Integration (base)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      outcome: ${{ steps.nextest.outcome }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        # Pinned per REVIEWS.md MEDIUM.
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: "1.92.0"
+          components: rustfmt, clippy
+
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@0abfcd587b70a713fdaa7fb502c885e2112acb15
+        with:
+          tool: cargo-nextest@0.9.132
+
+      - name: Sanity-check Docker
+        run: docker version && docker ps
+
+      - name: Clean stale Docker state
+        run: |
+          docker ps -aq | xargs -r docker rm -f || true
+          docker network prune -f || true
+
+      - name: Run ci-integration (base)
+        id: nextest
+        run: |
+          cargo nextest run \
+            --profile ci-integration \
+            --run-ignored ignored-only \
+            --workspace
+        continue-on-error: true
+
+      - name: Upload JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-base
+          path: target/nextest/ci-integration/junit.xml
+          if-no-files-found: ignore
+
+      - name: Fail job if nextest failed
+        # `continue-on-error: true` on the nextest step keeps the job alive
+        # long enough to upload JUnit. Propagate the step outcome to the job
+        # result so `needs.<job>.result` accurately signals failure to the
+        # summarize-and-issue / fail-if-any-job-failed jobs.
+        if: steps.nextest.outcome == 'failure'
+        run: exit 1
+
+  integration-aot:
+    name: Integration (roz-copper aot)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      outcome: ${{ steps.nextest.outcome }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: "1.92.0"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: taiki-e/install-action@0abfcd587b70a713fdaa7fb502c885e2112acb15
+        with:
+          tool: cargo-nextest@0.9.132
+      - run: docker version && docker ps
+      - name: Clean stale Docker state
+        run: |
+          docker ps -aq | xargs -r docker rm -f || true
+          docker network prune -f || true
+      - name: Run ci-integration (aot)
+        id: nextest
+        # Scoped to roz-copper with --features aot — picks up the
+        # `wasm_signature_integration` test binary (required-features=["aot"])
+        # as well as its #[ignore]-tagged `emits_trust_failure_event_on_verify_fail`.
+        run: |
+          cargo nextest run \
+            --profile ci-integration \
+            --run-ignored ignored-only \
+            -p roz-copper \
+            --features aot
+        continue-on-error: true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-aot
+          path: target/nextest/ci-integration/junit.xml
+          if-no-files-found: ignore
+
+      - name: Fail job if nextest failed
+        if: steps.nextest.outcome == 'failure'
+        run: exit 1
+
+  integration-gazebo:
+    name: Integration (roz-copper gazebo)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      outcome: ${{ steps.nextest.outcome }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: "1.92.0"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: taiki-e/install-action@0abfcd587b70a713fdaa7fb502c885e2112acb15
+        with:
+          tool: cargo-nextest@0.9.132
+      - run: docker version && docker ps
+      - name: Clean stale Docker state
+        run: |
+          docker ps -aq | xargs -r docker rm -f || true
+          docker network prune -f || true
+      - name: Run ci-integration (gazebo)
+        id: nextest
+        # --features gazebo compiles the `gazebo_docker_integration` and
+        # `gazebo_grpc_integration` test binaries (see
+        # crates/roz-copper/Cargo.toml:57).
+        run: |
+          cargo nextest run \
+            --profile ci-integration \
+            --run-ignored ignored-only \
+            -p roz-copper \
+            --features gazebo
+        continue-on-error: true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-gazebo
+          path: target/nextest/ci-integration/junit.xml
+          if-no-files-found: ignore
+
+      - name: Fail job if nextest failed
+        if: steps.nextest.outcome == 'failure'
+        run: exit 1
+
+  zenoh-chaos:
+    name: Integration (zenoh chaos + multi-worker, phase 16)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      outcome: ${{ steps.nextest.outcome }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: "1.92.0"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: taiki-e/install-action@0abfcd587b70a713fdaa7fb502c885e2112acb15
+        with:
+          tool: cargo-nextest@0.9.132
+      - run: docker version && docker ps
+      - name: Clean stale Docker state
+        run: |
+          docker ps -aq | xargs -r docker rm -f || true
+          docker network prune -f || true
+      - name: Pre-build roz-worker binary (needed for CARGO_BIN_EXE_roz-worker)
+        # Phase 16 fleet tests (ZEN-TEST-01/03) spawn the worker binary via
+        # tokio::process::Command; nextest's cargo-bin wiring only works if
+        # the binary has been built in the same target/debug directory first.
+        run: cargo build -p roz-worker --features zenoh
+      - name: Run ci-chaos profile
+        id: nextest
+        run: |
+          cargo nextest run \
+            --profile ci-chaos \
+            --run-ignored ignored-only \
+            -p roz-worker -p roz-zenoh \
+            --features zenoh
+        continue-on-error: true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-zenoh-chaos
+          path: target/nextest/ci-chaos/junit.xml
+          if-no-files-found: ignore
+
+      - name: Fail job if nextest failed
+        if: steps.nextest.outcome == 'failure'
+        run: exit 1
+
+  zenoh-bench:
+    name: Zenoh benches (regression-gated)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      outcome: ${{ steps.bench.outcome }}
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: "1.92.0"
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - run: docker version && docker ps
+      - name: Clean stale Docker state
+        run: |
+          docker ps -aq | xargs -r docker rm -f || true
+          docker network prune -f || true
+      - name: Install critcmp
+        run: cargo install --locked critcmp@0.1.8
+      - name: Restore main baseline
+        # Split cache into restore + save (CodeRabbit fix #1): a fixed-key
+        # `actions/cache@v4` entry is immutable once written, so the
+        # "Promote nightly-head to main baseline" mutation below was never
+        # being persisted. Use restore here with a prefix in `restore-keys`
+        # so subsequent runs pick up the newest saved baseline, and save
+        # with a unique key after the promote step.
+        uses: actions/cache/restore@v4
+        with:
+          path: target/criterion
+          key: bench-main-baseline-${{ runner.os }}-v1
+          restore-keys: |
+            bench-main-baseline-${{ runner.os }}-
+      - name: Run benches
+        id: bench
+        run: cargo bench -p roz-bench -- --save-baseline=nightly-head
+        continue-on-error: true
+      - name: Compare vs main baseline (tolerate missing on first run)
+        run: |
+          if ls target/criterion/*/main >/dev/null 2>&1; then
+            critcmp main nightly-head --threshold 1.25
+          else
+            echo "No main baseline yet — calibration run per D-03."
+          fi
+      - name: Promote nightly-head to main baseline (scheduled only)
+        if: github.event_name == 'schedule'
+        run: |
+          for d in target/criterion/*/nightly-head; do
+            [ -d "$d" ] || continue
+            main_dir="$(dirname "$d")/main"
+            rm -rf "$main_dir"
+            cp -r "$d" "$main_dir"
+          done
+      - name: Save promoted main baseline (scheduled only)
+        # Unique key per run ensures the cache entry is actually written;
+        # the restore step above falls back to the newest entry via the
+        # `bench-main-baseline-${{ runner.os }}-` prefix in restore-keys.
+        if: github.event_name == 'schedule'
+        uses: actions/cache/save@v4
+        with:
+          path: target/criterion
+          key: bench-main-baseline-${{ runner.os }}-${{ github.run_id }}
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-reports
+          path: target/criterion/**/report/index.html
+          if-no-files-found: ignore
+
+      - name: Fail job if bench failed
+        if: steps.bench.outcome == 'failure'
+        run: exit 1
+
+  summarize-and-issue:
+    name: Open/update failure issue
+    runs-on: ubuntu-latest
+    needs: [integration-base, integration-aot, integration-gazebo, zenoh-chaos, zenoh-bench]
+    permissions:
+      issues: write
+      contents: read
+    if: |
+      always() &&
+      (needs.integration-base.result == 'failure' ||
+       needs.integration-aot.result == 'failure' ||
+       needs.integration-gazebo.result == 'failure' ||
+       needs.zenoh-chaos.result == 'failure' ||
+       needs.zenoh-bench.result == 'failure')
+
+    steps:
+      - name: Compute ISO date
+        id: date
+        run: echo "iso=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Download JUnit artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: junits
+
+      - name: Prepare failure issue body
+        run: |
+          {
+            echo "# Nightly integration failure ${{ steps.date.outputs.iso }}"
+            echo
+            echo "Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            echo "## Job outcomes"
+            echo "- integration-base:   ${{ needs.integration-base.result }}"
+            echo "- integration-aot:    ${{ needs.integration-aot.result }}"
+            echo "- integration-gazebo: ${{ needs.integration-gazebo.result }}"
+            echo "- zenoh-chaos:        ${{ needs.zenoh-chaos.result }}"
+            echo "- zenoh-bench:        ${{ needs.zenoh-bench.result }}"
+            echo
+            echo "## JUnit summaries"
+            for j in junits/junit-*/junit.xml; do
+              [ -f "$j" ] || continue
+              echo
+              echo "### $j"
+              echo '```xml'
+              head -n 60 "$j"
+              echo '```'
+            done
+          } > nightly-failure.md
+
+      - name: Open / update failure issue
+        uses: peter-evans/create-issue-from-file@e8ef132d6df98ed982188e460ebb3b5d4ef3a9cd
+        with:
+          title: "Nightly integration failure ${{ steps.date.outputs.iso }}"
+          content-filepath: ./nightly-failure.md
+          labels: nightly-failure, auto-opened
+          update-existing: true
+
+  fail-if-any-job-failed:
+    name: Red badge on any failure
+    runs-on: ubuntu-latest
+    needs: [integration-base, integration-aot, integration-gazebo, zenoh-chaos, zenoh-bench]
+    if: |
+      always() &&
+      (needs.integration-base.result == 'failure' ||
+       needs.integration-aot.result == 'failure' ||
+       needs.integration-gazebo.result == 'failure' ||
+       needs.zenoh-chaos.result == 'failure' ||
+       needs.zenoh-bench.result == 'failure')
+    steps:
+      - run: |
+          echo "At least one integration job failed:"
+          echo "  base=${{ needs.integration-base.result }}"
+          echo "  aot=${{ needs.integration-aot.result }}"
+          echo "  gazebo=${{ needs.integration-gazebo.result }}"
+          echo "  zenoh-chaos=${{ needs.zenoh-chaos.result }}"
+          echo "  zenoh-bench=${{ needs.zenoh-bench.result }}"
+          exit 1

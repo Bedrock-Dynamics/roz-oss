@@ -1,6 +1,6 @@
 use axum::Extension;
 use axum::Json;
-use axum::extract::{Path, Query};
+use axum::extract::Path;
 use axum::http::StatusCode;
 use roz_core::auth::AuthIdentity;
 use serde::Deserialize;
@@ -8,6 +8,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::extractors::pagination::ValidatedPagination;
 use crate::middleware::tx::Tx;
 
 #[derive(Deserialize)]
@@ -25,18 +26,6 @@ pub struct UpdateStreamRequest {
     pub name: Option<String>,
     pub rate_hz: Option<f64>,
     pub config: Option<serde_json::Value>,
-}
-
-#[derive(Deserialize)]
-pub struct PaginationParams {
-    #[serde(default = "default_limit")]
-    pub limit: i64,
-    #[serde(default)]
-    pub offset: i64,
-}
-
-const fn default_limit() -> i64 {
-    50
 }
 
 /// POST /v1/streams
@@ -63,10 +52,10 @@ pub async fn create(
 pub async fn list(
     mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
-    Query(params): Query<PaginationParams>,
+    pagination: ValidatedPagination,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
-    let streams = roz_db::streams::list(&mut **tx, tenant_id, params.limit, params.offset).await?;
+    let streams = roz_db::streams::list(&mut **tx, tenant_id, pagination.limit, pagination.offset).await?;
     Ok(Json(json!({"data": streams})))
 }
 

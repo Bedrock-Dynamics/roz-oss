@@ -1,7 +1,7 @@
 use async_nats::jetstream::Context as JetStreamContext;
 use axum::Extension;
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use roz_core::auth::AuthIdentity;
 use roz_core::phases::PhaseSpec;
@@ -11,6 +11,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::extractors::pagination::ValidatedPagination;
 use crate::middleware::tx::Tx;
 use crate::state::AppState;
 
@@ -30,18 +31,6 @@ pub struct CreateTaskRequest {
     pub control_interface_manifest: Option<roz_core::embodiment::binding::ControlInterfaceManifest>,
     /// Optional inherited delegation scope forwarded to the worker invocation.
     pub delegation_scope: Option<roz_core::tasks::DelegationScope>,
-}
-
-#[derive(Deserialize)]
-pub struct PaginationParams {
-    #[serde(default = "default_limit")]
-    pub limit: i64,
-    #[serde(default)]
-    pub offset: i64,
-}
-
-const fn default_limit() -> i64 {
-    50
 }
 
 fn mode_from_phases(phases: &[PhaseSpec]) -> roz_nats::dispatch::ExecutionMode {
@@ -116,15 +105,34 @@ pub async fn create(
         .host_id
         .as_deref()
         .ok_or_else(|| AppError::bad_request("host_id is required until deferred assignment is implemented"))?;
-    let nats = state
-        .nats_client
-        .as_ref()
-        .ok_or_else(|| AppError::internal("task dispatch unavailable: NATS is not configured"))?;
     let host_uuid = Uuid::parse_str(host_id_str).map_err(|_| AppError::bad_request("host_id is not a valid UUID"))?;
     let host = roz_db::hosts::get_by_id(&mut **tx, host_uuid)
         .await
         .map_err(|e| AppError::internal(format!("failed to look up host: {e}")))?
         .ok_or_else(|| AppError::not_found(format!("host {host_id_str} not found")))?;
+
+    // ENF-01: device trust gate — MUST run BEFORE task row creation / Restate
+    // workflow / NATS publish so untrusted requests never touch durable state.
+    // Also runs BEFORE the NATS-availability check: trust rejection is a
+    // first-class wire response (409) and must not be masked by a 500 from
+    // downstream infrastructure being unconfigured.
+    // Detailed reason stays server-side via tracing::warn!; wire response is
+    // opaque 409 per CONTEXT D-04.
+    if let Err(rejection) = crate::trust::check_host_trust(&state.pool, tenant_id, host_uuid, &state.trust_policy).await
+    {
+        tracing::warn!(
+            %tenant_id,
+            %host_uuid,
+            reason = %rejection.reason,
+            "task dispatch rejected: host trust posture not satisfied"
+        );
+        return Err(AppError::trust_rejected());
+    }
+
+    let nats = state
+        .nats_client
+        .as_ref()
+        .ok_or_else(|| AppError::internal("task dispatch unavailable: NATS is not configured"))?;
 
     // Serialise phases to JSONB. An empty array is a valid default (single React phase).
     let phases_json = serde_json::to_value(&body.phases)
@@ -271,15 +279,15 @@ pub async fn approve(
 }
 
 /// GET /v1/tasks
-#[tracing::instrument(name = "tasks.list", skip(tx, auth, params), fields(tenant_id))]
+#[tracing::instrument(name = "tasks.list", skip(tx, auth, pagination), fields(tenant_id))]
 pub async fn list(
     mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
-    Query(params): Query<PaginationParams>,
+    pagination: ValidatedPagination,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
     tracing::Span::current().record("tenant_id", tracing::field::display(tenant_id));
-    let tasks = roz_db::tasks::list(&mut **tx, tenant_id, params.limit, params.offset).await?;
+    let tasks = roz_db::tasks::list(&mut **tx, tenant_id, pagination.limit, pagination.offset).await?;
     Ok(Json(json!({"data": tasks})))
 }
 

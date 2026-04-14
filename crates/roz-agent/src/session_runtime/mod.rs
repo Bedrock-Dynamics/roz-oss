@@ -164,7 +164,13 @@ impl ApprovalRuntimeHandle {
         }
     }
 
-    #[cfg(test)]
+    /// Construct an `ApprovalRuntimeHandle` from a raw `PendingApprovals` map.
+    ///
+    /// Visibility is `#[doc(hidden)] pub` so the integration test crate
+    /// `tests/agent_loop.rs` can reach it via
+    /// `AgentLoop::with_pending_approvals` (per Plan 12-02). Same Pitfall 2
+    /// constraint as `with_pending_approvals` itself.
+    #[doc(hidden)]
     #[must_use]
     pub fn from_pending_approvals(pending_approvals: PendingApprovals) -> Self {
         Self {
@@ -173,13 +179,19 @@ impl ApprovalRuntimeHandle {
         }
     }
 
-    #[cfg(test)]
+    /// Borrow the underlying `PendingApprovals` map.
+    ///
+    /// `#[doc(hidden)] pub` for integration-test reachability (Plan 12-02).
+    #[doc(hidden)]
     #[must_use]
     pub fn pending_approvals(&self) -> PendingApprovals {
         self.pending_approvals.clone()
     }
 
-    #[cfg(test)]
+    /// Replace the underlying `PendingApprovals` map.
+    ///
+    /// `#[doc(hidden)] pub` for integration-test reachability (Plan 12-02).
+    #[doc(hidden)]
     pub fn replace_pending_approvals(&mut self, pending_approvals: PendingApprovals) {
         self.pending_approvals = pending_approvals;
     }

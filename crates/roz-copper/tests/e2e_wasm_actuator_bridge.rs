@@ -1,9 +1,26 @@
-//! E2E: WASM controller → GrpcActuatorSink → SendJointCommand → Gazebo bridge.
+#![allow(
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::approx_constant,
+    clippy::doc_markdown,
+    clippy::ignore_without_reason,
+    clippy::large_enum_variant,
+    clippy::missing_const_for_fn,
+    clippy::or_fun_call,
+    clippy::struct_excessive_bools,
+    clippy::type_complexity,
+    clippy::derive_partial_eq_without_eq,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::format_collect,
+    reason = "test-only style/complexity lints; tech-debt follow-up"
+)]
+//! E2E: WASM controller → `GrpcActuatorSink` → `SendJointCommand` → Gazebo bridge.
 //!
 //! This test sends REAL velocity commands through the gRPC bridge to Gazebo.
-//! Uses the rebuilt bare-gazebo container with SendJointCommand on port 9098.
+//! Uses the rebuilt bare-gazebo container with `SendJointCommand` on port 9098.
 //!
-//! Run: cargo test -p roz-copper --test e2e_wasm_actuator_bridge -- --ignored --nocapture
+//! Run: cargo test -p roz-copper --test `e2e_wasm_actuator_bridge` -- --ignored --nocapture
 
 mod live_controller_support;
 
@@ -17,10 +34,10 @@ use roz_copper::channels::{ControllerCommand, ControllerState};
 use roz_copper::io::ActuatorSink;
 use roz_copper::io_grpc::GrpcActuatorSink;
 
-/// WASM controller sends velocity commands through GrpcActuatorSink → bridge → Gazebo.
+/// WASM controller sends velocity commands through `GrpcActuatorSink` → bridge → Gazebo.
 ///
-/// Proves the entire output pipeline: WASM tick contract → TickOutput → safety filter
-/// → GrpcActuatorSink → SendJointCommand RPC → bridge → gz-transport publish.
+/// Proves the entire output pipeline: WASM tick contract → `TickOutput` → safety filter
+/// → `GrpcActuatorSink` → `SendJointCommand` RPC → bridge → gz-transport publish.
 #[tokio::test]
 #[ignore]
 async fn wasm_velocity_reaches_gazebo_via_grpc() {

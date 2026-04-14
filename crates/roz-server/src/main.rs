@@ -44,75 +44,51 @@ fn app(state: AppState) -> Router {
     roz_server::build_router(state)
 }
 
-// ---------------------------------------------------------------------------
-// GrpcAuth implementation — bridges the binary crate's auth to the library.
-// ---------------------------------------------------------------------------
-
-/// Concrete auth provider that delegates API key validation to the database.
-struct AppGrpcAuth;
-
-#[tonic::async_trait]
-impl roz_server::grpc::agent::GrpcAuth for AppGrpcAuth {
-    async fn authenticate(
-        &self,
-        pool: &sqlx::PgPool,
-        auth_header: Option<&str>,
-    ) -> Result<roz_core::auth::AuthIdentity, String> {
-        let header = auth_header.ok_or_else(|| "missing authorization header".to_string())?;
-
-        let token = header
-            .strip_prefix("Bearer ")
-            .ok_or_else(|| "invalid authorization format".to_string())?;
-
-        if !token.starts_with("roz_sk_") {
-            return Err("only API key auth is supported — use Bearer roz_sk_...".to_string());
-        }
-
-        let api_key = roz_db::api_keys::verify_api_key(pool, token)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "API key verification failed");
-                "authentication failed".to_string()
-            })?
-            .ok_or_else(|| "invalid or revoked API key".to_string())?;
-
-        let scopes = api_key
-            .scopes
-            .iter()
-            .filter_map(
-                |s| match serde_json::from_value::<roz_core::auth::ApiKeyScope>(serde_json::json!(s)) {
-                    Ok(scope) => Some(scope),
-                    Err(e) => {
-                        tracing::warn!(scope = ?s, error = %e, "ignoring unparseable API key scope");
-                        None
-                    }
-                },
-            )
-            .collect();
-
-        Ok(roz_core::auth::AuthIdentity::ApiKey {
-            key_id: api_key.id,
-            tenant_id: roz_core::auth::TenantId::new(api_key.tenant_id),
-            scopes,
-        })
-    }
-}
-
 /// Build the gRPC services as an axum Router for multiplexing on the same port.
+///
+/// Authentication is performed structurally by `grpc_auth_middleware` (applied
+/// as the outer-most layer below). Each service reads `AuthIdentity` from
+/// request extensions via `crate::grpc::auth_ext::tenant_from_extensions`.
 fn grpc_router(state: &AppState) -> Router {
     let task_svc = roz_server::grpc::tasks::TaskServiceImpl::new(
         state.pool.clone(),
         state.http_client.clone(),
         state.restate_ingress_url.clone(),
         state.nats_client.clone(),
-        Arc::new(AppGrpcAuth) as Arc<dyn roz_server::grpc::agent::GrpcAuth>,
+        state.trust_policy.clone(),
     );
+    // Build the primary Gemini media backend. If its dedicated HTTP client
+    // fails to initialize (for example, transient TLS backend init errors —
+    // see SSRF Pitfall 8 for why we don't share AppState's client), fall back
+    // to a `DisabledMediaBackend` that returns UNAVAILABLE from every RPC.
+    // This keeps REST / session traffic healthy instead of turning a
+    // backend-local init failure into a full server outage (WR-03).
+    let media_backend: Arc<dyn roz_server::grpc::media::MediaBackend> =
+        match roz_server::grpc::media::GeminiBackend::new(roz_server::grpc::media::GeminiMediaConfig {
+            gateway_url: state.model_config.gateway_url.clone(),
+            gateway_api_key: state.model_config.api_key.clone(),
+            provider: state.model_config.gemini_provider.clone(),
+            direct_api_key: state.model_config.gemini_direct_api_key.clone(),
+            model: "gemini-2.5-pro".into(),
+            timeout: std::time::Duration::from_secs(state.model_config.timeout_secs),
+        }) {
+            Ok(backend) => Arc::new(backend),
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "failed to build GeminiBackend; AnalyzeMedia will return UNAVAILABLE"
+                );
+                Arc::new(roz_server::grpc::media::DisabledMediaBackend::new(format!(
+                    "gemini backend init failed: {err}"
+                )))
+            }
+        };
+    let media_fetcher = Arc::new(roz_server::grpc::media_fetch::MediaFetcher::new());
     let agent_svc = roz_server::grpc::agent::AgentServiceImpl::new(
         state.pool.clone(),
         state.http_client.clone(),
         state.restate_ingress_url.clone(),
         state.nats_client.clone(),
-        Arc::new(AppGrpcAuth) as Arc<dyn roz_server::grpc::agent::GrpcAuth>,
         state.model_config.default_model.clone(),
         state.model_config.gateway_url.clone(),
         state.model_config.api_key.clone(),
@@ -123,22 +99,32 @@ fn grpc_router(state: &AppState) -> Router {
             .ok()
             .filter(|k| !k.trim().is_empty()),
         state.meter.clone(),
+        media_backend,
+        media_fetcher,
     );
 
-    let embodiment_svc = roz_server::grpc::embodiment::EmbodimentServiceImpl::new(
-        state.pool.clone(),
-        Arc::new(AppGrpcAuth) as Arc<dyn roz_server::grpc::agent::GrpcAuth>,
-        state.nats_client.clone(),
-    );
+    let embodiment_svc =
+        roz_server::grpc::embodiment::EmbodimentServiceImpl::new(state.pool.clone(), state.nats_client.clone());
+
+    let grpc_auth_state = roz_server::middleware::grpc_auth::GrpcAuthState {
+        auth: state.auth.clone(),
+        pool: state.pool.clone(),
+    };
 
     // Use tonic::service::Routes directly (bypasses tonic::transport::Server
     // since axum manages TCP/TLS). into_axum_router() extracts the inner Router.
     tonic::service::Routes::new(roz_server::grpc::roz_v1::task_service_server::TaskServiceServer::new(
         task_svc,
     ))
-    .add_service(roz_server::grpc::roz_v1::agent_service_server::AgentServiceServer::new(
-        agent_svc,
-    ))
+    // AnalyzeMedia accepts inline_bytes up to 10 MB (D-04). The default tonic
+    // decoding cap is 4 MiB, which would reject a valid 10 MB upload at the
+    // transport layer before the handler's own cap can return ResourceExhausted
+    // with a descriptive message. Raise to 12 MiB (10 MB + proto overhead).
+    .add_service(
+        roz_server::grpc::roz_v1::agent_service_server::AgentServiceServer::new(agent_svc)
+            .max_decoding_message_size(12 * 1024 * 1024)
+            .max_encoding_message_size(12 * 1024 * 1024),
+    )
     .add_service(roz_server::grpc::roz_v1::embodiment_service_server::EmbodimentServiceServer::new(embodiment_svc))
     .add_service(
         tonic_reflection::server::Builder::configure()
@@ -148,6 +134,16 @@ fn grpc_router(state: &AppState) -> Router {
     )
     .prepare()
     .into_axum_router()
+    // Rate limit middleware (runs after auth in request order; AuthIdentity must be in extensions).
+    .layer(axum::middleware::from_fn_with_state(
+        state.rate_limiter.clone(),
+        roz_server::middleware::rate_limit::grpc_rate_limit_middleware,
+    ))
+    // Auth middleware (outermost = runs first on request).
+    .layer(axum::middleware::from_fn_with_state(
+        grpc_auth_state,
+        roz_server::middleware::grpc_auth::grpc_auth_middleware,
+    ))
 }
 
 /// Initialize tracing via Logfire, falling back to stdout if unavailable.
@@ -178,22 +174,47 @@ fn init_tracing() -> Option<logfire::ShutdownGuard> {
 async fn main() {
     let _logfire_guard = init_tracing();
 
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "roz-server starting");
+
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let pool = roz_db::create_pool(&database_url).await.expect("Failed to create pool");
 
-    match roz_db::run_migrations(&pool).await {
-        Ok(()) => tracing::info!("Database migrations applied successfully"),
-        Err(err) => {
-            // In production, migrations are managed externally via Supabase.
-            // A failure here likely means they were already applied out-of-band.
-            tracing::warn!("Migration runner error (may be externally managed): {err}");
+    if std::env::var("ROZ_SKIP_MIGRATIONS").is_ok_and(|v| !v.is_empty()) {
+        tracing::info!("ROZ_SKIP_MIGRATIONS is set — skipping database migrations");
+    } else {
+        match roz_db::run_migrations(&pool).await {
+            Ok(()) => tracing::info!("Database migrations applied successfully"),
+            Err(err) => {
+                tracing::error!(error = %err, "database migration failed — aborting startup");
+                std::process::exit(1);
+            }
         }
     }
 
-    let rate_limiter = middleware::rate_limit::create_rate_limiter(&middleware::rate_limit::RateLimitConfig {
-        requests_per_second: NonZeroU32::new(100).expect("non-zero"),
-        burst_size: NonZeroU32::new(200).expect("non-zero"),
+    let rate_limit_rps: u32 = std::env::var("ROZ_RATE_LIMIT_RPS").map_or(100, |s| {
+        s.parse().unwrap_or_else(|e| {
+            tracing::warn!(value = %s, error = %e, "invalid ROZ_RATE_LIMIT_RPS, using default 100");
+            100
+        })
     });
+    let rate_limit_burst: u32 = std::env::var("ROZ_RATE_LIMIT_BURST").map_or(200, |s| {
+        s.parse().unwrap_or_else(|e| {
+            tracing::warn!(value = %s, error = %e, "invalid ROZ_RATE_LIMIT_BURST, using default 200");
+            200
+        })
+    });
+    let rate_limiter = middleware::rate_limit::create_rate_limiter(&middleware::rate_limit::RateLimitConfig {
+        requests_per_second: NonZeroU32::new(rate_limit_rps).unwrap_or_else(|| {
+            tracing::warn!("ROZ_RATE_LIMIT_RPS must be > 0, using default 100");
+            NonZeroU32::new(100).expect("non-zero")
+        }),
+        burst_size: NonZeroU32::new(rate_limit_burst).unwrap_or_else(|| {
+            tracing::warn!("ROZ_RATE_LIMIT_BURST must be > 0, using default 200");
+            NonZeroU32::new(200).expect("non-zero")
+        }),
+    });
+
+    tracing::info!(rps = rate_limit_rps, burst = rate_limit_burst, "rate limit configured");
 
     let base_url = std::env::var("ROZ_BASE_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
 
@@ -226,6 +247,16 @@ async fn main() {
         None
     };
 
+    if nats_client.is_some() && operator_seed.is_none() {
+        let env = std::env::var("ROZ_ENVIRONMENT").unwrap_or_else(|_| "development".into());
+        if env != "dev" && env != "development" {
+            tracing::warn!(
+                environment = %env,
+                "NATS connection has no operator credentials — messages are unauthenticated"
+            );
+        }
+    }
+
     let model_config = ModelConfig {
         gateway_url: std::env::var("ROZ_GATEWAY_URL").unwrap_or_else(|_| "https://gateway-us.pydantic.dev".into()),
         api_key: std::env::var("ROZ_GATEWAY_API_KEY").unwrap_or_default(),
@@ -240,11 +271,19 @@ async fn main() {
         direct_api_key: std::env::var("ROZ_ANTHROPIC_API_KEY")
             .ok()
             .filter(|k| !k.trim().is_empty()),
+        // D-10: default provider is "google-vertex" — matches the verified PAIG path at
+        // /proxy/google-vertex/v1beta1/... already used by crates/roz-agent/src/model/gemini.rs.
+        gemini_provider: std::env::var("ROZ_GEMINI_PROVIDER").unwrap_or_else(|_| "google-vertex".into()),
+        gemini_direct_api_key: std::env::var("ROZ_GEMINI_API_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty()),
     };
 
     if model_config.api_key.is_empty() {
         tracing::warn!("ROZ_GATEWAY_API_KEY not set — gRPC agent sessions disabled");
     }
+
+    let trust_policy = Arc::new(roz_server::trust::load_trust_policy_from_env());
 
     let state = AppState {
         pool,
@@ -257,6 +296,7 @@ async fn main() {
         model_config,
         auth: Arc::new(roz_server::auth::ApiKeyAuth),
         meter: Arc::new(roz_agent::meter::NoOpMeter),
+        trust_policy,
     };
 
     // Spawn internal NATS request-reply handlers (e.g. spawn_worker tool bypass).
@@ -364,9 +404,12 @@ mod tests {
                 timeout_secs: 10,
                 anthropic_provider: "anthropic".to_string(),
                 direct_api_key: None,
+                gemini_provider: "google-vertex".to_string(),
+                gemini_direct_api_key: None,
             },
             auth: Arc::new(roz_server::auth::ApiKeyAuth),
             meter: Arc::new(roz_agent::meter::NoOpMeter),
+            trust_policy: Arc::new(roz_server::trust::permissive_policy_for_integration_tests()),
         }
     }
 
@@ -1385,6 +1428,34 @@ mod tests {
     async fn create_task_without_dispatch_backend_fails_closed() {
         let (pool, app, auth, env_id, host_id) = setup_task_test().await;
 
+        // The ENF-01 device-trust gate runs BEFORE the NATS availability check
+        // (see routes/tasks.rs). Seed a Trusted device_trust row so the test
+        // exercises the dispatch-unavailable path (→ 500) rather than being
+        // short-circuited by trust rejection (→ 409).
+        let api_key = roz_db::api_keys::verify_api_key(&pool, auth.trim_start_matches("Bearer "))
+            .await
+            .expect("verify api key")
+            .expect("api key should exist");
+        let host_uuid: uuid::Uuid = host_id.parse().expect("host_id is valid uuid");
+        sqlx::query(
+            "INSERT INTO roz_device_trust \
+             (tenant_id, host_id, posture, firmware, sbom_hash, last_attestation) \
+             VALUES ($1, $2, 'trusted', $3, NULL, $4)",
+        )
+        .bind(api_key.tenant_id)
+        .bind(host_uuid)
+        .bind(serde_json::json!({
+            "version": "1.0.0",
+            "sha256": "abc123deadbeef",
+            "crc32": 42u32,
+            "ed25519_signature": "sig-bytes-base64",
+            "partition": "a"
+        }))
+        .bind(chrono::Utc::now())
+        .execute(&pool)
+        .await
+        .expect("insert device_trust");
+
         let create_body = serde_json::json!({
             "prompt": "Pick up the red cube",
             "environment_id": env_id.to_string(),
@@ -1947,56 +2018,29 @@ mod tests {
     async fn grpc_stream_session_connects() {
         use roz_server::grpc;
 
-        struct NoopAuth;
-        #[tonic::async_trait]
-        impl grpc::agent::GrpcAuth for NoopAuth {
-            async fn authenticate(
-                &self,
-                _pool: &sqlx::PgPool,
-                _auth_header: Option<&str>,
-            ) -> Result<roz_core::auth::AuthIdentity, String> {
-                Err("not implemented in test".into())
-            }
-        }
-
         let url = roz_test::pg_url().await;
         let pool = roz_db::create_pool(url).await.expect("pool");
         roz_db::run_migrations(&pool).await.expect("migrations");
-        let state = test_state(pool);
+        let state = test_state(pool.clone());
+
+        // Phase 16.1 moved auth out of AgentServiceImpl::stream_session and into
+        // the axum `grpc_auth_middleware` layer. Reuse the production
+        // `grpc_router` to mirror the real wiring (auth + rate-limit layers,
+        // full service set) and attach a Bearer token on the client.
+        let slug = format!("grpc-stream-test-{}", uuid::Uuid::new_v4());
+        let tenant = roz_db::tenant::create_tenant(&pool, "gRPC Stream Test", &slug, "personal")
+            .await
+            .expect("create tenant");
+        let api_key = roz_db::api_keys::create_api_key(&pool, tenant.id, "grpc-key", &["admin".into()], "test")
+            .await
+            .expect("create api key");
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let task_svc = grpc::tasks::TaskServiceImpl::new(
-            state.pool.clone(),
-            state.http_client.clone(),
-            state.restate_ingress_url.clone(),
-            state.nats_client.clone(),
-            Arc::new(AppGrpcAuth),
-        );
-        let agent_svc = grpc::agent::AgentServiceImpl::new(
-            state.pool.clone(),
-            state.http_client.clone(),
-            state.restate_ingress_url.clone(),
-            state.nats_client.clone(),
-            std::sync::Arc::new(NoopAuth),
-            state.model_config.default_model.clone(),
-            state.model_config.gateway_url.clone(),
-            state.model_config.api_key.clone(),
-            state.model_config.timeout_secs,
-            state.model_config.anthropic_provider.clone(),
-            state.model_config.direct_api_key.clone(),
-            None, // fallback_model_name
-            state.meter.clone(),
-        );
-
+        let router = grpc_router(&state);
         tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(grpc::roz_v1::task_service_server::TaskServiceServer::new(task_svc))
-                .add_service(grpc::roz_v1::agent_service_server::AgentServiceServer::new(agent_svc))
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-                .await
-                .unwrap();
+            axum::serve(listener, router).await.unwrap();
         });
 
         // Brief yield to let the server start
@@ -2008,7 +2052,15 @@ mod tests {
             .await
             .unwrap();
 
-        let mut client = grpc::roz_v1::agent_service_client::AgentServiceClient::new(channel);
+        let bearer = api_key.full_key.clone();
+        let interceptor = move |mut req: tonic::Request<()>| -> Result<tonic::Request<()>, tonic::Status> {
+            req.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {bearer}").parse().expect("auth metadata"),
+            );
+            Ok(req)
+        };
+        let mut client = grpc::roz_v1::agent_service_client::AgentServiceClient::with_interceptor(channel, interceptor);
 
         let (_tx, rx) = tokio::sync::mpsc::channel::<grpc::roz_v1::SessionRequest>(16);
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -2040,9 +2092,12 @@ mod tests {
                 timeout_secs: 10,
                 anthropic_provider: "anthropic".to_string(),
                 direct_api_key: None,
+                gemini_provider: "google-vertex".to_string(),
+                gemini_direct_api_key: None,
             },
             auth: Arc::new(roz_server::auth::ApiKeyAuth),
             meter: Arc::new(roz_agent::meter::NoOpMeter),
+            trust_policy: Arc::new(roz_server::trust::permissive_policy_for_integration_tests()),
         }
     }
 

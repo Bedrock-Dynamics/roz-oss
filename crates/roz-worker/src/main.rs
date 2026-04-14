@@ -607,9 +607,14 @@ async fn execute_task(
         ));
     }
 
+    // DEBT-03: worker-side turn persistence. Opt-in via ROZ_DATABASE_URL.
+    // Fail-closed when unset: bundle is inert and the agent runs as before.
+    let turn_flush = roz_worker::turn_flush::build_turn_flush(&task_config).await;
+
     let agent = AgentLoop::new(model, dispatcher, safety, spatial)
         .with_extensions(extensions)
-        .with_approval_runtime(approval_runtime);
+        .with_approval_runtime(approval_runtime)
+        .with_turn_emitter_opt(turn_flush.emitter.clone());
     let mut executor = WorkerTaskStreamingExecutor {
         agent: Some(agent),
         agent_input,
@@ -700,6 +705,10 @@ async fn execute_task(
     if let Some(handle) = copper_handle {
         handle.shutdown().await;
     }
+
+    // DEBT-03: drain the write-behind flush task before returning so any
+    // queued turns are persisted and the task does not leak.
+    turn_flush.drain().await;
 }
 
 #[tokio::main]
@@ -879,12 +888,257 @@ async fn main() -> Result<()> {
         }
     }
 
+    // D-03 + D-04 + C-03 + C-07: open the Zenoh edge-transport session after
+    // NATS connect and host registration. Failure is non-fatal — worker falls
+    // back to NATS-only. Plan 15-05 consumes `zenoh_session.clone()` below to
+    // construct the ZenohSessionTransport; plan 15-06 will consume the same
+    // binding for health monitors without re-plumbing.
+    #[cfg(feature = "zenoh")]
+    let zenoh_session: Option<zenoh::Session> =
+        match roz_zenoh::session::open_session(config.zenoh_config_path.as_deref()).await {
+            Ok(sess) => {
+                tracing::info!(
+                    mode = "peer",
+                    robot_id = %config.worker_id,
+                    "zenoh edge transport ready",
+                );
+                Some(sess)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "zenoh edge transport unavailable; continuing without it",
+                );
+                None
+            }
+        };
+
+    // Plan 15-05 (D-19, D-22): compose ZenohSessionTransport when --features zenoh
+    // AND ROZ_DEVICE_SIGNING_KEY resolves. All other branches log a warn! and
+    // fall back to NATS-only event publish (graceful degradation).
+    #[cfg(feature = "zenoh")]
+    let zenoh_transport: Option<roz_zenoh::session::ZenohSessionTransport> = match (
+        zenoh_session.clone(),
+        config
+            .device_signing_key
+            .as_deref()
+            .map(roz_zenoh::envelope::load_signing_key),
+    ) {
+        (Some(session), Some(Ok(key))) => {
+            let signing_key = std::sync::Arc::new(key);
+            match roz_zenoh::session::ZenohSessionTransport::open(session, signing_key, config.worker_id.clone()).await
+            {
+                Ok(t) => {
+                    tracing::info!(robot_id = %config.worker_id, "zenoh edge transport ready (signed)");
+                    Some(t)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "ZenohSessionTransport open failed; NATS only");
+                    None
+                }
+            }
+        }
+        (Some(_), None) => {
+            tracing::warn!("ROZ_DEVICE_SIGNING_KEY unset; signed Zenoh relay disabled, NATS only (D-22)");
+            None
+        }
+        (Some(_), Some(Err(e))) => {
+            tracing::warn!(error = %e, "ROZ_DEVICE_SIGNING_KEY invalid; NATS only");
+            None
+        }
+        (None, _) => {
+            // zenoh_session was None (15-01 failed to open) — already warned there.
+            None
+        }
+    };
+
+    // Plan 15-06 (D-11, D-23, D-24): worker-level SessionEvent bus so transport-
+    // health state transitions emit SessionEvent::EdgeTransportDegraded on a
+    // real broadcast channel (see acceptance criterion `session_event_tx.send`).
+    // Capacity 64 matches the EdgeHealthAggregator signal channel. Consumers
+    // are plugged in by downstream plans; for now the channel guarantees the
+    // emission site exists and is reachable.
+    let (session_event_tx, _session_event_rx_keepalive): (
+        tokio::sync::broadcast::Sender<roz_core::session::event::EventEnvelope>,
+        tokio::sync::broadcast::Receiver<roz_core::session::event::EventEnvelope>,
+    ) = tokio::sync::broadcast::channel(64);
+
+    // Plan 15-06 (D-11, D-23, D-24): wire the three-mechanism transport health
+    // system — EdgeHealthAggregator, heartbeat publisher, liveliness monitor,
+    // subsystem freshness monitor — plus the state-transition -> SessionEvent
+    // emitter. All cfg-gated on `--features zenoh`.
+    //
+    // C-03: consumes `zenoh_session: Option<zenoh::Session>` directly from the
+    // binding introduced by 15-01 Task 3. No dependency on 15-05's transport
+    // struct — health monitors share the same zenoh Session (Session::clone is
+    // cheap per D-03) but do not require the signed Zenoh session to be
+    // running.
+    #[cfg(feature = "zenoh")]
+    {
+        use std::collections::HashMap;
+
+        use roz_core::edge_health::EdgeHealthAggregator;
+
+        let (aggregator, health_rx, health_handle) = EdgeHealthAggregator::new(64);
+
+        // Drive the aggregator loop.
+        tokio::spawn(aggregator.run());
+
+        // Plan 15-06 C-03 acceptance criterion pins this expression verbatim —
+        // we consume 15-01's `zenoh_session: Option<zenoh::Session>` binding
+        // directly, independent of plan 15-05's transport struct.
+        #[expect(
+            clippy::option_as_ref_cloned,
+            reason = "plan 15-06 acceptance criterion pins `zenoh_session.as_ref().cloned()` verbatim (C-03)"
+        )]
+        if let Some(session_clone) = zenoh_session.as_ref().cloned() {
+            match roz_zenoh::health::spawn_heartbeat_publisher(
+                session_clone.clone(),
+                config.worker_id.clone(),
+                health_rx.clone(),
+                roz_zenoh::health::HEARTBEAT_CADENCE,
+            )
+            .await
+            {
+                Ok(_h) => tracing::info!("transport health heartbeat publisher started"),
+                Err(e) => tracing::warn!(error = %e, "transport health heartbeat publisher failed"),
+            }
+
+            if let Err(e) =
+                roz_zenoh::health::spawn_liveliness_monitor(session_clone.clone(), health_handle.clone()).await
+            {
+                tracing::warn!(error = %e, "liveliness monitor failed to start");
+            }
+
+            // Four edge-state-bus summary topics tracked per D-23.
+            let subsystems: HashMap<&'static str, String> = HashMap::from([
+                ("telemetry_summary", "roz/*/telemetry/summary".to_string()),
+                ("controller_evidence", "roz/*/controller/evidence".to_string()),
+                ("safety_interventions", "roz/*/safety/interventions".to_string()),
+                ("perception_availability", "roz/*/perception/availability".to_string()),
+            ]);
+            if let Err(e) = roz_zenoh::health::spawn_subsystem_freshness_monitor(
+                session_clone,
+                subsystems,
+                health_handle.clone(),
+                roz_zenoh::health::SUBSYSTEM_FRESHNESS,
+            )
+            .await
+            {
+                tracing::warn!(error = %e, "freshness monitor failed to start");
+            }
+        }
+
+        // State-transition watcher: emits SessionEvent::EdgeTransportDegraded
+        // on the worker-level broadcast bus whenever the aggregator's
+        // EdgeTransportHealth value changes.
+        let mut health_rx_emitter = health_rx.clone();
+        let session_event_tx_for_health = session_event_tx.clone();
+        tokio::spawn(async move {
+            let mut last = health_rx_emitter.borrow().clone();
+            while health_rx_emitter.changed().await.is_ok() {
+                let current = health_rx_emitter.borrow_and_update().clone();
+                if current != last {
+                    let affected_capabilities = match &current {
+                        roz_core::edge_health::EdgeTransportHealth::Degraded { affected } => affected.clone(),
+                        _ => Vec::new(),
+                    };
+                    let event = roz_core::session::event::SessionEvent::EdgeTransportDegraded {
+                        transport: "zenoh".to_string(),
+                        health: current.clone(),
+                        affected_capabilities,
+                    };
+                    let envelope = roz_core::session::event::EventEnvelope {
+                        event_id: roz_core::session::event::EventId::new(),
+                        correlation_id: roz_core::session::event::CorrelationId::new(),
+                        parent_event_id: None,
+                        timestamp: chrono::Utc::now(),
+                        event,
+                    };
+                    // `.send` returns Err only when there are no live receivers;
+                    // the _session_event_rx_keepalive at worker main keeps at
+                    // least one receiver alive so this branch is informational.
+                    if let Err(e) = session_event_tx_for_health.send(envelope) {
+                        tracing::warn!(error = %e, "no SessionEvent receivers for EdgeTransportDegraded");
+                    }
+                    tracing::info!(?current, "edge transport health transition");
+                    last = current;
+                }
+            }
+        });
+    }
+
+    // Silence unused-variable warnings when zenoh feature is off; the channel
+    // is kept in scope so the feature-off build preserves the same local
+    // bindings as the feature-on build.
+    #[cfg(not(feature = "zenoh"))]
+    {
+        drop(session_event_tx);
+    }
+
+    // Plan 15-10 (ZEN-05 gap closure): instantiate EdgeStateBusRunner and
+    // ZenohCoordinator so the edge-horizontal subsystems have live worker
+    // call sites. Per VERIFICATION.md gap report: SC-5 names "sensor sharing"
+    // (EdgeStateBusRunner) and "pose coordination" (ZenohCoordinator) — both
+    // primitives existed in roz-zenoh but had zero references from this
+    // crate. This block closes that gap.
+    //
+    // Handles are retained in a local binding so publishers and liveliness
+    // tokens live for the worker lifetime. Downstream plans will wire live
+    // producers (spatial bridge -> publish_pose loop; telemetry aggregator
+    // -> publish(&TELEMETRY_SUMMARY, ...)) into these handles.
+    #[cfg(feature = "zenoh")]
+    #[expect(
+        clippy::option_as_ref_cloned,
+        reason = "plan 15-10 reuses the 15-06 C-03 convention for consuming zenoh_session"
+    )]
+    let _edge_transport_handles: Option<roz_worker::zenoh_edge::EdgeTransportHandles> =
+        match zenoh_session.as_ref().cloned() {
+            Some(session) => match roz_worker::zenoh_edge::start_edge_subsystems(session, &config.worker_id).await {
+                Ok(handles) => {
+                    tracing::info!(
+                        robot_id = %config.worker_id,
+                        "edge state bus + coordinator wired",
+                    );
+                    Some(handles)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "edge state bus / coordinator startup failed; continuing without",
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+
     // Spawn edge agent session relay (handles gRPC sessions relayed via NATS).
     let relay_nats = nats.clone();
     let relay_worker_id = config.worker_id.clone();
     let relay_config = config.clone();
     let relay_estop_rx = estop_rx.clone();
     let relay_camera_mgr = camera_manager.clone();
+    // C-01 narrowed (plan 15-04 + 15-05): `event_transport` is the single
+    // abstracted publish seam. When `--features zenoh` AND the device signing
+    // key resolves, we wrap NatsSessionTransport + ZenohSessionTransport in a
+    // DualPublishTransport (NATS primary, Zenoh best-effort secondary per D-19).
+    // Otherwise the inline Phase 13 NATS path runs verbatim (D-18 byte-stable).
+    let nats_event_transport = roz_worker::transport_nats::NatsSessionTransport::new(nats.clone());
+    #[cfg(feature = "zenoh")]
+    let event_transport: Option<std::sync::Arc<dyn roz_core::transport::SessionTransport>> = match zenoh_transport {
+        Some(zt) => {
+            tracing::info!("session relay using DualPublishTransport (NATS primary + Zenoh secondary)");
+            Some(std::sync::Arc::new(roz_core::transport::DualPublishTransport::new(
+                nats_event_transport,
+                zt,
+            )))
+        }
+        None => Some(std::sync::Arc::new(nats_event_transport)),
+    };
+    #[cfg(not(feature = "zenoh"))]
+    let event_transport: Option<std::sync::Arc<dyn roz_core::transport::SessionTransport>> =
+        Some(std::sync::Arc::new(nats_event_transport));
     tokio::spawn(async move {
         if let Err(e) = roz_worker::session_relay::spawn_session_relay(
             relay_nats,
@@ -892,6 +1146,7 @@ async fn main() -> Result<()> {
             relay_config,
             relay_estop_rx,
             relay_camera_mgr,
+            event_transport,
         )
         .await
         {

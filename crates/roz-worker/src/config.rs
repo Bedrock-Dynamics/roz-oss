@@ -20,6 +20,9 @@ use serde::Deserialize;
 /// - `ROZ_ANTHROPIC_PROVIDER` — PAIG proxy provider for Claude models (default: `anthropic`)
 /// - `ROZ_ANTHROPIC_API_KEY` — Direct Anthropic API key; bypasses the PAIG gateway when set
 /// - `ROZ_FALLBACK_MODEL` — Secondary model to use when the primary is rate-limited or overloaded
+/// - `ROZ_WASM_PUBKEYS` — Comma-separated `<key_id>:<base64 Ed25519 pubkey>`
+///   entries trusted to sign `.cwasm` modules. Empty/unset = no trusted
+///   keys, all AOT loads will fail (fail-closed).
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkerConfig {
     pub api_url: String,
@@ -61,6 +64,51 @@ pub struct WorkerConfig {
     /// Camera subsystem configuration.
     #[serde(default)]
     pub camera: CameraConfig,
+    /// Trusted signing keys for `.cwasm` modules. Set via `ROZ_WASM_PUBKEYS`.
+    ///
+    /// Format: `"<key_id>:<base64 Ed25519 pubkey>,..."`. Empty/unset yields
+    /// an empty keyset (fail-closed — AOT loads will fail `UnknownKeyId`).
+    #[serde(default)]
+    pub wasm_pubkeys: Option<String>,
+    /// Path to a Zenoh JSON5 config file (D-02). When unset, the in-code
+    /// default is used (peer mode, multicast scout enabled). Set via
+    /// `ROZ_ZENOH_CONFIG` (no `_PATH` suffix — mapped through an explicit env
+    /// alias in [`WorkerConfig::load`]).
+    ///
+    /// Per D-02: env-only this phase; TOML overlay deferred.
+    #[serde(default)]
+    pub zenoh_config_path: Option<std::path::PathBuf>,
+
+    /// Path to (or `base64:<seed>` form of) an Ed25519 32-byte signing seed
+    /// used to sign `SessionEvent` envelopes published over Zenoh (D-22). When
+    /// unset, signed Zenoh session relay is skipped.
+    ///
+    /// Doc guidance (T-15-02 partial mitigation): prefer the file-path form
+    /// (`ROZ_DEVICE_SIGNING_KEY=/etc/roz/device.key`) over inline `base64:...`
+    /// to keep seed material out of `ps`/`/proc/<pid>/environ`. Filesystem
+    /// permissions on the key file remain operator responsibility.
+    ///
+    /// Generate with:
+    ///   `openssl genpkey -algorithm ed25519 -out roz-device.key`
+    /// then extract raw seed:
+    ///   `openssl pkey -in roz-device.key -outform DER | tail -c 32 | base64`
+    ///
+    /// Parsed but unused until plan 15-05.
+    #[serde(default)]
+    pub device_signing_key: Option<String>,
+
+    /// Optional Postgres URL for worker-side session turn persistence (DEBT-03).
+    ///
+    /// When `Some`, the worker connects directly to Postgres and spawns a
+    /// [`roz_agent::agent_loop::TurnEmitter`] + flush task per `execute_task`
+    /// invocation so agent turns are durably persisted to `roz_session_turns`.
+    ///
+    /// Fail-closed when unset: turn persistence is disabled, agent loop runs
+    /// normally, no pool is created. Set via `ROZ_DATABASE_URL` (NOT
+    /// `DATABASE_URL` — kept separate to avoid picking up unrelated server DB
+    /// URLs in dev).
+    #[serde(default)]
+    pub database_url: Option<String>,
 }
 
 /// Camera subsystem configuration for the worker.
@@ -147,10 +195,20 @@ fn default_anthropic_provider() -> String {
 impl WorkerConfig {
     /// Load configuration from environment variables (prefixed `ROZ_`) and
     /// an optional `roz-worker.toml` file.
+    ///
+    /// Per D-02, the locked env var name for the zenoh config path is
+    /// `ROZ_ZENOH_CONFIG` (no `_PATH` suffix). The default `ROZ_`-prefix
+    /// provider would map it to field `zenoh_config`, so we layer an explicit
+    /// alias merge that rewrites `ROZ_ZENOH_CONFIG` into `zenoh_config_path`.
     pub fn load() -> Result<Self, Box<figment::Error>> {
         Figment::new()
             .merge(Toml::file("roz-worker.toml"))
             .merge(Env::prefixed("ROZ_"))
+            .merge(
+                Env::raw()
+                    .only(&["ROZ_ZENOH_CONFIG"])
+                    .map(|_| "zenoh_config_path".into()),
+            )
             .extract()
             .map_err(Box::new)
     }
@@ -159,6 +217,23 @@ impl WorkerConfig {
     pub fn from_figment(figment: &Figment) -> Result<Self, Box<figment::Error>> {
         figment.extract().map_err(Box::new)
     }
+
+    /// Parse `wasm_pubkeys` (from `ROZ_WASM_PUBKEYS`) into a
+    /// [`roz_copper::wasm_signature::TrustedKeys`]. Returns an empty keyset
+    /// when unset.
+    ///
+    /// # Errors
+    /// Returns [`roz_copper::wasm_signature::WasmLoadError::KeysetConfig`]
+    /// on malformed entries, bad base64, wrong-length pubkeys, invalid
+    /// Ed25519 points, or duplicate `key_id`s (fail-closed).
+    pub fn trusted_keys(
+        &self,
+    ) -> Result<roz_copper::wasm_signature::TrustedKeys, roz_copper::wasm_signature::WasmLoadError> {
+        self.wasm_pubkeys.as_ref().map_or_else(
+            || Ok(roz_copper::wasm_signature::TrustedKeys::new()),
+            |raw| roz_copper::wasm_signature::TrustedKeys::from_env_str(raw),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -166,7 +241,7 @@ mod tests {
     use super::*;
     use figment::providers::Serialized;
 
-    /// Minimal required fields for all tests (includes gateway_api_key).
+    /// Minimal required fields for all tests (includes `gateway_api_key`).
     fn base_config() -> serde_json::Value {
         serde_json::json!({
             "api_url": "http://localhost:8080",
@@ -348,5 +423,77 @@ mod tests {
         let figment = Figment::new().merge(Serialized::defaults(vals));
         let config = WorkerConfig::from_figment(&figment).unwrap();
         assert_eq!(config.robot_toml.as_deref(), Some("/etc/roz/robot.toml"));
+    }
+
+    #[test]
+    fn wasm_pubkeys_defaults_to_none() {
+        let figment = Figment::new().merge(Serialized::defaults(base_config()));
+        let config = WorkerConfig::from_figment(&figment).unwrap();
+        assert!(config.wasm_pubkeys.is_none());
+    }
+
+    #[test]
+    fn wasm_pubkeys_reads_env_string() {
+        let mut vals = base_config();
+        vals["wasm_pubkeys"] = serde_json::json!("alpha:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+        let figment = Figment::new().merge(Serialized::defaults(vals));
+        let config = WorkerConfig::from_figment(&figment).unwrap();
+        assert!(config.wasm_pubkeys.is_some());
+    }
+
+    #[test]
+    fn trusted_keys_empty_when_unset() {
+        let figment = Figment::new().merge(Serialized::defaults(base_config()));
+        let config = WorkerConfig::from_figment(&figment).unwrap();
+        let keys = config.trusted_keys().expect("empty is ok");
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn trusted_keys_parses_set_value() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+        let sk = SigningKey::generate(&mut OsRng);
+        let pubkey_b64 = STANDARD.encode(sk.verifying_key().to_bytes());
+        let mut vals = base_config();
+        vals["wasm_pubkeys"] = serde_json::json!(format!("alpha:{pubkey_b64}"));
+        let figment = Figment::new().merge(Serialized::defaults(vals));
+        let config = WorkerConfig::from_figment(&figment).unwrap();
+        let keys = config.trusted_keys().expect("valid parse");
+        assert_eq!(keys.len(), 1);
+    }
+
+    #[test]
+    fn config_zenoh_fields_default_to_none() {
+        let figment = Figment::new().merge(Serialized::defaults(base_config()));
+        let config = WorkerConfig::from_figment(&figment).unwrap();
+        assert!(config.zenoh_config_path.is_none());
+        assert!(config.device_signing_key.is_none());
+    }
+
+    #[test]
+    fn config_loads_zenoh_config_from_env() {
+        let mut vals = base_config();
+        vals["zenoh_config_path"] = serde_json::json!("/tmp/zenoh.json5");
+        vals["device_signing_key"] = serde_json::json!("base64:AAAA");
+        let figment = Figment::new().merge(Serialized::defaults(vals));
+        let config = WorkerConfig::from_figment(&figment).unwrap();
+        assert_eq!(
+            config.zenoh_config_path.as_deref(),
+            Some(std::path::Path::new("/tmp/zenoh.json5"))
+        );
+        assert_eq!(config.device_signing_key.as_deref(), Some("base64:AAAA"));
+    }
+
+    #[test]
+    fn trusted_keys_returns_err_on_malformed() {
+        let mut vals = base_config();
+        vals["wasm_pubkeys"] = serde_json::json!("no-colon-at-all");
+        let figment = Figment::new().merge(Serialized::defaults(vals));
+        let config = WorkerConfig::from_figment(&figment).unwrap();
+        let err = config.trusted_keys().expect_err("should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("no-colon-at-all") || msg.contains("missing"), "got: {msg}");
     }
 }

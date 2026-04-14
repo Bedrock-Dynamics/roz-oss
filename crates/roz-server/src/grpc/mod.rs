@@ -1,8 +1,11 @@
 pub mod agent;
+pub mod auth_ext;
 pub mod convert;
 pub mod embodiment;
 pub mod embodiment_convert;
 pub mod event_mapper;
+pub mod media;
+pub mod media_fetch;
 pub mod tasks;
 
 /// Generated protobuf types and gRPC service stubs for roz API v1.

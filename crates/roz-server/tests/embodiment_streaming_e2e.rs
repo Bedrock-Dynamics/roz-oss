@@ -16,37 +16,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt as _;
-use roz_core::auth::{AuthIdentity, TenantId};
 use roz_nats::dispatch::{EmbodimentChangedEvent, embodiment_changed_subject};
-use roz_server::grpc::agent::GrpcAuth;
+use roz_server::auth::ApiKeyAuth;
 use roz_server::grpc::roz_v1::embodiment_service_client::EmbodimentServiceClient;
 use roz_server::grpc::roz_v1::embodiment_service_server::EmbodimentServiceServer;
 use roz_server::grpc::roz_v1::{StreamFrameTreeRequest, WatchCalibrationRequest};
+use roz_server::middleware::grpc_auth::{GrpcAuthState, grpc_auth_middleware};
 use serde_json::json;
 use uuid::Uuid;
-
-// ---------------------------------------------------------------------------
-// Test auth — validates API key against DB (matches grpc_agent_session pattern)
-// ---------------------------------------------------------------------------
-
-struct TestAuth;
-
-#[tonic::async_trait]
-impl GrpcAuth for TestAuth {
-    async fn authenticate(&self, pool: &sqlx::PgPool, auth_header: Option<&str>) -> Result<AuthIdentity, String> {
-        let header = auth_header.ok_or("missing authorization")?;
-        let token = header.strip_prefix("Bearer ").ok_or("invalid format")?;
-        let api_key = roz_db::api_keys::verify_api_key(pool, token)
-            .await
-            .map_err(|e| format!("db error: {e}"))?
-            .ok_or("invalid key")?;
-        Ok(AuthIdentity::ApiKey {
-            key_id: api_key.id,
-            tenant_id: TenantId::new(api_key.tenant_id),
-            scopes: vec![],
-        })
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Server setup helpers
@@ -79,22 +56,28 @@ async fn start_grpc_server(
         Some(async_nats::connect(nats_guard.url()).await.expect("connect nats"))
     };
 
-    let embodiment_svc = roz_server::grpc::embodiment::EmbodimentServiceImpl::new(
-        pool.clone(),
-        Arc::new(TestAuth) as Arc<dyn GrpcAuth>,
-        server_nats,
-    );
+    let embodiment_svc = roz_server::grpc::embodiment::EmbodimentServiceImpl::new(pool.clone(), server_nats);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind grpc");
     let port = listener.local_addr().expect("local addr").port();
 
+    // Mirror production: wrap the gRPC router with grpc_auth_middleware so the
+    // service receives AuthIdentity in request extensions.
+    let grpc_auth_state = GrpcAuthState {
+        auth: Arc::new(ApiKeyAuth),
+        pool: pool.clone(),
+    };
+    let grpc_router = tonic::service::Routes::new(EmbodimentServiceServer::new(embodiment_svc))
+        .prepare()
+        .into_axum_router()
+        .layer(axum::middleware::from_fn_with_state(
+            grpc_auth_state,
+            grpc_auth_middleware,
+        ));
+
     tokio::spawn(async move {
         let _pg = pg; // keep pg alive
-        tonic::transport::Server::builder()
-            .add_service(EmbodimentServiceServer::new(embodiment_svc))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await
-            .expect("grpc serve");
+        axum::serve(listener, grpc_router).await.expect("grpc serve");
     });
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -419,19 +402,25 @@ async fn stream_frame_tree_failed_precondition_no_nats() {
     // EmbodimentServiceImpl with nats_client: None.
     let embodiment_svc = roz_server::grpc::embodiment::EmbodimentServiceImpl::new(
         pool.clone(),
-        Arc::new(TestAuth) as Arc<dyn GrpcAuth>,
         None, // no NATS
     );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
+    let grpc_auth_state = GrpcAuthState {
+        auth: Arc::new(ApiKeyAuth),
+        pool: pool.clone(),
+    };
+    let grpc_router = tonic::service::Routes::new(EmbodimentServiceServer::new(embodiment_svc))
+        .prepare()
+        .into_axum_router()
+        .layer(axum::middleware::from_fn_with_state(
+            grpc_auth_state,
+            grpc_auth_middleware,
+        ));
     tokio::spawn(async move {
         let _pg = pg;
-        tonic::transport::Server::builder()
-            .add_service(EmbodimentServiceServer::new(embodiment_svc))
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await
-            .expect("serve");
+        axum::serve(listener, grpc_router).await.expect("serve");
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
 
