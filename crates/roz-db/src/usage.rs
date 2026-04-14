@@ -22,7 +22,10 @@ use sqlx::types::Uuid;
 /// streaming does not expose cache-hit metrics today).
 ///
 /// Errors propagate from sqlx (connection / constraint / function failures).
-#[allow(clippy::too_many_arguments, reason = "mirrors the record_usage PL/pgSQL signature 1:1")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the record_usage PL/pgSQL signature 1:1"
+)]
 pub async fn record_media_usage(
     pool: &PgPool,
     tenant_id: Uuid,
@@ -34,18 +37,16 @@ pub async fn record_media_usage(
     output_tokens: Option<i64>,
     idempotency_key: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "SELECT record_usage($1, $2, $3, $4, $5, $6, $7, NULL::BIGINT, NULL::BIGINT, 0::NUMERIC, $8)",
-    )
-    .bind(tenant_id)
-    .bind(session_id)
-    .bind(resource_type)
-    .bind(model)
-    .bind(quantity)
-    .bind(input_tokens)
-    .bind(output_tokens)
-    .bind(idempotency_key)
-    .execute(pool)
-    .await?;
+    sqlx::query("SELECT record_usage($1, $2, $3, $4, $5, $6, $7, NULL::BIGINT, NULL::BIGINT, 0::NUMERIC, $8)")
+        .bind(tenant_id)
+        .bind(session_id)
+        .bind(resource_type)
+        .bind(model)
+        .bind(quantity)
+        .bind(input_tokens)
+        .bind(output_tokens)
+        .bind(idempotency_key)
+        .execute(pool)
+        .await?;
     Ok(())
 }

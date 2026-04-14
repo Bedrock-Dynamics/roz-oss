@@ -527,9 +527,7 @@ mod tests {
         let (addr, _srv) = spawn_test_server(app).await;
         let url = reqwest::Url::parse(&format!("http://{addr}/x.png")).unwrap();
 
-        let bytes = execute_fetch(&test_client(), url, "image")
-            .await
-            .expect("happy path");
+        let bytes = execute_fetch(&test_client(), url, "image").await.expect("happy path");
         assert_eq!(bytes, b"fake-png-bytes");
     }
 
@@ -544,11 +542,7 @@ mod tests {
 
         let err = execute_fetch(&test_client(), url, "image").await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
-        assert!(
-            err.message().contains("Content-Type"),
-            "message: {}",
-            err.message()
-        );
+        assert!(err.message().contains("Content-Type"), "message: {}", err.message());
     }
 
     #[tokio::test]
@@ -594,9 +588,8 @@ mod tests {
             // 101 chunks → 101 MiB (over the 100 MiB cap). Chunked encoding —
             // no Content-Length, so fail-fast doesn't trigger; the running
             // tally must.
-            let stream = stream::iter(
-                (0..101).map(move |_| Ok::<_, std::io::Error>(bytes::Bytes::from(chunk.clone()))),
-            );
+            let stream =
+                stream::iter((0..101).map(move |_| Ok::<_, std::io::Error>(bytes::Bytes::from(chunk.clone()))));
             let body = Body::from_stream(stream);
             let mut resp = Response::new(body);
             resp.headers_mut()

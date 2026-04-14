@@ -889,7 +889,7 @@ mod tests {
         };
         let empty_len = serde_json::to_vec(&empty_input).unwrap().len();
         let populated_len = serde_json::to_vec(&populated_input).unwrap().len();
-        let threshold = ((empty_len + populated_len) / 2) as i32;
+        let threshold = usize::midpoint(empty_len, populated_len) as i32;
         let short_output_json = r#"{"command_values":[1.0],"estop":false,"metrics":[]}"#;
         let short_len = short_output_json.len();
         let short_hex: String = short_output_json

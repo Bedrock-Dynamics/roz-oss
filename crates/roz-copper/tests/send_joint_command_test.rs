@@ -1,6 +1,23 @@
-//! Test SendJointCommand RPC against a rebuilt bare-gazebo container.
+#![allow(
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::approx_constant,
+    clippy::doc_markdown,
+    clippy::ignore_without_reason,
+    clippy::large_enum_variant,
+    clippy::missing_const_for_fn,
+    clippy::or_fun_call,
+    clippy::struct_excessive_bools,
+    clippy::type_complexity,
+    clippy::derive_partial_eq_without_eq,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::format_collect,
+    reason = "test-only style/complexity lints; tech-debt follow-up"
+)]
+//! Test `SendJointCommand` RPC against a rebuilt bare-gazebo container.
 //!
-//! Run: cargo test -p roz-copper --test send_joint_command_test -- --ignored --nocapture
+//! Run: cargo test -p roz-copper --test `send_joint_command_test` -- --ignored --nocapture
 //! Requires: bare-gazebo container with updated bridge on port 9098
 
 pub mod proto {
@@ -51,9 +68,10 @@ async fn send_joint_command_accepted_by_bridge() {
             println!("PASS: SendJointCommand RPC is live and responding");
         }
         Err(e) => {
-            if e.code() == tonic::Code::Unimplemented {
-                panic!("SendJointCommand not implemented — bridge needs rebuild: {e}");
-            }
+            assert!(
+                e.code() != tonic::Code::Unimplemented,
+                "SendJointCommand not implemented — bridge needs rebuild: {e}"
+            );
             panic!("SendJointCommand RPC error: {e}");
         }
     }

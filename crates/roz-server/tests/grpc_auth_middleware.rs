@@ -101,10 +101,7 @@ fn grpc_request(authorization: Option<&str>) -> Request<Body> {
 #[tokio::test]
 async fn unauthenticated_grpc_request_is_rejected_with_code_16() {
     let router = router_with_auth(Arc::new(RejectingAuth));
-    let response = router
-        .oneshot(grpc_request(None))
-        .await
-        .expect("oneshot completes");
+    let response = router.oneshot(grpc_request(None)).await.expect("oneshot completes");
 
     let grpc_status = response
         .headers()
@@ -131,10 +128,7 @@ async fn invalid_authorization_header_is_rejected_unauthenticated() {
         .await
         .expect("oneshot completes");
 
-    let grpc_status = response
-        .headers()
-        .get("grpc-status")
-        .and_then(|v| v.to_str().ok());
+    let grpc_status = response.headers().get("grpc-status").and_then(|v| v.to_str().ok());
     assert_eq!(grpc_status, Some("16"), "unauthenticated rejection expected");
 }
 

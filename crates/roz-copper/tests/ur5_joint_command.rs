@@ -1,6 +1,22 @@
+#![allow(
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::ignore_without_reason,
+    clippy::doc_markdown,
+    clippy::or_fun_call,
+    clippy::type_complexity,
+    clippy::derive_partial_eq_without_eq,
+    clippy::large_enum_variant,
+    clippy::struct_excessive_bools,
+    clippy::missing_const_for_fn,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::format_collect,
+    reason = "test-only style/complexity lints"
+)]
 //! Test: Send joint velocity command to UR5 arm and observe pose change.
 //!
-//! Run: cargo test -p roz-copper --test ur5_joint_command -- --ignored --nocapture
+//! Run: cargo test -p roz-copper --test `ur5_joint_command` -- --ignored --nocapture
 //! Requires: ros2-manipulator container with updated bridge on port 9094
 
 pub mod proto {
@@ -61,8 +77,7 @@ async fn send_velocity_to_ur5_shoulder() {
             let pos = p
                 .transform
                 .as_ref()
-                .map(|t| format!("({:.3}, {:.3}, {:.3})", t.x, t.y, t.z))
-                .unwrap_or("N/A".into());
+                .map_or("N/A".into(), |t| format!("({:.3}, {:.3}, {:.3})", t.x, t.y, t.z));
             println!("  {} @ {pos}", p.path);
         }
     }
@@ -124,9 +139,10 @@ async fn send_velocity_to_ur5_shoulder() {
             }
         }
         Err(e) => {
-            if e.code() == tonic::Code::Unimplemented {
-                panic!("SendJointCommand not in bridge — image needs rebuild");
-            }
+            assert!(
+                e.code() != tonic::Code::Unimplemented,
+                "SendJointCommand not in bridge — image needs rebuild"
+            );
             println!("RPC error: {e}");
         }
     }

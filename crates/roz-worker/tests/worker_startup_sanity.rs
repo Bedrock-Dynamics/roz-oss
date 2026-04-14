@@ -95,8 +95,7 @@ async fn worker_startup_publishes_transport_health_ready_and_zero_pose() {
                 .expect("TRANSPORT_HEALTH startup sample timed out — worker did not publish within 30s")
                 .expect("health subscriber channel closed");
             let bytes = sample.payload().to_bytes();
-            let json: serde_json::Value =
-                serde_json::from_slice(&bytes).expect("transport/health payload is not JSON");
+            let json: serde_json::Value = serde_json::from_slice(&bytes).expect("transport/health payload is not JSON");
             if json["source"] == "edge_state_bus_runner::startup" {
                 found = Some(json);
                 break;

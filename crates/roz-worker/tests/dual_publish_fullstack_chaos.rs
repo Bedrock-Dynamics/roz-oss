@@ -68,21 +68,17 @@ async fn setup_dual_transport() -> Harness {
 
     let signing_key = Arc::new(SigningKey::generate(&mut OsRng));
 
-    let nats_client = async_nats::connect(nats_guard.url())
-        .await
-        .expect("nats connect");
+    let nats_client = async_nats::connect(nats_guard.url()).await.expect("nats connect");
     let nats_transport = NatsSessionTransport::new(nats_client.clone());
 
     let publisher_session = zenoh::open(zenoh_guard.peer_config())
         .await
         .expect("zenoh open pub session");
-    let zenoh_transport =
-        ZenohSessionTransport::open(publisher_session, signing_key, "worker-A".to_owned())
-            .await
-            .expect("ZenohSessionTransport::open");
+    let zenoh_transport = ZenohSessionTransport::open(publisher_session, signing_key, "worker-A".to_owned())
+        .await
+        .expect("ZenohSessionTransport::open");
 
-    let dual: Arc<dyn SessionTransport> =
-        Arc::new(DualPublishTransport::new(nats_transport, zenoh_transport));
+    let dual: Arc<dyn SessionTransport> = Arc::new(DualPublishTransport::new(nats_transport, zenoh_transport));
 
     Harness {
         _nats_guard: nats_guard,
@@ -115,21 +111,13 @@ async fn dual_publish_fans_out_to_nats_and_zenoh() {
     // NATS subscribe on the canonical event subject
     // (`roz.v1.session.<session_id>.events.<event_type>` per event_nats::event_subject).
     let env = fixture_envelope("evt-16-04-fixture", "corr-16-04-fixture");
-    let nats_subject =
-        roz_worker::event_nats::event_subject("roz.v1", &env.correlation_id.0, &env.event);
-    let mut nats_sub = h
-        .nats_client
-        .subscribe(nats_subject.clone())
-        .await
-        .expect("nats sub");
+    let nats_subject = roz_worker::event_nats::event_subject("roz.v1", &env.correlation_id.0, &env.event);
+    let mut nats_sub = h.nats_client.subscribe(nats_subject.clone()).await.expect("nats sub");
 
     // Settle before publish (liveliness propagation — §8 pitfalls from 15-RESEARCH).
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    h.dual
-        .publish_event_envelope(&env)
-        .await
-        .expect("dual publish");
+    h.dual.publish_event_envelope(&env).await.expect("dual publish");
 
     // NATS side receives the envelope within 3s.
     let nats_msg = tokio::time::timeout(Duration::from_secs(3), nats_sub.next())
@@ -137,8 +125,7 @@ async fn dual_publish_fans_out_to_nats_and_zenoh() {
         .expect("nats recv timed out")
         .expect("nats channel closed");
     assert!(!nats_msg.payload.is_empty(), "nats payload empty");
-    let got_via_nats: EventEnvelope =
-        serde_json::from_slice(&nats_msg.payload).expect("decode nats payload");
+    let got_via_nats: EventEnvelope = serde_json::from_slice(&nats_msg.payload).expect("decode nats payload");
     assert_eq!(got_via_nats.event_id.0, "evt-16-04-fixture");
     assert_eq!(got_via_nats.correlation_id.0, "corr-16-04-fixture");
 
@@ -178,13 +165,8 @@ async fn zenoh_degraded_leaves_nats_path_functional() {
     // Use a distinct correlation_id so the NATS subscription from this test
     // cannot collide with the happy-path test if both run in the same binary.
     let env = fixture_envelope("evt-16-04-degraded", "corr-16-04-degraded");
-    let nats_subject =
-        roz_worker::event_nats::event_subject("roz.v1", &env.correlation_id.0, &env.event);
-    let mut nats_sub = h
-        .nats_client
-        .subscribe(nats_subject.clone())
-        .await
-        .expect("nats sub");
+    let nats_subject = roz_worker::event_nats::event_subject("roz.v1", &env.correlation_id.0, &env.event);
+    let mut nats_sub = h.nats_client.subscribe(nats_subject.clone()).await.expect("nats sub");
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -201,17 +183,13 @@ async fn zenoh_degraded_leaves_nats_path_functional() {
         .status()
         .await
         .expect("docker pause spawn");
-    assert!(
-        pause_status.success(),
-        "docker pause exited non-zero: {pause_status}"
-    );
+    assert!(pause_status.success(), "docker pause exited non-zero: {pause_status}");
 
     // With zenohd frozen, the secondary transport's `put` will block or fail.
     // Per D-19 non-fatal secondary semantics, the dual-publish call must
     // still return Ok — primary (NATS) succeeds and the secondary failure is
     // logged-and-swallowed.
-    let publish_result =
-        tokio::time::timeout(Duration::from_secs(10), h.dual.publish_event_envelope(&env)).await;
+    let publish_result = tokio::time::timeout(Duration::from_secs(10), h.dual.publish_event_envelope(&env)).await;
 
     // Cleanup FIRST so a surprising publish failure still unfreezes the
     // container for the testcontainers Drop impl. The unpause is best-effort
@@ -233,8 +211,7 @@ async fn zenoh_degraded_leaves_nats_path_functional() {
         .expect("nats recv timed out despite being primary")
         .expect("nats channel closed");
     assert!(!nats_msg.payload.is_empty(), "nats payload empty");
-    let got: EventEnvelope =
-        serde_json::from_slice(&nats_msg.payload).expect("decode nats payload");
+    let got: EventEnvelope = serde_json::from_slice(&nats_msg.payload).expect("decode nats payload");
     assert_eq!(got.event_id.0, "evt-16-04-degraded");
     assert_eq!(got.correlation_id.0, "corr-16-04-degraded");
 }

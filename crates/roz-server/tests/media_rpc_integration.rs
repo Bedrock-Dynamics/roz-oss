@@ -269,7 +269,10 @@ async fn file_uri_ssrf_private_ip_blocked_e2e() {
         prompt: "x".into(),
         model_hint: None,
     };
-    let err = client.analyze_media(req).await.expect_err("expected FailedPrecondition");
+    let err = client
+        .analyze_media(req)
+        .await
+        .expect_err("expected FailedPrecondition");
     assert_eq!(
         err.code(),
         tonic::Code::FailedPrecondition,
@@ -366,10 +369,7 @@ impl BytesCapturingBackend {
 
 #[async_trait]
 impl roz_server::grpc::media::MediaBackend for BytesCapturingBackend {
-    #[allow(
-        clippy::unnecessary_literal_bound,
-        reason = "matches MediaBackend trait signature"
-    )]
+    #[allow(clippy::unnecessary_literal_bound, reason = "matches MediaBackend trait signature")]
     fn name(&self) -> &str {
         "bytes-capturing"
     }
@@ -409,8 +409,7 @@ async fn file_uri_happy_path_round_trips_bytes_to_backend() {
     let fetcher = MockFetcher::ok(fixture.clone());
     let backend = BytesCapturingBackend::new();
 
-    let (mut client, _addr, _server) =
-        common::start_server_with_fetcher(backend.clone(), fetcher.clone()).await;
+    let (mut client, _addr, _server) = common::start_server_with_fetcher(backend.clone(), fetcher.clone()).await;
 
     let req = AnalyzeMediaRequest {
         media: Some(MediaPart {
@@ -424,20 +423,13 @@ async fn file_uri_happy_path_round_trips_bytes_to_backend() {
         model_hint: None,
     };
 
-    let mut stream = client
-        .analyze_media(req)
-        .await
-        .expect("analyze_media ok")
-        .into_inner();
+    let mut stream = client.analyze_media(req).await.expect("analyze_media ok").into_inner();
 
     // Drain the stream — assert we got a response (proves backend ran).
     let mut saw_done = false;
     while let Some(item) = stream.next().await {
         let chunk = item.expect("stream item ok");
-        if matches!(
-            chunk.payload,
-            Some(analyze_media_chunk::Payload::Done(_))
-        ) {
+        if matches!(chunk.payload, Some(analyze_media_chunk::Payload::Done(_))) {
             saw_done = true;
         }
     }
@@ -475,8 +467,7 @@ async fn file_uri_fetcher_resource_exhausted_propagates() {
     // Fetcher returns ResourceExhausted (e.g. body > 100 MB cap) → handler
     // must surface it unchanged to the client per D-16.
     let fetcher = MockFetcher::err(Status::resource_exhausted("fetched body exceeds 100 MB cap"));
-    let (mut client, _addr, _server) =
-        common::start_server_with_fetcher(Arc::new(MockBackend), fetcher).await;
+    let (mut client, _addr, _server) = common::start_server_with_fetcher(Arc::new(MockBackend), fetcher).await;
 
     let req = AnalyzeMediaRequest {
         media: Some(MediaPart {
@@ -499,8 +490,7 @@ async fn file_uri_fetcher_resource_exhausted_propagates() {
 #[tokio::test]
 async fn file_uri_fetcher_deadline_exceeded_propagates() {
     let fetcher = MockFetcher::err(Status::deadline_exceeded("file_uri fetch timeout (30s)"));
-    let (mut client, _addr, _server) =
-        common::start_server_with_fetcher(Arc::new(MockBackend), fetcher).await;
+    let (mut client, _addr, _server) = common::start_server_with_fetcher(Arc::new(MockBackend), fetcher).await;
 
     let req = AnalyzeMediaRequest {
         media: Some(MediaPart {
@@ -519,8 +509,7 @@ async fn file_uri_fetcher_deadline_exceeded_propagates() {
 async fn file_uri_fetcher_unavailable_propagates() {
     // Fetcher returns Unavailable (e.g. upstream 5xx) → handler surfaces it.
     let fetcher = MockFetcher::err(Status::unavailable("file_uri HTTP 503"));
-    let (mut client, _addr, _server) =
-        common::start_server_with_fetcher(Arc::new(MockBackend), fetcher).await;
+    let (mut client, _addr, _server) = common::start_server_with_fetcher(Arc::new(MockBackend), fetcher).await;
 
     let req = AnalyzeMediaRequest {
         media: Some(MediaPart {
@@ -542,8 +531,7 @@ async fn file_uri_fetcher_content_type_mismatch_propagates() {
     let fetcher = MockFetcher::err(Status::invalid_argument(
         "fetched Content-Type 'text/html' does not match expected family 'image/*'",
     ));
-    let (mut client, _addr, _server) =
-        common::start_server_with_fetcher(Arc::new(MockBackend), fetcher).await;
+    let (mut client, _addr, _server) = common::start_server_with_fetcher(Arc::new(MockBackend), fetcher).await;
 
     let req = AnalyzeMediaRequest {
         media: Some(MediaPart {
@@ -565,8 +553,7 @@ async fn file_uri_happy_path_audio_family() {
     let fixture = b"fake-ogg-bytes".to_vec();
     let fetcher = MockFetcher::ok(fixture.clone());
     let backend = BytesCapturingBackend::new();
-    let (mut client, _addr, _server) =
-        common::start_server_with_fetcher(backend.clone(), fetcher.clone()).await;
+    let (mut client, _addr, _server) = common::start_server_with_fetcher(backend.clone(), fetcher.clone()).await;
 
     let req = AnalyzeMediaRequest {
         media: Some(MediaPart {
@@ -600,7 +587,10 @@ async fn file_uri_loopback_blocked_e2e() {
         prompt: "x".into(),
         model_hint: None,
     };
-    let err = client.analyze_media(req).await.expect_err("expected FailedPrecondition");
+    let err = client
+        .analyze_media(req)
+        .await
+        .expect_err("expected FailedPrecondition");
     assert_eq!(
         err.code(),
         tonic::Code::FailedPrecondition,

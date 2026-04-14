@@ -24,8 +24,7 @@ use tonic::Status;
 
 // Generated types from the server crate's own protobuf build (D-01..D-06).
 use super::roz_v1::{
-    AnalyzeMediaChunk, Done, MediaPart, Usage, analyze_media_chunk,
-    analyze_media_chunk::MediaTextDelta, media_part,
+    AnalyzeMediaChunk, Done, MediaPart, Usage, analyze_media_chunk, analyze_media_chunk::MediaTextDelta, media_part,
 };
 
 // ---------------------------------------------------------------------------
@@ -39,9 +38,7 @@ pub fn route_backend(mime: &str) -> Result<&'static str, Status> {
     if mime.starts_with("video/") || mime.starts_with("image/") || mime.starts_with("audio/") {
         Ok("gemini-2.5-pro")
     } else {
-        Err(Status::invalid_argument(format!(
-            "unsupported mime_type: {mime}"
-        )))
+        Err(Status::invalid_argument(format!("unsupported mime_type: {mime}")))
     }
 }
 
@@ -60,9 +57,7 @@ pub fn resolve_backend_name(hint: Option<&str>, mime: &str) -> Result<String, St
                 let _ = route_backend(mime)?;
                 Ok(h.to_string())
             } else {
-                Err(Status::invalid_argument(format!(
-                    "model_hint not supported: {h}"
-                )))
+                Err(Status::invalid_argument(format!("model_hint not supported: {h}")))
             }
         }
         None => Ok(route_backend(mime)?.to_string()),
@@ -159,10 +154,7 @@ impl GeminiBackend {
     fn auth_header(&self) -> (&'static str, String) {
         // Gateway path: PAIG Bearer. Direct path: x-goog-api-key.
         self.config.direct_api_key.as_ref().map_or_else(
-            || (
-                "Authorization",
-                format!("Bearer {}", self.config.gateway_api_key),
-            ),
+            || ("Authorization", format!("Bearer {}", self.config.gateway_api_key)),
             |k| ("x-goog-api-key", k.clone()),
         )
     }
@@ -300,10 +292,7 @@ impl MediaBackend for GeminiBackend {
             })?;
 
         if !resp.status().is_success() {
-            return Err(Status::unavailable(format!(
-                "gemini upstream HTTP {}",
-                resp.status()
-            )));
+            return Err(Status::unavailable(format!("gemini upstream HTTP {}", resp.status())));
         }
 
         let (tx, rx) = mpsc::channel::<Result<AnalyzeMediaChunk, Status>>(16);
@@ -315,9 +304,7 @@ impl MediaBackend for GeminiBackend {
                 let event = match ev {
                     Ok(e) => e,
                     Err(e) => {
-                        let _ = tx
-                            .send(Err(Status::unavailable(format!("sse error: {e}"))))
-                            .await;
+                        let _ = tx.send(Err(Status::unavailable(format!("sse error: {e}")))).await;
                         errored = true;
                         break;
                     }
@@ -328,9 +315,7 @@ impl MediaBackend for GeminiBackend {
                 let chunk: GeminiStreamChunk = match serde_json::from_str(&event.data) {
                     Ok(c) => c,
                     Err(e) => {
-                        let _ = tx
-                            .send(Err(Status::internal(format!("parse sse json: {e}"))))
-                            .await;
+                        let _ = tx.send(Err(Status::internal(format!("parse sse json: {e}")))).await;
                         errored = true;
                         break;
                     }
@@ -342,9 +327,9 @@ impl MediaBackend for GeminiBackend {
                     for part in &cand.content.parts {
                         if let Some(text) = &part.text {
                             let item = AnalyzeMediaChunk {
-                                payload: Some(analyze_media_chunk::Payload::TextDelta(
-                                    MediaTextDelta { text: text.clone() },
-                                )),
+                                payload: Some(analyze_media_chunk::Payload::TextDelta(MediaTextDelta {
+                                    text: text.clone(),
+                                })),
                             };
                             if tx.send(Ok(item)).await.is_err() {
                                 return; // receiver dropped
@@ -473,11 +458,11 @@ mod tests {
     // like MediaFetcher.
     // -----------------------------------------------------------------------
 
+    use super::media_part;
     use axum::Router;
     use axum::http::header;
     use axum::response::IntoResponse;
     use axum::routing::post;
-    use super::media_part;
 
     async fn spawn_gemini_test_server(sse_body: &'static str) -> std::net::SocketAddr {
         async fn handler(sse: axum::extract::State<&'static str>) -> impl IntoResponse {
@@ -570,10 +555,7 @@ mod tests {
         let addr = spawn_gemini_test_server(sse).await;
         let backend = test_backend(addr);
 
-        let mut stream = backend
-            .analyze(png_part(), "x".into())
-            .await
-            .expect("analyze ok");
+        let mut stream = backend.analyze(png_part(), "x".into()).await.expect("analyze ok");
 
         let mut text = String::new();
         let mut saw_done = false;

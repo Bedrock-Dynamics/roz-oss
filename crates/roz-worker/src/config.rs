@@ -241,7 +241,7 @@ mod tests {
     use super::*;
     use figment::providers::Serialized;
 
-    /// Minimal required fields for all tests (includes gateway_api_key).
+    /// Minimal required fields for all tests (includes `gateway_api_key`).
     fn base_config() -> serde_json::Value {
         serde_json::json!({
             "api_url": "http://localhost:8080",

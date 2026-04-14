@@ -349,13 +349,10 @@ impl EmbodimentService for EmbodimentServiceImpl {
         // Subscribe BEFORE reading initial state to avoid losing events that arrive
         // between the DB read and subscribe call (subscribe-before-read race avoidance).
         let subject = roz_nats::dispatch::embodiment_changed_subject(host_id);
-        let mut sub = nats
-            .subscribe(subject)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "NATS subscribe failed");
-                Status::internal("NATS subscribe failed")
-            })?;
+        let mut sub = nats.subscribe(subject).await.map_err(|e| {
+            tracing::error!(error = %e, "NATS subscribe failed");
+            Status::internal("NATS subscribe failed")
+        })?;
 
         // D-04: Send initial full snapshot.
         let row = fetch_embodiment_row(&self.pool, host_id, tenant_id).await?;
@@ -503,13 +500,10 @@ impl EmbodimentService for EmbodimentServiceImpl {
 
         // Subscribe before DB read (subscribe-before-read race avoidance).
         let subject = roz_nats::dispatch::embodiment_changed_subject(host_id);
-        let mut sub = nats
-            .subscribe(subject)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "NATS subscribe failed");
-                Status::internal("NATS subscribe failed")
-            })?;
+        let mut sub = nats.subscribe(subject).await.map_err(|e| {
+            tracing::error!(error = %e, "NATS subscribe failed");
+            Status::internal("NATS subscribe failed")
+        })?;
 
         // D-04: Send initial full calibration snapshot.
         let row = fetch_embodiment_row(&self.pool, host_id, tenant_id).await?;

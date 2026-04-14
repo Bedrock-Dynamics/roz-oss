@@ -2,7 +2,7 @@
 //!
 //! Verifies that `build_turn_flush(&config)` with a configured Postgres URL
 //! returns a live emitter whose turns flow through `run_flush_task` and land
-//! in `roz_session_turns` with correct turn_index/role/content.
+//! in `roz_session_turns` with correct `turn_index/role/content`.
 //!
 //! Run with `--test-threads=1` to avoid parallel testcontainer conflicts:
 //!

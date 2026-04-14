@@ -481,10 +481,7 @@ mod tests {
     fn build_task_result_all_error_variants() {
         let cases: Vec<(AgentError, &str)> = vec![
             (
-                AgentError::Model(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "model exploded",
-                ))),
+                AgentError::Model(Box::new(std::io::Error::other("model exploded"))),
                 "model",
             ),
             (
