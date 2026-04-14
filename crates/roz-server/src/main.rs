@@ -1419,6 +1419,34 @@ mod tests {
     async fn create_task_without_dispatch_backend_fails_closed() {
         let (pool, app, auth, env_id, host_id) = setup_task_test().await;
 
+        // The ENF-01 device-trust gate runs BEFORE the NATS availability check
+        // (see routes/tasks.rs). Seed a Trusted device_trust row so the test
+        // exercises the dispatch-unavailable path (→ 500) rather than being
+        // short-circuited by trust rejection (→ 409).
+        let api_key = roz_db::api_keys::verify_api_key(&pool, auth.trim_start_matches("Bearer "))
+            .await
+            .expect("verify api key")
+            .expect("api key should exist");
+        let host_uuid: uuid::Uuid = host_id.parse().expect("host_id is valid uuid");
+        sqlx::query(
+            "INSERT INTO roz_device_trust \
+             (tenant_id, host_id, posture, firmware, sbom_hash, last_attestation) \
+             VALUES ($1, $2, 'trusted', $3, NULL, $4)",
+        )
+        .bind(api_key.tenant_id)
+        .bind(host_uuid)
+        .bind(serde_json::json!({
+            "version": "1.0.0",
+            "sha256": "abc123deadbeef",
+            "crc32": 42u32,
+            "ed25519_signature": "sig-bytes-base64",
+            "partition": "a"
+        }))
+        .bind(chrono::Utc::now())
+        .execute(&pool)
+        .await
+        .expect("insert device_trust");
+
         let create_body = serde_json::json!({
             "prompt": "Pick up the red cube",
             "environment_id": env_id.to_string(),
@@ -1980,11 +2008,23 @@ mod tests {
     #[tokio::test]
     async fn grpc_stream_session_connects() {
         use roz_server::grpc;
+        use roz_server::middleware::grpc_auth::{GrpcAuthState, grpc_auth_middleware};
 
         let url = roz_test::pg_url().await;
         let pool = roz_db::create_pool(url).await.expect("pool");
         roz_db::run_migrations(&pool).await.expect("migrations");
-        let state = test_state(pool);
+        let state = test_state(pool.clone());
+
+        // Phase 16.1 moved auth out of AgentServiceImpl::stream_session and into
+        // the axum `grpc_auth_middleware` layer. Build the server with that layer
+        // (mirroring grpc_router in main) and attach a Bearer token on the client.
+        let slug = format!("grpc-stream-test-{}", uuid::Uuid::new_v4());
+        let tenant = roz_db::tenant::create_tenant(&pool, "gRPC Stream Test", &slug, "personal")
+            .await
+            .expect("create tenant");
+        let api_key = roz_db::api_keys::create_api_key(&pool, tenant.id, "grpc-key", &["admin".into()], "test")
+            .await
+            .expect("create api key");
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2025,13 +2065,20 @@ mod tests {
             test_media_fetcher,
         );
 
+        let grpc_auth_state = GrpcAuthState {
+            auth: state.auth.clone(),
+            pool: state.pool.clone(),
+        };
+        let router = tonic::service::Routes::new(grpc::roz_v1::task_service_server::TaskServiceServer::new(task_svc))
+            .add_service(grpc::roz_v1::agent_service_server::AgentServiceServer::new(agent_svc))
+            .prepare()
+            .into_axum_router()
+            .layer(axum::middleware::from_fn_with_state(
+                grpc_auth_state,
+                grpc_auth_middleware,
+            ));
         tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(grpc::roz_v1::task_service_server::TaskServiceServer::new(task_svc))
-                .add_service(grpc::roz_v1::agent_service_server::AgentServiceServer::new(agent_svc))
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-                .await
-                .unwrap();
+            axum::serve(listener, router).await.unwrap();
         });
 
         // Brief yield to let the server start
@@ -2043,7 +2090,15 @@ mod tests {
             .await
             .unwrap();
 
-        let mut client = grpc::roz_v1::agent_service_client::AgentServiceClient::new(channel);
+        let bearer = api_key.full_key.clone();
+        let interceptor = move |mut req: tonic::Request<()>| -> Result<tonic::Request<()>, tonic::Status> {
+            req.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {bearer}").parse().expect("auth metadata"),
+            );
+            Ok(req)
+        };
+        let mut client = grpc::roz_v1::agent_service_client::AgentServiceClient::with_interceptor(channel, interceptor);
 
         let (_tx, rx) = tokio::sync::mpsc::channel::<grpc::roz_v1::SessionRequest>(16);
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
