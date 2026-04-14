@@ -134,6 +134,8 @@ pub enum Commands {
     Skill(commands::skill::SkillArgs),
     /// Stream management.
     Stream(commands::stream::StreamArgs),
+    /// Media analysis via the unified `AnalyzeMedia` gRPC (Phase 16.1).
+    Media(commands::media::MediaArgs),
     /// Recording and sim-to-real comparison.
     Recording(commands::recording::RecordingArgs),
     /// Simulation environment management.
