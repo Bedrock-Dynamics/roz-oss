@@ -100,9 +100,15 @@ fn grpc_router(state: &AppState) -> Result<Router, reqwest::Error> {
     let router = tonic::service::Routes::new(roz_server::grpc::roz_v1::task_service_server::TaskServiceServer::new(
         task_svc,
     ))
-    .add_service(roz_server::grpc::roz_v1::agent_service_server::AgentServiceServer::new(
-        agent_svc,
-    ))
+    // AnalyzeMedia accepts inline_bytes up to 10 MB (D-04). The default tonic
+    // decoding cap is 4 MiB, which would reject a valid 10 MB upload at the
+    // transport layer before the handler's own cap can return ResourceExhausted
+    // with a descriptive message. Raise to 12 MiB (10 MB + proto overhead).
+    .add_service(
+        roz_server::grpc::roz_v1::agent_service_server::AgentServiceServer::new(agent_svc)
+            .max_decoding_message_size(12 * 1024 * 1024)
+            .max_encoding_message_size(12 * 1024 * 1024),
+    )
     .add_service(roz_server::grpc::roz_v1::embodiment_service_server::EmbodimentServiceServer::new(embodiment_svc))
     .add_service(
         tonic_reflection::server::Builder::configure()
