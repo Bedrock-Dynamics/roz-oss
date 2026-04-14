@@ -40,6 +40,11 @@ impl Default for MediaFetcher {
 impl MediaFetcher {
     #[must_use]
     pub fn new() -> Self {
+        // NOTE (hickory 0.24): `TokioAsyncResolver::tokio(..)` returns `Self`
+        // directly, so `MediaFetcher::new` is infallible. Bumping hickory to
+        // 0.25+ will change this to `Result<Self, ResolveError>` (silent API
+        // break at dependency bump time) — update both this constructor and
+        // `MediaFetcher::default` accordingly (IN-02).
         let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
         Self { resolver }
     }
@@ -84,6 +89,12 @@ impl MediaFetcher {
             ));
         }
 
+        // INVARIANT (IN-01): `reqwest::ClientBuilder::resolve_to_addrs` expects
+        // the un-bracketed hostname form. `url::Url::host_str()` returns
+        // `"2001:db8::1"` (no brackets) for `https://[2001:db8::1]/x`, which is
+        // exactly what `resolve_to_addrs` wants. Do NOT wrap `host` in brackets
+        // here — a future refactor that does so will silently break IPv6 SSRF
+        // pinning by failing to match the connection target.
         let client = reqwest::Client::builder()
             .timeout(FETCH_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
