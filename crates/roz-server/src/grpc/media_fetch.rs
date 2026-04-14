@@ -19,6 +19,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use futures::StreamExt as _;
 use hickory_resolver::TokioAsyncResolver;
 use hickory_resolver::config::{ResolverConfig, ResolverOpts};
@@ -26,6 +27,18 @@ use tonic::Status;
 
 const MAX_BYTES: u64 = 100 * 1024 * 1024;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Trait-erased fetcher interface so the RPC handler can be driven by a mock
+/// in tests. Production code uses [`MediaFetcher`]; integration tests inject
+/// a mock implementation to exercise the `file_uri` → backend data flow
+/// without needing self-signed HTTPS infrastructure (which the SSRF-pinned
+/// production fetcher requires).
+#[async_trait]
+pub trait MediaFetch: Send + Sync {
+    /// Fetch `uri` into memory, validating against `expected_mime_family`
+    /// (the left-hand side of the request `mime_type`, e.g. `"image"`).
+    async fn fetch(&self, uri: &str, expected_mime_family: &str) -> Result<Vec<u8>, Status>;
+}
 
 pub struct MediaFetcher {
     resolver: TokioAsyncResolver,
@@ -48,13 +61,16 @@ impl MediaFetcher {
         let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
         Self { resolver }
     }
+}
 
+#[async_trait]
+impl MediaFetch for MediaFetcher {
     /// Fetch `uri` into memory, enforcing SSRF / size / timeout / mime guards.
     #[allow(
         clippy::too_many_lines,
         reason = "Single cohesive fetch pipeline: URL parse + DNS + SSRF check + HTTP + stream cap"
     )]
-    pub async fn fetch(&self, uri: &str, expected_mime_family: &str) -> Result<Vec<u8>, Status> {
+    async fn fetch(&self, uri: &str, expected_mime_family: &str) -> Result<Vec<u8>, Status> {
         let url = reqwest::Url::parse(uri).map_err(|e| Status::invalid_argument(format!("invalid file_uri: {e}")))?;
         if url.scheme() != "https" {
             return Err(Status::invalid_argument("file_uri scheme must be https (D-13)"));
@@ -106,6 +122,24 @@ impl MediaFetcher {
     }
 }
 
+/// Pure Content-Length cap check (Pitfall 4). Extracted so the fail-fast
+/// branch is directly unit-testable without trying to lie to hyper about
+/// response body size (which it normalizes away).
+///
+/// Returns `Err(ResourceExhausted)` if `len` is `Some(n)` with `n > MAX_BYTES`.
+/// `None` (no Content-Length header) and `Some(n <= MAX_BYTES)` return `Ok`.
+#[allow(clippy::result_large_err, reason = "tonic::Status is the RPC-boundary error type")]
+pub(crate) fn check_content_length_cap(len: Option<u64>) -> Result<(), Status> {
+    if let Some(n) = len
+        && n > MAX_BYTES
+    {
+        return Err(Status::resource_exhausted(format!(
+            "file_uri body {n} bytes exceeds 100 MB cap"
+        )));
+    }
+    Ok(())
+}
+
 /// Pure HTTP pipeline: GET → status → Content-Type family → Content-Length cap →
 /// streaming body read with running cap. Extracted from [`MediaFetcher::fetch`]
 /// so integration tests can exercise the response-handling logic against a
@@ -148,13 +182,7 @@ pub(crate) async fn execute_fetch(
     }
 
     // Fail-fast on Content-Length over cap (Pitfall 4).
-    if let Some(len) = resp.content_length()
-        && len > MAX_BYTES
-    {
-        return Err(Status::resource_exhausted(format!(
-            "file_uri body {len} bytes exceeds 100 MB cap"
-        )));
-    }
+    check_content_length_cap(resp.content_length())?;
 
     let cap_hint = usize::try_from(resp.content_length().map_or(0, |n| n.min(MAX_BYTES))).unwrap_or(0);
     let mut bytes: Vec<u8> = Vec::with_capacity(cap_hint);
@@ -371,6 +399,54 @@ mod tests {
     fn does_not_block_ipv6_public() {
         assert!(!is_blocked_ip(&v6("2001:4860:4860::8888"))); // Google DNS
         assert!(!is_blocked_ip(&v6("2606:4700:4700::1111"))); // Cloudflare DNS
+    }
+
+    // -----------------------------------------------------------------------
+    // check_content_length_cap — unit-tests the Pitfall 4 fail-fast branch
+    // directly because hyper overrides caller-supplied Content-Length on
+    // responses with empty/real bodies, so testing through a live server is
+    // not possible without raw TCP.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn content_length_cap_none_ok() {
+        assert!(check_content_length_cap(None).is_ok());
+    }
+
+    #[test]
+    fn content_length_cap_zero_ok() {
+        assert!(check_content_length_cap(Some(0)).is_ok());
+    }
+
+    #[test]
+    fn content_length_cap_under_cap_ok() {
+        assert!(check_content_length_cap(Some(1)).is_ok());
+        assert!(check_content_length_cap(Some(MAX_BYTES - 1)).is_ok());
+    }
+
+    #[test]
+    fn content_length_cap_exactly_at_cap_ok() {
+        // Equal is OK — only strictly greater is rejected.
+        assert!(check_content_length_cap(Some(MAX_BYTES)).is_ok());
+    }
+
+    #[test]
+    fn content_length_cap_over_cap_rejected() {
+        let err = check_content_length_cap(Some(MAX_BYTES + 1)).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        assert!(err.message().contains("100 MB"), "message: {}", err.message());
+        assert!(
+            err.message().contains(&(MAX_BYTES + 1).to_string()),
+            "message should include actual byte count: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn content_length_cap_u64_max_rejected() {
+        // Adversarial Content-Length header: u64::MAX must be cleanly rejected.
+        let err = check_content_length_cap(Some(u64::MAX)).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
     }
 
     #[tokio::test]

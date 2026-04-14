@@ -284,6 +284,307 @@ async fn file_uri_ssrf_private_ip_blocked_e2e() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// MockFetcher — captures the uri it was asked to fetch and returns operator-
+// controlled bytes + optional error. Enables full-stack file_uri happy-path
+// testing without self-signed HTTPS.
+// ---------------------------------------------------------------------------
+
+use std::sync::Mutex;
+
+use roz_server::grpc::media_fetch::MediaFetch;
+
+struct MockFetcher {
+    last_uri: Mutex<Option<String>>,
+    last_family: Mutex<Option<String>>,
+    bytes: Vec<u8>,
+    err: Option<Status>,
+}
+
+impl MockFetcher {
+    fn ok(bytes: Vec<u8>) -> Arc<Self> {
+        Arc::new(Self {
+            last_uri: Mutex::new(None),
+            last_family: Mutex::new(None),
+            bytes,
+            err: None,
+        })
+    }
+
+    fn err(status: Status) -> Arc<Self> {
+        Arc::new(Self {
+            last_uri: Mutex::new(None),
+            last_family: Mutex::new(None),
+            bytes: Vec::new(),
+            err: Some(status),
+        })
+    }
+
+    fn captured_uri(&self) -> Option<String> {
+        self.last_uri.lock().unwrap().clone()
+    }
+
+    fn captured_family(&self) -> Option<String> {
+        self.last_family.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl MediaFetch for MockFetcher {
+    async fn fetch(&self, uri: &str, family: &str) -> Result<Vec<u8>, Status> {
+        *self.last_uri.lock().unwrap() = Some(uri.to_string());
+        *self.last_family.lock().unwrap() = Some(family.to_string());
+        self.err.as_ref().map_or_else(
+            || Ok(self.bytes.clone()),
+            |s| Err(Status::new(s.code(), s.message().to_string())),
+        )
+    }
+}
+
+// BytesCapturingBackend — asserts the handler forwards the exact bytes that
+// the fetcher returned. Closes the non-tautology gap where MockBackend was
+// ignoring the bytes it received.
+struct BytesCapturingBackend {
+    received_bytes: Mutex<Option<Vec<u8>>>,
+    received_mime: Mutex<Option<String>>,
+}
+
+impl BytesCapturingBackend {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            received_bytes: Mutex::new(None),
+            received_mime: Mutex::new(None),
+        })
+    }
+    fn captured_bytes(&self) -> Option<Vec<u8>> {
+        self.received_bytes.lock().unwrap().clone()
+    }
+    fn captured_mime(&self) -> Option<String> {
+        self.received_mime.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl roz_server::grpc::media::MediaBackend for BytesCapturingBackend {
+    #[allow(
+        clippy::unnecessary_literal_bound,
+        reason = "matches MediaBackend trait signature"
+    )]
+    fn name(&self) -> &str {
+        "bytes-capturing"
+    }
+    async fn analyze(&self, media: MediaPart, _prompt: String) -> Result<ChunkStream, Status> {
+        let Some(media_part::Source::InlineBytes(bytes)) = media.source else {
+            return Err(Status::invalid_argument(
+                "BytesCapturingBackend received non-InlineBytes source — the handler should have resolved file_uri to inline_bytes before dispatching",
+            ));
+        };
+        *self.received_bytes.lock().unwrap() = Some(bytes);
+        *self.received_mime.lock().unwrap() = Some(media.mime_type);
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let _ = tx
+                .send(Ok(AnalyzeMediaChunk {
+                    payload: Some(analyze_media_chunk::Payload::TextDelta(MediaTextDelta {
+                        text: "ok".into(),
+                    })),
+                }))
+                .await;
+            let _ = tx
+                .send(Ok(AnalyzeMediaChunk {
+                    payload: Some(analyze_media_chunk::Payload::Done(Done {})),
+                }))
+                .await;
+        });
+        Ok(Box::pin(ReceiverStream::new(rx)))
+    }
+}
+
+#[tokio::test]
+async fn file_uri_happy_path_round_trips_bytes_to_backend() {
+    // PROVES: file_uri → fetcher → handler → backend data flow end-to-end.
+    // Previously NO test exercised this path — the handler's FileUri branch
+    // at agent.rs:470 was entirely integration-uncovered.
+    let fixture = tiny_png();
+    let fetcher = MockFetcher::ok(fixture.clone());
+    let backend = BytesCapturingBackend::new();
+
+    let (mut client, _addr, _server) =
+        common::start_server_with_fetcher(backend.clone(), fetcher.clone()).await;
+
+    let req = AnalyzeMediaRequest {
+        media: Some(MediaPart {
+            mime_type: "image/png".into(),
+            hints: None,
+            source: Some(media_part::Source::FileUri(
+                "https://fixtures.example.com/tiny.png".into(),
+            )),
+        }),
+        prompt: "describe".into(),
+        model_hint: None,
+    };
+
+    let mut stream = client
+        .analyze_media(req)
+        .await
+        .expect("analyze_media ok")
+        .into_inner();
+
+    // Drain the stream — assert we got a response (proves backend ran).
+    let mut saw_done = false;
+    while let Some(item) = stream.next().await {
+        let chunk = item.expect("stream item ok");
+        if matches!(
+            chunk.payload,
+            Some(analyze_media_chunk::Payload::Done(_))
+        ) {
+            saw_done = true;
+        }
+    }
+    assert!(saw_done, "backend should have run and emitted Done");
+
+    // The CORE non-tautology assertions:
+    // 1. Fetcher was asked for the exact URI we sent
+    assert_eq!(
+        fetcher.captured_uri().as_deref(),
+        Some("https://fixtures.example.com/tiny.png"),
+        "fetcher must receive the exact URI submitted by the client"
+    );
+    // 2. Fetcher was asked for the correct mime family extracted from mime_type
+    assert_eq!(
+        fetcher.captured_family().as_deref(),
+        Some("image"),
+        "fetcher must receive the mime_type's family prefix"
+    );
+    // 3. Backend received the exact bytes the fetcher returned (byte-for-byte)
+    assert_eq!(
+        backend.captured_bytes().as_deref(),
+        Some(fixture.as_slice()),
+        "backend must receive the exact bytes fetched — byte-for-byte"
+    );
+    // 4. Backend received the original mime_type (not a resolved/mutated form)
+    assert_eq!(
+        backend.captured_mime().as_deref(),
+        Some("image/png"),
+        "backend must receive the original mime_type"
+    );
+}
+
+#[tokio::test]
+async fn file_uri_fetcher_resource_exhausted_propagates() {
+    // Fetcher returns ResourceExhausted (e.g. body > 100 MB cap) → handler
+    // must surface it unchanged to the client per D-16.
+    let fetcher = MockFetcher::err(Status::resource_exhausted("fetched body exceeds 100 MB cap"));
+    let (mut client, _addr, _server) =
+        common::start_server_with_fetcher(Arc::new(MockBackend), fetcher).await;
+
+    let req = AnalyzeMediaRequest {
+        media: Some(MediaPart {
+            mime_type: "image/png".into(),
+            hints: None,
+            source: Some(media_part::Source::FileUri("https://hosted.example.com/big.png".into())),
+        }),
+        prompt: "x".into(),
+        model_hint: None,
+    };
+    let err = client.analyze_media(req).await.expect_err("expected ResourceExhausted");
+    assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    assert!(
+        err.message().contains("100 MB"),
+        "message should propagate fetcher error verbatim: {}",
+        err.message()
+    );
+}
+
+#[tokio::test]
+async fn file_uri_fetcher_deadline_exceeded_propagates() {
+    let fetcher = MockFetcher::err(Status::deadline_exceeded("file_uri fetch timeout (30s)"));
+    let (mut client, _addr, _server) =
+        common::start_server_with_fetcher(Arc::new(MockBackend), fetcher).await;
+
+    let req = AnalyzeMediaRequest {
+        media: Some(MediaPart {
+            mime_type: "image/png".into(),
+            hints: None,
+            source: Some(media_part::Source::FileUri("https://slow.example.com/x.png".into())),
+        }),
+        prompt: "x".into(),
+        model_hint: None,
+    };
+    let err = client.analyze_media(req).await.expect_err("expected DeadlineExceeded");
+    assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
+}
+
+#[tokio::test]
+async fn file_uri_fetcher_unavailable_propagates() {
+    // Fetcher returns Unavailable (e.g. upstream 5xx) → handler surfaces it.
+    let fetcher = MockFetcher::err(Status::unavailable("file_uri HTTP 503"));
+    let (mut client, _addr, _server) =
+        common::start_server_with_fetcher(Arc::new(MockBackend), fetcher).await;
+
+    let req = AnalyzeMediaRequest {
+        media: Some(MediaPart {
+            mime_type: "video/mp4".into(),
+            hints: None,
+            source: Some(media_part::Source::FileUri("https://origin.example.com/x.mp4".into())),
+        }),
+        prompt: "x".into(),
+        model_hint: None,
+    };
+    let err = client.analyze_media(req).await.expect_err("expected Unavailable");
+    assert_eq!(err.code(), tonic::Code::Unavailable);
+}
+
+#[tokio::test]
+async fn file_uri_fetcher_content_type_mismatch_propagates() {
+    // Fetcher returns InvalidArgument (server returned wrong Content-Type
+    // family) → handler surfaces as InvalidArgument unchanged.
+    let fetcher = MockFetcher::err(Status::invalid_argument(
+        "fetched Content-Type 'text/html' does not match expected family 'image/*'",
+    ));
+    let (mut client, _addr, _server) =
+        common::start_server_with_fetcher(Arc::new(MockBackend), fetcher).await;
+
+    let req = AnalyzeMediaRequest {
+        media: Some(MediaPart {
+            mime_type: "image/png".into(),
+            hints: None,
+            source: Some(media_part::Source::FileUri("https://wrong-ct.example.com/x.png".into())),
+        }),
+        prompt: "x".into(),
+        model_hint: None,
+    };
+    let err = client.analyze_media(req).await.expect_err("expected InvalidArgument");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("Content-Type"));
+}
+
+#[tokio::test]
+async fn file_uri_happy_path_audio_family() {
+    // Audio round-trips too — proves family extraction is not image-specific.
+    let fixture = b"fake-ogg-bytes".to_vec();
+    let fetcher = MockFetcher::ok(fixture.clone());
+    let backend = BytesCapturingBackend::new();
+    let (mut client, _addr, _server) =
+        common::start_server_with_fetcher(backend.clone(), fetcher.clone()).await;
+
+    let req = AnalyzeMediaRequest {
+        media: Some(MediaPart {
+            mime_type: "audio/ogg".into(),
+            hints: None,
+            source: Some(media_part::Source::FileUri("https://a.example.com/clip.ogg".into())),
+        }),
+        prompt: "transcribe".into(),
+        model_hint: None,
+    };
+    let mut stream = client.analyze_media(req).await.expect("ok").into_inner();
+    while stream.next().await.is_some() {}
+
+    assert_eq!(fetcher.captured_family().as_deref(), Some("audio"));
+    assert_eq!(backend.captured_bytes().as_deref(), Some(fixture.as_slice()));
+    assert_eq!(backend.captured_mime().as_deref(), Some("audio/ogg"));
+}
+
 #[tokio::test]
 async fn file_uri_loopback_blocked_e2e() {
     // Operator-hosted attack vector: submit file_uri pointing at the server's

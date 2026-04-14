@@ -27,6 +27,7 @@ use std::time::Duration;
 use roz_server::auth::ApiKeyAuth;
 use roz_server::grpc::agent::AgentServiceImpl;
 use roz_server::grpc::media::MediaBackend;
+use roz_server::grpc::media_fetch::{MediaFetch, MediaFetcher};
 use roz_server::grpc::roz_v1::agent_service_client::AgentServiceClient;
 use roz_server::grpc::roz_v1::agent_service_server::AgentServiceServer;
 use roz_server::middleware::grpc_auth::{GrpcAuthState, grpc_auth_middleware};
@@ -108,6 +109,17 @@ fn spawn_grpc_server_with_auth(pool: sqlx::PgPool, agent_svc: AgentServiceImpl, 
 pub async fn start_server(
     media_backend: Arc<dyn MediaBackend>,
 ) -> (AuthedClient, SocketAddr, tokio::task::JoinHandle<()>) {
+    start_server_with_fetcher(media_backend, Arc::new(MediaFetcher::new())).await
+}
+
+/// Variant of [`start_server`] that allows the test to inject a custom
+/// `MediaFetch` implementation. Enables full-stack testing of the `file_uri`
+/// branch of the `AnalyzeMedia` handler without needing self-signed HTTPS
+/// infrastructure (which the SSRF-pinned production fetcher requires).
+pub async fn start_server_with_fetcher(
+    media_backend: Arc<dyn MediaBackend>,
+    media_fetcher: Arc<dyn MediaFetch>,
+) -> (AuthedClient, SocketAddr, tokio::task::JoinHandle<()>) {
     let pg_url = roz_test::pg_url().await;
     let pool = roz_db::create_pool(pg_url).await.expect("create pool");
     roz_db::run_migrations(&pool).await.expect("run migrations");
@@ -130,10 +142,6 @@ pub async fn start_server(
         .await
         .expect("bind grpc server");
     let addr = listener.local_addr().expect("addr");
-
-    // MediaFetcher is required even though media_rpc_integration exercises
-    // inline_bytes only — it is constructed here once.
-    let media_fetcher = Arc::new(roz_server::grpc::media_fetch::MediaFetcher::new());
 
     let agent_svc = AgentServiceImpl::new(
         pool.clone(),

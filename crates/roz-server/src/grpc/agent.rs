@@ -50,7 +50,7 @@ use super::roz_v1::agent_service_server::AgentService;
 use super::roz_v1::{self, SessionRequest, SessionResponse, WatchTeamRequest, session_request, session_response};
 use crate::grpc::auth_ext;
 use crate::grpc::media::{MediaBackend, resolve_backend_name};
-use crate::grpc::media_fetch::MediaFetcher;
+use crate::grpc::media_fetch::MediaFetch;
 
 /// Keepalive interval while an agent turn is in progress.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -173,7 +173,7 @@ pub struct AgentServiceImpl {
     /// requests after input validation + SSRF fetch.
     media_backend: Arc<dyn MediaBackend>,
     /// SSRF-guarded fetcher for `MediaPart::file_uri` (Phase 16.1 / MED-03).
-    media_fetcher: Arc<MediaFetcher>,
+    media_fetcher: Arc<dyn MediaFetch>,
 }
 
 impl AgentServiceImpl {
@@ -192,7 +192,7 @@ impl AgentServiceImpl {
         fallback_model_name: Option<String>,
         meter: Arc<dyn roz_agent::meter::UsageMeter>,
         media_backend: Arc<dyn MediaBackend>,
-        media_fetcher: Arc<MediaFetcher>,
+        media_fetcher: Arc<dyn MediaFetch>,
     ) -> Self {
         Self {
             pool,

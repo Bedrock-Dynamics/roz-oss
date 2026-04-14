@@ -51,6 +51,7 @@ hickory-resolver = { workspace = true }
 tonic-build = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 roz-test = { path = "../roz-test" }
 roz-worker = { path = "../roz-worker" }
 roz-copper = { path = "../roz-copper", default-features = false }
