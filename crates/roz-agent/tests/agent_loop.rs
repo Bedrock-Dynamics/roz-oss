@@ -2383,8 +2383,8 @@ impl roz_agent::dispatch::ToolExecutor for TimingMockToolExecutor {
 }
 
 /// Test: 2 Pure + 1 Physical tool. Model returns all 3 as tool calls.
-/// Pure tools execute concurrently, physical goes through safety stack,
-/// results returned in original call order.
+/// Contiguous pure tools execute concurrently within their segment, physical
+/// goes through safety stack, results returned in original call order.
 #[tokio::test]
 async fn mixed_pure_and_physical_tools_dispatch_correctly() {
     use roz_core::tools::ToolCategory;
@@ -2393,6 +2393,11 @@ async fn mixed_pure_and_physical_tools_dispatch_correctly() {
     let completed = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
 
     // Model returns 3 tool calls, then ends.
+    // Ordering note: the two pure calls are CONTIGUOUS (indices 0 and 1) so
+    // they form a single pure segment and dispatch concurrently. The physical
+    // call follows them in its own sequential segment. This matches the
+    // segmented dispatcher's contract: pure-parallelism is only expected
+    // within a contiguous pure run.
     let responses = vec![
         CompletionResponse {
             parts: vec![
@@ -2403,12 +2408,12 @@ async fn mixed_pure_and_physical_tools_dispatch_correctly() {
                 },
                 ContentPart::ToolUse {
                     id: "call_1".into(),
-                    name: "physical_arm".into(),
+                    name: "pure_lookup".into(),
                     input: json!({}),
                 },
                 ContentPart::ToolUse {
                     id: "call_2".into(),
-                    name: "pure_lookup".into(),
+                    name: "physical_arm".into(),
                     input: json!({}),
                 },
             ],
@@ -2687,6 +2692,156 @@ async fn results_returned_in_original_call_order() {
         result_ids,
         vec!["id_alpha", "id_beta", "id_gamma"],
         "results must be in original call order"
+    );
+}
+
+/// Regression: mixed `[pure, physical, pure]` batches must execute in ORIGINAL
+/// call order, so a pure observation before a physical action sees pre-action
+/// state and a pure observation after it sees post-action state.
+///
+/// Prior behavior partitioned calls into separate physical/pure phases and
+/// executed physical calls BEFORE any pure calls, which turned pre-action
+/// observations into post-action observations. The segmented dispatcher must
+/// complete the physical tool BEFORE starting the second pure tool.
+#[tokio::test]
+async fn segmented_dispatch_preserves_original_order_across_pure_physical_pure() {
+    use roz_core::tools::ToolCategory;
+
+    let started = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let completed = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+
+    let responses = vec![
+        CompletionResponse {
+            parts: vec![
+                ContentPart::ToolUse {
+                    id: "pre".into(),
+                    name: "pure_capture_pre".into(),
+                    input: json!({}),
+                },
+                ContentPart::ToolUse {
+                    id: "act".into(),
+                    name: "physical_move".into(),
+                    input: json!({}),
+                },
+                ContentPart::ToolUse {
+                    id: "post".into(),
+                    name: "pure_capture_post".into(),
+                    input: json!({}),
+                },
+            ],
+            stop_reason: StopReason::ToolUse,
+            usage: TokenUsage {
+                input_tokens: 30,
+                output_tokens: 15,
+                ..Default::default()
+            },
+        },
+        CompletionResponse {
+            parts: vec![ContentPart::Text { text: "Done.".into() }],
+            stop_reason: StopReason::EndTurn,
+            usage: TokenUsage {
+                input_tokens: 60,
+                output_tokens: 10,
+                ..Default::default()
+            },
+        },
+    ];
+
+    let model = Box::new(MockModel::new(vec![ModelCapability::TextReasoning], responses));
+
+    let mut dispatcher = ToolDispatcher::new(Duration::from_secs(5));
+    // Use small but nonzero delays so any reordering shows up clearly in timestamps.
+    dispatcher.register_with_category(
+        Box::new(TimingMockToolExecutor::new(
+            "pure_capture_pre",
+            ToolResult::success(json!({"frame": "pre"})),
+            Duration::from_millis(20),
+            started.clone(),
+            completed.clone(),
+        )),
+        ToolCategory::Pure,
+    );
+    dispatcher.register_with_category(
+        Box::new(TimingMockToolExecutor::new(
+            "physical_move",
+            ToolResult::success(json!({"moved": true})),
+            Duration::from_millis(40),
+            started.clone(),
+            completed.clone(),
+        )),
+        ToolCategory::Physical,
+    );
+    dispatcher.register_with_category(
+        Box::new(TimingMockToolExecutor::new(
+            "pure_capture_post",
+            ToolResult::success(json!({"frame": "post"})),
+            Duration::from_millis(20),
+            started.clone(),
+            completed.clone(),
+        )),
+        ToolCategory::Pure,
+    );
+
+    let safety = SafetyStack::new(vec![]);
+    let spatial = Box::new(MockSpatialContextProvider::empty());
+
+    let mut agent = AgentLoop::new(model, dispatcher, safety, spatial);
+
+    let input = AgentInput {
+        task_id: "segmented-order-test".into(),
+        tenant_id: "test".into(),
+        model_name: String::new(),
+        seed: AgentInputSeed::new(vec![], vec![], "observe, act, observe"),
+        max_cycles: 5,
+        max_tokens: 4096,
+        max_context_tokens: 200_000,
+        mode: AgentLoopMode::OodaReAct,
+        phases: vec![],
+        tool_choice: None,
+        response_schema: None,
+        streaming: false,
+        cancellation_token: None,
+        control_mode: roz_core::safety::ControlMode::default(),
+    };
+
+    let output = agent.run(input).await.unwrap();
+    assert_eq!(output.cycles, 2);
+
+    let starts = started.lock();
+    let ends = completed.lock();
+    assert_eq!(starts.len(), 3, "all 3 tools should have started");
+    assert_eq!(ends.len(), 3, "all 3 tools should have completed");
+
+    let pre_end = ends
+        .iter()
+        .find(|(n, _)| n == "pure_capture_pre")
+        .map(|(_, t)| *t)
+        .expect("pure_capture_pre completion recorded");
+    let physical_start = starts
+        .iter()
+        .find(|(n, _)| n == "physical_move")
+        .map(|(_, t)| *t)
+        .expect("physical_move start recorded");
+    let physical_end = ends
+        .iter()
+        .find(|(n, _)| n == "physical_move")
+        .map(|(_, t)| *t)
+        .expect("physical_move completion recorded");
+    let post_start = starts
+        .iter()
+        .find(|(n, _)| n == "pure_capture_post")
+        .map(|(_, t)| *t)
+        .expect("pure_capture_post start recorded");
+
+    // Pre-action observation must finish before the physical action begins.
+    assert!(
+        pre_end <= physical_start,
+        "pure_capture_pre must complete BEFORE physical_move starts (got pre_end={pre_end:?}, physical_start={physical_start:?})"
+    );
+    // The physical action must complete before the post-action observation begins.
+    assert!(
+        physical_end <= post_start,
+        "physical_move must complete BEFORE pure_capture_post starts (got physical_end={physical_end:?}, post_start={post_start:?})"
     );
 }
 

@@ -86,7 +86,14 @@ pub struct EdgeStateBusRunner {
     publishers: HashMap<&'static str, Publisher<'static>>,
     /// C-08 memoization: one `broadcast::Sender<T>` per topic suffix, boxed as `Any`
     /// for heterogeneous storage. Downcast to concrete `Sender<T>` on `subscribe()`.
-    subscriber_senders: parking_lot::Mutex<HashMap<&'static str, Box<dyn std::any::Any + Send + Sync>>>,
+    ///
+    /// Uses `tokio::sync::Mutex` (async) so the guard can be held across
+    /// `spawn_topic_fanout().await` in [`EdgeStateBusRunner::subscribe`]. This
+    /// serializes first-subscriber initialization and prevents a race where two
+    /// concurrent callers both observe no entry, both spawn a fanout task, and
+    /// the second overwrites the first's sender (violating the first-caller-wins
+    /// contract and the documented type-mismatch error behavior).
+    subscriber_senders: tokio::sync::Mutex<HashMap<&'static str, Box<dyn std::any::Any + Send + Sync>>>,
 }
 
 impl EdgeStateBusRunner {
@@ -109,7 +116,7 @@ impl EdgeStateBusRunner {
             session,
             robot_id,
             publishers,
-            subscriber_senders: parking_lot::Mutex::new(HashMap::new()),
+            subscriber_senders: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -150,30 +157,24 @@ impl EdgeStateBusRunner {
         T: DeserializeOwned + Clone + Send + 'static,
     {
         let key_id = topic.suffix;
-        {
-            let guard = self.subscriber_senders.lock();
-            if let Some(entry) = guard.get(key_id) {
-                if let Some(sender) = entry.downcast_ref::<tokio::sync::broadcast::Sender<T>>() {
-                    return Ok(sender.subscribe());
-                }
-                anyhow::bail!(
-                    "EdgeStateBus::subscribe::<T> type mismatch for topic {key_id}: a different T was registered previously"
-                );
+        // Hold the async mutex across the spawn + insert so concurrent first
+        // subscribers cannot both observe an empty slot and both initialize /
+        // overwrite. Serializes `subscribe()` for a given runner, which is
+        // acceptable: subscribe is not a hot path (called ~once per (topic, T)
+        // per process).
+        let mut guard = self.subscriber_senders.lock().await;
+        if let Some(entry) = guard.get(key_id) {
+            if let Some(sender) = entry.downcast_ref::<tokio::sync::broadcast::Sender<T>>() {
+                return Ok(sender.subscribe());
             }
+            anyhow::bail!(
+                "EdgeStateBus::subscribe::<T> type mismatch for topic {key_id}: a different T was registered previously"
+            );
         }
         let sub_key = format!("roz/*/{}", topic.suffix);
         let sender =
             spawn_topic_fanout::<T>(self.session.clone(), sub_key, topic.suffix, DEFAULT_BROADCAST_CAPACITY).await?;
         let rx = sender.subscribe();
-        // Race: if another task inserted in between, prefer the existing entry.
-        let mut guard = self.subscriber_senders.lock();
-        if let Some(entry) = guard.get(key_id)
-            && let Some(existing) = entry.downcast_ref::<tokio::sync::broadcast::Sender<T>>()
-        {
-            let existing_rx = existing.subscribe();
-            drop(guard);
-            return Ok(existing_rx);
-        }
         guard.insert(key_id, Box::new(sender));
         drop(guard);
         Ok(rx)
@@ -292,9 +293,90 @@ mod runner_tests {
             .await
             .expect("sub ok 2");
         assert_eq!(
-            runner.subscriber_senders.lock().len(),
+            runner.subscriber_senders.lock().await.len(),
             1,
             "exactly one fanout task memoized"
+        );
+    }
+
+    // Regression: two tasks that call `subscribe::<T>` for the same topic
+    // concurrently must both end up attached to the SAME spawned fanout task
+    // (i.e. the same `broadcast::Sender`). Before the fix, both callers could
+    // observe an empty slot, both spawn a fanout, and the second `insert` would
+    // overwrite the first — violating first-caller-wins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn subscribe_concurrent_first_callers_share_sender() {
+        use std::sync::Arc;
+
+        let session = zenoh::open(peer_only_config()).await.unwrap();
+        let runner = Arc::new(EdgeStateBusRunner::start(session, "robot-1").await.unwrap());
+
+        let r1 = Arc::clone(&runner);
+        let r2 = Arc::clone(&runner);
+        let (rx1, rx2) = tokio::join!(
+            async move { r1.subscribe::<serde_json::Value>(&TELEMETRY_SUMMARY).await },
+            async move { r2.subscribe::<serde_json::Value>(&TELEMETRY_SUMMARY).await },
+        );
+        let rx1 = rx1.expect("concurrent sub ok 1");
+        let rx2 = rx2.expect("concurrent sub ok 2");
+
+        // Exactly one sender memoized.
+        let guard = runner.subscriber_senders.lock().await;
+        assert_eq!(guard.len(), 1, "exactly one fanout task memoized under concurrency");
+        let entry = guard.get(TELEMETRY_SUMMARY.suffix).expect("entry present");
+        let sender = entry
+            .downcast_ref::<tokio::sync::broadcast::Sender<serde_json::Value>>()
+            .expect("downcast to concrete Sender<T>");
+
+        // Both receivers are attached to the same broadcast::Sender => receiver_count
+        // from the sender's perspective includes both subscribers (+ the `_rx` held
+        // inside `spawn_topic_fanout`'s channel creation, which is dropped immediately
+        // there, so only our two remain).
+        assert_eq!(
+            sender.receiver_count(),
+            2,
+            "both concurrent subscribers attached to the same broadcast::Sender",
+        );
+        // Keep receivers alive until after the assertions.
+        drop(rx1);
+        drop(rx2);
+    }
+
+    // Regression: after a first subscriber registers `T1`, a subsequent caller
+    // for the same topic with `T2 != T1` must return the documented type-mismatch
+    // error (not overwrite the existing entry).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_type_mismatch_returns_error() {
+        #[derive(Clone, serde::Deserialize)]
+        struct OtherType {
+            #[allow(dead_code)]
+            n: u32,
+        }
+
+        let session = zenoh::open(peer_only_config()).await.unwrap();
+        let runner = EdgeStateBusRunner::start(session, "robot-1").await.unwrap();
+        let _rx1 = runner
+            .subscribe::<serde_json::Value>(&TELEMETRY_SUMMARY)
+            .await
+            .expect("first T registers");
+        let err = runner
+            .subscribe::<OtherType>(&TELEMETRY_SUMMARY)
+            .await
+            .expect_err("different T must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("type mismatch") && msg.contains(TELEMETRY_SUMMARY.suffix),
+            "expected type-mismatch error, got: {msg}"
+        );
+
+        // And the existing entry is preserved (still the original Sender<serde_json::Value>).
+        let guard = runner.subscriber_senders.lock().await;
+        let entry = guard.get(TELEMETRY_SUMMARY.suffix).expect("entry preserved");
+        assert!(
+            entry
+                .downcast_ref::<tokio::sync::broadcast::Sender<serde_json::Value>>()
+                .is_some(),
+            "original Sender<serde_json::Value> is preserved",
         );
     }
 }

@@ -15,9 +15,20 @@ use crate::model::types::Message;
 use crate::safety::SafetyResult;
 
 impl AgentLoop {
-    /// Pure tools are dispatched concurrently (no safety stack needed).
-    /// Results are pushed to messages in the original call order regardless of
-    /// dispatch strategy.
+    /// Dispatches tool calls in their original order while parallelizing only
+    /// contiguous runs of `Pure` tools.
+    ///
+    /// Execution strategy (segmented):
+    /// - Walk `tool_calls` in order.
+    /// - A `Physical` call runs alone through the safety stack (sequential).
+    /// - A contiguous run of `Pure` calls runs concurrently via `join_all`.
+    /// - Segments execute sequentially with respect to each other so that a
+    ///   `Pure` observation before a `Physical` action sees pre-action state,
+    ///   and a `Pure` observation after a `Physical` action sees post-action
+    ///   state. This preserves correctness for mixed batches such as
+    ///   `[capture_frame (pure), move_robot (physical), capture_frame (pure)]`.
+    ///
+    /// Results are collected in original call order for context compaction.
     pub(crate) async fn dispatch_tool_calls(
         &self,
         tool_calls: &[roz_core::tools::ToolCall],
@@ -29,74 +40,84 @@ impl AgentLoop {
     ) {
         use roz_core::tools::ToolCategory;
 
-        // Collect all results indexed by original position.
-        let mut indexed_results: Vec<(usize, roz_core::tools::ToolResult)> = Vec::with_capacity(tool_calls.len());
+        // Buffer results by original index so we can emit them in order.
+        let mut indexed_results: Vec<Option<roz_core::tools::ToolResult>> =
+            (0..tool_calls.len()).map(|_| None).collect();
 
-        // Partition calls by category, preserving original indices.
-        let mut physical_indices = Vec::new();
-        let mut pure_indices = Vec::new();
-        for (i, call) in tool_calls.iter().enumerate() {
-            if self.dispatcher.category(&call.tool) == ToolCategory::Pure {
-                pure_indices.push(i);
+        let mut i = 0;
+        while i < tool_calls.len() {
+            let call = &tool_calls[i];
+            let category = self.dispatcher.category(&call.tool);
+
+            if category == ToolCategory::Pure {
+                // Grow a contiguous pure segment [i, j).
+                let mut j = i + 1;
+                while j < tool_calls.len() && self.dispatcher.category(&tool_calls[j].tool) == ToolCategory::Pure {
+                    j += 1;
+                }
+
+                let pure_futures: Vec<_> = (i..j)
+                    .map(|idx| {
+                        let c = &tool_calls[idx];
+                        tracing::debug!(
+                            tool = %c.tool,
+                            category = "pure",
+                            segment_start = i,
+                            segment_end = j,
+                            "dispatching pure tool in contiguous segment"
+                        );
+                        async move { (idx, self.dispatcher.dispatch(c, tool_ctx).await) }
+                    })
+                    .collect();
+
+                let pure_results = futures::future::join_all(pure_futures).await;
+                for (idx, res) in pure_results {
+                    indexed_results[idx] = Some(res);
+                }
+
+                i = j;
             } else {
-                physical_indices.push(i);
+                // Physical: sequential through safety stack.
+                tracing::debug!(
+                    tool = %call.tool,
+                    category = "physical",
+                    index = i,
+                    "dispatching physical tool sequentially"
+                );
+
+                let safety_result = self.safety.evaluate(call, spatial_ctx).await;
+
+                let tool_result = match safety_result {
+                    SafetyResult::Approved(approved_call) => self.dispatcher.dispatch(&approved_call, tool_ctx).await,
+                    SafetyResult::Blocked { ref guard, ref reason } => {
+                        tracing::warn!(guard = %guard, reason = %reason, "tool blocked by safety guard");
+                        roz_core::tools::ToolResult::error(format!("Blocked by {guard}: {reason}"))
+                    }
+                    SafetyResult::NeedsHuman { reason, timeout_secs } => {
+                        if let Some(ref approval_runtime) = self.approval_runtime {
+                            self.wait_for_human_approval(
+                                call,
+                                &reason,
+                                timeout_secs,
+                                approval_runtime,
+                                presence_tx,
+                                tool_ctx,
+                                cancellation_token,
+                            )
+                            .await
+                        } else {
+                            tracing::error!(tool = %call.tool, reason = %reason, "human approval required but no runtime approval authority is configured");
+                            roz_core::tools::ToolResult::error(format!(
+                                "Human approval required but no approval runtime is configured: {reason}"
+                            ))
+                        }
+                    }
+                };
+
+                indexed_results[i] = Some(tool_result);
+                i += 1;
             }
         }
-
-        // Physical: sequential through safety stack (existing behavior).
-        for &idx in &physical_indices {
-            let call = &tool_calls[idx];
-            tracing::debug!(tool = %call.tool, category = "physical", "dispatching tool sequentially");
-
-            let safety_result = self.safety.evaluate(call, spatial_ctx).await;
-
-            let tool_result = match safety_result {
-                SafetyResult::Approved(approved_call) => self.dispatcher.dispatch(&approved_call, tool_ctx).await,
-                SafetyResult::Blocked { ref guard, ref reason } => {
-                    tracing::warn!(guard = %guard, reason = %reason, "tool blocked by safety guard");
-                    roz_core::tools::ToolResult::error(format!("Blocked by {guard}: {reason}"))
-                }
-                SafetyResult::NeedsHuman { reason, timeout_secs } => {
-                    if let Some(ref approval_runtime) = self.approval_runtime {
-                        self.wait_for_human_approval(
-                            call,
-                            &reason,
-                            timeout_secs,
-                            approval_runtime,
-                            presence_tx,
-                            tool_ctx,
-                            cancellation_token,
-                        )
-                        .await
-                    } else {
-                        tracing::error!(tool = %call.tool, reason = %reason, "human approval required but no runtime approval authority is configured");
-                        roz_core::tools::ToolResult::error(format!(
-                            "Human approval required but no approval runtime is configured: {reason}"
-                        ))
-                    }
-                }
-            };
-
-            indexed_results.push((idx, tool_result));
-        }
-
-        // Pure: concurrent dispatch (no safety stack needed for pure computation).
-        if !pure_indices.is_empty() {
-            let pure_futures: Vec<_> = pure_indices
-                .iter()
-                .map(|&idx| {
-                    let call = &tool_calls[idx];
-                    tracing::debug!(tool = %call.tool, category = "pure", "dispatching tool concurrently");
-                    async move { (idx, self.dispatcher.dispatch(call, tool_ctx).await) }
-                })
-                .collect();
-
-            let pure_results = futures::future::join_all(pure_futures).await;
-            indexed_results.extend(pure_results);
-        }
-
-        // Sort by original index to maintain call order.
-        indexed_results.sort_by_key(|(idx, _)| *idx);
 
         // Batch all tool results into ONE User message so that
         // context compaction (split_preserving_pairs) can always
@@ -104,6 +125,8 @@ impl AgentLoop {
         // message that issued the tool calls.
         let all_results: Vec<_> = indexed_results
             .into_iter()
+            .enumerate()
+            .filter_map(|(idx, maybe_result)| maybe_result.map(|r| (idx, r)))
             .map(|(idx, tool_result)| {
                 let call = &tool_calls[idx];
                 let result_json = serde_json::to_string(&tool_result).unwrap_or_default();
