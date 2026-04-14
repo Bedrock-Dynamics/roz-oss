@@ -146,7 +146,8 @@ fn default_media_deps(
             direct_api_key: None,
             model: "gemini-2.5-pro".into(),
             timeout: Duration::from_secs(30),
-        }),
+        })
+        .expect("build gemini backend"),
     );
     let fetcher = Arc::new(roz_server::grpc::media_fetch::MediaFetcher::new());
     (backend, fetcher)
@@ -351,7 +352,8 @@ async fn full_agent_session_lifecycle() {
             direct_api_key: None,
             model: "gemini-2.5-pro".into(),
             timeout: Duration::from_secs(30),
-        }),
+        })
+        .expect("build gemini backend"),
     );
     let media_fetcher = Arc::new(roz_server::grpc::media_fetch::MediaFetcher::new());
     let agent_svc = AgentServiceImpl::new(

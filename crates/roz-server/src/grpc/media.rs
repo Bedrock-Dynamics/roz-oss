@@ -121,12 +121,20 @@ pub struct GeminiBackend {
 impl GeminiBackend {
     /// Build a Gemini backend with a dedicated `reqwest::Client`. Do NOT share
     /// with `AppState::http_client` (SSRF Pitfall 8).
+    ///
+    /// Returns `reqwest::Error` if the underlying HTTP client fails to
+    /// initialize (e.g., transient TLS backend init failure). Callers should
+    /// propagate the error rather than aborting the process so healthy
+    /// REST / session traffic is not disrupted (WR-03).
+    pub fn new(config: GeminiMediaConfig) -> Result<Self, reqwest::Error> {
+        let client = reqwest::Client::builder().timeout(config.timeout).build()?;
+        Ok(Self { config, client })
+    }
+
+    /// Build a Gemini backend from an externally-provided `reqwest::Client`.
+    /// Useful in tests or when the caller wants full control of the HTTP stack.
     #[must_use]
-    pub fn new(config: GeminiMediaConfig) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(config.timeout)
-            .build()
-            .expect("failed to build reqwest client for GeminiBackend");
+    pub const fn with_client(config: GeminiMediaConfig, client: reqwest::Client) -> Self {
         Self { config, client }
     }
 
@@ -431,7 +439,7 @@ mod tests {
             model: "gemini-2.5-pro".into(),
             timeout: Duration::from_secs(30),
         };
-        let b = GeminiBackend::new(cfg);
+        let b = GeminiBackend::new(cfg).expect("build gemini backend");
         assert_eq!(
             b.stream_url(),
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
@@ -448,7 +456,7 @@ mod tests {
             model: "gemini-2.5-pro".into(),
             timeout: Duration::from_secs(30),
         };
-        let b = GeminiBackend::new(cfg);
+        let b = GeminiBackend::new(cfg).expect("build gemini backend");
         assert_eq!(
             b.stream_url(),
             "https://gw.example/proxy/google-vertex/v1beta1/models/gemini-2.5-pro:streamGenerateContent?alt=sse"

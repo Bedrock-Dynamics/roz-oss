@@ -69,7 +69,7 @@ async fn gemini_live_streams_png_analysis() {
         model: "gemini-2.5-pro".into(),
         timeout: Duration::from_secs(60),
     };
-    let backend = Arc::new(GeminiBackend::new(config));
+    let backend = Arc::new(GeminiBackend::new(config).expect("build gemini backend"));
 
     // Spin up in-process tonic server with the real GeminiBackend injected,
     // via the shared harness created in Plan 05 Task 0 (`tests/common/mod.rs`).

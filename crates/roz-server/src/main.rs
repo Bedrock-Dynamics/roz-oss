@@ -49,7 +49,7 @@ fn app(state: AppState) -> Router {
 /// Authentication is performed structurally by `grpc_auth_middleware` (applied
 /// as the outer-most layer below). Each service reads `AuthIdentity` from
 /// request extensions via `crate::grpc::auth_ext::tenant_from_extensions`.
-fn grpc_router(state: &AppState) -> Router {
+fn grpc_router(state: &AppState) -> Result<Router, reqwest::Error> {
     let task_svc = roz_server::grpc::tasks::TaskServiceImpl::new(
         state.pool.clone(),
         state.http_client.clone(),
@@ -65,7 +65,7 @@ fn grpc_router(state: &AppState) -> Router {
             direct_api_key: state.model_config.gemini_direct_api_key.clone(),
             model: "gemini-2.5-pro".into(),
             timeout: std::time::Duration::from_secs(state.model_config.timeout_secs),
-        }),
+        })?,
     );
     let media_fetcher = Arc::new(roz_server::grpc::media_fetch::MediaFetcher::new());
     let agent_svc = roz_server::grpc::agent::AgentServiceImpl::new(
@@ -97,7 +97,7 @@ fn grpc_router(state: &AppState) -> Router {
 
     // Use tonic::service::Routes directly (bypasses tonic::transport::Server
     // since axum manages TCP/TLS). into_axum_router() extracts the inner Router.
-    tonic::service::Routes::new(roz_server::grpc::roz_v1::task_service_server::TaskServiceServer::new(
+    let router = tonic::service::Routes::new(roz_server::grpc::roz_v1::task_service_server::TaskServiceServer::new(
         task_svc,
     ))
     .add_service(roz_server::grpc::roz_v1::agent_service_server::AgentServiceServer::new(
@@ -121,7 +121,8 @@ fn grpc_router(state: &AppState) -> Router {
     .layer(axum::middleware::from_fn_with_state(
         grpc_auth_state,
         roz_server::middleware::grpc_auth::grpc_auth_middleware,
-    ))
+    ));
+    Ok(router)
 }
 
 /// Initialize tracing via Logfire, falling back to stdout if unavailable.
@@ -336,7 +337,13 @@ async fn main() {
         });
     }
 
-    let grpc = grpc_router(&state);
+    let grpc = match grpc_router(&state) {
+        Ok(router) => router,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to build gRPC router — aborting startup");
+            std::process::exit(1);
+        }
+    };
     let rest = app(state);
 
     // Multiplex REST and gRPC on the same port.
@@ -1983,15 +1990,17 @@ mod tests {
             state.nats_client.clone(),
             state.trust_policy.clone(),
         );
-        let test_media_backend: Arc<dyn grpc::media::MediaBackend> =
-            Arc::new(grpc::media::GeminiBackend::new(grpc::media::GeminiMediaConfig {
+        let test_media_backend: Arc<dyn grpc::media::MediaBackend> = Arc::new(
+            grpc::media::GeminiBackend::new(grpc::media::GeminiMediaConfig {
                 gateway_url: state.model_config.gateway_url.clone(),
                 gateway_api_key: state.model_config.api_key.clone(),
                 provider: state.model_config.gemini_provider.clone(),
                 direct_api_key: state.model_config.gemini_direct_api_key.clone(),
                 model: "gemini-2.5-pro".into(),
                 timeout: std::time::Duration::from_secs(state.model_config.timeout_secs),
-            }));
+            })
+            .expect("build test gemini backend"),
+        );
         let test_media_fetcher = Arc::new(grpc::media_fetch::MediaFetcher::new());
         let agent_svc = grpc::agent::AgentServiceImpl::new(
             state.pool.clone(),
