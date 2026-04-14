@@ -153,13 +153,29 @@ pub async fn start_server(
     );
 
     spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
-        .expect("parse channel uri")
-        .connect()
-        .await
-        .expect("connect");
+    // IN-06: Replace the fixed 50 ms sleep with a bounded connect-retry loop.
+    // The listener is already bound before `spawn_grpc_server_with_auth`
+    // returns, so `connect()` usually succeeds on the first attempt; retry
+    // defensively to handle the rare scheduling race where the axum serve
+    // task has not yet polled `accept()`. Total worst-case ~100 ms (same as
+    // the old sleep) but typical case is <1 ms.
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}")).expect("parse channel uri");
+    let mut last_err: Option<tonic::transport::Error> = None;
+    let mut channel: Option<tonic::transport::Channel> = None;
+    for _ in 0..20 {
+        match endpoint.clone().connect().await {
+            Ok(c) => {
+                channel = Some(c);
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+    let channel = channel.unwrap_or_else(|| panic!("connect failed after retries: {last_err:?}"));
 
     // Attach Bearer auth metadata via interceptor so every RPC carries the
     // API-key bearer token. Callers do not need to add it per-request.
