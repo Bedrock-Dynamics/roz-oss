@@ -617,7 +617,7 @@ async fn ooda_react_mode_injects_image_when_screenshot_present() {
 }
 
 #[tokio::test]
-async fn ooda_react_mode_uses_system_message_without_screenshot() {
+async fn ooda_react_mode_uses_user_message_without_screenshot() {
     let recorded_requests: std::sync::Arc<parking_lot::Mutex<Vec<CompletionRequest>>> =
         std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
 
@@ -707,7 +707,10 @@ async fn ooda_react_mode_uses_system_message_without_screenshot() {
     let requests = recorded_requests.lock();
     assert_eq!(requests.len(), 1);
 
-    // Find the spatial observation message -- should be a system message (no image)
+    // Find the spatial observation message. Per CR #3, the role must be
+    // stable across both the with-screenshot and without-screenshot paths
+    // so model precedence does not flip based on image presence — both emit
+    // a user message.
     let spatial_msg = requests[0]
         .messages
         .iter()
@@ -715,14 +718,13 @@ async fn ooda_react_mode_uses_system_message_without_screenshot() {
     assert!(spatial_msg.is_some(), "Expected a [Spatial Observation] message");
 
     let msg = spatial_msg.unwrap();
-    // Must be a system message (text-only observation)
     assert_eq!(
         msg.role,
-        MessageRole::System,
-        "Spatial observation without image must be a system message"
+        MessageRole::User,
+        "Spatial observation role must match the with-screenshot branch (user)"
     );
 
-    // Must NOT contain any Image content parts
+    // Must NOT contain any Image content parts when no screenshot is present.
     let has_image = msg.parts.iter().any(|p| matches!(p, ContentPart::Image { .. }));
     assert!(!has_image, "Should not have Image content parts when no screenshot");
 }
