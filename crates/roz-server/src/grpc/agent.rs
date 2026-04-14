@@ -482,9 +482,69 @@ impl AgentService for AgentServiceImpl {
         };
 
         // --- Dispatch ---
-        let stream = self.media_backend.analyze(resolved, req.prompt).await?;
+        let raw_stream = self.media_backend.analyze(resolved, req.prompt).await?;
 
-        Ok(Response::new(stream))
+        // --- Wrap stream for usage metering ---
+        // Forward each chunk to the client; on the terminal Done chunk,
+        // invoke `record_media_usage` with the input/output token counts
+        // captured from the Usage chunk. Never block the client stream on
+        // the DB call — it runs after the last chunk is forwarded. Usage is
+        // NOT recorded on mid-stream errors (prevents double-billing when a
+        // retry happens). Record-failure is logged at warn! and does not
+        // fail the request — usage metering must not affect user-facing RPC
+        // success.
+        let pool = self.pool.clone();
+        let tenant_uuid = auth_identity.tenant_id().0;
+        let backend_for_usage = backend_name.clone();
+        let idempotency_key = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<roz_v1::AnalyzeMediaChunk, Status>>(16);
+        tokio::spawn(async move {
+            let mut input_tokens: Option<i64> = None;
+            let mut output_tokens: Option<i64> = None;
+            let mut saw_done = false;
+            let mut stream = raw_stream;
+            while let Some(item) = stream.next().await {
+                if let Ok(chunk) = &item
+                    && let Some(roz_v1::analyze_media_chunk::Payload::Usage(u)) = &chunk.payload
+                {
+                    input_tokens = i64::try_from(u.input_tokens).ok();
+                    output_tokens = i64::try_from(u.output_tokens).ok();
+                }
+                let is_done = matches!(
+                    &item,
+                    Ok(c) if matches!(c.payload, Some(roz_v1::analyze_media_chunk::Payload::Done(_)))
+                );
+                if tx.send(item).await.is_err() {
+                    return; // client dropped — no usage row recorded
+                }
+                if is_done {
+                    saw_done = true;
+                }
+            }
+            if saw_done
+                && let Err(e) = roz_db::usage::record_media_usage(
+                    &pool,
+                    tenant_uuid,
+                    None,
+                    "media_analysis",
+                    Some(&backend_for_usage),
+                    1,
+                    input_tokens,
+                    output_tokens,
+                    &idempotency_key,
+                )
+                .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    tenant = %tenant_uuid,
+                    backend = %backend_for_usage,
+                    "record_media_usage failed (usage row not inserted)"
+                );
+            }
+        });
+
+        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }
 

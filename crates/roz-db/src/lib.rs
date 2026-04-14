@@ -18,6 +18,7 @@ pub mod streams;
 pub mod tasks;
 pub mod tenant;
 pub mod triggers;
+pub mod usage;
 
 use std::time::Duration;
 
