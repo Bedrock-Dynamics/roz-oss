@@ -24,7 +24,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 ROZ_API_URL="${ROZ_API_URL:-https://roz-api-dev.fly.dev}"
-FIXTURE="${ROOT}/scripts/e2e-fixtures/gradient-16x16.png"
+FIXTURE_PNG="${ROOT}/scripts/e2e-fixtures/gradient-16x16.png"
+FIXTURE_MP4="${ROOT}/scripts/e2e-fixtures/tiny-1s-128x128.mp4"
+FIXTURE_WAV="${ROOT}/scripts/e2e-fixtures/tiny-1s-440hz.wav"
+# back-compat alias (earlier tests only referenced image)
+FIXTURE="$FIXTURE_PNG"
 PASS=0
 FAIL=0
 
@@ -32,10 +36,12 @@ if [ -z "${ROZ_API_KEY:-}" ]; then
   echo "ERROR: ROZ_API_KEY is not set. Export a dev API key before running." >&2
   exit 1
 fi
-if [ ! -f "$FIXTURE" ]; then
-  echo "ERROR: fixture not found: $FIXTURE" >&2
-  exit 1
-fi
+for f in "$FIXTURE_PNG" "$FIXTURE_MP4" "$FIXTURE_WAV"; do
+  if [ ! -f "$f" ]; then
+    echo "ERROR: fixture not found: $f" >&2
+    exit 1
+  fi
+done
 
 export ROZ_API_URL
 export ROZ_API_KEY
@@ -97,6 +103,70 @@ if [ -n "$TEXT" ] && [ ${#TEXT} -gt 10 ]; then
   printf '    sample: %.120s...\n' "$TEXT"
 else
   fail "text response empty or too short"
+fi
+
+# ---------------------------------------------------------------------------
+# 1b. Video happy path — 1s 128x128 H.264 test pattern
+# ---------------------------------------------------------------------------
+banner "1b. Inline video/mp4 happy path"
+set +e
+"$BIN" media analyze "$FIXTURE_MP4" \
+  --prompt "In one short sentence, what kind of test pattern is in this video?" \
+  --mime video/mp4 \
+  --json \
+  > "$OUT" 2>&1
+RC=$?
+set -e
+
+if [ $RC -eq 0 ]; then pass "video exit code 0"; else fail "video exit code $RC"; cat "$OUT"; fi
+if grep -q '"type":"text_delta"' "$OUT" || grep -q '"type": "text_delta"' "$OUT"; then
+  pass "video: text_delta chunks received"
+else
+  fail "video: no text_delta chunks"; head -10 "$OUT"
+fi
+if grep -q '"type":"done"' "$OUT" || grep -q '"type": "done"' "$OUT"; then
+  pass "video: done chunk received"
+else
+  fail "video: no done chunk"
+fi
+VTEXT=$(grep -o '"text":"[^"]*"' "$OUT" | sed 's/"text":"//; s/"$//' | tr -d '\n')
+if [ -n "$VTEXT" ] && [ ${#VTEXT} -gt 10 ]; then
+  pass "video: non-trivial response (${#VTEXT} chars)"
+  printf '    sample: %.120s...\n' "$VTEXT"
+else
+  fail "video: response empty or too short"
+fi
+
+# ---------------------------------------------------------------------------
+# 1c. Audio happy path — 1s 440Hz sine tone, 16kHz mono
+# ---------------------------------------------------------------------------
+banner "1c. Inline audio/wav happy path"
+set +e
+"$BIN" media analyze "$FIXTURE_WAV" \
+  --prompt "In one sentence, describe what you hear (tone, pitch, duration)." \
+  --mime audio/wav \
+  --json \
+  > "$OUT" 2>&1
+RC=$?
+set -e
+
+if [ $RC -eq 0 ]; then pass "audio exit code 0"; else fail "audio exit code $RC"; cat "$OUT"; fi
+if grep -q '"type":"text_delta"' "$OUT" || grep -q '"type": "text_delta"' "$OUT"; then
+  pass "audio: text_delta chunks received"
+else
+  fail "audio: no text_delta chunks"; head -10 "$OUT"
+fi
+if grep -q '"type":"done"' "$OUT" || grep -q '"type": "done"' "$OUT"; then
+  pass "audio: done chunk received"
+else
+  fail "audio: no done chunk"
+fi
+ATEXT=$(grep -o '"text":"[^"]*"' "$OUT" | sed 's/"text":"//; s/"$//' | tr -d '\n')
+if [ -n "$ATEXT" ] && [ ${#ATEXT} -gt 10 ]; then
+  pass "audio: non-trivial response (${#ATEXT} chars)"
+  printf '    sample: %.120s...\n' "$ATEXT"
+else
+  fail "audio: response empty or too short"
 fi
 
 # ---------------------------------------------------------------------------
