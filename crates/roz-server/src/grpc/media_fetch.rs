@@ -160,6 +160,7 @@ const fn is_blocked_v4(v4: Ipv4Addr) -> bool {
         || v4.is_broadcast()
         || v4.is_unspecified()
         || v4.is_documentation()
+        || v4.is_multicast()
     {
         return true;
     }
@@ -172,15 +173,36 @@ const fn is_blocked_v4(v4: Ipv4Addr) -> bool {
     if oct[0] == 100 && (oct[1] & 0xC0) == 0x40 {
         return true;
     }
+    // 192.0.0.0/24 IETF protocol assignments (RFC 6890)
+    if oct[0] == 192 && oct[1] == 0 && oct[2] == 0 {
+        return true;
+    }
     false
 }
 
 const fn is_blocked_v6(v6: Ipv6Addr) -> bool {
-    if v6.is_loopback() || v6.is_unspecified() {
+    if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
         return true;
     }
-    if is_ipv6_link_local(v6) || is_ipv6_unique_local(v6) {
+    if is_ipv6_link_local(v6) || is_ipv6_unique_local(v6) || is_ipv6_site_local(v6) {
         return true;
+    }
+    let seg = v6.segments();
+    // IPv6 documentation 2001:db8::/32 (RFC 3849)
+    if seg[0] == 0x2001 && seg[1] == 0x0db8 {
+        return true;
+    }
+    // 6to4 (2002::/16) — embedded IPv4 in segments[1..=2] must not be private.
+    if seg[0] == 0x2002 {
+        let embedded = Ipv4Addr::new(
+            (seg[1] >> 8) as u8,
+            (seg[1] & 0xff) as u8,
+            (seg[2] >> 8) as u8,
+            (seg[2] & 0xff) as u8,
+        );
+        if is_blocked_v4(embedded) {
+            return true;
+        }
     }
     if let Some(mapped) = v6.to_ipv4_mapped() {
         return is_blocked_v4(mapped);
@@ -194,6 +216,12 @@ const fn is_ipv6_link_local(v6: Ipv6Addr) -> bool {
 
 const fn is_ipv6_unique_local(v6: Ipv6Addr) -> bool {
     (v6.segments()[0] & 0xfe00) == 0xfc00
+}
+
+// Deprecated IPv6 site-local (fec0::/10). Still routable on some legacy
+// internal networks — reject defensively.
+const fn is_ipv6_site_local(v6: Ipv6Addr) -> bool {
+    (v6.segments()[0] & 0xffc0) == 0xfec0
 }
 
 // ---------------------------------------------------------------------------
@@ -254,6 +282,59 @@ mod tests {
     fn blocks_ipv6_mapped_to_private_v4() {
         assert!(is_blocked_ip(&v6("::ffff:10.0.0.1")));
         assert!(is_blocked_ip(&v6("::ffff:127.0.0.1")));
+    }
+
+    #[test]
+    fn blocks_ipv6_site_local() {
+        // fec0::/10 (deprecated but still routable on some networks)
+        assert!(is_blocked_ip(&v6("fec0::1")));
+        assert!(is_blocked_ip(&v6("fecf::ffff")));
+        assert!(is_blocked_ip(&v6("feff::1")));
+    }
+
+    #[test]
+    fn blocks_ipv6_multicast() {
+        assert!(is_blocked_ip(&v6("ff00::1")));
+        assert!(is_blocked_ip(&v6("ff02::1")));
+    }
+
+    #[test]
+    fn blocks_ipv6_documentation() {
+        // 2001:db8::/32
+        assert!(is_blocked_ip(&v6("2001:db8::1")));
+        assert!(is_blocked_ip(&v6("2001:db8:dead:beef::1")));
+    }
+
+    #[test]
+    fn blocks_ipv6_6to4_with_embedded_private_v4() {
+        // 2002:<v4-hex>::/48 — embedded v4 is 10.0.0.1
+        assert!(is_blocked_ip(&v6("2002:0a00:0001::1")));
+        // 2002:<v4-hex>::/48 — embedded v4 is 192.168.1.1
+        assert!(is_blocked_ip(&v6("2002:c0a8:0101::1")));
+        // 2002:<v4-hex>::/48 — embedded v4 is 127.0.0.1
+        assert!(is_blocked_ip(&v6("2002:7f00:0001::1")));
+    }
+
+    #[test]
+    fn does_not_block_ipv6_6to4_with_embedded_public_v4() {
+        // 2002:0808:0808::/48 — embedded v4 is 8.8.8.8 (public)
+        assert!(!is_blocked_ip(&v6("2002:0808:0808::1")));
+    }
+
+    #[test]
+    fn blocks_ipv4_multicast() {
+        assert!(is_blocked_ip(&v4("224.0.0.1")));
+        assert!(is_blocked_ip(&v4("239.255.255.250")));
+    }
+
+    #[test]
+    fn blocks_ipv4_ietf_protocol_assignments() {
+        // 192.0.0.0/24 (RFC 6890)
+        assert!(is_blocked_ip(&v4("192.0.0.0")));
+        assert!(is_blocked_ip(&v4("192.0.0.170"))); // DNS64
+        assert!(is_blocked_ip(&v4("192.0.0.255")));
+        // Boundary — just outside the /24
+        assert!(!is_blocked_ip(&v4("192.0.1.1")));
     }
 
     #[test]
