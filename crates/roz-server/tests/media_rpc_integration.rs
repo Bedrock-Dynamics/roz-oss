@@ -215,3 +215,96 @@ async fn rejects_bad_mime() {
         err.message()
     );
 }
+
+// ---------------------------------------------------------------------------
+// file_uri end-to-end tests
+//
+// These exercise the full RPC stack (proto → handler → MediaFetcher) for
+// MediaPart::FileUri. The happy-path variant (fetcher → real HTTPS test
+// server → backend) would require self-signed TLS + a test-only trust store,
+// so it is deferred. These tests cover the security-critical and
+// always-reachable failure modes end-to-end.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn file_uri_non_https_scheme_rejected() {
+    // Scheme enforcement runs BEFORE DNS, so this round-trips through the
+    // actual handler + fetcher code path without needing any test HTTP server.
+    let (mut client, _addr, _server) = common::start_server(Arc::new(MockBackend)).await;
+    let req = AnalyzeMediaRequest {
+        media: Some(MediaPart {
+            mime_type: "image/png".into(),
+            hints: None,
+            source: Some(media_part::Source::FileUri("http://example.com/x.png".into())),
+        }),
+        prompt: "x".into(),
+        model_hint: None,
+    };
+    let err = client.analyze_media(req).await.expect_err("expected InvalidArgument");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(
+        err.message().contains("https"),
+        "message should mention https scheme: {}",
+        err.message()
+    );
+}
+
+#[tokio::test]
+async fn file_uri_ssrf_private_ip_blocked_e2e() {
+    // AWS/GCP instance metadata service (IMDS) — the canonical SSRF target.
+    // 169.254.169.254 is in 169.254.0.0/16 (link-local), which is_blocked_ip
+    // rejects. This test proves the rejection surfaces correctly through the
+    // full RPC stack (proto → handler → fetcher → Status mapping) as the
+    // expected FailedPrecondition per D-15/D-16, not InvalidArgument or
+    // Internal. Regression guard for the most important SSRF vector.
+    let (mut client, _addr, _server) = common::start_server(Arc::new(MockBackend)).await;
+    let req = AnalyzeMediaRequest {
+        media: Some(MediaPart {
+            mime_type: "image/png".into(),
+            hints: None,
+            source: Some(media_part::Source::FileUri(
+                "https://169.254.169.254/latest/meta-data/iam/security-credentials/".into(),
+            )),
+        }),
+        prompt: "x".into(),
+        model_hint: None,
+    };
+    let err = client.analyze_media(req).await.expect_err("expected FailedPrecondition");
+    assert_eq!(
+        err.code(),
+        tonic::Code::FailedPrecondition,
+        "SSRF block must surface as FailedPrecondition, got: {:?} — {}",
+        err.code(),
+        err.message()
+    );
+    assert!(
+        err.message().contains("blocked IP"),
+        "message must identify the block reason: {}",
+        err.message()
+    );
+}
+
+#[tokio::test]
+async fn file_uri_loopback_blocked_e2e() {
+    // Operator-hosted attack vector: submit file_uri pointing at the server's
+    // own loopback interface to reach internal-only services (metrics,
+    // admin endpoints, etc.). Loopback 127.0.0.0/8 must be blocked too.
+    let (mut client, _addr, _server) = common::start_server(Arc::new(MockBackend)).await;
+    let req = AnalyzeMediaRequest {
+        media: Some(MediaPart {
+            mime_type: "image/png".into(),
+            hints: None,
+            source: Some(media_part::Source::FileUri("https://127.0.0.1/secrets.png".into())),
+        }),
+        prompt: "x".into(),
+        model_hint: None,
+    };
+    let err = client.analyze_media(req).await.expect_err("expected FailedPrecondition");
+    assert_eq!(
+        err.code(),
+        tonic::Code::FailedPrecondition,
+        "loopback must be blocked, got: {:?} — {}",
+        err.code(),
+        err.message()
+    );
+}
