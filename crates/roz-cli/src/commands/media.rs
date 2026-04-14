@@ -94,7 +94,13 @@ async fn analyze(
         eprintln!("Analyzing {source} (mime={resolved_mime}) @ {}", config.api_url);
     }
 
-    let channel = build_channel(&config.api_url).await?;
+    let channel = match build_channel(&config.api_url).await {
+        Ok(c) => c,
+        Err(e) => {
+            emit_transport_error(&e, json_mode);
+            std::process::exit(4);
+        }
+    };
     let auth_value: tonic::metadata::MetadataValue<_> = format!("Bearer {api_key}")
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid API key format for metadata: {e}"))?;
@@ -263,6 +269,21 @@ async fn build_channel(api_url: &str) -> anyhow::Result<Channel> {
         .connect()
         .await
         .map_err(|e| anyhow::anyhow!("connect {api_url}: {e}"))
+}
+
+fn emit_transport_error(err: &anyhow::Error, json_mode: bool) {
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::json!({
+                "type": "error",
+                "code": "TransportError",
+                "message": err.to_string(),
+            })
+        );
+    } else {
+        eprintln!("transport error: {err}");
+    }
 }
 
 fn emit_error(status: &tonic::Status, json_mode: bool) {
