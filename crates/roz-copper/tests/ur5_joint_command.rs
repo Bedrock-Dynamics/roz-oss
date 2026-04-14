@@ -16,7 +16,7 @@
 )]
 //! Test: Send joint velocity command to UR5 arm and observe pose change.
 //!
-//! Run: cargo test -p roz-copper --test `ur5_joint_command` -- --ignored --nocapture
+//! Run: cargo test -p roz-copper --test ur5_joint_command -- --ignored --nocapture
 //! Requires: ros2-manipulator container with updated bridge on port 9094
 
 pub mod proto {
@@ -139,11 +139,10 @@ async fn send_velocity_to_ur5_shoulder() {
             }
         }
         Err(e) => {
-            assert!(
-                e.code() != tonic::Code::Unimplemented,
-                "SendJointCommand not in bridge — image needs rebuild"
-            );
-            println!("RPC error: {e}");
+            if e.code() == tonic::Code::Unimplemented {
+                panic!("SendJointCommand not in bridge — image needs rebuild");
+            }
+            panic!("SendJointCommand RPC failed: {e}");
         }
     }
 

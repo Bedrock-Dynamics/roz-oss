@@ -17,7 +17,7 @@
 )]
 //! Test `SendJointCommand` RPC against a rebuilt bare-gazebo container.
 //!
-//! Run: cargo test -p roz-copper --test `send_joint_command_test` -- --ignored --nocapture
+//! Run: cargo test -p roz-copper --test send_joint_command_test -- --ignored --nocapture
 //! Requires: bare-gazebo container with updated bridge on port 9098
 
 pub mod proto {

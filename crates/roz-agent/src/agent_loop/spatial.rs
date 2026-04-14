@@ -48,15 +48,17 @@ pub fn format_spatial_context(ctx: &WorldState) -> String {
 
 /// Build the observation message for spatial context injection.
 ///
-/// When screenshots are present, returns a user message with both text and
-/// image content blocks (Anthropic requires images in user messages).
-/// Otherwise returns a system message with text-only observation.
+/// Always returns a `user` message so the role is identical whether screenshots
+/// are attached or not (CodeRabbit #3: precedence must not flip based on
+/// presence of images). When screenshots are present the user message carries
+/// both text and image content blocks (Anthropic requires images in user
+/// messages).
 #[doc(hidden)]
 pub fn build_spatial_observation(ctx: &WorldState) -> Message {
     let formatted = format_spatial_context(ctx);
     let observation_text = format!("[Spatial Observation]\n{formatted}");
     if ctx.screenshots.is_empty() {
-        Message::system(observation_text)
+        Message::user(observation_text)
     } else {
         let images: Vec<(String, String)> = ctx
             .screenshots
