@@ -102,61 +102,77 @@ impl MediaFetcher {
             .build()
             .map_err(|e| Status::internal(format!("reqwest build: {e}")))?;
 
-        let resp = client.get(url).send().await.map_err(|e| {
+        execute_fetch(&client, url, expected_mime_family).await
+    }
+}
+
+/// Pure HTTP pipeline: GET → status → Content-Type family → Content-Length cap →
+/// streaming body read with running cap. Extracted from [`MediaFetcher::fetch`]
+/// so integration tests can exercise the response-handling logic against a
+/// local test server without needing to satisfy the SSRF guard (which blocks
+/// loopback by design).
+///
+/// The caller is responsible for building a `reqwest::Client` with the
+/// appropriate SSRF pinning, timeout, and redirect policy.
+pub(crate) async fn execute_fetch(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    expected_mime_family: &str,
+) -> Result<Vec<u8>, Status> {
+    let resp = client.get(url).send().await.map_err(|e| {
+        if e.is_timeout() {
+            Status::deadline_exceeded("file_uri fetch timeout (30s)")
+        } else {
+            Status::unavailable(format!("file_uri fetch failed: {e}"))
+        }
+    })?;
+
+    if !resp.status().is_success() {
+        return Err(Status::unavailable(format!("file_uri HTTP {}", resp.status())));
+    }
+
+    // Content-Type family check (on FINAL response — Pitfall 3).
+    // RFC 7231 §3.1.1.1: media type tokens are case-insensitive, so compare
+    // via eq_ignore_ascii_case after trimming whitespace (some servers emit
+    // `image /png` or `IMAGE/PNG`).
+    let ct = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let ct_family = ct.split('/').next().unwrap_or("").trim();
+    if !ct_family.eq_ignore_ascii_case(expected_mime_family) {
+        return Err(Status::invalid_argument(format!(
+            "fetched Content-Type '{ct}' does not match expected family '{expected_mime_family}/*'"
+        )));
+    }
+
+    // Fail-fast on Content-Length over cap (Pitfall 4).
+    if let Some(len) = resp.content_length()
+        && len > MAX_BYTES
+    {
+        return Err(Status::resource_exhausted(format!(
+            "file_uri body {len} bytes exceeds 100 MB cap"
+        )));
+    }
+
+    let cap_hint = usize::try_from(resp.content_length().map_or(0, |n| n.min(MAX_BYTES))).unwrap_or(0);
+    let mut bytes: Vec<u8> = Vec::with_capacity(cap_hint);
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
             if e.is_timeout() {
-                Status::deadline_exceeded("file_uri fetch timeout (30s)")
+                Status::deadline_exceeded("file_uri body timeout")
             } else {
-                Status::unavailable(format!("file_uri fetch failed: {e}"))
+                Status::unavailable(format!("body read failed: {e}"))
             }
         })?;
-
-        if !resp.status().is_success() {
-            return Err(Status::unavailable(format!("file_uri HTTP {}", resp.status())));
+        if bytes.len() as u64 + chunk.len() as u64 > MAX_BYTES {
+            return Err(Status::resource_exhausted("file_uri body exceeds 100 MB cap"));
         }
-
-        // Content-Type family check (on FINAL response — Pitfall 3).
-        // RFC 7231 §3.1.1.1: media type tokens are case-insensitive, so compare
-        // via eq_ignore_ascii_case after trimming whitespace (some servers emit
-        // `image /png` or `IMAGE/PNG`).
-        let ct = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let ct_family = ct.split('/').next().unwrap_or("").trim();
-        if !ct_family.eq_ignore_ascii_case(expected_mime_family) {
-            return Err(Status::invalid_argument(format!(
-                "fetched Content-Type '{ct}' does not match expected family '{expected_mime_family}/*'"
-            )));
-        }
-
-        // Fail-fast on Content-Length over cap (Pitfall 4).
-        if let Some(len) = resp.content_length()
-            && len > MAX_BYTES
-        {
-            return Err(Status::resource_exhausted(format!(
-                "file_uri body {len} bytes exceeds 100 MB cap"
-            )));
-        }
-
-        let cap_hint = usize::try_from(resp.content_length().map_or(0, |n| n.min(MAX_BYTES))).unwrap_or(0);
-        let mut bytes: Vec<u8> = Vec::with_capacity(cap_hint);
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| {
-                if e.is_timeout() {
-                    Status::deadline_exceeded("file_uri body timeout")
-                } else {
-                    Status::unavailable(format!("body read failed: {e}"))
-                }
-            })?;
-            if bytes.len() as u64 + chunk.len() as u64 > MAX_BYTES {
-                return Err(Status::resource_exhausted("file_uri body exceeds 100 MB cap"));
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        Ok(bytes)
+        bytes.extend_from_slice(&chunk);
     }
+    Ok(bytes)
 }
 
 /// Reject private / loopback / link-local / CGNAT / IPv6 ULA / IPv4-mapped.
@@ -389,5 +405,165 @@ mod tests {
             "got {:?}",
             err.code()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // HTTP-pipeline integration tests (via `execute_fetch`)
+    //
+    // These exercise the actual GET + response handling against a local axum
+    // server: happy path, oversize body, Content-Type family mismatch, redirect
+    // rejection. The SSRF IP-block + TOCTOU pin are unit-tested above against
+    // `is_blocked_ip` directly — they block loopback by design, so happy-path
+    // integration must bypass the IP check via the extracted helper.
+    // -----------------------------------------------------------------------
+
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{StatusCode, header};
+    use axum::response::{IntoResponse, Redirect, Response};
+    use axum::routing::get;
+
+    async fn spawn_test_server(app: Router) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        (addr, handle)
+    }
+
+    fn test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("test client")
+    }
+
+    #[tokio::test]
+    async fn execute_fetch_returns_body_on_happy_path() {
+        async fn handler() -> impl IntoResponse {
+            ([(header::CONTENT_TYPE, "image/png")], b"fake-png-bytes".to_vec())
+        }
+        let app = Router::new().route("/x.png", get(handler));
+        let (addr, _srv) = spawn_test_server(app).await;
+        let url = reqwest::Url::parse(&format!("http://{addr}/x.png")).unwrap();
+
+        let bytes = execute_fetch(&test_client(), url, "image")
+            .await
+            .expect("happy path");
+        assert_eq!(bytes, b"fake-png-bytes");
+    }
+
+    #[tokio::test]
+    async fn execute_fetch_rejects_content_type_family_mismatch() {
+        async fn handler() -> impl IntoResponse {
+            ([(header::CONTENT_TYPE, "text/html")], b"<html></html>".to_vec())
+        }
+        let app = Router::new().route("/x.png", get(handler));
+        let (addr, _srv) = spawn_test_server(app).await;
+        let url = reqwest::Url::parse(&format!("http://{addr}/x.png")).unwrap();
+
+        let err = execute_fetch(&test_client(), url, "image").await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("Content-Type"),
+            "message: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_fetch_accepts_content_type_case_insensitive() {
+        // RFC 7231: media types are case-insensitive. WR-02 fix regression guard.
+        async fn handler() -> impl IntoResponse {
+            ([(header::CONTENT_TYPE, "IMAGE/PNG")], b"png".to_vec())
+        }
+        let app = Router::new().route("/x.png", get(handler));
+        let (addr, _srv) = spawn_test_server(app).await;
+        let url = reqwest::Url::parse(&format!("http://{addr}/x.png")).unwrap();
+
+        let bytes = execute_fetch(&test_client(), url, "image")
+            .await
+            .expect("uppercase content-type accepted");
+        assert_eq!(bytes, b"png");
+    }
+
+    // NOTE: the `content_length() > MAX_BYTES` fail-fast branch is NOT
+    // covered at integration level because hyper overrides caller-specified
+    // Content-Length on responses with empty/real-sized bodies, making a
+    // "lying Content-Length" server server-side impossible without dropping
+    // below hyper to raw TCP. The defense-in-depth running-tally guard IS
+    // covered by `execute_fetch_streams_body_and_aborts_on_overflow` below.
+
+    #[tokio::test]
+    async fn execute_fetch_streams_body_and_aborts_on_overflow() {
+        // Server declares Content-Length just under the cap (passes fail-fast)
+        // but streams more bytes than it advertised. Client-side running tally
+        // must still abort the read when it crosses MAX_BYTES.
+        //
+        // Uses a smaller bogus cap by redeclaring locally — we stream ~200 KiB
+        // but advertise `None` so the client enters streaming mode and enforces
+        // the running-tally guard. We exercise the guard path with a smaller
+        // MAX via direct assertion: stream exactly MAX_BYTES + 1 bytes as 1 MiB
+        // chunks. This test is a proof of guard, not a memory stress test.
+        //
+        // To keep the test fast, we use `http::Response` streaming of a repeated
+        // byte-pattern.
+        use futures::stream;
+        async fn handler() -> impl IntoResponse {
+            let chunk: Vec<u8> = vec![0u8; 1024 * 1024]; // 1 MiB
+            // 101 chunks → 101 MiB (over the 100 MiB cap). Chunked encoding —
+            // no Content-Length, so fail-fast doesn't trigger; the running
+            // tally must.
+            let stream = stream::iter(
+                (0..101).map(move |_| Ok::<_, std::io::Error>(bytes::Bytes::from(chunk.clone()))),
+            );
+            let body = Body::from_stream(stream);
+            let mut resp = Response::new(body);
+            resp.headers_mut()
+                .insert(header::CONTENT_TYPE, "image/png".parse().unwrap());
+            resp
+        }
+        let app = Router::new().route("/huge.png", get(handler));
+        let (addr, _srv) = spawn_test_server(app).await;
+        let url = reqwest::Url::parse(&format!("http://{addr}/huge.png")).unwrap();
+
+        let err = execute_fetch(&test_client(), url, "image").await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn execute_fetch_rejects_redirect_with_no_policy_client() {
+        // The production `fetch()` builds the reqwest client with
+        // `redirect::Policy::none()`, so a 3xx surfaces as a non-success status.
+        async fn redirect_handler() -> impl IntoResponse {
+            Redirect::temporary("/elsewhere")
+        }
+        let app = Router::new().route("/x.png", get(redirect_handler));
+        let (addr, _srv) = spawn_test_server(app).await;
+        let url = reqwest::Url::parse(&format!("http://{addr}/x.png")).unwrap();
+
+        // test_client() above also uses Policy::none — same semantics as prod.
+        let err = execute_fetch(&test_client(), url, "image").await.unwrap_err();
+        // 307 is not a success code → fetch surfaces it as Unavailable.
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(err.message().contains("HTTP 307"), "message: {}", err.message());
+    }
+
+    #[tokio::test]
+    async fn execute_fetch_surfaces_upstream_5xx_as_unavailable() {
+        async fn handler() -> impl IntoResponse {
+            (StatusCode::INTERNAL_SERVER_ERROR, "oops")
+        }
+        let app = Router::new().route("/broken.png", get(handler));
+        let (addr, _srv) = spawn_test_server(app).await;
+        let url = reqwest::Url::parse(&format!("http://{addr}/broken.png")).unwrap();
+
+        let err = execute_fetch(&test_client(), url, "image").await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(err.message().contains("HTTP 500"), "message: {}", err.message());
     }
 }
