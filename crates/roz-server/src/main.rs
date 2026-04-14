@@ -49,7 +49,7 @@ fn app(state: AppState) -> Router {
 /// Authentication is performed structurally by `grpc_auth_middleware` (applied
 /// as the outer-most layer below). Each service reads `AuthIdentity` from
 /// request extensions via `crate::grpc::auth_ext::tenant_from_extensions`.
-fn grpc_router(state: &AppState) -> Result<Router, reqwest::Error> {
+fn grpc_router(state: &AppState) -> Router {
     let task_svc = roz_server::grpc::tasks::TaskServiceImpl::new(
         state.pool.clone(),
         state.http_client.clone(),
@@ -57,16 +57,32 @@ fn grpc_router(state: &AppState) -> Result<Router, reqwest::Error> {
         state.nats_client.clone(),
         state.trust_policy.clone(),
     );
-    let media_backend: Arc<dyn roz_server::grpc::media::MediaBackend> = Arc::new(
-        roz_server::grpc::media::GeminiBackend::new(roz_server::grpc::media::GeminiMediaConfig {
+    // Build the primary Gemini media backend. If its dedicated HTTP client
+    // fails to initialize (for example, transient TLS backend init errors —
+    // see SSRF Pitfall 8 for why we don't share AppState's client), fall back
+    // to a `DisabledMediaBackend` that returns UNAVAILABLE from every RPC.
+    // This keeps REST / session traffic healthy instead of turning a
+    // backend-local init failure into a full server outage (WR-03).
+    let media_backend: Arc<dyn roz_server::grpc::media::MediaBackend> =
+        match roz_server::grpc::media::GeminiBackend::new(roz_server::grpc::media::GeminiMediaConfig {
             gateway_url: state.model_config.gateway_url.clone(),
             gateway_api_key: state.model_config.api_key.clone(),
             provider: state.model_config.gemini_provider.clone(),
             direct_api_key: state.model_config.gemini_direct_api_key.clone(),
             model: "gemini-2.5-pro".into(),
             timeout: std::time::Duration::from_secs(state.model_config.timeout_secs),
-        })?,
-    );
+        }) {
+            Ok(backend) => Arc::new(backend),
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    "failed to build GeminiBackend; AnalyzeMedia will return UNAVAILABLE"
+                );
+                Arc::new(roz_server::grpc::media::DisabledMediaBackend::new(format!(
+                    "gemini backend init failed: {err}"
+                )))
+            }
+        };
     let media_fetcher = Arc::new(roz_server::grpc::media_fetch::MediaFetcher::new());
     let agent_svc = roz_server::grpc::agent::AgentServiceImpl::new(
         state.pool.clone(),
@@ -97,7 +113,7 @@ fn grpc_router(state: &AppState) -> Result<Router, reqwest::Error> {
 
     // Use tonic::service::Routes directly (bypasses tonic::transport::Server
     // since axum manages TCP/TLS). into_axum_router() extracts the inner Router.
-    let router = tonic::service::Routes::new(roz_server::grpc::roz_v1::task_service_server::TaskServiceServer::new(
+    tonic::service::Routes::new(roz_server::grpc::roz_v1::task_service_server::TaskServiceServer::new(
         task_svc,
     ))
     // AnalyzeMedia accepts inline_bytes up to 10 MB (D-04). The default tonic
@@ -127,8 +143,7 @@ fn grpc_router(state: &AppState) -> Result<Router, reqwest::Error> {
     .layer(axum::middleware::from_fn_with_state(
         grpc_auth_state,
         roz_server::middleware::grpc_auth::grpc_auth_middleware,
-    ));
-    Ok(router)
+    ))
 }
 
 /// Initialize tracing via Logfire, falling back to stdout if unavailable.
@@ -343,13 +358,7 @@ async fn main() {
         });
     }
 
-    let grpc = match grpc_router(&state) {
-        Ok(router) => router,
-        Err(err) => {
-            tracing::error!(error = %err, "failed to build gRPC router — aborting startup");
-            std::process::exit(1);
-        }
-    };
+    let grpc = grpc_router(&state);
     let rest = app(state);
 
     // Multiplex REST and gRPC on the same port.
@@ -2008,7 +2017,6 @@ mod tests {
     #[tokio::test]
     async fn grpc_stream_session_connects() {
         use roz_server::grpc;
-        use roz_server::middleware::grpc_auth::{GrpcAuthState, grpc_auth_middleware};
 
         let url = roz_test::pg_url().await;
         let pool = roz_db::create_pool(url).await.expect("pool");
@@ -2016,8 +2024,9 @@ mod tests {
         let state = test_state(pool.clone());
 
         // Phase 16.1 moved auth out of AgentServiceImpl::stream_session and into
-        // the axum `grpc_auth_middleware` layer. Build the server with that layer
-        // (mirroring grpc_router in main) and attach a Bearer token on the client.
+        // the axum `grpc_auth_middleware` layer. Reuse the production
+        // `grpc_router` to mirror the real wiring (auth + rate-limit layers,
+        // full service set) and attach a Bearer token on the client.
         let slug = format!("grpc-stream-test-{}", uuid::Uuid::new_v4());
         let tenant = roz_db::tenant::create_tenant(&pool, "gRPC Stream Test", &slug, "personal")
             .await
@@ -2029,54 +2038,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let task_svc = grpc::tasks::TaskServiceImpl::new(
-            state.pool.clone(),
-            state.http_client.clone(),
-            state.restate_ingress_url.clone(),
-            state.nats_client.clone(),
-            state.trust_policy.clone(),
-        );
-        let test_media_backend: Arc<dyn grpc::media::MediaBackend> = Arc::new(
-            grpc::media::GeminiBackend::new(grpc::media::GeminiMediaConfig {
-                gateway_url: state.model_config.gateway_url.clone(),
-                gateway_api_key: state.model_config.api_key.clone(),
-                provider: state.model_config.gemini_provider.clone(),
-                direct_api_key: state.model_config.gemini_direct_api_key.clone(),
-                model: "gemini-2.5-pro".into(),
-                timeout: std::time::Duration::from_secs(state.model_config.timeout_secs),
-            })
-            .expect("build test gemini backend"),
-        );
-        let test_media_fetcher = Arc::new(grpc::media_fetch::MediaFetcher::new());
-        let agent_svc = grpc::agent::AgentServiceImpl::new(
-            state.pool.clone(),
-            state.http_client.clone(),
-            state.restate_ingress_url.clone(),
-            state.nats_client.clone(),
-            state.model_config.default_model.clone(),
-            state.model_config.gateway_url.clone(),
-            state.model_config.api_key.clone(),
-            state.model_config.timeout_secs,
-            state.model_config.anthropic_provider.clone(),
-            state.model_config.direct_api_key.clone(),
-            None, // fallback_model_name
-            state.meter.clone(),
-            test_media_backend,
-            test_media_fetcher,
-        );
-
-        let grpc_auth_state = GrpcAuthState {
-            auth: state.auth.clone(),
-            pool: state.pool.clone(),
-        };
-        let router = tonic::service::Routes::new(grpc::roz_v1::task_service_server::TaskServiceServer::new(task_svc))
-            .add_service(grpc::roz_v1::agent_service_server::AgentServiceServer::new(agent_svc))
-            .prepare()
-            .into_axum_router()
-            .layer(axum::middleware::from_fn_with_state(
-                grpc_auth_state,
-                grpc_auth_middleware,
-            ));
+        let router = grpc_router(&state);
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });

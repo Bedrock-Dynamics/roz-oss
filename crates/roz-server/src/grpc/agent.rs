@@ -422,6 +422,48 @@ impl AgentService for AgentServiceImpl {
         let tenant = auth_identity.tenant_id().0.to_string();
         tracing::Span::current().record("tenant", tracing::field::display(&tenant));
 
+        // --- Resolve retry-stable idempotency key (CodeRabbit #10) ---
+        // The usage row written after the terminal Done chunk must collide on
+        // retry so ambiguous stream failures do not double-bill. We take the
+        // key from the `idempotency-key` gRPC metadata header (a
+        // metadata-level contract — no proto change). If the caller does not
+        // supply one we fall back to a freshly generated UUID and log a warn,
+        // which matches pre-fix behavior for callers that have not adopted
+        // the contract yet. Validation: non-empty, ASCII printable, max 256
+        // chars — reject anything else with InvalidArgument so we never feed
+        // hostile input into the DB key.
+        #[expect(
+            clippy::single_match_else,
+            reason = "Symmetric match keeps the metadata-present validation and metadata-absent fallback visually parallel"
+        )]
+        let idempotency_key = match request.metadata().get("idempotency-key") {
+            Some(raw) => {
+                let s = raw
+                    .to_str()
+                    .map_err(|_| Status::invalid_argument("idempotency-key metadata must be valid UTF-8"))?;
+                if s.is_empty() {
+                    return Err(Status::invalid_argument("idempotency-key metadata must be non-empty"));
+                }
+                if s.len() > 256 {
+                    return Err(Status::invalid_argument("idempotency-key metadata exceeds 256 chars"));
+                }
+                if !s.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+                    return Err(Status::invalid_argument(
+                        "idempotency-key metadata must be ASCII printable",
+                    ));
+                }
+                s.to_owned()
+            }
+            None => {
+                let k = uuid::Uuid::new_v4().to_string();
+                tracing::warn!(
+                    tenant = %tenant,
+                    "analyze_media called without `idempotency-key` metadata; generated a non-stable key — retries will double-bill"
+                );
+                k
+            }
+        };
+
         // --- Validate request ---
         let req = request.into_inner();
         let media = req
@@ -496,7 +538,6 @@ impl AgentService for AgentServiceImpl {
         let pool = self.pool.clone();
         let tenant_uuid = auth_identity.tenant_id().0;
         let backend_for_usage = backend_name.clone();
-        let idempotency_key = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<roz_v1::AnalyzeMediaChunk, Status>>(16);
         tokio::spawn(async move {
             let mut input_tokens: Option<i64> = None;
@@ -688,16 +729,31 @@ async fn run_session_loop(
                                 tool_calls = output.tool_calls_made,
                                 "agent_session.turn_complete"
                             );
-                            if let Err(e) = roz_db::agent_sessions::update_session_usage(
-                                pool,
-                                sess.id,
-                                i64::try_from(output.input_tokens).unwrap_or(i64::MAX),
-                                i64::try_from(output.output_tokens).unwrap_or(i64::MAX),
-                                1,
-                            )
-                            .await
-                            {
-                                tracing::warn!(session_id = %sess.id, error = %e, "failed to update session usage");
+                            // Wrap the RLS-sensitive update in a transaction so
+                            // `set_tenant_context` persists across the UPDATE query.
+                            match pool.begin().await {
+                                Ok(mut tx) => {
+                                    if let Err(e) =
+                                        roz_db::set_tenant_context(&mut *tx, &sess.tenant_id).await
+                                    {
+                                        tracing::warn!(session_id = %sess.id, error = %e, "failed to set tenant context for session usage update");
+                                    } else if let Err(e) = roz_db::agent_sessions::update_session_usage(
+                                        &mut *tx,
+                                        sess.id,
+                                        i64::try_from(output.input_tokens).unwrap_or(i64::MAX),
+                                        i64::try_from(output.output_tokens).unwrap_or(i64::MAX),
+                                        1,
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(session_id = %sess.id, error = %e, "failed to update session usage");
+                                    } else if let Err(e) = tx.commit().await {
+                                        tracing::warn!(session_id = %sess.id, error = %e, "failed to commit session usage update");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(session_id = %sess.id, error = %e, "failed to begin tx for session usage update");
+                                }
                             }
                             let runtime = sess
                                 .runtime
@@ -1498,10 +1554,23 @@ async fn run_session_loop(
             "agent_session.ended"
         );
     }
-    if let Some(ref s) = session
-        && let Err(e) = roz_db::agent_sessions::complete_session(pool, s.id, status).await
-    {
-        tracing::warn!(session_id = %s.id, error = %e, "failed to complete session");
+    if let Some(ref s) = session {
+        // Wrap the RLS-sensitive update in a transaction so `set_tenant_context`
+        // persists across the UPDATE query.
+        match pool.begin().await {
+            Ok(mut tx) => {
+                if let Err(e) = roz_db::set_tenant_context(&mut *tx, &s.tenant_id).await {
+                    tracing::warn!(session_id = %s.id, error = %e, "failed to set tenant context for session completion");
+                } else if let Err(e) = roz_db::agent_sessions::complete_session(&mut *tx, s.id, status).await {
+                    tracing::warn!(session_id = %s.id, error = %e, "failed to complete session");
+                } else if let Err(e) = tx.commit().await {
+                    tracing::warn!(session_id = %s.id, error = %e, "failed to commit session completion");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(session_id = %s.id, error = %e, "failed to begin tx for session completion");
+            }
+        }
     }
 }
 
@@ -1871,13 +1940,36 @@ async fn handle_start(
     };
 
     // Write session metadata to Postgres.
-    let session_row = match roz_db::agent_sessions::create_session(pool, tenant_id, env_id, &model_name).await {
-        Ok(row) => row,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to create agent session");
+    // Wrap the RLS-sensitive insert in a transaction so `set_tenant_context`
+    // persists across the INSERT query.
+    let session_row = {
+        let mut db_tx = match pool.begin().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to begin tx for agent session creation");
+                send_error(tx, "internal", "failed to create session", true).await;
+                return false;
+            }
+        };
+        if let Err(e) = roz_db::set_tenant_context(&mut *db_tx, &tenant_id).await {
+            tracing::error!(error = %e, "failed to set tenant context for agent session creation");
             send_error(tx, "internal", "failed to create session", true).await;
             return false;
         }
+        let row = match roz_db::agent_sessions::create_session(&mut *db_tx, tenant_id, env_id, &model_name).await {
+            Ok(row) => row,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to create agent session");
+                send_error(tx, "internal", "failed to create session", true).await;
+                return false;
+            }
+        };
+        if let Err(e) = db_tx.commit().await {
+            tracing::error!(error = %e, "failed to commit agent session creation");
+            send_error(tx, "internal", "failed to create session", true).await;
+            return false;
+        }
+        row
     };
 
     let session_id = session_row.id;

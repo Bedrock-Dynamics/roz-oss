@@ -427,6 +427,17 @@ impl EmbodimentService for EmbodimentServiceImpl {
                                 Ok(None) => { tracing::warn!(%host_id, "host disappeared"); continue; }
                                 Err(e) => { tracing::warn!(error = %e, "DB read error"); continue; }
                             };
+                            // Multi-tenant safety: revalidate row ownership against caller's tenant.
+                            // Guards against stale/forged events or host reassignment leaking data.
+                            if row.tenant_id != tenant_id {
+                                tracing::warn!(
+                                    %host_id,
+                                    event_tenant = %tenant_id,
+                                    row_tenant = %row.tenant_id,
+                                    "tenant mismatch on re-read; skipping frame tree emission"
+                                );
+                                continue;
+                            }
                             let new_model: roz_core::embodiment::model::EmbodimentModel =
                                 match serde_json::from_value(match row.embodiment_model {
                                     Some(v) => v,
@@ -580,6 +591,17 @@ impl EmbodimentService for EmbodimentServiceImpl {
                                 Ok(None) => { tracing::warn!(%host_id, "host disappeared"); continue; }
                                 Err(e) => { tracing::warn!(error = %e, "DB read error"); continue; }
                             };
+                            // Multi-tenant safety: revalidate row ownership against caller's tenant.
+                            // Guards against stale/forged events or host reassignment leaking data.
+                            if row.tenant_id != tenant_id {
+                                tracing::warn!(
+                                    %host_id,
+                                    event_tenant = %tenant_id,
+                                    row_tenant = %row.tenant_id,
+                                    "tenant mismatch on re-read; skipping calibration emission"
+                                );
+                                continue;
+                            }
 
                             let runtime: roz_core::embodiment::embodiment_runtime::EmbodimentRuntime =
                                 match serde_json::from_value(match row.embodiment_runtime {

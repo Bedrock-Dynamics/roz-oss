@@ -131,32 +131,47 @@ impl GeminiBackend {
         Self { config, client }
     }
 
+    /// Returns `true` when the gateway (PAIG) path is usable — both a non-empty
+    /// `gateway_url` AND a non-empty `gateway_api_key` are configured. Gateway
+    /// is the PRIMARY path per D-10/D-11, so this takes precedence over
+    /// `direct_api_key` whenever both are set. Direct is strictly a
+    /// degradation path.
+    fn gateway_configured(&self) -> bool {
+        !self.config.gateway_url.is_empty() && !self.config.gateway_api_key.is_empty()
+    }
+
     /// Compose the `streamGenerateContent` URL per D-10/D-11.
     ///
-    /// Gateway path uses `v1beta1` to match the verified PAIG path in
-    /// `crates/roz-agent/src/model/gemini.rs`. Direct path uses `v1beta`,
-    /// the standard googleapis URL shape for the Gemini API.
+    /// Gateway is the PRIMARY path and wins whenever `gateway_url` and
+    /// `gateway_api_key` are both present/non-empty. The gateway path uses
+    /// `v1beta1` to match the verified PAIG path in
+    /// `crates/roz-agent/src/model/gemini.rs`. Only when gateway config is
+    /// missing/empty do we fall back to the direct `generativelanguage.googleapis.com`
+    /// path (which uses `v1beta`, the standard googleapis URL shape).
     #[must_use]
     pub fn stream_url(&self) -> String {
-        if self.config.direct_api_key.is_some() {
-            format!(
-                "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse",
-                self.config.model
-            )
-        } else {
+        if self.gateway_configured() {
             format!(
                 "{}/proxy/{}/v1beta1/models/{}:streamGenerateContent?alt=sse",
                 self.config.gateway_url, self.config.provider, self.config.model
+            )
+        } else {
+            format!(
+                "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?alt=sse",
+                self.config.model
             )
         }
     }
 
     fn auth_header(&self) -> (&'static str, String) {
-        // Gateway path: PAIG Bearer. Direct path: x-goog-api-key.
-        self.config.direct_api_key.as_ref().map_or_else(
-            || ("Authorization", format!("Bearer {}", self.config.gateway_api_key)),
-            |k| ("x-goog-api-key", k.clone()),
-        )
+        // Gateway path (PRIMARY): PAIG Bearer. Direct path (fallback): x-goog-api-key.
+        // Gateway wins whenever it is configured, even if direct_api_key is also
+        // set, so dual-key deployments do not silently bypass PAIG mediation.
+        if self.gateway_configured() {
+            ("Authorization", format!("Bearer {}", self.config.gateway_api_key))
+        } else {
+            ("x-goog-api-key", self.config.direct_api_key.clone().unwrap_or_default())
+        }
     }
 }
 
@@ -366,6 +381,37 @@ impl MediaBackend for GeminiBackend {
 }
 
 // ---------------------------------------------------------------------------
+// DisabledMediaBackend — fallback when init fails (WR-03)
+// ---------------------------------------------------------------------------
+
+/// A no-op `MediaBackend` used when the primary backend fails to initialize.
+///
+/// Covers transient TLS/HTTP client init errors inside `GeminiBackend::new`.
+/// Returns `UNAVAILABLE` with a descriptive reason from every RPC so healthy
+/// REST / session traffic is not disrupted.
+pub struct DisabledMediaBackend {
+    reason: String,
+}
+
+impl DisabledMediaBackend {
+    #[must_use]
+    pub const fn new(reason: String) -> Self {
+        Self { reason }
+    }
+}
+
+#[async_trait]
+impl MediaBackend for DisabledMediaBackend {
+    fn name(&self) -> &str {
+        "disabled"
+    }
+
+    async fn analyze(&self, _media: MediaPart, _prompt: String) -> Result<ChunkStream, Status> {
+        Err(Status::unavailable(format!("media backend disabled: {}", self.reason)))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -411,7 +457,9 @@ mod tests {
     }
 
     #[test]
-    fn gemini_url_uses_direct_when_key_set() {
+    fn gemini_url_prefers_gateway_when_both_configured() {
+        // Per D-10/D-11, gateway is the PRIMARY path. When both gateway and
+        // direct are configured, requests MUST go through PAIG, not bypass it.
         let cfg = GeminiMediaConfig {
             gateway_url: "https://gw.example".into(),
             gateway_api_key: "gw".into(),
@@ -423,8 +471,11 @@ mod tests {
         let b = GeminiBackend::new(cfg).expect("build gemini backend");
         assert_eq!(
             b.stream_url(),
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+            "https://gw.example/proxy/google-vertex/v1beta1/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
         );
+        let (h, v) = b.auth_header();
+        assert_eq!(h, "Authorization");
+        assert_eq!(v, "Bearer gw");
     }
 
     #[test]
@@ -442,6 +493,51 @@ mod tests {
             b.stream_url(),
             "https://gw.example/proxy/google-vertex/v1beta1/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
         );
+        let (h, v) = b.auth_header();
+        assert_eq!(h, "Authorization");
+        assert_eq!(v, "Bearer gw");
+    }
+
+    #[test]
+    fn gemini_url_falls_back_to_direct_when_gateway_url_empty() {
+        // Degradation path: gateway not configured, only direct key set.
+        let cfg = GeminiMediaConfig {
+            gateway_url: String::new(),
+            gateway_api_key: String::new(),
+            provider: "google-vertex".into(),
+            direct_api_key: Some("direct".into()),
+            model: "gemini-2.5-pro".into(),
+            timeout: Duration::from_secs(30),
+        };
+        let b = GeminiBackend::new(cfg).expect("build gemini backend");
+        assert_eq!(
+            b.stream_url(),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+        );
+        let (h, v) = b.auth_header();
+        assert_eq!(h, "x-goog-api-key");
+        assert_eq!(v, "direct");
+    }
+
+    #[test]
+    fn gemini_url_falls_back_to_direct_when_gateway_api_key_empty() {
+        // Partial gateway config (URL without key) is not usable; fall back.
+        let cfg = GeminiMediaConfig {
+            gateway_url: "https://gw.example".into(),
+            gateway_api_key: String::new(),
+            provider: "google-vertex".into(),
+            direct_api_key: Some("direct".into()),
+            model: "gemini-2.5-pro".into(),
+            timeout: Duration::from_secs(30),
+        };
+        let b = GeminiBackend::new(cfg).expect("build gemini backend");
+        assert_eq!(
+            b.stream_url(),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+        );
+        let (h, v) = b.auth_header();
+        assert_eq!(h, "x-goog-api-key");
+        assert_eq!(v, "direct");
     }
 
     // -----------------------------------------------------------------------

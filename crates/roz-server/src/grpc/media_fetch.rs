@@ -235,6 +235,15 @@ const fn is_blocked_v4(v4: Ipv4Addr) -> bool {
     if oct[0] == 192 && oct[1] == 0 && oct[2] == 0 {
         return true;
     }
+    // 198.18.0.0/15 IETF benchmarking (RFC 2544) — spans 198.18.0.0–198.19.255.255
+    if oct[0] == 198 && (oct[1] & 0xfe) == 18 {
+        return true;
+    }
+    // 240.0.0.0/4 Class E reserved — first octet ≥ 240 (255.255.255.255 already
+    // covered by is_broadcast above).
+    if oct[0] >= 240 {
+        return true;
+    }
     false
 }
 
@@ -393,6 +402,26 @@ mod tests {
         assert!(is_blocked_ip(&v4("192.0.0.255")));
         // Boundary — just outside the /24
         assert!(!is_blocked_ip(&v4("192.0.1.1")));
+    }
+
+    #[test]
+    fn blocks_ipv4_benchmarking() {
+        // 198.18.0.0/15 (RFC 2544)
+        assert!(is_blocked_ip(&v4("198.18.0.0")));
+        assert!(is_blocked_ip(&v4("198.18.5.10")));
+        assert!(is_blocked_ip(&v4("198.19.255.255")));
+        // Boundary — just outside the /15
+        assert!(!is_blocked_ip(&v4("198.20.0.0")));
+    }
+
+    #[test]
+    fn blocks_ipv4_class_e_reserved() {
+        // 240.0.0.0/4 Class E reserved
+        assert!(is_blocked_ip(&v4("240.0.0.0")));
+        assert!(is_blocked_ip(&v4("250.1.2.3")));
+        assert!(is_blocked_ip(&v4("254.254.254.254")));
+        // 255.255.255.255 already blocked via is_broadcast()
+        assert!(is_blocked_ip(&v4("255.255.255.255")));
     }
 
     #[test]
