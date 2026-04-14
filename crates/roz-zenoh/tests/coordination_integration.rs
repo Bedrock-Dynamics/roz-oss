@@ -80,15 +80,20 @@ async fn barrier_three_joiners_plus_late_query() {
         .await
         .unwrap();
 
-    // Allow the seed replies + subscriber declare to settle.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Sanity: observer sees all three.
-    // Snapshot under the read guard and release before running assertions.
+    // Poll for all three participants to propagate. Fixed sleeps flaked under
+    // CI load; polling with a 5s ceiling is reliable and typically completes
+    // in <100 ms.
+    let all_present = wait_until(
+        || {
+            let s = participants.read();
+            s.contains("a") && s.contains("b") && s.contains("c")
+        },
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+    )
+    .await;
     let snapshot: std::collections::BTreeSet<String> = participants.read().iter().cloned().collect();
-    assert!(snapshot.contains("a"), "expected a, got {snapshot:?}");
-    assert!(snapshot.contains("b"), "expected b, got {snapshot:?}");
-    assert!(snapshot.contains("c"), "expected c, got {snapshot:?}");
+    assert!(all_present, "expected a,b,c within 5s, got {snapshot:?}");
 
     // Late joiner queries without joining.
     let members = ZenohCoordinator::query_barrier_participants(&s_late, "sync-start")
@@ -111,11 +116,36 @@ async fn barrier_leave_on_drop() {
         .unwrap();
 
     let guard = ZenohCoordinator::join_barrier(&s_a, "leave-test", "a").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    assert!(participants.read().contains("a"));
+    // Poll for liveliness propagation instead of sleeping a fixed duration —
+    // CI runners under load can exceed any static timeout (flake observed at
+    // 400ms).
+    let present = wait_until(
+        || participants.read().contains("a"),
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+    )
+    .await;
+    assert!(present, "'a' did not appear within 5s");
 
     drop(guard);
-    // Liveliness Delete propagation.
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    assert!(!participants.read().contains("a"));
+    let gone = wait_until(
+        || !participants.read().contains("a"),
+        Duration::from_secs(5),
+        Duration::from_millis(25),
+    )
+    .await;
+    assert!(gone, "'a' did not leave within 5s after guard drop");
+}
+
+async fn wait_until<F: FnMut() -> bool>(mut check: F, timeout: Duration, poll: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if check() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(poll).await;
+    }
 }
