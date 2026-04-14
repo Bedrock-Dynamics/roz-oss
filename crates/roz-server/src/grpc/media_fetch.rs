@@ -104,13 +104,16 @@ impl MediaFetcher {
         }
 
         // Content-Type family check (on FINAL response — Pitfall 3).
+        // RFC 7231 §3.1.1.1: media type tokens are case-insensitive, so compare
+        // via eq_ignore_ascii_case after trimming whitespace (some servers emit
+        // `image /png` or `IMAGE/PNG`).
         let ct = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let ct_family = ct.split('/').next().unwrap_or("");
-        if ct_family != expected_mime_family {
+        let ct_family = ct.split('/').next().unwrap_or("").trim();
+        if !ct_family.eq_ignore_ascii_case(expected_mime_family) {
             return Err(Status::invalid_argument(format!(
                 "fetched Content-Type '{ct}' does not match expected family '{expected_mime_family}/*'"
             )));
