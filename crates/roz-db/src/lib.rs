@@ -1,4 +1,5 @@
 pub mod activity_events;
+pub mod agent_memory;
 pub mod agent_sessions;
 pub mod api_keys;
 pub mod commands;
@@ -8,10 +9,13 @@ pub mod embodiments;
 pub mod environments;
 pub mod hosts;
 pub mod leases;
+pub mod mcp_servers;
 pub mod message_feedback;
+pub mod model_endpoints;
 pub mod provenance;
 pub mod safety_audit;
 pub mod safety_policies;
+pub mod scheduled_tasks;
 pub mod session_turns;
 pub mod skills;
 pub mod streams;
@@ -19,6 +23,7 @@ pub mod tasks;
 pub mod tenant;
 pub mod triggers;
 pub mod usage;
+pub mod user_model_facts;
 
 use std::time::Duration;
 

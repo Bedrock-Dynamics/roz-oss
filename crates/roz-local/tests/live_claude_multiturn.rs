@@ -81,7 +81,17 @@ async fn real_claude_multiturn_observe_act_reason() {
 
     // --- Turn 1: Observe — "What joints does the arm have?" ---
     println!("\n=== Turn 1: Observe joint state ===");
-    let model = roz_agent::model::create_model("claude-sonnet-4-6", "", "", 120, "anthropic", Some(&api_key)).unwrap();
+    let model = roz_agent::model::create_model(
+        "claude-sonnet-4-6",
+        "",
+        "",
+        120,
+        "anthropic",
+        Some(&api_key),
+        &roz_core::auth::TenantId::new(uuid::Uuid::nil()),
+        std::sync::Arc::new(roz_core::model_endpoint::EndpointRegistry::empty()),
+    )
+    .unwrap();
     let dispatcher = build_dispatcher(&mcp);
     let safety = SafetyStack::new(vec![]);
     let spatial = Box::new(MockSpatialContextProvider::empty());
@@ -108,7 +118,17 @@ async fn real_claude_multiturn_observe_act_reason() {
 
     // --- Turn 2: Act — "Move to the home position" ---
     println!("\n=== Turn 2: Move to home position ===");
-    let model = roz_agent::model::create_model("claude-sonnet-4-6", "", "", 120, "anthropic", Some(&api_key)).unwrap();
+    let model = roz_agent::model::create_model(
+        "claude-sonnet-4-6",
+        "",
+        "",
+        120,
+        "anthropic",
+        Some(&api_key),
+        &roz_core::auth::TenantId::new(uuid::Uuid::nil()),
+        std::sync::Arc::new(roz_core::model_endpoint::EndpointRegistry::empty()),
+    )
+    .unwrap();
     let dispatcher = build_dispatcher(&mcp);
     let safety = SafetyStack::new(vec![]);
     let spatial = Box::new(MockSpatialContextProvider::empty());
@@ -132,7 +152,17 @@ async fn real_claude_multiturn_observe_act_reason() {
 
     // --- Turn 3: Reason — "Read joint state again, report shoulder angle" ---
     println!("\n=== Turn 3: Read and interpret joint angle ===");
-    let model = roz_agent::model::create_model("claude-sonnet-4-6", "", "", 120, "anthropic", Some(&api_key)).unwrap();
+    let model = roz_agent::model::create_model(
+        "claude-sonnet-4-6",
+        "",
+        "",
+        120,
+        "anthropic",
+        Some(&api_key),
+        &roz_core::auth::TenantId::new(uuid::Uuid::nil()),
+        std::sync::Arc::new(roz_core::model_endpoint::EndpointRegistry::empty()),
+    )
+    .unwrap();
     let dispatcher = build_dispatcher(&mcp);
     let safety = SafetyStack::new(vec![]);
     let spatial = Box::new(MockSpatialContextProvider::empty());

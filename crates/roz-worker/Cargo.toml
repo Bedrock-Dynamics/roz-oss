@@ -55,6 +55,7 @@ bytes = "1"
 str0m = { workspace = true }
 openh264 = { workspace = true }
 image = { workspace = true }
+object_store = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 v4l = { workspace = true }

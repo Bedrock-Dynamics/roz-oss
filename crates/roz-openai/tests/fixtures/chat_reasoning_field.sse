@@ -1,0 +1,8 @@
+data: {"choices":[{"delta":{"reasoning_content":"Need to move..."},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"content":"Actually yes."},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+

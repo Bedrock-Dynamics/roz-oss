@@ -2,24 +2,17 @@
 
 use chrono::Utc;
 use roz_core::session::event::{CorrelationId, EventEnvelope, EventId, SessionEvent};
+use std::sync::{Arc, RwLock};
 use tokio::sync::broadcast;
 
 /// Emits `SessionEvent`s through a broadcast channel.
 ///
 /// Multiple subscribers can receive every event via `subscribe()`.
 /// The emitter owns the active `CorrelationId` and auto-generates `EventId`s.
+#[derive(Clone)]
 pub struct EventEmitter {
     tx: broadcast::Sender<EventEnvelope>,
-    correlation_id: CorrelationId,
-}
-
-impl Clone for EventEmitter {
-    fn clone(&self) -> Self {
-        Self {
-            tx: self.tx.clone(),
-            correlation_id: self.correlation_id.clone(),
-        }
-    }
+    correlation_id: Arc<RwLock<CorrelationId>>,
 }
 
 impl EventEmitter {
@@ -29,7 +22,7 @@ impl EventEmitter {
         let (tx, _) = broadcast::channel(capacity);
         Self {
             tx,
-            correlation_id: CorrelationId::new(),
+            correlation_id: Arc::new(RwLock::new(CorrelationId::new())),
         }
     }
 
@@ -41,7 +34,7 @@ impl EventEmitter {
     pub fn emit(&self, event: SessionEvent) -> EventEnvelope {
         let envelope = EventEnvelope {
             event_id: EventId::new(),
-            correlation_id: self.correlation_id.clone(),
+            correlation_id: self.correlation_id(),
             parent_event_id: None,
             timestamp: Utc::now(),
             event,
@@ -55,7 +48,7 @@ impl EventEmitter {
     pub fn emit_with_parent(&self, event: SessionEvent, parent: &EventId) -> EventEnvelope {
         let envelope = EventEnvelope {
             event_id: EventId::new(),
-            correlation_id: self.correlation_id.clone(),
+            correlation_id: self.correlation_id(),
             parent_event_id: Some(parent.clone()),
             timestamp: Utc::now(),
             event,
@@ -74,14 +67,20 @@ impl EventEmitter {
     /// Current correlation group for newly-emitted events.
     #[must_use]
     pub fn correlation_id(&self) -> CorrelationId {
-        self.correlation_id.clone()
+        self.correlation_id
+            .read()
+            .expect("event emitter correlation lock poisoned")
+            .clone()
     }
 
     /// Start a new correlation group (e.g., for a new turn).
     ///
     /// Subsequent events will carry the new `CorrelationId`.
     pub fn new_correlation(&mut self) {
-        self.correlation_id = CorrelationId::new();
+        *self
+            .correlation_id
+            .write()
+            .expect("event emitter correlation lock poisoned") = CorrelationId::new();
     }
 }
 
@@ -145,6 +144,26 @@ mod tests {
         assert_ne!(
             old_corr, new_corr,
             "new_correlation must yield a different CorrelationId"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_emitter_clone_observes_rotated_correlation() {
+        let mut emitter = EventEmitter::new(16);
+        let clone = emitter.clone();
+        let old_corr = clone.correlation_id();
+
+        emitter.new_correlation();
+        let expected_corr = emitter.correlation_id();
+        let emitted = clone.emit(SessionEvent::TurnStarted { turn_index: 1 });
+
+        assert_eq!(
+            emitted.correlation_id, expected_corr,
+            "cloned emitters must observe the latest shared turn correlation"
+        );
+        assert_ne!(
+            emitted.correlation_id, old_corr,
+            "pre-rotation clones must not keep emitting on a stale correlation"
         );
     }
 

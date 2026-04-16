@@ -42,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
             cli::Commands::Host(args) => commands::host::execute(&args.command, &config).await,
             cli::Commands::Env(args) => commands::env::execute(&args.command, &config).await,
             cli::Commands::Trigger(args) => commands::trigger::execute(&args.command, &config).await,
+            cli::Commands::Schedule(args) => commands::schedule::execute(&args.command, &config).await,
             cli::Commands::Skill(args) => commands::skill::execute(&args.command, &config).await,
             cli::Commands::Stream(args) => commands::stream::execute(&args.command, &config).await,
             cli::Commands::Media(args) => commands::media::execute(&args.command, &config).await,

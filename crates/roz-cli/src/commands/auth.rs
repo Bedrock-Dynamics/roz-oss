@@ -1,17 +1,19 @@
+//! Authentication commands.
+//!
+//! Plan 19-15 collapsed the OpenAI login + refresh helpers into thin callers
+//! over [`roz_openai::auth::oauth`]. The Roz-cloud OAuth flow
+//! (`login_localhost`) and device-code flow (`login_device_code`) remain here
+//! because they target Roz-cloud endpoints, not OpenAI's OAuth.
+
 use std::time::Duration;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Args, Subcommand};
 use rand::RngCore;
-use sha2::{Digest, Sha256};
+use secrecy::{ExposeSecret, SecretString};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 use crate::config::CliConfig;
-
-const OPENAI_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const OPENAI_AUTHORIZE: &str = "https://auth.openai.com/oauth/authorize";
-const OPENAI_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
-const OPENAI_SCOPES: &str = "openid profile email offline_access api.connectors.read api.connectors.invoke";
 
 /// Authentication commands.
 #[derive(Debug, Args)]
@@ -59,7 +61,7 @@ async fn login(config: &CliConfig, device_code: bool, provider: Option<&str>) ->
                 login_localhost(config).await
             }
         }
-        Some("openai") => login_openai(config).await,
+        Some("openai") => login_openai().await,
         Some(other) => anyhow::bail!("Unsupported auth provider: {other}. Supported: cloud, openai"),
     }
 }
@@ -157,99 +159,33 @@ async fn login_localhost(config: &CliConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn login_openai(_config: &CliConfig) -> anyhow::Result<()> {
-    let mut verifier_bytes = [0u8; 64];
-    rand::thread_rng().fill_bytes(&mut verifier_bytes);
-    let verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
-    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-    let state = generate_state();
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-    let port = listener.local_addr()?.port();
-
-    let auth_url = format!(
-        "{OPENAI_AUTHORIZE}?response_type=code&client_id={OPENAI_CLIENT_ID}\
-         &redirect_uri=http://localhost:{port}/auth/callback\
-         &code_challenge={challenge}&code_challenge_method=S256\
-         &scope={}&state={state}&originator=roz_cli",
-        OPENAI_SCOPES.replace(' ', "+")
-    );
-
-    if webbrowser::open(&auth_url).is_err() {
-        eprintln!("Open this URL in your browser:\n  {auth_url}");
-    }
-
-    let spinner = indicatif::ProgressBar::new_spinner();
-    spinner.set_message("Waiting for OpenAI authentication...");
-    spinner.enable_steady_tick(Duration::from_millis(100));
-
-    let (stream, _) = tokio::time::timeout(Duration::from_secs(120), listener.accept())
+/// Thin caller into [`roz_openai::auth::oauth::run_oauth_flow`].
+///
+/// Plan 19-15: PKCE + callback server + token exchange all live in roz-openai
+/// now. This function just orchestrates persistence to `~/.roz/credentials.toml`
+/// with the v2 schema (absolute `expires_at` + optional `account_id`).
+async fn login_openai() -> anyhow::Result<()> {
+    let tokens = roz_openai::auth::oauth::run_oauth_flow()
         .await
-        .map_err(|_| anyhow::anyhow!("Timed out waiting for OpenAI callback."))??;
+        .map_err(|e| anyhow::anyhow!("OpenAI OAuth flow failed: {e}"))?;
 
-    let mut reader = tokio::io::BufReader::new(stream);
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line).await?;
-    let (code, received_state) = parse_callback_query(&request_line);
+    let expires_at =
+        chrono::Utc::now() + chrono::Duration::seconds(tokens.expires_in_secs.unwrap_or(3600).cast_signed());
 
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
-        if line.trim().is_empty() {
-            break;
-        }
-    }
-    let mut stream = reader.into_inner();
+    let account_id = tokens
+        .id_token
+        .as_deref()
+        .and_then(|jwt| roz_openai::auth::token_data::parse_chatgpt_jwt_claims(jwt).ok())
+        .and_then(|info| info.chatgpt_account_id);
 
-    if received_state != state {
-        send_http_response_async(&mut stream, 400, "CSRF state mismatch.").await;
-        spinner.finish_with_message("error");
-        anyhow::bail!("CSRF state mismatch in OpenAI callback");
-    }
+    CliConfig::save_provider_credential_v2(
+        "openai",
+        tokens.access_token.expose_secret(),
+        tokens.refresh_token.as_ref().map(ExposeSecret::expose_secret),
+        Some(expires_at),
+        account_id.as_deref(),
+    )?;
 
-    if code.is_empty() {
-        send_http_response_async(&mut stream, 400, "Missing authorization code.").await;
-        spinner.finish_with_message("error");
-        anyhow::bail!("Missing authorization code in OpenAI callback");
-    }
-
-    let client = reqwest::Client::new();
-    let token_resp: serde_json::Value = client
-        .post(OPENAI_TOKEN_URL)
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", &*code),
-            ("redirect_uri", &format!("http://localhost:{port}/auth/callback")),
-            ("client_id", OPENAI_CLIENT_ID),
-            ("code_verifier", &*verifier),
-        ])
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    if let Some(error) = token_resp.get("error").and_then(|e| e.as_str()) {
-        send_http_response_async(&mut stream, 400, &format!("Auth failed: {error}")).await;
-        spinner.finish_with_message("error");
-        anyhow::bail!("OpenAI token exchange failed: {error}");
-    }
-
-    let access_token = token_resp["access_token"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("OpenAI did not return access_token"))?;
-    let refresh_token = token_resp["refresh_token"].as_str();
-    let expires_in = token_resp["expires_in"].as_u64();
-
-    CliConfig::save_provider_credential("openai", access_token, refresh_token, expires_in)?;
-
-    send_http_response_async(
-        &mut stream,
-        200,
-        "<!DOCTYPE html><html><body><h1>Authorized!</h1><p>You can close this window.</p></body></html>",
-    )
-    .await;
-
-    spinner.finish_with_message("authenticated");
     eprintln!("Logged in to OpenAI successfully.");
     Ok(())
 }
@@ -409,110 +345,44 @@ fn token(config: &CliConfig) -> anyhow::Result<()> {
     }
 }
 
-/// Refresh an `OpenAI` OAuth token using the stored `refresh_token`.
+/// Refresh an OpenAI OAuth token using the stored `refresh_token`.
 ///
-/// Reads the current credentials from `~/.roz/credentials.toml`, exchanges
-/// the refresh token for a new access token via `OpenAI`'s token endpoint,
-/// and persists the updated credentials back to disk.
+/// Plan 19-15: delegates the HTTP + parse to
+/// [`roz_openai::auth::oauth::refresh_access_token`]. Persists the new tokens
+/// back to `~/.roz/credentials.toml` with the v2 schema.
 ///
-/// This is designed for background use -- callers should log failures rather
+/// This is designed for background use — callers should log failures rather
 /// than propagating them to the user.
 pub async fn refresh_openai_token() -> anyhow::Result<()> {
-    let cred_path = CliConfig::config_dir()?.join("credentials.toml");
-    let refresh_token = read_openai_refresh_token(&cred_path)?;
-
-    let client = reqwest::Client::new();
-    let resp: serde_json::Value = client
-        .post(OPENAI_TOKEN_URL)
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("client_id", OPENAI_CLIENT_ID),
-            ("refresh_token", &*refresh_token),
-        ])
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    if let Some(error) = resp.get("error").and_then(|e| e.as_str()) {
-        anyhow::bail!("OpenAI token refresh failed: {error}");
-    }
-
-    let access_token = resp["access_token"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("OpenAI refresh did not return access_token"))?;
-    let new_refresh = resp["refresh_token"].as_str();
-    let expires_in = resp["expires_in"].as_u64();
-
-    // TODO: Add file-lock protection for concurrent refresh across multiple roz instances.
-    // OpenAI handles concurrent refresh requests gracefully, so this is not critical.
-    CliConfig::save_provider_credential("openai", access_token, new_refresh, expires_in)?;
-    Ok(())
-}
-
-/// Extract the `refresh_token` from a credentials file at the given path.
-///
-/// Returns the refresh token string, or an error if the file is missing,
-/// has no `[openai]` section, or lacks a `refresh_token` key.
-fn read_openai_refresh_token(cred_path: &std::path::Path) -> anyhow::Result<String> {
-    let contents = std::fs::read_to_string(cred_path)?;
-    let table: toml::Table = contents.parse()?;
-    let section = table
-        .get("openai")
-        .and_then(|v| v.as_table())
+    let stored = CliConfig::load_provider_credential_full("openai")
         .ok_or_else(|| anyhow::anyhow!("No OpenAI credentials stored"))?;
-    let refresh_token = section
-        .get("refresh_token")
-        .and_then(|v| v.as_str())
+    let refresh_token = stored
+        .refresh_token
         .ok_or_else(|| anyhow::anyhow!("No refresh_token stored for OpenAI"))?;
-    Ok(refresh_token.to_string())
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    let http = reqwest::Client::new();
+    let refresh_secret = SecretString::from(refresh_token);
+    let tokens = roz_openai::auth::oauth::refresh_access_token(&refresh_secret, &http)
+        .await
+        .map_err(|e| anyhow::anyhow!("OpenAI token refresh failed: {e}"))?;
 
-    #[test]
-    fn refresh_requires_credentials_file() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let missing = dir.path().join("nonexistent.toml");
-        let result = read_openai_refresh_token(&missing);
-        assert!(result.is_err(), "should fail when credentials file is missing");
-    }
+    let expires_at =
+        chrono::Utc::now() + chrono::Duration::seconds(tokens.expires_in_secs.unwrap_or(3600).cast_signed());
 
-    #[test]
-    fn refresh_requires_openai_section() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let cred_path = dir.path().join("credentials.toml");
-        std::fs::write(&cred_path, "[default]\napi_key = \"roz_sk_test\"\n").unwrap();
+    // Preserve existing account_id; refresh responses typically omit id_token.
+    let account_id = tokens
+        .id_token
+        .as_deref()
+        .and_then(|jwt| roz_openai::auth::token_data::parse_chatgpt_jwt_claims(jwt).ok())
+        .and_then(|info| info.chatgpt_account_id)
+        .or(stored.account_id);
 
-        let result = read_openai_refresh_token(&cred_path);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No OpenAI credentials"));
-    }
-
-    #[test]
-    fn refresh_requires_refresh_token() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let cred_path = dir.path().join("credentials.toml");
-        std::fs::write(&cred_path, "[openai]\naccess_token = \"tok_test\"\n").unwrap();
-
-        let result = read_openai_refresh_token(&cred_path);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("No refresh_token"));
-    }
-
-    #[test]
-    fn refresh_reads_valid_token() {
-        let dir = tempfile::tempdir().expect("create temp dir");
-        let cred_path = dir.path().join("credentials.toml");
-        std::fs::write(
-            &cred_path,
-            "[openai]\naccess_token = \"at_test\"\nrefresh_token = \"rt_test_123\"\n",
-        )
-        .unwrap();
-
-        let token = read_openai_refresh_token(&cred_path).expect("should read refresh token");
-        assert_eq!(token, "rt_test_123");
-    }
+    CliConfig::save_provider_credential_v2(
+        "openai",
+        tokens.access_token.expose_secret(),
+        tokens.refresh_token.as_ref().map(ExposeSecret::expose_secret),
+        Some(expires_at),
+        account_id.as_deref(),
+    )?;
+    Ok(())
 }

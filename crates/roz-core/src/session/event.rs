@@ -162,6 +162,7 @@ pub const fn canonical_event_type_name(event: &SessionEvent) -> &'static str {
         SessionEvent::ControllerRolledBack { .. } => "controller_rolled_back",
         SessionEvent::SafetyIntervention { .. } => "safety_intervention",
         SessionEvent::EdgeTransportDegraded { .. } => "edge_degraded",
+        SessionEvent::McpServerDegraded { .. } => "mcp_server_degraded",
         SessionEvent::ReasoningTrace { .. } => "reasoning_trace",
         SessionEvent::ContextCompacted { .. } => "context_compacted",
         SessionEvent::ModelCallCompleted { .. } => "model_call",
@@ -171,6 +172,8 @@ pub const fn canonical_event_type_name(event: &SessionEvent) -> &'static str {
         SessionEvent::MemoryRead { .. } => "memory_read",
         SessionEvent::MemoryWrite { .. } => "memory_write",
         SessionEvent::SensorRepositioned { .. } => "sensor_repositioned",
+        SessionEvent::SkillCrystallized { .. } => "skill_crystallized",
+        SessionEvent::SkillLoaded { .. } => "skill_loaded",
         SessionEvent::ContactStateChanged { .. } => "contact_state_changed",
         SessionEvent::FeedbackReceived { .. } => "feedback_received",
     }
@@ -341,6 +344,11 @@ pub enum SessionEvent {
         health: EdgeTransportHealth,
         affected_capabilities: Vec<String>,
     },
+    McpServerDegraded {
+        server_name: String,
+        failure_count: u32,
+        last_error: String,
+    },
 
     // -- Observability (Section 27) --
     ReasoningTrace {
@@ -400,6 +408,21 @@ pub enum SessionEvent {
         old_pose: crate::embodiment::frame_tree::Transform3D,
         new_pose: crate::embodiment::frame_tree::Transform3D,
         goal: crate::embodiment::perception::ObservationGoal,
+    },
+
+    // -- Skills (Phase 18 SKILL-06) --
+    /// Emitted by `skill_manage create` after a successful insert of a new
+    /// skill version. Payload carries metadata only — never body or assets.
+    SkillCrystallized {
+        name: String,
+        version: String,
+        /// `"local"` for v2.1; future: `"git"` | `"zip"`.
+        source: String,
+    },
+    /// Emitted by `skill_view` after the `body_md` is returned to the caller.
+    SkillLoaded {
+        name: String,
+        version: String,
     },
 
     // -- Contact --
@@ -695,5 +718,57 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(restored, SessionEvent::ResumeSummaryReady { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 18 SKILL-06 — SkillCrystallized / SkillLoaded
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn skill_crystallized_serde_roundtrip() {
+        let event = SessionEvent::SkillCrystallized {
+            name: "demo".into(),
+            version: "1.0.0".into(),
+            source: "local".into(),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "skill_crystallized");
+        assert_eq!(json["name"], "demo");
+        assert_eq!(json["version"], "1.0.0");
+        assert_eq!(json["source"], "local");
+
+        let back: SessionEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, SessionEvent::SkillCrystallized { .. }));
+    }
+
+    #[test]
+    fn skill_loaded_serde_roundtrip() {
+        let event = SessionEvent::SkillLoaded {
+            name: "demo".into(),
+            version: "1.0.0".into(),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "skill_loaded");
+        assert_eq!(json["name"], "demo");
+        assert_eq!(json["version"], "1.0.0");
+
+        let back: SessionEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(back, SessionEvent::SkillLoaded { .. }));
+    }
+
+    #[test]
+    fn canonical_event_type_name_skill_variants() {
+        let crystallized = SessionEvent::SkillCrystallized {
+            name: "demo".into(),
+            version: "1.0.0".into(),
+            source: "local".into(),
+        };
+        assert_eq!(canonical_event_type_name(&crystallized), "skill_crystallized");
+
+        let loaded = SessionEvent::SkillLoaded {
+            name: "demo".into(),
+            version: "1.0.0".into(),
+        };
+        assert_eq!(canonical_event_type_name(&loaded), "skill_loaded");
     }
 }

@@ -8,6 +8,7 @@ pub mod leases;
 pub mod metrics;
 pub mod safety_policies;
 pub mod streams;
+pub mod task_dispatch;
 pub mod tasks;
 pub mod triggers;
 pub mod webhooks;

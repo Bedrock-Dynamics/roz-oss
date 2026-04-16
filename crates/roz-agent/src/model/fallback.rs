@@ -262,6 +262,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             tool_choice: None,
+            response_schema: None,
         };
 
         let resp = model.complete(&req).await.unwrap();
@@ -337,6 +338,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             tool_choice: None,
+            response_schema: None,
         };
         let resp = chain.complete(&req).await.unwrap();
         assert_eq!(resp.text().as_deref(), Some("from first"));
@@ -388,6 +390,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             tool_choice: None,
+            response_schema: None,
         };
         let result = chain.complete(&req).await;
         assert!(result.is_err(), "all models on cooldown should error");
@@ -422,6 +425,7 @@ mod tests {
             tools: vec![],
             max_tokens: 100,
             tool_choice: None,
+            response_schema: None,
         };
         let resp = chain.complete(&req).await.unwrap();
         assert_eq!(resp.text().as_deref(), Some("from sonnet"));

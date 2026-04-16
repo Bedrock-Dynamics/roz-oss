@@ -1,0 +1,84 @@
+syntax = "proto3";
+package roz.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// Phase 18 SKILL-07 / D-15: per-tenant skill library service.
+// - List/Get: ungated reads (RLS-tenant-scoped)
+// - Import: client-streaming tar.gz upload (10 MB cap server-side; CLI tars dir per D-04/D-05)
+// - Export: server-streaming tar.gz download
+// - Delete: gated by Permissions::can_write_skills (D-10) at server handler.
+service SkillsService {
+  rpc List(ListSkillsRequest) returns (ListSkillsResponse);
+  rpc Get(GetSkillRequest) returns (SkillDetail);
+  rpc Import(stream ImportChunk) returns (ImportResponse);
+  rpc Export(ExportRequest) returns (stream ExportChunk);
+  rpc Delete(DeleteSkillRequest) returns (DeleteSkillResponse);
+}
+
+message ListSkillsRequest {
+  optional string name_prefix = 1;
+  uint32 page_size = 2;          // server caps at 100 (RESEARCH §Security)
+  optional string page_token = 3;
+}
+
+message ListSkillsResponse {
+  repeated SkillMeta skills = 1;
+  optional string next_page_token = 2;
+}
+
+message SkillMeta {
+  string name = 1;
+  string version = 2;
+  string description = 3;        // ≤1024c — DB-enforced via CHECK
+  google.protobuf.Timestamp created_at = 4;
+  string created_by = 5;
+  repeated string tags = 6;      // from frontmatter.metadata.hermes.tags
+}
+
+message GetSkillRequest {
+  string name = 1;
+  optional string version = 2;   // latest-by-semver (server-side) if absent (D-13)
+}
+
+message SkillDetail {
+  SkillMeta meta = 1;
+  string body_md = 2;            // full SKILL.md body
+  string frontmatter_json = 3;   // serialized JSONB
+  repeated string asset_paths = 4;
+}
+
+message ImportChunk {
+  oneof chunk {
+    ImportHeader header = 1;     // first message only
+    bytes tar_gz_bytes = 2;      // subsequent chunks; server enforces 10 MB cap on cumulative bytes
+  }
+}
+
+message ImportHeader {
+  string source = 1;             // e.g. "./path/to/skill/" for audit
+  uint64 total_size_bytes = 2;   // for early cap-exceeded rejection (server still recounts on receive)
+}
+
+message ImportResponse {
+  SkillMeta meta = 1;
+  uint32 files_stored = 2;
+}
+
+message ExportRequest {
+  string name = 1;
+  optional string version = 2;
+}
+
+message ExportChunk {
+  bytes tar_gz_bytes = 1;
+}
+
+message DeleteSkillRequest {
+  string name = 1;
+  optional string version = 2;   // if absent, delete all versions
+}
+
+message DeleteSkillResponse {
+  uint32 versions_deleted = 1;
+}

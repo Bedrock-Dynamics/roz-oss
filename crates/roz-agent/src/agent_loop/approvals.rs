@@ -6,6 +6,198 @@ use super::AgentLoop;
 use super::input::{ActivityState, PresenceSignal};
 use crate::dispatch::ToolContext;
 
+pub(crate) enum ApprovalGateResult {
+    Approved(roz_core::tools::ToolCall),
+    Rejected(roz_core::tools::ToolResult),
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "approval gating needs the request context, signal sink, and cancellation state"
+)]
+pub(crate) async fn gate_tool_call_for_human_approval(
+    call: &roz_core::tools::ToolCall,
+    reason: &str,
+    timeout_secs: u64,
+    approval_runtime: &crate::session_runtime::ApprovalRuntimeHandle,
+    presence_tx: &mpsc::Sender<PresenceSignal>,
+    task_id: &str,
+    cancellation_token: Option<&tokio_util::sync::CancellationToken>,
+) -> ApprovalGateResult {
+    tracing::info!(
+        tool = %call.tool,
+        tool_call_id = %call.id,
+        %reason,
+        "NeedsHuman: suspending agent turn for IDE approval"
+    );
+    let _ = presence_tx
+        .send(PresenceSignal::ActivityUpdate {
+            state: ActivityState::WaitingApproval,
+            detail: call.id.clone(),
+            progress: None,
+        })
+        .await;
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<crate::dispatch::remote::ApprovalDecision>();
+    approval_runtime.register_pending_approval(call.id.clone(), tx);
+    approval_runtime
+        .notify_requested(crate::dispatch::remote::PendingApprovalRequest {
+            task_id: task_id.to_string(),
+            tool_call_id: call.id.clone(),
+            tool_name: call.tool.clone(),
+            tool_input: call.params.clone(),
+            reason: reason.to_string(),
+            timeout_secs,
+        })
+        .await;
+
+    let _ = presence_tx
+        .send(PresenceSignal::ApprovalRequested {
+            approval_id: call.id.clone(),
+            action: call.tool.clone(),
+            reason: reason.to_string(),
+            timeout_secs,
+        })
+        .await;
+
+    let timed_rx = tokio::time::timeout(tokio::time::Duration::from_secs(timeout_secs), rx);
+
+    // Race the approval wait against the session cancellation token so that
+    // a cancelled session does not hang until the approval timeout expires.
+    let (decision, denial_reason) = if let Some(token) = cancellation_token {
+        tokio::select! {
+            result = timed_rx => {
+                match result {
+                    Ok(Ok(v)) => {
+                        let denial_reason = if v.approved {
+                            None
+                        } else {
+                            Some("denied by user".to_string())
+                        };
+                        (v, denial_reason)
+                    }
+                    Ok(Err(_)) => {
+                        tracing::warn!(tool_call_id = %call.id, "approval channel closed unexpectedly");
+                        (
+                            crate::dispatch::remote::ApprovalDecision { approved: false, modifier: None },
+                            Some("approval channel closed".to_string()),
+                        )
+                    }
+                    Err(_) => {
+                        tracing::warn!(tool_call_id = %call.id, timeout_secs, "approval timed out");
+                        approval_runtime.remove_pending_approval(&call.id);
+                        (
+                            crate::dispatch::remote::ApprovalDecision { approved: false, modifier: None },
+                            Some("approval timed out".to_string()),
+                        )
+                    }
+                }
+            }
+            () = token.cancelled() => {
+                tracing::info!(tool_call_id = %call.id, "approval wait cancelled by session");
+                approval_runtime.remove_pending_approval(&call.id);
+                (
+                    crate::dispatch::remote::ApprovalDecision { approved: false, modifier: None },
+                    Some("approval wait cancelled".to_string()),
+                )
+            }
+        }
+    } else {
+        match timed_rx.await {
+            Ok(Ok(v)) => {
+                let denial_reason = if v.approved {
+                    None
+                } else {
+                    Some("denied by user".to_string())
+                };
+                (v, denial_reason)
+            }
+            Ok(Err(_)) => {
+                tracing::warn!(tool_call_id = %call.id, "approval channel closed unexpectedly");
+                (
+                    crate::dispatch::remote::ApprovalDecision {
+                        approved: false,
+                        modifier: None,
+                    },
+                    Some("approval channel closed".to_string()),
+                )
+            }
+            Err(_) => {
+                tracing::warn!(tool_call_id = %call.id, timeout_secs, "approval timed out");
+                approval_runtime.remove_pending_approval(&call.id);
+                (
+                    crate::dispatch::remote::ApprovalDecision {
+                        approved: false,
+                        modifier: None,
+                    },
+                    Some("approval timed out".to_string()),
+                )
+            }
+        }
+    };
+
+    if decision.approved {
+        let effective_call = if let Some(modifier) = decision.modifier {
+            let mut modified = call.clone();
+            let approval_outcome = approval_outcome_for_decision(
+                &call.params,
+                &crate::dispatch::remote::ApprovalDecision {
+                    approved: true,
+                    modifier: Some(modifier.clone()),
+                },
+                None,
+            );
+            let merged = match merge_approval_modifier_into_value(call.params.clone(), modifier) {
+                Ok(merged) => merged,
+                Err(error) => {
+                    let _ = presence_tx
+                        .send(PresenceSignal::ApprovalResolved {
+                            approval_id: call.id.clone(),
+                            outcome: roz_core::session::feedback::ApprovalOutcome::Denied {
+                                reason: Some(format!("invalid approval modifier: {error}")),
+                                category: None,
+                            },
+                        })
+                        .await;
+                    return ApprovalGateResult::Rejected(roz_core::tools::ToolResult::error(format!(
+                        "Invalid approval modifier for {}: {error}",
+                        call.tool
+                    )));
+                }
+            };
+            let _ = presence_tx
+                .send(PresenceSignal::ApprovalResolved {
+                    approval_id: call.id.clone(),
+                    outcome: approval_outcome,
+                })
+                .await;
+            modified.params = merged;
+            modified
+        } else {
+            let _ = presence_tx
+                .send(PresenceSignal::ApprovalResolved {
+                    approval_id: call.id.clone(),
+                    outcome: roz_core::session::feedback::ApprovalOutcome::Approved,
+                })
+                .await;
+            call.clone()
+        };
+        ApprovalGateResult::Approved(effective_call)
+    } else {
+        let approval_outcome = approval_outcome_for_decision(&call.params, &decision, denial_reason);
+        let _ = presence_tx
+            .send(PresenceSignal::ApprovalResolved {
+                approval_id: call.id.clone(),
+                outcome: approval_outcome,
+            })
+            .await;
+        ApprovalGateResult::Rejected(roz_core::tools::ToolResult::error(format!(
+            "Permission denied by user for: {}",
+            call.tool
+        )))
+    }
+}
+
 impl AgentLoop {
     /// Suspends the current turn waiting for IDE approval of a `NeedsHuman` tool call.
     /// Notifies the IDE via `presence_tx`, registers a oneshot channel, then waits up to
@@ -24,174 +216,19 @@ impl AgentLoop {
         tool_ctx: &ToolContext,
         cancellation_token: Option<&tokio_util::sync::CancellationToken>,
     ) -> roz_core::tools::ToolResult {
-        tracing::info!(
-            tool = %call.tool,
-            tool_call_id = %call.id,
-            %reason,
-            "NeedsHuman: suspending agent turn for IDE approval"
-        );
-        let _ = presence_tx
-            .send(PresenceSignal::ActivityUpdate {
-                state: ActivityState::WaitingApproval,
-                detail: call.id.clone(),
-                progress: None,
-            })
-            .await;
-
-        let (tx, rx) = tokio::sync::oneshot::channel::<crate::dispatch::remote::ApprovalDecision>();
-        approval_runtime.register_pending_approval(call.id.clone(), tx);
-        approval_runtime
-            .notify_requested(crate::dispatch::remote::PendingApprovalRequest {
-                task_id: tool_ctx.task_id.clone(),
-                tool_call_id: call.id.clone(),
-                tool_name: call.tool.clone(),
-                tool_input: call.params.clone(),
-                reason: reason.to_string(),
-                timeout_secs,
-            })
-            .await;
-
-        let _ = presence_tx
-            .send(PresenceSignal::ApprovalRequested {
-                approval_id: call.id.clone(),
-                action: call.tool.clone(),
-                reason: reason.to_string(),
-                timeout_secs,
-            })
-            .await;
-
-        let timed_rx = tokio::time::timeout(tokio::time::Duration::from_secs(timeout_secs), rx);
-
-        // Race the approval wait against the session cancellation token so that
-        // a cancelled session does not hang until the approval timeout expires.
-        let (decision, denial_reason) = if let Some(token) = cancellation_token {
-            tokio::select! {
-                result = timed_rx => {
-                    match result {
-                        Ok(Ok(v)) => {
-                            let denial_reason = if v.approved {
-                                None
-                            } else {
-                                Some("denied by user".to_string())
-                            };
-                            (v, denial_reason)
-                        }
-                        Ok(Err(_)) => {
-                            tracing::warn!(tool_call_id = %call.id, "approval channel closed unexpectedly");
-                            (
-                                crate::dispatch::remote::ApprovalDecision { approved: false, modifier: None },
-                                Some("approval channel closed".to_string()),
-                            )
-                        }
-                        Err(_) => {
-                            tracing::warn!(tool_call_id = %call.id, timeout_secs, "approval timed out");
-                            approval_runtime.remove_pending_approval(&call.id);
-                            (
-                                crate::dispatch::remote::ApprovalDecision { approved: false, modifier: None },
-                                Some("approval timed out".to_string()),
-                            )
-                        }
-                    }
-                }
-                () = token.cancelled() => {
-                    tracing::info!(tool_call_id = %call.id, "approval wait cancelled by session");
-                    approval_runtime.remove_pending_approval(&call.id);
-                    (
-                        crate::dispatch::remote::ApprovalDecision { approved: false, modifier: None },
-                        Some("approval wait cancelled".to_string()),
-                    )
-                }
-            }
-        } else {
-            match timed_rx.await {
-                Ok(Ok(v)) => {
-                    let denial_reason = if v.approved {
-                        None
-                    } else {
-                        Some("denied by user".to_string())
-                    };
-                    (v, denial_reason)
-                }
-                Ok(Err(_)) => {
-                    tracing::warn!(tool_call_id = %call.id, "approval channel closed unexpectedly");
-                    (
-                        crate::dispatch::remote::ApprovalDecision {
-                            approved: false,
-                            modifier: None,
-                        },
-                        Some("approval channel closed".to_string()),
-                    )
-                }
-                Err(_) => {
-                    tracing::warn!(tool_call_id = %call.id, timeout_secs, "approval timed out");
-                    approval_runtime.remove_pending_approval(&call.id);
-                    (
-                        crate::dispatch::remote::ApprovalDecision {
-                            approved: false,
-                            modifier: None,
-                        },
-                        Some("approval timed out".to_string()),
-                    )
-                }
-            }
-        };
-
-        if decision.approved {
-            let effective_call = if let Some(modifier) = decision.modifier {
-                let mut modified = call.clone();
-                let approval_outcome = approval_outcome_for_decision(
-                    &call.params,
-                    &crate::dispatch::remote::ApprovalDecision {
-                        approved: true,
-                        modifier: Some(modifier.clone()),
-                    },
-                    None,
-                );
-                let merged = match merge_approval_modifier_into_value(call.params.clone(), modifier) {
-                    Ok(merged) => merged,
-                    Err(error) => {
-                        let _ = presence_tx
-                            .send(PresenceSignal::ApprovalResolved {
-                                approval_id: call.id.clone(),
-                                outcome: roz_core::session::feedback::ApprovalOutcome::Denied {
-                                    reason: Some(format!("invalid approval modifier: {error}")),
-                                    category: None,
-                                },
-                            })
-                            .await;
-                        return roz_core::tools::ToolResult::error(format!(
-                            "Invalid approval modifier for {}: {error}",
-                            call.tool
-                        ));
-                    }
-                };
-                let _ = presence_tx
-                    .send(PresenceSignal::ApprovalResolved {
-                        approval_id: call.id.clone(),
-                        outcome: approval_outcome,
-                    })
-                    .await;
-                modified.params = merged;
-                modified
-            } else {
-                let _ = presence_tx
-                    .send(PresenceSignal::ApprovalResolved {
-                        approval_id: call.id.clone(),
-                        outcome: roz_core::session::feedback::ApprovalOutcome::Approved,
-                    })
-                    .await;
-                call.clone()
-            };
-            self.dispatcher.dispatch(&effective_call, tool_ctx).await
-        } else {
-            let approval_outcome = approval_outcome_for_decision(&call.params, &decision, denial_reason);
-            let _ = presence_tx
-                .send(PresenceSignal::ApprovalResolved {
-                    approval_id: call.id.clone(),
-                    outcome: approval_outcome,
-                })
-                .await;
-            roz_core::tools::ToolResult::error(format!("Permission denied by user for: {}", call.tool))
+        match gate_tool_call_for_human_approval(
+            call,
+            reason,
+            timeout_secs,
+            approval_runtime,
+            presence_tx,
+            &tool_ctx.task_id,
+            cancellation_token,
+        )
+        .await
+        {
+            ApprovalGateResult::Approved(effective_call) => self.dispatcher.dispatch(&effective_call, tool_ctx).await,
+            ApprovalGateResult::Rejected(result) => result,
         }
     }
 

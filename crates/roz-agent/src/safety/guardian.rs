@@ -81,6 +81,7 @@ impl SafetyGuard for LlmGuardian {
             tools: vec![],
             max_tokens: 256,
             tool_choice: None,
+            response_schema: None,
         };
 
         let response = match self.model.complete(&request).await {

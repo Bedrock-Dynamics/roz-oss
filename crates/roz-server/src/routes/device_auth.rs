@@ -163,11 +163,14 @@ pub async fn poll_token(
         )
     })?;
 
+    // Stored scopes must match the kebab-case serde format of `ApiKeyScope` so
+    // the gRPC auth middleware can parse them back into enum variants and
+    // derive `Permissions`. See 18-12 gap closure.
     let default_scopes = vec![
-        "ReadTasks".into(),
-        "WriteTasks".into(),
-        "ReadHosts".into(),
-        "ReadStreams".into(),
+        "read-tasks".into(),
+        "write-tasks".into(),
+        "read-hosts".into(),
+        "read-streams".into(),
     ];
     let key_result =
         roz_db::api_keys::create_api_key(&state.pool, tenant_id, "CLI (device flow)", &default_scopes, user_id)

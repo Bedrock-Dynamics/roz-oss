@@ -1,0 +1,27 @@
+Roz — https://github.com/BedrockDynamics/roz
+
+This product includes software developed by Bedrock Dynamics and contributors
+under the Apache License, Version 2.0. See LICENSE for the full Roz license text.
+
+-----------------------------------------------------------------------
+Portions of this software include the following third-party components:
+
+openai/codex (https://github.com/openai/codex) — Apache License 2.0
+    Copied files (pinned SHA da86cedbd439d38fbd7e613e4e88f8f6f138debb):
+      - codex-rs/core/gpt_5_1_prompt.md
+      - codex-rs/core/gpt_5_2_prompt.md
+      - codex-rs/core/gpt_5_codex_prompt.md
+      - codex-rs/core/gpt-5.1-codex-max_prompt.md
+      - codex-rs/core/gpt-5.2-codex_prompt.md
+      - codex-rs/codex-api/src/common.rs (types, see crates/roz-openai/src/wire/responses.rs)
+      - codex-rs/codex-api/src/sse/responses.rs (parser, see crates/roz-openai/src/sse.rs)
+      - codex-rs/login/src/{token_data,pkce}.rs (see crates/roz-openai/src/auth/)
+    Full license text: https://github.com/openai/codex/blob/main/LICENSE
+
+numman-ali/opencode-openai-codex-auth (https://github.com/numman-ali/opencode-openai-codex-auth) — MIT License
+    Ported transforms in crates/roz-openai/src/transform.rs (pinned SHA bec2ad69):
+      - lib/request/request-transformer.ts
+      - lib/request/fetch-helpers.ts
+      - lib/request/response-handler.ts
+      - lib/constants.ts
+-----------------------------------------------------------------------

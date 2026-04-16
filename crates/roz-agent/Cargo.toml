@@ -11,6 +11,8 @@ roz-core = { path = "../roz-core" }
 roz-copper = { path = "../roz-copper", default-features = false }
 roz-db = { path = "../roz-db" }
 roz-nats = { path = "../roz-nats" }
+roz-openai = { path = "../roz-openai" }
+secrecy = { workspace = true }
 sqlx = { workspace = true }
 async-trait.workspace = true
 async-nats.workspace = true
@@ -35,11 +37,19 @@ async-stream.workspace = true
 tokio-stream.workspace = true
 schemars.workspace = true
 tokio-util.workspace = true
+object_store = { workspace = true }
+semver = { workspace = true }
+rhai = { version = "1", features = ["serde"] }
+quick-js = "0.4"
 
 [dev-dependencies]
 crc32fast = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+mockito = "1"
+wiremock = { workspace = true }
+bytes = { workspace = true }
+tempfile = { workspace = true }
 roz-local = { path = "../roz-local" }
 roz-copper = { path = "../roz-copper", default-features = false }
 roz-test = { path = "../roz-test" }

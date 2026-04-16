@@ -1,0 +1,10 @@
+data: {"choices":[{"delta":{"content":"<think>"},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"content":"Need to move..."},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"content":"</think>Actually yes."},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+

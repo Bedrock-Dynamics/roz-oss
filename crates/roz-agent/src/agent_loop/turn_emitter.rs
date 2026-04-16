@@ -42,6 +42,19 @@ pub struct TurnEnvelope {
     pub role: &'static str, // "user" | "assistant" | "tool"
     pub content: serde_json::Value,
     pub token_usage: Option<serde_json::Value>,
+    /// Turn kind for FTS filtering and audit.
+    ///
+    /// Default is `"turn"` (regular agent turn). MEM-06 rolling-compaction
+    /// synthetic turns use `"compaction"` so `search_by_tsquery` can skip
+    /// them. The DB-level CHECK constraint rejects any other value.
+    pub kind: &'static str,
+}
+
+impl TurnEnvelope {
+    /// Kind value for regular agent turns (default).
+    pub const KIND_TURN: &'static str = "turn";
+    /// Kind value for MEM-06 rolling-compaction synthetic turns.
+    pub const KIND_COMPACTION: &'static str = "compaction";
 }
 
 /// Cloneable handle used by the agent loop to enqueue turns non-blockingly.
@@ -52,6 +65,10 @@ pub struct TurnEnvelope {
 #[derive(Clone)]
 pub struct TurnEmitter {
     tx: mpsc::Sender<TurnEnvelope>,
+    /// Secondary fan-out sender for MEM-03 `FactExtractor`. `None` when the
+    /// extractor is not wired (local/dev runtime). Drop-newest independently
+    /// per consumer (see research §"Pattern 3: Write-Behind Queue Fan-Out").
+    fact_tx: Option<mpsc::Sender<TurnEnvelope>>,
 }
 
 impl TurnEmitter {
@@ -65,7 +82,33 @@ impl TurnEmitter {
     #[must_use]
     pub fn with_capacity(cap: usize) -> (Self, Receiver<TurnEnvelope>) {
         let (tx, rx) = mpsc::channel(cap);
-        (Self { tx }, rx)
+        (Self { tx, fact_tx: None }, rx)
+    }
+
+    /// MEM-03 variant: also fan out to a fact-extraction receiver.
+    ///
+    /// Returns `(emitter, turn_rx, fact_rx)`. Drop-newest independently per
+    /// consumer — a full fact-extraction channel never blocks or drops a
+    /// turn-persistence envelope, and vice versa.
+    #[must_use]
+    pub fn with_fact_extractor(cap: usize) -> (Self, Receiver<TurnEnvelope>, Receiver<TurnEnvelope>) {
+        let (tx, rx) = mpsc::channel(cap);
+        let (fact_tx, fact_rx) = mpsc::channel(cap);
+        (
+            Self {
+                tx,
+                fact_tx: Some(fact_tx),
+            },
+            rx,
+            fact_rx,
+        )
+    }
+
+    /// Best-effort enqueue with the caller-provided `kind` stamped into the
+    /// envelope before send. Thin shim over [`Self::emit`].
+    pub fn emit_with_kind(&self, mut envelope: TurnEnvelope, kind: &'static str) {
+        envelope.kind = kind;
+        self.emit(envelope);
     }
 
     /// Best-effort enqueue. Never blocks.
@@ -74,7 +117,21 @@ impl TurnEmitter {
     /// envelope (drop-newest policy). On `TrySendError::Closed` — logs
     /// `tracing::debug!`; the flush task has already exited, so silent drop
     /// is the correct shutdown behavior.
+    ///
+    /// MEM-03 fan-out: when `fact_tx` is `Some`, a clone of the envelope is
+    /// also best-effort enqueued onto the fact-extraction channel — but ONLY
+    /// for `envelope.kind == "turn"`. Compaction synthetic turns never become
+    /// fact-extraction input (T-17-53 mitigation).
     pub fn emit(&self, envelope: TurnEnvelope) {
+        // Clone only when the secondary fan-out is wired AND this envelope
+        // qualifies. Keeps the no-fan-out hot path allocation-free.
+        let fact_clone = if self.fact_tx.is_some() && envelope.kind == TurnEnvelope::KIND_TURN {
+            Some(envelope.clone())
+        } else {
+            None
+        };
+
+        // Primary: turn persistence.
         match self.tx.try_send(envelope) {
             Ok(()) => {}
             Err(TrySendError::Full(dropped)) => {
@@ -93,6 +150,19 @@ impl TurnEmitter {
                     role = dropped.role,
                     "session turn dropped: flush task terminated"
                 );
+            }
+        }
+
+        // Secondary: fact extraction (if wired and eligible).
+        if let (Some(fact_tx), Some(env)) = (self.fact_tx.as_ref(), fact_clone) {
+            match fact_tx.try_send(env) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    tracing::warn!("fact-extraction buffer full; turn skipped");
+                }
+                Err(TrySendError::Closed(_)) => {
+                    tracing::debug!("fact-extraction task terminated; drop");
+                }
             }
         }
     }
@@ -255,13 +325,14 @@ async fn flush_one(
     let base = base_offsets.get(&key).copied().unwrap_or(0);
     let absolute_index = env.turn_index.saturating_add(base);
 
-    match roz_db::session_turns::insert_turn(
+    match roz_db::session_turns::insert_turn_with_kind(
         &mut *tx,
         env.session_id,
         absolute_index,
         env.role,
         &env.content,
         env.token_usage.as_ref(),
+        env.kind,
     )
     .await
     {
@@ -304,6 +375,7 @@ mod tests {
             role: "user",
             content: json!({ "i": idx }),
             token_usage: None,
+            kind: TurnEnvelope::KIND_TURN,
         }
     }
 

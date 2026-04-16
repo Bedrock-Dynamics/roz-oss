@@ -1,4 +1,8 @@
+pub mod memory_tool;
 pub mod remote;
+pub mod session_search;
+pub mod skill_tools;
+pub mod user_model_tool;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -103,6 +107,12 @@ impl<T: TypedToolExecutor> ToolExecutor for T {
             "properties": properties,
             "required": required,
         });
+        let mut parameters = parameters;
+        if let Some(defs) = root_json.get("$defs").cloned()
+            && let Some(obj) = parameters.as_object_mut()
+        {
+            obj.insert("$defs".to_string(), defs);
+        }
 
         ToolSchema {
             name: TypedToolExecutor::name(self).to_string(),
@@ -156,6 +166,7 @@ impl std::fmt::Debug for Extensions {
     }
 }
 
+#[derive(Clone)]
 pub struct ToolContext {
     pub task_id: String,
     pub tenant_id: String,
@@ -168,12 +179,14 @@ pub struct ToolContext {
 }
 
 /// Internal wrapper around a tool executor that tracks enabled state and category.
+#[derive(Clone)]
 struct ToolEntry {
-    executor: Box<dyn ToolExecutor>,
+    executor: Arc<dyn ToolExecutor>,
     enabled: bool,
     category: ToolCategory,
 }
 
+#[derive(Clone)]
 pub struct ToolDispatcher {
     tools: HashMap<String, ToolEntry>,
     timeout: Duration,
@@ -201,7 +214,7 @@ impl ToolDispatcher {
         self.tools.insert(
             name,
             ToolEntry {
-                executor,
+                executor: Arc::from(executor),
                 enabled: true,
                 category,
             },
@@ -230,6 +243,66 @@ impl ToolDispatcher {
         // The bool return is intentionally discarded — we just registered the tool above,
         // so it is guaranteed to be present.
         let _ = self.set_enabled(crate::tools::advance_phase::ADVANCE_PHASE_TOOL_NAME, false);
+    }
+
+    /// Register the four Phase 17 memory tools as [`ToolCategory::Pure`].
+    ///
+    /// - `session_search` — Postgres FTS over this tenant's session turns.
+    /// - `memory_read` — read curated agent/user-scope memory.
+    /// - `memory_write` — write curated memory (requires `can_write_memory` in
+    ///   `ToolContext::extensions`; runs `scan_memory_content` pre-insert).
+    /// - `user_model_query` — read non-stale dialectic user-model facts.
+    ///
+    /// All four read a `PgPool` from `ToolContext::extensions`; bootstrap paths
+    /// MUST call `extensions.insert(pool.clone())` before dispatch.
+    /// `memory_write` additionally reads `roz_core::auth::Permissions`.
+    pub fn register_phase17_memory_tools(&mut self) {
+        self.register_with_category(
+            Box::new(crate::dispatch::session_search::SessionSearchTool),
+            ToolCategory::Pure,
+        );
+        self.register_with_category(
+            Box::new(crate::dispatch::memory_tool::MemoryReadTool),
+            ToolCategory::Pure,
+        );
+        self.register_with_category(
+            Box::new(crate::dispatch::memory_tool::MemoryWriteTool),
+            ToolCategory::Pure,
+        );
+        self.register_with_category(
+            Box::new(crate::dispatch::user_model_tool::UserModelQueryTool),
+            ToolCategory::Pure,
+        );
+    }
+
+    /// Phase 18 SKILL-03/04: register the four `skill_*` Pure tools.
+    ///
+    /// - `skills_list` — tier-0 listing of recent skills (name, version, description).
+    /// - `skill_view` — tier-1 fetch of SKILL.md body + frontmatter.
+    /// - `skill_read_file` — tier-2 read of a bundled file from object store.
+    /// - `skill_manage` — gated create of a new skill version (requires
+    ///   `can_write_skills` in `ToolContext::extensions`; runs
+    ///   `scan_skill_content` pre-insert).
+    ///
+    /// Caller MUST inject `PgPool`, `Arc<dyn ObjectStore>`, and `Permissions`
+    /// into `ToolContext::extensions` at bootstrap (PLAN-08).
+    pub fn register_phase18_skill_tools(&mut self) {
+        self.register_with_category(
+            Box::new(crate::dispatch::skill_tools::SkillsListTool),
+            ToolCategory::Pure,
+        );
+        self.register_with_category(
+            Box::new(crate::dispatch::skill_tools::SkillViewTool),
+            ToolCategory::Pure,
+        );
+        self.register_with_category(
+            Box::new(crate::dispatch::skill_tools::SkillReadFileTool),
+            ToolCategory::Pure,
+        );
+        self.register_with_category(
+            Box::new(crate::dispatch::skill_tools::SkillManageTool),
+            ToolCategory::Pure,
+        );
     }
 
     /// Enable the `advance_phase` tool so the model can call it.
@@ -1059,6 +1132,17 @@ mod tests {
     }
 
     #[test]
+    fn register_with_category_code_sandbox() {
+        let mut dispatcher = ToolDispatcher::new(Duration::from_secs(5));
+        dispatcher.register_with_category(
+            Box::new(MockToolExecutor::new("execute_code", ToolResult::success(json!(null)))),
+            ToolCategory::CodeSandbox,
+        );
+
+        assert_eq!(dispatcher.category("execute_code"), ToolCategory::CodeSandbox);
+    }
+
+    #[test]
     fn category_unknown_tool_defaults_to_physical() {
         let dispatcher = ToolDispatcher::new(Duration::from_secs(5));
         assert_eq!(
@@ -1219,7 +1303,12 @@ mod tests {
 
     #[test]
     fn truncate_tool_output_over_limit_contains_omission() {
-        let content = "A".repeat(HEAD_CHARS) + &"B".repeat(10_000) + &"C".repeat(TAIL_CHARS);
+        let content = format!(
+            "{}{}{}",
+            "A".repeat(HEAD_CHARS),
+            "B".repeat(10_000),
+            "C".repeat(TAIL_CHARS)
+        );
         let truncated = truncate_tool_output(&content);
         assert!(truncated.contains("chars omitted"), "should contain omission notice");
         assert!(truncated.starts_with(&"A".repeat(HEAD_CHARS)), "should start with head");

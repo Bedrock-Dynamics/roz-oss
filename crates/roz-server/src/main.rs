@@ -1,9 +1,47 @@
+//! `roz-server` entry point.
+//!
+//! # Environment variables
+//!
+//! Required:
+//! - `DATABASE_URL` — Postgres connection string.
+//!
+//! Optional:
+//! - `PORT` (default `8080`)
+//! - `ROZ_BASE_URL` (default `http://localhost:8080`)
+//! - `RESTATE_INGRESS_URL` (default `http://localhost:9080`)
+//! - `NATS_URL` — when set, connects to NATS for task dispatch
+//! - `NATS_OPERATOR_SEED` — credential seed for signing account JWTs
+//! - `ROZ_GATEWAY_URL`, `ROZ_GATEWAY_API_KEY` — PAIG model gateway
+//! - `ROZ_DEFAULT_MODEL` (default `claude-sonnet-4-6`)
+//! - `ROZ_MODEL_TIMEOUT_SECS` (default `120`)
+//! - `ROZ_ANTHROPIC_PROVIDER`, `ROZ_ANTHROPIC_API_KEY` — gateway provider / direct-API degradation path
+//! - `ROZ_GEMINI_PROVIDER`, `ROZ_GEMINI_API_KEY` — same for Gemini (D-10/D-11)
+//! - `ROZ_FALLBACK_MODEL` — secondary model used when primary fails
+//! - `ROZ_STUDIO_URL`, `ROZ_ENVIRONMENT` — tracing / deployment metadata
+//! - `ROZ_RATE_LIMIT_RPS`, `ROZ_RATE_LIMIT_BURST` — per-tenant rate limits
+//! - `ROZ_TRUST_*` — device trust policy knobs (see `roz_server::trust`)
+//! - `ROZ_SKILL_STORE_ROOT`, `ROZ_DATA_DIR` — on-disk object store root for skills
+//! - **Phase 19 additions:**
+//!   - `ROZ_ENCRYPTION_KEY` — 32-byte base64-encoded AES-256 key for
+//!     [`roz_core::key_provider::StaticKeyProvider`]. Required if any endpoint
+//!     in `ROZ_ENDPOINTS_CONFIG` uses `auth_mode='api_key'` or
+//!     `auth_mode='oauth_chatgpt'`. Unset ⇒
+//!     [`roz_openai::auth::null_key::NullKeyProvider`] is installed and
+//!     endpoints requiring a key fail fast at bootstrap.
+//!   - `ROZ_ENDPOINTS_CONFIG` — path to an `endpoints.toml` for OSS operators
+//!     who want to register local vLLM / Ollama / llama.cpp servers. Unset ⇒
+//!     [`roz_core::EndpointRegistry::empty()`] (no OSS endpoints registered).
+
 use axum::Router;
 use std::convert::Infallible;
 use std::num::NonZeroU32;
+use std::path::Path;
 use std::sync::Arc;
 use tower::Service;
 
+use roz_core::EndpointRegistry;
+use roz_core::key_provider::{KeyProvider, KeyProviderError, StaticKeyProvider};
+use roz_openai::auth::null_key::NullKeyProvider;
 use roz_server::middleware;
 use roz_server::nats_handlers;
 use roz_server::state::{AppState, ModelConfig};
@@ -101,10 +139,24 @@ fn grpc_router(state: &AppState) -> Router {
         state.meter.clone(),
         media_backend,
         media_fetcher,
+        state.object_store.clone(),
+        state.endpoint_registry.clone(),
+        state.mcp_registry.clone(),
+        state.key_provider.clone(),
+        state.session_bus.clone(),
     );
 
     let embodiment_svc =
         roz_server::grpc::embodiment::EmbodimentServiceImpl::new(state.pool.clone(), state.nats_client.clone());
+
+    // Phase 18 SKILL-04/05: SkillsService for tenant skill library CRUD.
+    let skills_svc = roz_server::grpc::skills::SkillsServiceImpl::new(state.pool.clone(), state.object_store.clone());
+    let mcp_svc = roz_server::grpc::mcp::McpServerServiceImpl::new(
+        state.pool.clone(),
+        state.key_provider.clone(),
+        state.mcp_registry.clone(),
+        state.session_bus.clone(),
+    );
 
     let grpc_auth_state = roz_server::middleware::grpc_auth::GrpcAuthState {
         auth: state.auth.clone(),
@@ -126,6 +178,8 @@ fn grpc_router(state: &AppState) -> Router {
             .max_encoding_message_size(12 * 1024 * 1024),
     )
     .add_service(roz_server::grpc::roz_v1::embodiment_service_server::EmbodimentServiceServer::new(embodiment_svc))
+    .add_service(skills_svc.into_server())
+    .add_service(mcp_svc.into_server())
     .add_service(
         tonic_reflection::server::Builder::configure()
             .register_encoded_file_descriptor_set(roz_server::grpc::roz_v1::FILE_DESCRIPTOR_SET)
@@ -285,6 +339,97 @@ async fn main() {
 
     let trust_policy = Arc::new(roz_server::trust::load_trust_policy_from_env());
 
+    // Phase 18 SKILL-01: initialize the local-filesystem object store for skill
+    // bundled assets. CONTEXT D-discretion: defaults to `{ROZ_DATA_DIR}/skills`,
+    // `/var/lib/roz/skills` when ROZ_DATA_DIR is unset. Operator may override
+    // via ROZ_SKILL_STORE_ROOT.
+    let skill_store_root = std::env::var("ROZ_SKILL_STORE_ROOT").map_or_else(
+        |_| {
+            let data_dir = std::env::var("ROZ_DATA_DIR").unwrap_or_else(|_| "/var/lib/roz".into());
+            std::path::PathBuf::from(data_dir).join("skills")
+        },
+        std::path::PathBuf::from,
+    );
+    if let Err(err) = std::fs::create_dir_all(&skill_store_root) {
+        tracing::error!(
+            error = %err,
+            path = %skill_store_root.display(),
+            "failed to create ROZ_SKILL_STORE_ROOT — aborting startup"
+        );
+        std::process::exit(1);
+    }
+    let object_store: Arc<dyn object_store::ObjectStore> =
+        match object_store::local::LocalFileSystem::new_with_prefix(&skill_store_root) {
+            Ok(fs) => Arc::new(fs),
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    path = %skill_store_root.display(),
+                    "failed to construct LocalFileSystem object store — aborting startup"
+                );
+                std::process::exit(1);
+            }
+        };
+    tracing::info!(
+        skill_store_root = %skill_store_root.display(),
+        "initialized skill object store"
+    );
+
+    // Phase 19 Plan 11: OSS bootstrap of the AEAD key provider + endpoint registry.
+    //
+    // - `StaticKeyProvider::from_env()` reads `ROZ_ENCRYPTION_KEY` (base64).
+    //   If the env var is unset we install `NullKeyProvider` and log a warning;
+    //   the server only fails fast if an endpoint requires a usable key.
+    // - `EndpointRegistry::from_config(path)` loads `ROZ_ENDPOINTS_CONFIG`.
+    //   If unset we install `EndpointRegistry::empty()` (zero endpoints).
+    let (key_provider, key_provider_usable): (Arc<dyn KeyProvider>, bool) = match StaticKeyProvider::from_env() {
+        Ok(p) => (Arc::new(p), true),
+        Err(e) => {
+            if matches!(e, KeyProviderError::KeyNotConfigured) {
+                tracing::warn!(
+                    "ROZ_ENCRYPTION_KEY not set; endpoints with auth_mode=api_key|oauth_chatgpt will be unusable"
+                );
+                (Arc::new(NullKeyProvider), false)
+            } else {
+                tracing::error!(error = %e, "failed to initialize key provider — aborting startup");
+                std::process::exit(1);
+            }
+        }
+    };
+
+    let endpoint_registry: Arc<EndpointRegistry> = std::env::var("ROZ_ENDPOINTS_CONFIG").map_or_else(
+        |_| {
+            tracing::info!("ROZ_ENDPOINTS_CONFIG not set — using empty endpoint registry");
+            Arc::new(EndpointRegistry::empty())
+        },
+        |path| match EndpointRegistry::from_config(Path::new(&path)) {
+            Ok(r) => Arc::new(r),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    path = %path,
+                    "failed to load ROZ_ENDPOINTS_CONFIG — aborting startup"
+                );
+                std::process::exit(1);
+            }
+        },
+    );
+
+    // Fail-fast: if the registry is non-empty AND the key provider is not
+    // usable, we cannot decrypt any `api_key` material at request time.
+    // `from_config` already dereferences `api_key_env` at load time, so if the
+    // registry loaded successfully any ApiKey endpoints have a live key in
+    // memory — but future DB-backed cloud wrappers will rely on the KeyProvider
+    // at decrypt time. Surface the misconfiguration NOW rather than at the
+    // first user-facing request.
+    if !key_provider_usable && !endpoint_registry.is_empty() {
+        tracing::error!(
+            "endpoint registry loaded with {} entries but ROZ_ENCRYPTION_KEY is unset — aborting startup",
+            endpoint_registry.len()
+        );
+        std::process::exit(1);
+    }
+
     let state = AppState {
         pool,
         rate_limiter,
@@ -297,6 +442,11 @@ async fn main() {
         auth: Arc::new(roz_server::auth::ApiKeyAuth),
         meter: Arc::new(roz_agent::meter::NoOpMeter),
         trust_policy,
+        object_store,
+        endpoint_registry,
+        key_provider,
+        mcp_registry: Arc::new(roz_mcp::Registry::new()),
+        session_bus: Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
     };
 
     // Spawn internal NATS request-reply handlers (e.g. spawn_worker tool bypass).
@@ -317,10 +467,20 @@ async fn main() {
     {
         use restate_sdk::endpoint::Endpoint;
         use restate_sdk::http_server::HttpServer;
+        use roz_server::restate::scheduled_task_workflow::{ScheduledTaskRuntime, ScheduledTaskWorkflow};
         use roz_server::restate::task_workflow::TaskWorkflow;
+
+        roz_server::restate::scheduled_task_workflow::install_scheduled_task_runtime(ScheduledTaskRuntime {
+            pool: state.pool.clone(),
+            http_client: state.http_client.clone(),
+            restate_ingress_url: state.restate_ingress_url.clone(),
+            nats_client: state.nats_client.clone(),
+            trust_policy: state.trust_policy.clone(),
+        });
 
         let endpoint = Endpoint::builder()
             .bind(roz_server::restate::TaskWorkflowImpl.serve())
+            .bind(roz_server::restate::ScheduledTaskWorkflowImpl.serve())
             .build();
 
         let restate_addr = format!("[::]:{restate_port}");
@@ -410,6 +570,11 @@ mod tests {
             auth: Arc::new(roz_server::auth::ApiKeyAuth),
             meter: Arc::new(roz_agent::meter::NoOpMeter),
             trust_policy: Arc::new(roz_server::trust::permissive_policy_for_integration_tests()),
+            object_store: Arc::new(object_store::memory::InMemory::new()),
+            endpoint_registry: Arc::new(roz_core::EndpointRegistry::empty()),
+            key_provider: Arc::new(roz_openai::auth::null_key::NullKeyProvider),
+            mcp_registry: Arc::new(roz_mcp::Registry::new()),
+            session_bus: Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
         }
     }
 
@@ -2098,6 +2263,11 @@ mod tests {
             auth: Arc::new(roz_server::auth::ApiKeyAuth),
             meter: Arc::new(roz_agent::meter::NoOpMeter),
             trust_policy: Arc::new(roz_server::trust::permissive_policy_for_integration_tests()),
+            object_store: Arc::new(object_store::memory::InMemory::new()),
+            endpoint_registry: Arc::new(roz_core::EndpointRegistry::empty()),
+            key_provider: Arc::new(roz_openai::auth::null_key::NullKeyProvider),
+            mcp_registry: Arc::new(roz_mcp::Registry::new()),
+            session_bus: Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
         }
     }
 

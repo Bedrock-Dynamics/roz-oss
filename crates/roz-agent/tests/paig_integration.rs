@@ -40,6 +40,7 @@ fn simple_request() -> CompletionRequest {
         tools: vec![],
         max_tokens: 64,
         tool_choice: None,
+        response_schema: None,
     }
 }
 

@@ -16,6 +16,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use futures::Stream;
 use sqlx::PgPool;
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc};
@@ -35,8 +36,10 @@ use roz_agent::session_runtime::{
 use roz_agent::spatial_provider::{
     NullWorldStateProvider, bootstrap_runtime_world_state_provider, format_runtime_world_state_bootstrap_note,
 };
+use roz_agent::tools::execute_code::{EXECUTE_CODE_TOOL_NAME, ExecuteCodeTool};
 use roz_core::auth::AuthIdentity;
 use roz_core::edge_health::EdgeTransportHealth;
+use roz_core::key_provider::KeyProvider;
 use roz_core::session::event::SessionPermissionRule;
 use roz_core::session::event::{CanonicalSessionEventEnvelope, CorrelationId, EventEnvelope, SessionEvent};
 use roz_core::tools::ToolCategory;
@@ -51,6 +54,7 @@ use super::roz_v1::{self, SessionRequest, SessionResponse, WatchTeamRequest, ses
 use crate::grpc::auth_ext;
 use crate::grpc::media::{MediaBackend, resolve_backend_name};
 use crate::grpc::media_fetch::MediaFetch;
+use crate::grpc::session_bus::SessionBus;
 
 /// Keepalive interval while an agent turn is in progress.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -69,9 +73,16 @@ struct Session {
     environment_id: uuid::Uuid,
     model_name: String,
     max_context_tokens: u32,
-    tools: Vec<roz_core::tools::ToolSchema>,
-    /// Proto-declared categories per tool (for dispatcher registration).
-    tool_categories: HashMap<String, ToolCategory>,
+    /// Client-owned tool inventory (`StartSession.tools`, `RegisterTools`, and
+    /// `UserMessage.tools`). Server-owned MCP tools live separately so IDE hot
+    /// swaps do not clobber them.
+    client_tools: Vec<roz_core::tools::ToolSchema>,
+    /// Proto-declared categories for the client-owned tool inventory.
+    client_tool_categories: HashMap<String, ToolCategory>,
+    /// Cloud-only server-owned MCP tools discovered from registered healthy
+    /// MCP servers. Shared with MCP executors so degradation can prune the
+    /// surface immediately for later turns.
+    server_owned_mcp: Arc<Mutex<ServerOwnedMcpSurface>>,
     /// Client-provided project context (AGENTS.md, .substrate/rules/*.md, etc.)
     /// sent once at session start. Included in the system prompt for every turn.
     project_context: Vec<String>,
@@ -98,6 +109,93 @@ struct Session {
     edge_mirror: Option<Arc<AsyncMutex<EdgeSessionMirror>>>,
     /// Subscription to the canonical runtime event stream for cloud forwarding.
     event_rx: Option<broadcast::Receiver<EventEnvelope>>,
+    /// Phase 18 SKILL-05 / D-12: frozen tier-0 skill snapshot loaded once at
+    /// session start via `roz_db::skills::list_recent` under tenant RLS. Stays
+    /// stable for the session — mid-session `SkillCrystallized` events do NOT
+    /// refresh this; the agent uses `skills_list` for live discovery (RESEARCH
+    /// OQ #4). Read by every turn's `AssemblyContext.skill_entries` via
+    /// `SessionRuntime::set_skill_snapshot` at session start; this field is the
+    /// session-owned audit copy in case future reconnect / handoff paths need
+    /// to re-install it onto a freshly rehydrated runtime.
+    #[allow(dead_code)]
+    frozen_skills: Vec<roz_db::skills::SkillSummary>,
+}
+
+#[derive(Debug, Clone)]
+struct ServerOwnedMcpTool {
+    server_name: String,
+    original_name: String,
+    schema: roz_core::tools::ToolSchema,
+    category: ToolCategory,
+}
+
+#[derive(Debug, Default)]
+struct ServerOwnedMcpSurface {
+    tools: HashMap<String, ServerOwnedMcpTool>,
+}
+
+impl ServerOwnedMcpSurface {
+    fn replace_manifests(&mut self, manifests: Vec<roz_mcp::McpToolManifest>) {
+        self.tools = manifests
+            .into_iter()
+            .map(|manifest| {
+                (
+                    manifest.namespaced_name.clone(),
+                    ServerOwnedMcpTool {
+                        server_name: manifest.server_name,
+                        original_name: manifest.original_name,
+                        schema: manifest.schema,
+                        category: manifest.category,
+                    },
+                )
+            })
+            .collect();
+    }
+
+    fn prune_server(&mut self, server_name: &str) {
+        self.tools.retain(|_, tool| tool.server_name != server_name);
+    }
+
+    fn schemas(&self) -> Vec<roz_core::tools::ToolSchema> {
+        let mut tools: Vec<_> = self.tools.values().map(|tool| tool.schema.clone()).collect();
+        tools.sort_by(|left, right| left.name.cmp(&right.name));
+        tools
+    }
+
+    fn categories(&self) -> HashMap<String, ToolCategory> {
+        self.tools
+            .iter()
+            .map(|(name, tool)| (name.clone(), tool.category))
+            .collect()
+    }
+
+    fn get(&self, namespaced_name: &str) -> Option<ServerOwnedMcpTool> {
+        self.tools.get(namespaced_name).cloned()
+    }
+
+    fn len(&self) -> usize {
+        self.tools.len()
+    }
+}
+
+impl Session {
+    fn active_tools(&self) -> Vec<roz_core::tools::ToolSchema> {
+        let mut tools = self.client_tools.clone();
+        let server_owned = self.server_owned_mcp.lock().expect("mcp surface lock poisoned");
+        tools.extend(server_owned.schemas());
+        tools
+    }
+
+    fn active_tool_categories(&self) -> HashMap<String, ToolCategory> {
+        let mut categories = self.client_tool_categories.clone();
+        let server_owned = self.server_owned_mcp.lock().expect("mcp surface lock poisoned");
+        categories.extend(server_owned.categories());
+        categories
+    }
+
+    fn active_tool_count(&self) -> usize {
+        self.client_tools.len() + self.server_owned_mcp.lock().expect("mcp surface lock poisoned").len()
+    }
 }
 
 struct EdgeSessionMirror {
@@ -130,8 +228,8 @@ impl EdgeSessionMirror {
 struct ActiveTurn {
     /// Resolves pending remote tool calls when the client sends `ToolResult`.
     pending: PendingResults,
-    /// Canonical runtime authority for resolving approvals on the active turn.
-    runtime: Arc<AsyncMutex<SessionRuntime>>,
+    /// Runtime-owned approval authority shared with the active turn.
+    approval_runtime: roz_agent::session_runtime::ApprovalRuntimeHandle,
     /// Cancel token scoped to this turn.
     cancel_token: tokio_util::sync::CancellationToken,
     /// Handle to the spawned agent task (dropped on turn completion).
@@ -174,6 +272,20 @@ pub struct AgentServiceImpl {
     media_backend: Arc<dyn MediaBackend>,
     /// SSRF-guarded fetcher for `MediaPart::file_uri` (Phase 16.1 / MED-03).
     media_fetcher: Arc<dyn MediaFetch>,
+    /// Phase 18 SKILL-01: pluggable object store for skill bundled assets.
+    /// Injected into every `AgentLoop` `ToolContext::extensions` so the
+    /// `skill_read_file` Pure tool can stream tier-2 bytes (PLAN-06).
+    object_store: Arc<dyn object_store::ObjectStore>,
+    /// Phase 19 Plan 11: endpoint registry threaded through to `create_model`
+    /// so `openai-compat:<name>` prefixes + bare-name fallthrough resolve.
+    endpoint_registry: Arc<roz_core::model_endpoint::EndpointRegistry>,
+    /// Phase 20 Plan 06: shared registry for server-owned MCP tools.
+    mcp_registry: Arc<roz_mcp::Registry>,
+    /// Phase 20 Plan 06: decrypts tenant MCP credentials when loading
+    /// registered servers from Postgres into the shared registry.
+    key_provider: Arc<dyn KeyProvider>,
+    /// Phase 20 Plan 07: cross-RPC session bus for MCP OAuth approval flows.
+    session_bus: Arc<SessionBus>,
 }
 
 impl AgentServiceImpl {
@@ -193,6 +305,11 @@ impl AgentServiceImpl {
         meter: Arc<dyn roz_agent::meter::UsageMeter>,
         media_backend: Arc<dyn MediaBackend>,
         media_fetcher: Arc<dyn MediaFetch>,
+        object_store: Arc<dyn object_store::ObjectStore>,
+        endpoint_registry: Arc<roz_core::model_endpoint::EndpointRegistry>,
+        mcp_registry: Arc<roz_mcp::Registry>,
+        key_provider: Arc<dyn KeyProvider>,
+        session_bus: Arc<SessionBus>,
     ) -> Self {
         Self {
             pool,
@@ -209,6 +326,11 @@ impl AgentServiceImpl {
             meter,
             media_backend,
             media_fetcher,
+            object_store,
+            endpoint_registry,
+            mcp_registry,
+            key_provider,
+            session_bus,
         }
     }
 }
@@ -234,6 +356,11 @@ impl AgentService for AgentServiceImpl {
         let fallback_model_name = self.fallback_model_name.clone();
         let nats_client = self.nats_client.clone();
         let meter = self.meter.clone();
+        let object_store = self.object_store.clone();
+        let endpoint_registry = self.endpoint_registry.clone();
+        let mcp_registry = self.mcp_registry.clone();
+        let key_provider = self.key_provider.clone();
+        let session_bus = self.session_bus.clone();
 
         // Extract AuthIdentity from request extensions (set by grpc_auth_middleware)
         // BEFORE consuming the request via into_inner().
@@ -253,6 +380,7 @@ impl AgentService for AgentServiceImpl {
                 anthropic_provider,
                 direct_api_key,
                 fallback_model_name,
+                endpoint_registry,
             };
             run_session_loop(
                 &tx,
@@ -263,6 +391,10 @@ impl AgentService for AgentServiceImpl {
                 &mut inbound,
                 nats_client.as_ref(),
                 meter,
+                &object_store,
+                &mcp_registry,
+                &key_provider,
+                &session_bus,
             )
             .await;
         });
@@ -600,6 +732,74 @@ struct ModelConfig {
     anthropic_provider: String,
     direct_api_key: Option<String>,
     fallback_model_name: Option<String>,
+    /// Phase 19 Plan 11: endpoint registry for `openai-compat:<name>` routing.
+    endpoint_registry: Arc<roz_core::model_endpoint::EndpointRegistry>,
+}
+
+struct ServerMcpToolExecutor {
+    schema: roz_core::tools::ToolSchema,
+    pool: PgPool,
+    registry: Arc<roz_mcp::Registry>,
+    event_emitter: roz_agent::session_runtime::EventEmitter,
+    server_owned_mcp: Arc<Mutex<ServerOwnedMcpSurface>>,
+    tenant_id: uuid::Uuid,
+    server_name: String,
+    original_tool_name: String,
+}
+
+#[async_trait]
+impl roz_agent::dispatch::ToolExecutor for ServerMcpToolExecutor {
+    fn schema(&self) -> roz_core::tools::ToolSchema {
+        self.schema.clone()
+    }
+
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        _ctx: &roz_agent::dispatch::ToolContext,
+    ) -> Result<roz_core::tools::ToolResult, Box<dyn std::error::Error + Send + Sync>> {
+        let outcome = match self
+            .registry
+            .call_tool(self.tenant_id, &self.server_name, &self.original_tool_name, params)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return Ok(roz_core::tools::ToolResult::error(error.to_string())),
+        };
+
+        if let Some(degraded) = outcome.degraded_server {
+            self.server_owned_mcp
+                .lock()
+                .expect("mcp surface lock poisoned")
+                .prune_server(&degraded.server_name);
+            self.event_emitter.emit(SessionEvent::McpServerDegraded {
+                server_name: degraded.server_name.clone(),
+                failure_count: degraded.failure_count,
+                last_error: degraded.last_error.clone(),
+            });
+
+            let registry = self.registry.clone();
+            let pool = self.pool.clone();
+            let tenant_id = self.tenant_id;
+            let server_name = degraded.server_name;
+            let last_error = degraded.last_error;
+            tokio::spawn(async move {
+                if let Err(error) = registry
+                    .persist_degraded_transition(&pool, tenant_id, &server_name, &last_error)
+                    .await
+                {
+                    tracing::warn!(
+                        tenant_id = %tenant_id,
+                        server_name = %server_name,
+                        error = %error,
+                        "failed to persist degraded MCP server state after tool-call transition"
+                    );
+                }
+            });
+        }
+
+        Ok(outcome.result)
+    }
 }
 
 struct ServerStreamingExecutor {
@@ -663,7 +863,7 @@ impl StreamingTurnExecutor for ServerStreamingExecutor {
 
 #[tracing::instrument(
     name = "agent_session.stream",
-    skip(tx, pool, model_config, inbound, nats_client, meter, auth_identity),
+    skip(tx, pool, model_config, inbound, nats_client, meter, auth_identity, mcp_registry, key_provider),
     fields(session_id = tracing::field::Empty, tenant_id = tracing::field::Empty, environment_id = tracing::field::Empty, model = %default_model)
 )]
 #[expect(
@@ -683,6 +883,10 @@ async fn run_session_loop(
     inbound: &mut Streaming<SessionRequest>,
     nats_client: Option<&async_nats::Client>,
     meter: Arc<dyn roz_agent::meter::UsageMeter>,
+    object_store: &Arc<dyn object_store::ObjectStore>,
+    mcp_registry: &Arc<roz_mcp::Registry>,
+    key_provider: &Arc<dyn KeyProvider>,
+    session_bus: &Arc<SessionBus>,
 ) {
     let mut session: Option<Session> = None;
     let mut cancelled = false;
@@ -810,7 +1014,18 @@ async fn run_session_loop(
 
         match req.request {
             Some(session_request::Request::Start(start)) => {
-                if !handle_start(tx, pool, default_model, &auth_identity, start, &mut session).await {
+                if !handle_start(
+                    tx,
+                    pool,
+                    default_model,
+                    &auth_identity,
+                    start,
+                    &mut session,
+                    mcp_registry,
+                    key_provider,
+                )
+                .await
+                {
                     break;
                 }
                 if let Some(ref sess) = session {
@@ -836,11 +1051,12 @@ async fn run_session_loop(
                         tenant_id = %sess.tenant_id,
                         environment_id = %sess.environment_id,
                         model = %sess.model_name,
-                        tools_count = sess.tools.len(),
+                        tools_count = sess.active_tool_count(),
                         history_messages,
                         project_context_count = sess.project_context.len(),
                         "agent_session.started"
                     );
+                    session_bus.attach_session(sess.id, tx.clone());
 
                     // Spawn telemetry relay: subscribe to NATS telemetry for the
                     // session's host and forward updates on the gRPC stream.
@@ -855,14 +1071,48 @@ async fn run_session_loop(
                     // DEBT-03: spawn write-behind flush task for cloud (non-edge) sessions.
                     // TODO(phase 13+): edge session turn persistence deferred — the server
                     // would double-persist if the worker also emitted. See 13-01 plan.
+                    //
+                    // MEM-03 (17-09): also fan out the emitter to the fact extractor so
+                    // durable user-model facts are produced off the agent hot path.
                     if !sess.is_edge && turn_emitter.is_none() {
-                        let (emitter, rx) = roz_agent::agent_loop::TurnEmitter::new();
+                        let (emitter, turn_rx, fact_rx) = roz_agent::agent_loop::TurnEmitter::with_fact_extractor(
+                            roz_agent::agent_loop::TURN_BUFFER_CAPACITY,
+                        );
                         turn_emitter = Some(emitter);
+
+                        // Primary: turn persistence (unchanged semantics).
                         let flush_cancel = relay_cancel.child_token();
                         let flush_pool = pool.clone();
                         tokio::spawn(async move {
-                            roz_agent::agent_loop::run_flush_task(rx, flush_pool, flush_cancel).await;
+                            roz_agent::agent_loop::run_flush_task(turn_rx, flush_pool, flush_cancel).await;
                         });
+
+                        // Secondary: MEM-03 fact extraction. Only spawn when the aux-LLM
+                        // is reachable (ROZ_GEMINI_API_KEY set). Otherwise fact_rx is
+                        // dropped and the emitter's fan-out logs
+                        // `fact-extraction task terminated; drop` on each emit — harmless.
+                        if let Some(aux) = roz_agent::aux_llm::GeminiFlashAuxLlm::from_env() {
+                            let fact_cancel = relay_cancel.child_token();
+                            let fact_pool = pool.clone();
+                            let aux_arc: std::sync::Arc<dyn roz_agent::aux_llm::AuxLlm> = std::sync::Arc::new(aux);
+                            let cfg = roz_agent::agent_loop::fact_extractor::FactExtractorConfig {
+                                observed_peer_id: sess.tenant_id.to_string(),
+                                ..Default::default()
+                            };
+                            tokio::spawn(async move {
+                                roz_agent::agent_loop::fact_extractor::run_fact_extractor_task(
+                                    fact_rx,
+                                    fact_pool,
+                                    aux_arc,
+                                    cfg,
+                                    fact_cancel,
+                                )
+                                .await;
+                            });
+                        } else {
+                            drop(fact_rx);
+                            tracing::info!("MEM-03: fact extraction disabled (ROZ_GEMINI_API_KEY not set)");
+                        }
                     }
 
                     // Edge mode: relay the entire session to the worker via NATS
@@ -928,6 +1178,7 @@ async fn run_session_loop(
                 // Primary always routes through the gateway (PAIG or equivalent).
                 // Never pass direct_api_key to the primary — that would bypass the
                 // gateway entirely, defeating the FallbackModel's purpose.
+                let session_tenant_id = roz_core::auth::TenantId::new(sess.tenant_id);
                 let primary = match roz_agent::model::create_model(
                     &sess.model_name,
                     &model_config.gateway_url,
@@ -935,6 +1186,8 @@ async fn run_session_loop(
                     model_config.timeout_secs,
                     &model_config.anthropic_provider,
                     None, // primary always via gateway
+                    &session_tenant_id,
+                    model_config.endpoint_registry.clone(),
                 ) {
                     Ok(m) => m,
                     Err(e) => {
@@ -956,6 +1209,8 @@ async fn run_session_loop(
                             model_config.timeout_secs,
                             &model_config.anthropic_provider,
                             model_config.direct_api_key.as_deref(),
+                            &session_tenant_id,
+                            model_config.endpoint_registry.clone(),
                         )
                         .map(|m| (fallback_name.as_str(), m))
                     } else if let Some(ref direct_key) = model_config.direct_api_key {
@@ -968,6 +1223,8 @@ async fn run_session_loop(
                             model_config.timeout_secs,
                             &model_config.anthropic_provider,
                             Some(direct_key.as_str()),
+                            &session_tenant_id,
+                            model_config.endpoint_registry.clone(),
                         )
                         .map(|m| (sess.model_name.as_str(), m))
                     } else {
@@ -995,59 +1252,100 @@ async fn run_session_loop(
                     let runtime = turn_runtime.lock().await;
                     runtime.cognition_mode()
                 };
-                let tools_changed = if msg.tools.is_empty() {
-                    false
-                } else {
-                    sess.tool_categories = msg
+                refresh_server_owned_mcp_tools(
+                    pool,
+                    mcp_registry,
+                    key_provider.as_ref(),
+                    sess.tenant_id,
+                    &sess.server_owned_mcp,
+                    Some(&turn_runtime),
+                )
+                .await;
+
+                if !msg.tools.is_empty() {
+                    sess.client_tool_categories = msg
                         .tools
                         .iter()
                         .map(|tool| (tool.name.clone(), proto_tool_category(tool)))
                         .collect();
-                    sess.tools = msg
+                    sess.client_tools = msg
                         .tools
                         .iter()
                         .cloned()
                         .map(roz_core::tools::ToolSchema::from)
                         .collect();
-                    sess.active_permissions = derive_permissions(&sess.tools);
-                    true
-                };
+                }
 
                 let mode = resolved_user_message_mode(msg.ai_mode.as_deref(), current_mode);
                 let session_project_context = sess.project_context.clone();
+                let turn_tools = sess.active_tools();
+                let turn_categories = sess.active_tool_categories();
+                sess.active_permissions = derive_permissions(&turn_tools);
                 let active_permissions = sess.active_permissions.clone();
-                if tools_changed || mode != current_mode {
+                {
                     let mut runtime = turn_runtime.lock().await;
                     sync_cloud_runtime_surface(
                         &mut runtime,
                         mode,
-                        &sess.tools,
+                        &turn_tools,
                         &session_project_context,
                         &active_permissions,
                     );
                 }
+                let turn_event_emitter = {
+                    let runtime = turn_runtime.lock().await;
+                    runtime.event_emitter()
+                };
 
                 // Register remote tool executors for the current session-owned tool inventory.
                 let mut dispatcher = ToolDispatcher::new(DEFAULT_TOOL_TIMEOUT);
-                let turn_tools = sess.tools.clone();
-                let turn_categories = sess.tool_categories.clone();
+                let server_owned_mcp = sess.server_owned_mcp.clone();
                 for tool in &turn_tools {
                     let category = turn_categories
                         .get(&tool.name)
                         .copied()
                         .unwrap_or(ToolCategory::Physical);
-                    dispatcher.register_with_category(
-                        Box::new(RemoteToolExecutor::new(
-                            &tool.name,
-                            &tool.description,
-                            tool.parameters.clone(),
-                            tool_request_tx.clone(),
-                            pending.clone(),
-                            DEFAULT_TOOL_TIMEOUT,
-                        )),
-                        category,
-                    );
+                    if category == ToolCategory::CodeSandbox && tool.name == EXECUTE_CODE_TOOL_NAME {
+                        dispatcher.register_with_category(Box::new(ExecuteCodeTool), ToolCategory::CodeSandbox);
+                    } else if let Some(mcp_tool) = server_owned_mcp
+                        .lock()
+                        .expect("mcp surface lock poisoned")
+                        .get(&tool.name)
+                    {
+                        dispatcher.register_with_category(
+                            Box::new(ServerMcpToolExecutor {
+                                schema: tool.clone(),
+                                pool: pool.clone(),
+                                registry: mcp_registry.clone(),
+                                event_emitter: turn_event_emitter.clone(),
+                                server_owned_mcp: server_owned_mcp.clone(),
+                                tenant_id: sess.tenant_id,
+                                server_name: mcp_tool.server_name,
+                                original_tool_name: mcp_tool.original_name,
+                            }),
+                            category,
+                        );
+                    } else {
+                        dispatcher.register_with_category(
+                            Box::new(RemoteToolExecutor::new(
+                                &tool.name,
+                                &tool.description,
+                                tool.parameters.clone(),
+                                tool_request_tx.clone(),
+                                pending.clone(),
+                                DEFAULT_TOOL_TIMEOUT,
+                            )),
+                            category,
+                        );
+                    }
                 }
+                // Phase 17 PLAN-07 + Phase 18 PLAN-08: register the four
+                // memory tools (Phase 17) and four skill tools (Phase 18) as
+                // Pure tools. Both rely on PgPool + Permissions in
+                // ToolContext::extensions; the skill tools additionally need
+                // Arc<dyn ObjectStore>. All extensions are inserted below.
+                dispatcher.register_phase17_memory_tools();
+                dispatcher.register_phase18_skill_tools();
 
                 // Build AgentInput from session state + user message.
                 // The agent loop will add the user message to its messages internally,
@@ -1097,7 +1395,25 @@ async fn run_session_loop(
                     None
                 };
                 let spatial = spatial_bootstrap.provider;
+                // MEM-07 + PLAN-17-07 Task 3 + Phase 18 PLAN-08: inject PgPool,
+                // Permissions, and Arc<dyn ObjectStore> into
+                // ToolContext.extensions so the eight Pure tools
+                // (session_search, memory_read, memory_write, user_model_query,
+                // skills_list, skill_view, skill_read_file, skill_manage) can
+                // reach Postgres + skill assets and so the permission gates on
+                // `memory_write` and `skill_manage` have concrete values. Cloud
+                // sessions default to `Permissions::default()` (can_write_memory
+                // and can_write_skills both false — D-08 / D-10); owner-CLI
+                // sessions will upgrade in a future phase.
+                let mut tool_extensions = roz_agent::dispatch::Extensions::new();
+                tool_extensions.insert(pool.clone());
+                tool_extensions.insert(roz_core::auth::Permissions::default());
+                tool_extensions.insert(object_store.clone());
+                tool_extensions.insert(auth_identity.clone());
+                tool_extensions.insert(turn_event_emitter.clone());
+
                 let agent_loop = AgentLoop::new(model, dispatcher, safety, spatial)
+                    .with_extensions(tool_extensions)
                     .with_approval_runtime(approval_runtime.clone())
                     .with_meter(meter.clone())
                     .with_turn_emitter_opt(turn_emitter.clone());
@@ -1247,7 +1563,7 @@ async fn run_session_loop(
 
                 active_turn = Some(ActiveTurn {
                     pending: pending.clone(),
-                    runtime: turn_runtime.clone(),
+                    approval_runtime: approval_runtime.clone(),
                     cancel_token: turn_cancel.clone(),
                     _handle: handle,
                 });
@@ -1378,12 +1694,14 @@ async fn run_session_loop(
             }
             // D2: IDE sends user's Deny/Allow decision for a Roz-authoritative approval.
             Some(session_request::Request::PermissionDecision(decision)) => {
+                let modifier = decision.modifier.map(super::tasks::prost_struct_to_json);
+                if session_bus.resolve_mcp_oauth_approval(&decision.approval_id, decision.approved, modifier.clone()) {
+                    continue;
+                }
                 if let Some(ref turn) = active_turn {
-                    let modifier = decision.modifier.map(super::tasks::prost_struct_to_json);
-                    let resolved = {
-                        let runtime = turn.runtime.lock().await;
-                        runtime.resolve_approval(&decision.approval_id, decision.approved, modifier)
-                    };
+                    let resolved =
+                        turn.approval_runtime
+                            .resolve_approval(&decision.approval_id, decision.approved, modifier);
                     if !resolved {
                         tracing::warn!(
                             approval_id = %decision.approval_id,
@@ -1410,8 +1728,8 @@ async fn run_session_loop(
                 // Remove all tools previously registered under this source.
                 if !source.is_empty() {
                     let prefix = format!("{source}__");
-                    sess.tools.retain(|t| !t.name.starts_with(prefix.as_str()));
-                    sess.tool_categories
+                    sess.client_tools.retain(|t| !t.name.starts_with(prefix.as_str()));
+                    sess.client_tool_categories
                         .retain(|name, _| !name.starts_with(prefix.as_str()));
                 }
 
@@ -1427,13 +1745,14 @@ async fn run_session_loop(
                     reg.tools.into_iter().map(roz_core::tools::ToolSchema::from).collect();
 
                 let n_added = new_tools.len();
-                sess.tools.extend(new_tools);
-                sess.tool_categories.extend(new_categories);
-                sess.active_permissions = derive_permissions(&sess.tools);
+                sess.client_tools.extend(new_tools);
+                sess.client_tool_categories.extend(new_categories);
+                let active_tools = sess.active_tools();
+                sess.active_permissions = derive_permissions(&active_tools);
 
                 let runtime = sess.runtime.clone();
                 let session_id = sess.id;
-                let total_tools = sess.tools.len();
+                let total_tools = active_tools.len();
                 let session_project_context = sess.project_context.clone();
                 let active_permissions = sess.active_permissions.clone();
 
@@ -1443,7 +1762,7 @@ async fn run_session_loop(
                     sync_cloud_runtime_surface(
                         &mut runtime,
                         mode,
-                        &sess.tools,
+                        &active_tools,
                         &session_project_context,
                         &active_permissions,
                     );
@@ -1545,6 +1864,7 @@ async fn run_session_loop(
     // Cleanup: mark session with the appropriate terminal status.
     let status = if cancelled { "cancelled" } else { "completed" };
     if let Some(ref s) = session {
+        session_bus.detach_session(s.id);
         tracing::info!(
             session_id = %s.id,
             tenant_id = %s.tenant_id,
@@ -1892,6 +2212,8 @@ async fn handle_start(
     auth_identity: &AuthIdentity,
     start: roz_v1::StartSession,
     session: &mut Option<Session>,
+    mcp_registry: &Arc<roz_mcp::Registry>,
+    key_provider: &Arc<dyn KeyProvider>,
 ) -> bool {
     if session.is_some() {
         send_error(tx, "already_started", "session already started", false).await;
@@ -1981,6 +2303,7 @@ async fn handle_start(
         .map(|t| {
             let cat = match t.category() {
                 roz_v1::ToolCategoryHint::ToolCategoryPure => ToolCategory::Pure,
+                roz_v1::ToolCategoryHint::ToolCategoryCodeSandbox => ToolCategory::CodeSandbox,
                 _ => ToolCategory::Physical,
             };
             (t.name.clone(), cat)
@@ -1998,10 +2321,8 @@ async fn handle_start(
         .filter_map(|m| roz_agent::model::types::Message::try_from(m).ok())
         .collect();
 
-    // Derive permission rules from tool schemas.
-    let base_permissions = derive_permissions(&tools);
-
     let is_edge = resolve_placement(start.agent_placement.unwrap_or(0), start.host_id.is_some());
+    let server_owned_mcp = Arc::new(Mutex::new(ServerOwnedMcpSurface::default()));
 
     // Resolve host_id to worker_name once at session start to avoid per-message DB lookups.
     let worker_name = if let Some(ref hid) = start.host_id {
@@ -2009,6 +2330,42 @@ async fn handle_start(
     } else {
         None
     };
+
+    if !is_edge {
+        match mcp_registry
+            .discover_tenant_tools(pool, key_provider.as_ref(), tenant_id)
+            .await
+        {
+            Ok(discovery) => {
+                server_owned_mcp
+                    .lock()
+                    .expect("mcp surface lock poisoned")
+                    .replace_manifests(discovery.manifests);
+                for degraded in discovery.degraded_servers {
+                    tracing::warn!(
+                        tenant_id = %tenant_id,
+                        server_name = %degraded.server_name,
+                        failure_count = degraded.failure_count,
+                        error = %degraded.last_error,
+                        "mcp server degraded during session start discovery; tools will be omitted from the initial prompt surface"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    tenant_id = %tenant_id,
+                    error = %error,
+                    "failed to discover server-owned MCP tools at session start; continuing without MCP tools"
+                );
+            }
+        }
+    }
+
+    let mut active_tools = tools.clone();
+    active_tools.extend(server_owned_mcp.lock().expect("mcp surface lock poisoned").schemas());
+
+    // Derive permission rules from the merged client + server-owned tool surface.
+    let base_permissions = derive_permissions(&active_tools);
 
     let session_config = roz_agent::session_runtime::SessionConfig {
         session_id: session_id.to_string(),
@@ -2019,14 +2376,58 @@ async fn handle_start(
             roz_core::session::control::SessionMode::Server
         },
         cognition_mode: roz_core::session::control::CognitionMode::React,
-        constitution_text: build_constitution_for_tools(AgentLoopMode::React, &tools),
+        constitution_text: build_constitution_for_tools(AgentLoopMode::React, &active_tools),
         blueprint_toml: String::new(),
         model_name: Some(model_name.clone()),
         permissions: base_permissions.clone(),
-        tool_schemas: prompt_tool_schemas(&tools),
+        tool_schemas: prompt_tool_schemas(&active_tools),
         project_context: start.project_context.clone(),
         initial_history: messages,
     };
+
+    // Phase 18 SKILL-05 / D-12: load the frozen tier-0 skill snapshot once per
+    // session under tenant RLS. Mirrors the Phase 17 frozen memory snapshot
+    // pattern: mid-session writes do NOT mutate this prompt snapshot; the
+    // agent uses `skills_list` for live discovery and `skill_view` for live
+    // body/version loads until the next session refreshes the snapshot.
+    // Fail-open: an empty Vec on backend error degrades only prompt quality
+    // (T-18-08-03 mitigation: RLS is enforced before list_recent runs).
+    let frozen_skills: Vec<roz_db::skills::SkillSummary> = match pool.begin().await {
+        Ok(mut db_tx) => {
+            if let Err(err) = roz_db::set_tenant_context(&mut *db_tx, &tenant_id).await {
+                tracing::warn!(
+                    error = %err,
+                    tenant_id = %tenant_id,
+                    "skills snapshot set_tenant_context failed; continuing with empty snapshot"
+                );
+                Vec::new()
+            } else {
+                match roz_db::skills::list_recent(&mut *db_tx, 20).await {
+                    Ok(rows) => {
+                        let _ = db_tx.commit().await;
+                        rows
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            tenant_id = %tenant_id,
+                            "skills snapshot list_recent failed; continuing with empty snapshot"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                tenant_id = %tenant_id,
+                "skills snapshot tx begin failed; continuing with empty snapshot"
+            );
+            Vec::new()
+        }
+    };
+
     let (runtime, edge_mirror, event_rx) = if is_edge {
         (
             None,
@@ -2036,7 +2437,19 @@ async fn handle_start(
             None,
         )
     } else {
-        let mut session_rt = roz_agent::session_runtime::SessionRuntime::new(&session_config);
+        // MEM-04 / MEM-05: wire the Postgres-backed MemoryStore into the cloud
+        // session runtime so the frozen session-start snapshot is read through
+        // tenant-RLS-enforced queries. The `pool` is already available in this
+        // handler scope (`handle_start(pool: &PgPool, ...)`).
+        let memory_store: std::sync::Arc<dyn roz_agent::memory_store::MemoryStore> =
+            std::sync::Arc::new(roz_agent::memory_store::PostgresMemoryStore::new(pool.clone()));
+        let mut session_rt =
+            roz_agent::session_runtime::SessionRuntime::new_with_memory_store(&session_config, memory_store).await;
+        // Phase 18 SKILL-05 / PLAN-08: install the frozen tier-0 skill snapshot
+        // (loaded above under tenant RLS) so every turn's
+        // AssemblyContext.skill_entries reads from the same stable Vec while
+        // `skills_list` / `skill_view` remain the live mid-session surfaces.
+        session_rt.set_skill_snapshot(frozen_skills.clone());
         let mut event_rx = session_rt.subscribe_events();
         if let Err(error) = session_rt.start_session().await {
             tracing::error!(error = %error, "failed to start cloud session runtime");
@@ -2055,8 +2468,9 @@ async fn handle_start(
         environment_id: env_id,
         model_name,
         max_context_tokens,
-        tools,
-        tool_categories,
+        client_tools: tools,
+        client_tool_categories: tool_categories,
+        server_owned_mcp,
         project_context: start.project_context,
         cancel_token: tokio_util::sync::CancellationToken::new(),
         base_permissions: base_permissions.clone(),
@@ -2067,6 +2481,7 @@ async fn handle_start(
         runtime,
         edge_mirror,
         event_rx,
+        frozen_skills,
     });
 
     true
@@ -2075,6 +2490,41 @@ async fn handle_start(
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
+
+async fn refresh_server_owned_mcp_tools(
+    pool: &PgPool,
+    registry: &Arc<roz_mcp::Registry>,
+    key_provider: &dyn KeyProvider,
+    tenant_id: uuid::Uuid,
+    server_owned_mcp: &Arc<Mutex<ServerOwnedMcpSurface>>,
+    runtime: Option<&Arc<AsyncMutex<SessionRuntime>>>,
+) {
+    match registry.discover_tenant_tools(pool, key_provider, tenant_id).await {
+        Ok(discovery) => {
+            server_owned_mcp
+                .lock()
+                .expect("mcp surface lock poisoned")
+                .replace_manifests(discovery.manifests);
+            if let Some(runtime) = runtime {
+                for degraded in discovery.degraded_servers {
+                    let runtime = runtime.lock().await;
+                    runtime.emit(SessionEvent::McpServerDegraded {
+                        server_name: degraded.server_name,
+                        failure_count: degraded.failure_count,
+                        last_error: degraded.last_error,
+                    });
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                error = %error,
+                "failed to refresh server-owned MCP tools; leaving previous MCP tool surface intact"
+            );
+        }
+    }
+}
 
 /// Assemble system prompt as separate blocks for prompt prefix caching.
 ///
@@ -2144,6 +2594,7 @@ fn prompt_tool_schemas(tools: &[roz_core::tools::ToolSchema]) -> Vec<roz_agent::
 fn proto_tool_category(tool: &roz_v1::ToolSchema) -> ToolCategory {
     match tool.category() {
         roz_v1::ToolCategoryHint::ToolCategoryPure => ToolCategory::Pure,
+        roz_v1::ToolCategoryHint::ToolCategoryCodeSandbox => ToolCategory::CodeSandbox,
         _ => ToolCategory::Physical,
     }
 }
@@ -2193,6 +2644,7 @@ fn prompt_context_blocks(blocks: &[roz_v1::ContentBlock]) -> Vec<String> {
 fn edge_tool_category_name(tool: &roz_v1::ToolSchema) -> &'static str {
     match tool.category() {
         roz_v1::ToolCategoryHint::ToolCategoryPure => "pure",
+        roz_v1::ToolCategoryHint::ToolCategoryCodeSandbox => "code_sandbox",
         _ => "physical",
     }
 }
@@ -2554,7 +3006,7 @@ fn derive_permissions(tools: &[roz_core::tools::ToolSchema]) -> Vec<SessionPermi
 fn plan_mode_permissions(base: &[SessionPermissionRule]) -> Vec<SessionPermissionRule> {
     base.iter()
         .map(|rule| {
-            if rule.category.as_deref() == Some("physical") {
+            if matches!(rule.category.as_deref(), Some("physical" | "code_sandbox")) {
                 SessionPermissionRule {
                     policy: "block".into(),
                     reason: Some("plan mode: observation only".into()),
@@ -3097,6 +3549,33 @@ mod tests {
         assert_eq!(envelope["system_context"], "sim workflow");
         assert_eq!(envelope["tools"][0]["name"], "scan_area");
         assert_eq!(envelope["tools"][0]["category"], "pure");
+    }
+
+    #[test]
+    fn build_edge_relay_user_message_envelope_preserves_code_sandbox_category() {
+        let envelope = build_edge_relay_user_message_envelope(&roz_v1::UserMessage {
+            content: "run the program".into(),
+            context: Vec::new(),
+            ai_mode: None,
+            message_id: None,
+            tools: vec![roz_v1::ToolSchema {
+                name: "execute_code".into(),
+                description: "Run sandbox code".into(),
+                parameters_schema: Some(crate::grpc::convert::value_to_struct(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "language": { "type": "string" },
+                        "code": { "type": "string" }
+                    }
+                }))),
+                timeout_ms: 30_000,
+                category: roz_v1::ToolCategoryHint::ToolCategoryCodeSandbox as i32,
+            }],
+            system_context: None,
+        });
+
+        assert_eq!(envelope["tools"][0]["name"], "execute_code");
+        assert_eq!(envelope["tools"][0]["category"], "code_sandbox");
     }
 
     #[test]

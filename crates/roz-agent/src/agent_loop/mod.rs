@@ -3,12 +3,14 @@
 mod approvals;
 mod core;
 mod dispatch;
+pub mod fact_extractor;
 mod input;
 mod retry;
 mod spatial;
 mod streaming;
 pub mod turn_emitter;
 
+pub(crate) use self::approvals::{ApprovalGateResult, gate_tool_call_for_human_approval};
 pub use self::input::{
     ActivityState, AgentInput, AgentInputSeed, AgentOutput, PresenceLevel, PresenceSignal, RESPOND_TOOL_NAME,
 };

@@ -618,6 +618,8 @@ impl LocalRuntime {
         let blueprint_toml = load_blueprint_toml(project_dir);
         let evidence_archive = EvidenceArchive::new(project_dir);
         let model_factory: ModelFactory = Box::new(move || {
+            let tenant_id = roz_core::auth::TenantId::new(uuid::Uuid::nil());
+            let registry = Arc::new(roz_core::model_endpoint::EndpointRegistry::empty());
             create_model(
                 &model_name,
                 "",             // gateway_url: unused for direct access
@@ -625,6 +627,8 @@ impl LocalRuntime {
                 120,            // timeout_secs
                 "anthropic",    // proxy_provider
                 key.as_deref(), // direct_api_key: hits provider API directly
+                &tenant_id,
+                registry,
             )
         });
 
@@ -823,6 +827,9 @@ impl LocalRuntime {
     /// Takes `&self` for future use with manifest-based spatial config (roz.toml).
     #[allow(clippy::unused_self)]
     fn create_spatial_model(&self) -> Option<Arc<dyn Model>> {
+        let tenant_id = roz_core::auth::TenantId::new(uuid::Uuid::nil());
+        let registry = Arc::new(roz_core::model_endpoint::EndpointRegistry::empty());
+
         // Direct Gemini access via GEMINI_API_KEY
         if let Ok(gemini_key) = std::env::var("GEMINI_API_KEY")
             && !gemini_key.is_empty()
@@ -834,6 +841,8 @@ impl LocalRuntime {
                 120,      // timeout_secs
                 "google", // proxy_provider
                 Some(&gemini_key),
+                &tenant_id,
+                registry.clone(),
             );
             match model {
                 Ok(m) => return Some(Arc::from(m)),
@@ -848,7 +857,16 @@ impl LocalRuntime {
             && !gateway_url.is_empty()
         {
             let gateway_key = std::env::var("ROZ_GATEWAY_KEY").unwrap_or_default();
-            let model = create_model("gemini-2.5-flash", &gateway_url, &gateway_key, 120, "google", None);
+            let model = create_model(
+                "gemini-2.5-flash",
+                &gateway_url,
+                &gateway_key,
+                120,
+                "google",
+                None,
+                &tenant_id,
+                registry,
+            );
             match model {
                 Ok(m) => return Some(Arc::from(m)),
                 Err(e) => {
@@ -1048,7 +1066,7 @@ impl LocalRuntime {
         let model = (self.model_factory)().map_err(RuntimeError::Model)?;
         let assessment = self.assess_mode_transition();
         let mode = assessment.mode;
-        let (dispatcher, extensions, system_prompt) = self.prepare_turn(mode);
+        let (dispatcher, mut extensions, system_prompt) = self.prepare_turn(mode);
         let tool_schemas = prompt_tool_schemas(&dispatcher);
         let safety = self.build_safety_stack();
         let spatial = self.build_spatial_provider();
@@ -1088,6 +1106,10 @@ impl LocalRuntime {
             spatial
         };
         let constitution = system_prompt.first().cloned().unwrap_or_default();
+        {
+            let runtime = self.session_runtime.lock().await;
+            extensions.insert(runtime.event_emitter());
+        }
 
         // Extract project context for PromptAssembler (AGENTS.md,
         // embodiment.toml-derived prompt blocks, etc.)
@@ -1151,7 +1173,7 @@ impl LocalRuntime {
         let model = (self.model_factory)().map_err(RuntimeError::Model)?;
         let assessment = self.assess_mode_transition();
         let mode = assessment.mode;
-        let (dispatcher, extensions, prepare_prompt) = self.prepare_turn(mode);
+        let (dispatcher, mut extensions, prepare_prompt) = self.prepare_turn(mode);
         let tool_schemas = prompt_tool_schemas(&dispatcher);
         let safety = self.build_safety_stack();
         let spatial = self.build_spatial_provider();
@@ -1200,10 +1222,11 @@ impl LocalRuntime {
             volatile_blocks: Vec::new(),
         };
 
-        let approval_runtime = {
+        let (approval_runtime, event_emitter) = {
             let runtime = self.session_runtime.lock().await;
-            runtime.approval_handle()
+            (runtime.approval_handle(), runtime.event_emitter())
         };
+        extensions.insert(event_emitter);
         let agent = AgentLoop::new(model, dispatcher, safety, spatial)
             .with_extensions(extensions)
             .with_approval_runtime(approval_runtime.clone());

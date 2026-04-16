@@ -62,6 +62,11 @@ async fn start_server() -> (String, String, uuid::Uuid, sqlx::PgPool) {
         auth: Arc::new(roz_server::auth::ApiKeyAuth),
         meter: Arc::new(roz_agent::meter::NoOpMeter),
         trust_policy: Arc::new(roz_server::trust::permissive_policy_for_integration_tests()),
+        object_store: Arc::new(object_store::memory::InMemory::new()),
+        endpoint_registry: Arc::new(roz_core::EndpointRegistry::empty()),
+        key_provider: Arc::new(roz_openai::auth::null_key::NullKeyProvider),
+        mcp_registry: Arc::new(roz_mcp::Registry::new()),
+        session_bus: Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
     };
 
     let app = roz_server::build_router(state);

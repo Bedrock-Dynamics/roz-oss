@@ -1,0 +1,29 @@
+[package]
+name = "roz-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+roz-core = { path = "../roz-core" }
+roz-db = { path = "../roz-db" }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+http = "1"
+oauth2 = { version = "5.0", default-features = false }
+rmcp = { version = "0.16", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "auth", "schemars", "server", "macros"] }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }

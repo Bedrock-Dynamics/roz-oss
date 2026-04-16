@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/roz-core",
     "crates/roz-db",
+    "crates/roz-mcp",
     "crates/roz-nats",
     "crates/roz-proto",
     "crates/roz-server",
@@ -15,6 +16,7 @@ members = [
     "crates/roz-copper",
     "crates/roz-zenoh",
     "crates/roz-local",
+    "crates/roz-openai",
 ]
 
 [workspace.package]
@@ -67,6 +69,7 @@ clap = { version = "4", features = ["derive"] }
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 thiserror = "2"
 anyhow = "1"
 figment = { version = "0.10", features = ["env", "toml"] }
@@ -147,6 +150,30 @@ v4l = "0.14"
 inotify = "0.11"
 viuer = "0.11"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+# Phase 18 additions — Skills as Artifacts (SKILL-01)
+# `object_store` uses default features only (`fs` = LocalFileSystem); cloud backends
+# (aws/gcp/azure) are opt-in at server build time via `--features object_store/aws` etc.
+# See .planning/phases/18-skills-as-artifacts/18-RESEARCH.md §Standard Stack.
+object_store = { version = "0.13", default-features = true }
+tar = "0.4"
+flate2 = "1"
+semver = "1"
+
+# Phase 19 additions — Open-Weight Model Path
+# Note: `secrecy` is consumed by roz-core::model_endpoint (OAuthCredentials,
+# ModelEndpoint::api_key) introduced in Plan 19-01. Per Plan 19-03's W3
+# consolidation note, 19-03 was originally responsible for adding this
+# alongside aes-gcm/zeroize, but sequential execution of Wave 1 placed 19-01
+# first; adding here as a Rule 3 (blocking) auto-fix. Plan 19-03 will skip
+# this dep when it lands (already present).
+secrecy = { version = "0.10", features = ["serde"] }
+aes-gcm = "0.10"
+zeroize = "1"
+serial_test = "3"
+# Phase 19 Plan 19-05 — roz-openai crate scaffold
+url = "2"
+wiremock = "0.6"
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

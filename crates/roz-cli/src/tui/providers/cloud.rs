@@ -48,6 +48,7 @@ fn core_schema_to_proto(
     let proto_category = match category {
         roz_core::tools::ToolCategory::Physical => roz_v1::ToolCategoryHint::ToolCategoryPhysical,
         roz_core::tools::ToolCategory::Pure => roz_v1::ToolCategoryHint::ToolCategoryPure,
+        roz_core::tools::ToolCategory::CodeSandbox => roz_v1::ToolCategoryHint::ToolCategoryCodeSandbox,
     };
     roz_v1::ToolSchema {
         name: schema.name.clone(),
@@ -346,6 +347,19 @@ fn session_event_to_agent_event(event: &roz_v1::SessionEventEnvelope) -> Option<
             content: payload.result_summary.clone(),
             is_error: false,
         }),
+        roz_v1::session_event_envelope::TypedEvent::SkillLoaded(payload) => Some(AgentEvent::ToolResultDisplay {
+            name: "skill_loaded".into(),
+            content: format!("skill loaded: {} v{}", payload.name, payload.version),
+            is_error: false,
+        }),
+        roz_v1::session_event_envelope::TypedEvent::SkillCrystallized(payload) => Some(AgentEvent::ToolResultDisplay {
+            name: "skill_crystallized".into(),
+            content: format!(
+                "skill crystallized: {} v{} ({})",
+                payload.name, payload.version, payload.source
+            ),
+            is_error: false,
+        }),
         roz_v1::session_event_envelope::TypedEvent::ToolUnavailable(payload) => {
             Some(AgentEvent::Error(if payload.reason.is_empty() {
                 format!("tool unavailable: {}", payload.tool_name)
@@ -517,6 +531,17 @@ mod tests {
         assert_eq!(proto.category, i32::from(roz_v1::ToolCategoryHint::ToolCategoryPure));
     }
 
+    #[test]
+    fn core_schema_to_proto_maps_code_sandbox_category() {
+        let schema = test_schema("execute_code");
+        let proto = core_schema_to_proto(&schema, ToolCategory::CodeSandbox);
+        assert_eq!(proto.name, "execute_code");
+        assert_eq!(
+            proto.category,
+            i32::from(roz_v1::ToolCategoryHint::ToolCategoryCodeSandbox)
+        );
+    }
+
     /// Regression test: previously all tools were hardcoded to Physical.
     #[test]
     fn build_local_tool_opts_preserves_categories() {
@@ -581,6 +606,13 @@ body = '{"pitch": {{head_pitch}}, "duration": {{duration}}}'
             read_file.category,
             i32::from(roz_v1::ToolCategoryHint::ToolCategoryPure),
             "read_file should be Pure"
+        );
+
+        let execute_code = opts.proto_schemas.iter().find(|s| s.name == "execute_code").unwrap();
+        assert_eq!(
+            execute_code.category,
+            i32::from(roz_v1::ToolCategoryHint::ToolCategoryCodeSandbox),
+            "execute_code should be CodeSandbox"
         );
     }
 
@@ -654,6 +686,48 @@ body = '{"pitch": {{head_pitch}}, "duration": {{duration}}}'
             mapped,
             Some(AgentEvent::ToolResultDisplay { name, content, is_error: false })
                 if name == "read_file" && content == "read 18 lines"
+        ));
+    }
+
+    #[test]
+    fn session_event_to_agent_event_maps_skill_loaded() {
+        let event = typed_envelope(
+            "evt-skill-loaded",
+            "corr-skill-loaded",
+            "skill_loaded",
+            roz_v1::session_event_envelope::TypedEvent::SkillLoaded(roz_v1::SkillLoadedPayload {
+                name: "warehouse-skill".into(),
+                version: "0.1.0".into(),
+            }),
+        );
+
+        let mapped = session_event_to_agent_event(&event);
+        assert!(matches!(
+            mapped,
+            Some(AgentEvent::ToolResultDisplay { name, content, is_error: false })
+                if name == "skill_loaded" && content == "skill loaded: warehouse-skill v0.1.0"
+        ));
+    }
+
+    #[test]
+    fn session_event_to_agent_event_maps_skill_crystallized() {
+        let event = typed_envelope(
+            "evt-skill-crystallized",
+            "corr-skill-crystallized",
+            "skill_crystallized",
+            roz_v1::session_event_envelope::TypedEvent::SkillCrystallized(roz_v1::SkillCrystallizedPayload {
+                name: "warehouse-skill".into(),
+                version: "0.2.0".into(),
+                source: "local".into(),
+            }),
+        );
+
+        let mapped = session_event_to_agent_event(&event);
+        assert!(matches!(
+            mapped,
+            Some(AgentEvent::ToolResultDisplay { name, content, is_error: false })
+                if name == "skill_crystallized"
+                    && content == "skill crystallized: warehouse-skill v0.2.0 (local)"
         ));
     }
 

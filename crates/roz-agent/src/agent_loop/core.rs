@@ -54,6 +54,7 @@ fn emit_turn_if_enabled(
         role,
         content,
         token_usage,
+        kind: TurnEnvelope::KIND_TURN,
     });
     *turn_index = turn_index.saturating_add(1);
 }
@@ -71,11 +72,20 @@ impl AgentLoop {
         chunk_tx: mpsc::Sender<StreamChunk>,
         presence_tx: mpsc::Sender<PresenceSignal>,
     ) -> Result<AgentOutput, AgentError> {
+        let mut tool_extensions = self.extensions.clone();
+        tool_extensions.insert(std::sync::Arc::new(self.dispatcher.clone()));
+        if let Some(approval_runtime) = self.approval_runtime.clone() {
+            tool_extensions.insert(approval_runtime);
+        }
+        tool_extensions.insert(presence_tx.clone());
+        if let Some(cancellation_token) = input.cancellation_token.clone() {
+            tool_extensions.insert(cancellation_token);
+        }
         let tool_ctx = ToolContext {
             task_id: input.task_id.clone(),
             tenant_id: input.tenant_id.clone(),
             call_id: String::new(), // set per-call by ToolDispatcher::dispatch
-            extensions: self.extensions.clone(),
+            extensions: tool_extensions,
         };
 
         let ctx_mgr = ContextManager::new(input.max_context_tokens);
@@ -148,6 +158,23 @@ impl AgentLoop {
                 });
             }
 
+            // MEM-06: rolling mid-session compaction.
+            //
+            // Fires BEFORE the next LLM call when context is ≥ 80% full. Uses
+            // the AuxLlm from `self.extensions` when present; falls back to
+            // `ContextManager::compact_escalating` (cheap structural levels)
+            // if aux is missing OR errors. Gracefully degrades — never panics.
+            self.maybe_run_compaction(
+                &ctx_mgr,
+                &mut messages,
+                &input,
+                cycles,
+                session_uuid,
+                tenant_uuid,
+                &mut turn_index,
+            )
+            .await;
+
             // Usage budget check — stop before the next LLM call if hard-limited.
             let budget = self.meter.check_budget(&input.tenant_id).await;
             if let BudgetStatus::HardLimited { plan, period_end } = budget {
@@ -192,6 +219,7 @@ impl AgentLoop {
                     tools: vec![],
                     max_tokens: input.max_tokens,
                     tool_choice: None,
+                    response_schema: None,
                 };
                 if let Ok(resp) = if input.streaming {
                     self.stream_and_forward_with_retry(&summary_req, &chunk_tx).await
@@ -340,6 +368,7 @@ impl AgentLoop {
                 tools,
                 max_tokens: input.max_tokens,
                 tool_choice,
+                response_schema: None,
             };
 
             let resp = if input.streaming {
@@ -492,5 +521,115 @@ impl AgentLoop {
             total_usage,
             messages: turn_messages,
         })
+    }
+
+    /// MEM-06: rolling compaction trigger invoked at the top of the cycle
+    /// loop in [`Self::run_streaming_core`]. Never panics and never returns
+    /// `Err` — any failure path degrades to a `tracing::warn!` and leaves
+    /// `messages` untouched so the next LLM call still makes progress.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirror of call-site locals; split would make the hook harder to follow"
+    )]
+    async fn maybe_run_compaction(
+        &self,
+        ctx_mgr: &ContextManager,
+        messages: &mut Vec<Message>,
+        input: &AgentInput,
+        cycles: u32,
+        session_uuid: Option<Uuid>,
+        tenant_uuid: Option<Uuid>,
+        turn_index: &mut i32,
+    ) {
+        let fraction = ctx_mgr.fraction_used(messages);
+        if fraction < 0.80 {
+            return;
+        }
+
+        tracing::info!(
+            task_id = %input.task_id,
+            cycles,
+            fraction,
+            messages = messages.len(),
+            "MEM-06: context at 80% — triggering compaction"
+        );
+
+        // Level 1+2: cheap structural compaction (existing escalation path).
+        // Always runs regardless of aux availability.
+        let _cheap_events = ctx_mgr.compact_escalating(messages, Some(self.model.as_ref())).await;
+
+        // Level 3: LLM summary via aux model, only if an AuxLlm is wired.
+        let Some(aux) = self
+            .extensions
+            .get::<std::sync::Arc<dyn crate::aux_llm::AuxLlm>>()
+            .cloned()
+        else {
+            tracing::debug!("MEM-06: no AuxLlm in extensions; skipping summary step");
+            return;
+        };
+
+        // Wrap &Message into a CompactableMessage adapter inline.
+        struct MsgAdapter<'a>(&'a Message);
+        impl crate::context_compressor::CompactableMessage for MsgAdapter<'_> {
+            fn approx_text(&self) -> String {
+                // The compressor only needs approximate char counts; Debug
+                // is a stable cheap stand-in without pulling a provider-
+                // specific text accessor into the adapter.
+                format!("{:?}", self.0)
+            }
+        }
+
+        let compressor = crate::context_compressor::ContextCompressor::new();
+        let adapted: Vec<MsgAdapter<'_>> = messages.iter().map(MsgAdapter).collect();
+
+        match compressor.compact(&adapted, Some(aux.as_ref())).await {
+            Ok(crate::context_compressor::CompactionOutcome::Summarized {
+                summary_text,
+                removed_count,
+            }) => {
+                // Replace the middle segment with a single synthetic system
+                // message. Head is HEAD_PROTECTED_COUNT = 2 messages.
+                drop(adapted);
+                let head_count = crate::context_compressor::HEAD_PROTECTED_COUNT;
+                let end = head_count.saturating_add(removed_count);
+                let summary_msg = Message::system(&summary_text);
+                messages.splice(head_count..end, std::iter::once(summary_msg));
+
+                tracing::info!(
+                    task_id = %input.task_id,
+                    removed_count,
+                    summary_chars = summary_text.len(),
+                    "MEM-06: context compacted — summary turn installed"
+                );
+
+                // Emit a synthetic kind='compaction' turn for audit.
+                if let (Some(emitter), Some(session_id), Some(tenant_id)) =
+                    (self.turn_emitter.as_ref(), session_uuid, tenant_uuid)
+                {
+                    let content = serde_json::json!({
+                        "role": "system",
+                        "compaction": true,
+                        "summary": summary_text,
+                    });
+                    let envelope = TurnEnvelope {
+                        session_id,
+                        tenant_id,
+                        turn_index: *turn_index,
+                        role: "system",
+                        content,
+                        token_usage: None,
+                        kind: TurnEnvelope::KIND_TURN, // overridden by emit_with_kind
+                    };
+                    emitter.emit_with_kind(envelope, TurnEnvelope::KIND_COMPACTION);
+                    *turn_index = turn_index.saturating_add(1);
+                }
+            }
+            Ok(other) => {
+                tracing::debug!(outcome = ?other, "MEM-06: compaction skipped");
+            }
+            Err(err) => {
+                tracing::warn!(%err, "MEM-06: compaction errored; continuing with cheap levels only");
+            }
+        }
     }
 }

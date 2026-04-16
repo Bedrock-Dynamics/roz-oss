@@ -51,6 +51,25 @@ pub enum AgentError {
     #[error("usage limit reached on plan '{plan}', resets {period_end}")]
     BudgetExceeded { plan: String, period_end: String },
 
+    /// Structured-output request failed to parse as valid JSON after repair + retry.
+    ///
+    /// Added by Phase 19 Plan 10 for the OpenAI-compat provider structured-output loop:
+    /// the provider attempts one `json_repair::repair` + one model-call retry with
+    /// a synthetic repair prompt. If both fail this variant surfaces the final raw
+    /// output + the serde error so callers can decide whether to degrade or abort.
+    #[error("structured output parse failed: {err} (raw: {raw})")]
+    StructuredOutputParse { raw: String, err: String },
+
+    /// A model name targeted an OpenAI-compat endpoint by name
+    /// (`openai-compat:<name>` prefix) but the registry has no entry for that name.
+    ///
+    /// Added by Phase 19 Plan 11 as part of the `create_model` factory dispatch
+    /// for `EndpointRegistry` — distinguishes "unknown endpoint name" from the
+    /// generic `UnsupportedModel` case so operators can tell the difference
+    /// between an unregistered endpoint and an entirely unknown model family.
+    #[error("unknown endpoint: {name}")]
+    UnknownEndpoint { name: String },
+
     /// Internal / unexpected error that does not fit another variant.
     #[error("internal error: {0}")]
     Internal(#[source] anyhow::Error),

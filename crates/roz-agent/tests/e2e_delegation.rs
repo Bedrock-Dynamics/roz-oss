@@ -31,6 +31,9 @@ use roz_agent::spatial_provider::MockSpatialContextProvider;
 async fn claude_delegates_spatial_to_gemini() {
     let api_key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY required");
 
+    let tenant_id = roz_core::auth::TenantId::new(uuid::Uuid::nil());
+    let registry = std::sync::Arc::new(roz_core::model_endpoint::EndpointRegistry::empty());
+
     // Primary model: Claude Sonnet (the orchestrator)
     let claude = roz_agent::model::create_model(
         "claude-sonnet-4-6",
@@ -39,6 +42,8 @@ async fn claude_delegates_spatial_to_gemini() {
         120,
         "anthropic",
         Some(&api_key),
+        &tenant_id,
+        registry.clone(),
     )
     .expect("should create Claude Sonnet model");
 
@@ -48,8 +53,17 @@ async fn claude_delegates_spatial_to_gemini() {
     // sub-AgentLoop) even when Gemini is not available. Swap to a GeminiProvider
     // once a GEMINI_API_KEY is wired into the test environment.
     let spatial: Arc<dyn roz_agent::model::Model> = Arc::from(
-        roz_agent::model::create_model("claude-haiku-4-5-20251001", "", "", 60, "anthropic", Some(&api_key))
-            .expect("should create Haiku model"),
+        roz_agent::model::create_model(
+            "claude-haiku-4-5-20251001",
+            "",
+            "",
+            60,
+            "anthropic",
+            Some(&api_key),
+            &tenant_id,
+            registry,
+        )
+        .expect("should create Haiku model"),
     );
 
     // Primary dispatcher: just the DelegationTool — Claude must call it.

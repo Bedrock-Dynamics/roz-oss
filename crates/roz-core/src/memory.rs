@@ -1,5 +1,7 @@
 //! Session memory and skill persistence for agent runtime.
 
+pub mod threat_scan;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 

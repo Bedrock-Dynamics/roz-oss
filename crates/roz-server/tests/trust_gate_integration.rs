@@ -4,6 +4,15 @@
 //! parity (REST 409 + gRPC `FailedPrecondition`) against an Untrusted host,
 //! plus Trusted happy path and exact-shape assertions.
 //!
+//! # ⚠️ Bypass contract (18-12)
+//!
+//! These tests call `TaskServiceImpl::create_task` DIRECTLY and inject
+//! `AuthIdentity` into the request extensions themselves. They do NOT
+//! exercise `grpc_auth_middleware` and therefore do NOT cover the
+//! `AuthIdentity` → `Permissions` derivation chain. That coverage lives
+//! in `skills_grpc_real_auth_integration.rs`. Add real-auth coverage
+//! there whenever you gate a new RPC on `Permissions`.
+//!
 //! Run: `cargo test -p roz-server --test trust_gate_integration -- --ignored --test-threads=1`
 
 #![allow(clippy::too_many_lines, clippy::missing_const_for_fn)]
@@ -303,6 +312,11 @@ fn build_test_app_state(
         auth: Arc::new(roz_server::auth::ApiKeyAuth),
         meter: Arc::new(roz_agent::meter::NoOpMeter),
         trust_policy: Arc::new(policy),
+        object_store: Arc::new(object_store::memory::InMemory::new()),
+        endpoint_registry: Arc::new(roz_core::EndpointRegistry::empty()),
+        key_provider: Arc::new(roz_openai::auth::null_key::NullKeyProvider),
+        mcp_registry: Arc::new(roz_mcp::Registry::new()),
+        session_bus: Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
     }
 }
 

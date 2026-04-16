@@ -1,8 +1,10 @@
 pub mod agent_loop;
+pub mod aux_llm;
 pub mod blueprint_resolver;
 pub mod bt;
 pub mod constitution;
 pub mod context;
+pub mod context_compressor;
 pub mod delegation;
 pub mod dispatch;
 pub mod drift;

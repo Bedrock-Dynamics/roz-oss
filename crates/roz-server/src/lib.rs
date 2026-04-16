@@ -8,6 +8,7 @@ pub mod nats_handlers;
 pub mod response;
 pub mod restate;
 pub mod routes;
+pub mod scheduled_tasks;
 pub mod state;
 pub mod triggers;
 pub mod trust;

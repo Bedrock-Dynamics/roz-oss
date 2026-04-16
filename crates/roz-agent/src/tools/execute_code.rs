@@ -1,9 +1,11 @@
-//! Agent tool for compiling and verifying WebAssembly robot control code.
-//!
-//! Uses [`roz_copper::wasm::CuWasmTask`] to compile WAT/WASM source and
-//! optionally verify it by running a set number of ticks in the sandbox.
+//! Sandboxed programmatic tool calling for Phase 20.
 
-use std::fmt::Write as _;
+pub(crate) mod bridge;
+mod quickjs;
+mod rhai;
+
+use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use roz_core::tools::ToolResult;
@@ -11,71 +13,93 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::dispatch::{ToolContext, TypedToolExecutor};
+use crate::dispatch::{ToolContext, ToolDispatcher, TypedToolExecutor};
+
+use self::bridge::{SandboxBridge, SandboxExecutionConfig, SandboxOutcome};
 
 /// The canonical name of the execute-code tool.
 pub const EXECUTE_CODE_TOOL_NAME: &str = "execute_code";
 
+pub(crate) const MAX_CODE_SIZE: usize = 100_000;
+pub(crate) const MAX_TOOL_CALLS: u32 = 50;
+pub(crate) const STDOUT_LIMIT_BYTES: usize = 50 * 1024;
+pub(crate) const STDERR_LIMIT_BYTES: usize = 10 * 1024;
+pub(crate) const DEFAULT_TIMEOUT_SECS: u64 = 300;
+
+/// Supported Phase 20 sandbox languages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecuteCodeLanguage {
+    Rhai,
+    JavascriptQjs,
+}
+
+/// Structured tool status reserved for the sandbox runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecuteCodeStatus {
+    Success,
+    Error,
+    Timeout,
+    Interrupted,
+}
+
 /// Input for the `execute_code` tool.
-#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ExecuteCodeInput {
-    /// WebAssembly Text (WAT) or binary code.
+    /// Script language executed inside the sandbox runtime.
+    pub language: ExecuteCodeLanguage,
+    /// Source code executed inside the sandbox runtime.
     pub code: String,
-    /// Whether to verify in sim mode before deploying live.
-    #[serde(default = "default_true")]
-    pub verify_first: bool,
 }
 
-const fn default_true() -> bool {
-    true
-}
-
-/// Output from the `execute_code` tool.
-#[derive(Debug, Serialize, Deserialize)]
+/// Output envelope from the `execute_code` tool.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ExecuteCodeOutput {
-    /// Status: "compiled", "verified", "error".
-    pub status: String,
-    /// Human-readable message describing the result.
-    pub message: String,
+    /// Result status reserved for runtime plans.
+    pub status: ExecuteCodeStatus,
+    /// Only script `print()` output is surfaced here.
+    pub output: String,
+    /// Nested tool calls made by the script.
+    pub tool_calls_made: u32,
+    /// Wall-clock duration for the sandbox run.
+    pub duration_seconds: f64,
 }
 
-/// Number of ticks to run during verification (1 second at 100 Hz).
-const VERIFY_TICK_COUNT: u64 = 100;
-
-/// Maximum code size for Rust source (larger than WAT limit since Rust is verbose).
-#[allow(dead_code)]
-const MAX_RUST_CODE_SIZE: usize = 500_000; // 500KB
-
-/// Attempt to compile Rust source to WASM via cargo subprocess.
-/// Returns the compiled WASM bytes, or an error.
-///
-/// This is a stub -- the actual subprocess invocation requires:
-/// 1. Temp crate with user code as `lib.rs`
-/// 2. `cargo build --target wasm32-wasip2 --release`
-/// 3. Read `.wasm` from `target/`
-///
-/// For now, returns an error explaining this is not available yet.
-fn compile_rust_to_wasm(_code: &str) -> Result<Vec<u8>, String> {
-    Err("Rust-to-WASM compilation requires wasm32-wasip2 target. \
-         Currently only WAT/WASM binary input is supported."
-        .to_string())
+fn structured_tool_result(outcome: SandboxOutcome) -> ToolResult {
+    ToolResult {
+        output: json!(ExecuteCodeOutput {
+            status: outcome.status,
+            output: outcome.output,
+            tool_calls_made: outcome.tool_calls_made,
+            duration_seconds: outcome.duration.as_secs_f64(),
+        }),
+        error: outcome.error,
+        exit_code: None,
+        truncated: outcome.stdout_truncated || outcome.stderr_truncated,
+        duration_ms: Some(outcome.duration.as_millis().try_into().unwrap_or(u64::MAX)),
+    }
 }
 
-/// Tool that compiles WebAssembly (WAT or WASM binary) robot control code
-/// and optionally verifies it by running ticks in the WASM sandbox.
+fn immediate_error(message: impl Into<String>, started_at: Instant) -> ToolResult {
+    let message = message.into();
+    structured_tool_result(SandboxOutcome {
+        status: ExecuteCodeStatus::Error,
+        output: message.clone(),
+        error: Some(message),
+        tool_calls_made: 0,
+        duration: started_at.elapsed(),
+        stdout_truncated: false,
+        stderr_truncated: false,
+    })
+}
+
+fn runtime_dispatcher(ctx: &ToolContext) -> Option<Arc<ToolDispatcher>> {
+    ctx.extensions.get::<Arc<ToolDispatcher>>().cloned()
+}
+
+/// Tool entrypoint for sandboxed programmatic tool calling.
 pub struct ExecuteCodeTool;
-
-fn control_manifest_from_ctx(
-    ctx: &ToolContext,
-) -> Result<roz_core::embodiment::binding::ControlInterfaceManifest, Box<dyn std::error::Error + Send + Sync>> {
-    ctx.extensions
-        .get::<roz_core::embodiment::binding::ControlInterfaceManifest>()
-        .cloned()
-        .ok_or_else(|| {
-            "no ControlInterfaceManifest in ToolContext — configure the canonical robot control interface before executing code"
-                .into()
-        })
-}
 
 #[async_trait]
 impl TypedToolExecutor for ExecuteCodeTool {
@@ -88,7 +112,7 @@ impl TypedToolExecutor for ExecuteCodeTool {
 
     #[allow(clippy::unnecessary_literal_bound)]
     fn description(&self) -> &str {
-        "Compile and verify WebAssembly (WAT or WASM binary) robot control code."
+        "Run sandboxed programmatic tool-calling code in `rhai` or `javascript_qjs`. Only script print output is returned."
     }
 
     async fn execute(
@@ -96,232 +120,177 @@ impl TypedToolExecutor for ExecuteCodeTool {
         input: Self::Input,
         ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
-        const MAX_CODE_SIZE: usize = 100_000; // 100 KB
+        let started_at = Instant::now();
+
         if input.code.len() > MAX_CODE_SIZE {
-            return Ok(ToolResult::error(format!(
-                "Code too large: {} bytes (max {MAX_CODE_SIZE})",
-                input.code.len()
-            )));
+            return Ok(immediate_error(
+                format!("Code too large: {} bytes (max {MAX_CODE_SIZE})", input.code.len()),
+                started_at,
+            ));
         }
 
         if input.code.trim().is_empty() {
-            let output = ExecuteCodeOutput {
-                status: "error".to_string(),
-                message: "Code must not be empty.".to_string(),
-            };
-            return Ok(ToolResult::error(serde_json::to_string(&output)?));
+            return Ok(immediate_error("Code must not be empty.", started_at));
         }
 
-        // Read manifest from context — no UR5 fallback.
-        let control_manifest = control_manifest_from_ctx(ctx)?;
-        let host_ctx = roz_copper::wit_host::HostContext::with_control_manifest(&control_manifest);
-        let wasm_result = roz_copper::wasm::CuWasmTask::from_source_with_host(input.code.as_bytes(), host_ctx);
-        let mut task = match wasm_result {
-            Ok(t) => t,
-            Err(wat_err) => {
-                // If code looks like Rust, try the Rust compilation path
-                if input.code.contains("fn ") || input.code.contains("use ") {
-                    match compile_rust_to_wasm(&input.code) {
-                        Ok(wasm_bytes) => match roz_copper::wasm::CuWasmTask::from_source(&wasm_bytes) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                let output = ExecuteCodeOutput {
-                                    status: "error".to_string(),
-                                    message: format!("compiled WASM failed to load: {e}"),
-                                };
-                                return Ok(ToolResult::error(serde_json::to_string(&output)?));
-                            }
-                        },
-                        Err(rust_err) => {
-                            let output = ExecuteCodeOutput {
-                                status: "error".to_string(),
-                                message: format!("WAT compilation failed: {wat_err}\nRust compilation: {rust_err}"),
-                            };
-                            return Ok(ToolResult::error(serde_json::to_string(&output)?));
-                        }
-                    }
-                } else {
-                    let output = ExecuteCodeOutput {
-                        status: "error".to_string(),
-                        message: format!("WASM compilation failed: {wat_err}"),
-                    };
-                    return Ok(ToolResult::error(serde_json::to_string(&output)?));
-                }
-            }
+        let Some(dispatcher) = runtime_dispatcher(ctx) else {
+            return Ok(immediate_error(
+                "execute_code: ToolDispatcher extension missing",
+                started_at,
+            ));
         };
 
-        if input.verify_first {
-            for tick in 0..VERIFY_TICK_COUNT {
-                if let Err(e) = task.tick_with_contract(tick, None) {
-                    let output = ExecuteCodeOutput {
-                        status: "error".to_string(),
-                        message: format!("Verification failed on tick {tick}: {e}"),
-                    };
-                    return Ok(ToolResult::error(serde_json::to_string(&output)?));
-                }
-            }
-            let mut message = format!(
-                "WASM module compiled and verified ({VERIFY_TICK_COUNT} ticks, {} bytes).",
-                input.code.len()
-            );
-            let rejections = task
-                .host_context()
-                .rejection_count
-                .load(std::sync::atomic::Ordering::Relaxed);
-            if rejections > 0 {
-                let _ = write!(
-                    message,
-                    "\nWarning: {rejections} command(s) rejected by channel safety limits"
-                );
-            }
-            let output = ExecuteCodeOutput {
-                status: "verified".to_string(),
-                message,
-            };
-            Ok(ToolResult::success(json!(output)))
-        } else {
-            let output = ExecuteCodeOutput {
-                status: "compiled".to_string(),
-                message: format!("WASM module compiled successfully ({} bytes).", input.code.len()),
-            };
-            Ok(ToolResult::success(json!(output)))
-        }
+        let bridge = match SandboxBridge::new(
+            dispatcher,
+            ctx.clone(),
+            tokio::runtime::Handle::current(),
+            SandboxExecutionConfig::default(),
+        ) {
+            Ok(bridge) => bridge,
+            Err(error) => return Ok(immediate_error(error.to_string(), started_at)),
+        };
+        let code = input.code;
+
+        let outcome = tokio::task::spawn_blocking(move || match input.language {
+            ExecuteCodeLanguage::JavascriptQjs => quickjs::run(&code, bridge),
+            ExecuteCodeLanguage::Rhai => rhai::run(&code, bridge),
+        })
+        .await;
+
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => SandboxOutcome {
+                status: ExecuteCodeStatus::Interrupted,
+                output: String::new(),
+                error: Some(format!("execute_code runtime task failed: {error}")),
+                tool_calls_made: 0,
+                duration: started_at.elapsed(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+            },
+        };
+
+        Ok(structured_tool_result(outcome))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::dispatch::ToolExecutor;
-
     use super::*;
+    use crate::dispatch::{Extensions, ToolExecutor};
+    use roz_core::auth::{ApiKeyScope, AuthIdentity, TenantId};
+    use roz_core::tools::ToolCategory;
 
-    fn compatible_control_manifest() -> roz_core::embodiment::binding::ControlInterfaceManifest {
-        let mut manifest = roz_core::embodiment::binding::ControlInterfaceManifest {
-            version: 1,
-            manifest_digest: String::new(),
-            channels: (0..6)
-                .map(|index| roz_core::embodiment::binding::ControlChannelDef {
-                    name: format!("joint{index}/velocity"),
-                    interface_type: roz_core::embodiment::binding::CommandInterfaceType::JointVelocity,
-                    units: "rad/s".into(),
-                    frame_id: format!("joint{index}_link"),
-                })
-                .collect(),
-            bindings: (0..6)
-                .map(|index| roz_core::embodiment::binding::ChannelBinding {
-                    physical_name: format!("joint{index}"),
-                    channel_index: index as u32,
-                    binding_type: roz_core::embodiment::binding::BindingType::JointVelocity,
-                    frame_id: format!("joint{index}_link"),
-                    units: "rad/s".into(),
-                    semantic_role: None,
-                })
-                .collect(),
-        };
-        manifest.stamp_digest();
-        manifest
+    struct EchoTool;
+
+    #[async_trait]
+    impl TypedToolExecutor for EchoTool {
+        type Input = serde_json::Value;
+
+        fn name(&self) -> &str {
+            "echo_json"
+        }
+
+        fn description(&self) -> &str {
+            "Echo JSON"
+        }
+
+        async fn execute(
+            &self,
+            input: Self::Input,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(ToolResult::success(input))
+        }
+    }
+
+    fn test_auth_identity() -> AuthIdentity {
+        AuthIdentity::ApiKey {
+            key_id: uuid::Uuid::nil(),
+            tenant_id: TenantId::new(uuid::Uuid::nil()),
+            scopes: vec![ApiKeyScope::Admin],
+        }
     }
 
     fn test_ctx() -> ToolContext {
-        let mut ext = crate::dispatch::Extensions::new();
-        let control_manifest = compatible_control_manifest();
-        ext.insert(control_manifest);
         ToolContext {
             task_id: "test-task".to_string(),
-            tenant_id: "test-tenant".to_string(),
+            tenant_id: uuid::Uuid::nil().to_string(),
             call_id: String::new(),
-            extensions: ext,
+            extensions: Extensions::new(),
+        }
+    }
+
+    fn test_ctx_with_dispatcher() -> ToolContext {
+        let mut dispatcher = ToolDispatcher::new(std::time::Duration::from_secs(5));
+        dispatcher.register_with_category(Box::new(EchoTool), ToolCategory::Pure);
+
+        let mut extensions = Extensions::new();
+        extensions.insert(Arc::new(dispatcher));
+        extensions.insert(test_auth_identity());
+        ToolContext {
+            task_id: "test-task".to_string(),
+            tenant_id: uuid::Uuid::nil().to_string(),
+            call_id: String::new(),
+            extensions,
         }
     }
 
     #[test]
-    fn execute_code_input_schema() {
+    fn execute_code_tool_name_stays_stable() {
+        let tool = ExecuteCodeTool;
+        assert_eq!(ToolExecutor::schema(&tool).name, EXECUTE_CODE_TOOL_NAME);
+    }
+
+    #[test]
+    fn execute_code_input_schema_uses_language_contract() {
         let tool = ExecuteCodeTool;
         let schema = ToolExecutor::schema(&tool);
 
-        assert_eq!(schema.name, EXECUTE_CODE_TOOL_NAME);
         assert_eq!(schema.parameters["type"], "object");
 
         let required = schema.parameters["required"]
             .as_array()
             .expect("required should be an array");
         let required_names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(required_names.contains(&"language"));
+        assert!(required_names.contains(&"code"));
         assert!(
-            required_names.contains(&"code"),
-            "code should be required, got: {required_names:?}"
+            schema.parameters["properties"].get("verify_first").is_none(),
+            "legacy verify_first field should not remain in the public schema"
         );
     }
 
     #[tokio::test]
-    async fn execute_empty_code_returns_error() {
+    async fn execute_empty_code_returns_structured_error() {
         let tool = ExecuteCodeTool;
         let input = ExecuteCodeInput {
+            language: ExecuteCodeLanguage::Rhai,
             code: "   ".to_string(),
-            verify_first: true,
         };
         let result = TypedToolExecutor::execute(&tool, input, &test_ctx())
             .await
             .expect("execute should not fail");
 
-        assert!(!result.is_success(), "empty code should return an error result");
-        assert!(
-            result.error.as_deref().unwrap_or("").contains("empty"),
-            "error message should mention empty code, got: {:?}",
-            result.error
-        );
-    }
-
-    #[tokio::test]
-    async fn execute_wat_code_compiles_successfully() {
-        let tool = ExecuteCodeTool;
-        let input = ExecuteCodeInput {
-            code: "(module (func (export \"process\") (param i64)))".to_string(),
-            verify_first: false,
-        };
-        let result = TypedToolExecutor::execute(&tool, input, &test_ctx()).await.unwrap();
-        assert!(result.is_success(), "WAT code should compile");
-        let output_str = result.output.to_string();
-        assert!(output_str.contains("compiled"), "should show compiled: {output_str}");
-    }
-
-    #[tokio::test]
-    async fn execute_invalid_wasm_returns_compile_error() {
-        let tool = ExecuteCodeTool;
-        let input = ExecuteCodeInput {
-            code: "fn main() { println!(\"hello\"); }".to_string(),
-            verify_first: false,
-        };
-        let result = TypedToolExecutor::execute(&tool, input, &test_ctx()).await.unwrap();
-        assert!(!result.is_success(), "Rust source should fail WASM compilation");
-    }
-
-    #[tokio::test]
-    async fn rust_code_returns_not_supported_error() {
-        let tool = ExecuteCodeTool;
-        let input = ExecuteCodeInput {
-            code: "use std::io;\nfn process(tick: u64) { }".to_string(),
-            verify_first: false,
-        };
-        let result = TypedToolExecutor::execute(&tool, input, &test_ctx()).await.unwrap();
-        assert!(!result.is_success(), "Rust code should not compile yet");
-        let err = result.error.as_deref().unwrap_or("");
-        assert!(
-            err.contains("Rust compilation") || err.contains("wasm32-wasip2"),
-            "error should mention Rust compilation path, got: {err}"
-        );
+        assert!(result.is_error(), "empty code should return an error result");
+        assert_eq!(result.error.as_deref(), Some("Code must not be empty."));
+        let output: ExecuteCodeOutput = serde_json::from_value(result.output.clone()).unwrap();
+        assert_eq!(output.status, ExecuteCodeStatus::Error);
+        assert_eq!(output.tool_calls_made, 0);
+        assert!(output.output.contains("empty"));
     }
 
     #[tokio::test]
     async fn execute_code_rejects_oversized_input() {
         let tool = ExecuteCodeTool;
         let input = ExecuteCodeInput {
+            language: ExecuteCodeLanguage::JavascriptQjs,
             code: "x".repeat(200_000),
-            verify_first: false,
         };
         let result = TypedToolExecutor::execute(&tool, input, &test_ctx())
             .await
             .expect("execute should not fail");
-        assert!(!result.is_success(), "oversized code should be rejected");
+        assert!(result.is_error(), "oversized code should be rejected");
         assert!(
             result.error.as_deref().unwrap_or("").contains("too large"),
             "error message should mention size limit, got: {:?}",
@@ -330,86 +299,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_wat_with_verification_runs_ticks() {
+    async fn execute_code_requires_dispatcher_extension() {
         let tool = ExecuteCodeTool;
         let input = ExecuteCodeInput {
-            code: "(module (func (export \"process\") (param i64)))".to_string(),
-            verify_first: true,
+            language: ExecuteCodeLanguage::JavascriptQjs,
+            code: "print('hello')".to_string(),
         };
-        let result = TypedToolExecutor::execute(&tool, input, &test_ctx()).await.unwrap();
-        assert!(result.is_success(), "verified WAT should succeed");
-        let output_str = result.output.to_string();
-        assert!(output_str.contains("verified"), "should show verified: {output_str}");
-    }
+        let result = TypedToolExecutor::execute(&tool, input, &test_ctx())
+            .await
+            .expect("execute should not fail");
 
-    /// A WASM module that calls `set_velocity(999.0)` every tick must have
-    /// those commands rejected by the production safety limit (1.5 rad/s).
-    /// Verification completes successfully but reports the rejections.
-    #[tokio::test]
-    async fn verify_with_production_limits_rejects_old_abi() {
-        // Old ABI modules that import motor::set_velocity should fail to compile
-        // (import cannot be satisfied with the tick contract host functions).
-        let wat = r#"
-            (module
-                (import "motor" "set_velocity" (func $sv (param f64) (result i32)))
-                (func (export "process") (param i64)
-                    (drop (call $sv (f64.const 999.0)))
-                )
-            )
-        "#;
-        let tool = ExecuteCodeTool;
-        let input = ExecuteCodeInput {
-            code: wat.to_string(),
-            verify_first: true,
-        };
-        let result = TypedToolExecutor::execute(&tool, input, &test_ctx()).await.unwrap();
-        assert!(result.is_error(), "old ABI imports should fail to link");
-    }
-
-    /// A minimal tick-contract WASM module should pass verification.
-    #[tokio::test]
-    async fn verify_with_production_limits_accepts_tick_contract_module() {
-        let wat = r#"
-            (module
-                (func (export "process") (param i64) nop)
-            )
-        "#;
-        let tool = ExecuteCodeTool;
-        let input = ExecuteCodeInput {
-            code: wat.to_string(),
-            verify_first: true,
-        };
-        let result = TypedToolExecutor::execute(&tool, input, &test_ctx()).await.unwrap();
-        assert!(result.is_success(), "tick contract module should pass verification");
-        let output_str = result.output.to_string();
-        assert!(
-            !output_str.contains("Warning") && !output_str.contains("rejected"),
-            "clean tick contract module should not produce warnings, got: {output_str}"
+        assert_eq!(
+            result.error.as_deref(),
+            Some("execute_code: ToolDispatcher extension missing")
         );
     }
 
-    #[test]
-    fn control_manifest_from_ctx_prefers_canonical_manifest() {
-        let ctx = test_ctx();
-        let manifest = control_manifest_from_ctx(&ctx).expect("manifest resolution should succeed");
-        assert_eq!(manifest.version, 1);
-        assert_eq!(manifest.channels.len(), 6);
-        assert_eq!(manifest.channels[0].name, "joint0/velocity");
-    }
-
-    #[test]
-    fn control_manifest_from_ctx_accepts_control_manifest_without_legacy_fallback() {
-        let control_manifest = compatible_control_manifest();
-        let mut ext = crate::dispatch::Extensions::new();
-        ext.insert(control_manifest.clone());
-        let ctx = ToolContext {
-            task_id: "test-task".into(),
-            tenant_id: "test-tenant".into(),
-            call_id: String::new(),
-            extensions: ext,
+    #[tokio::test]
+    async fn execute_code_requires_auth_identity_extension() {
+        let tool = ExecuteCodeTool;
+        let input = ExecuteCodeInput {
+            language: ExecuteCodeLanguage::JavascriptQjs,
+            code: "print('hello')".to_string(),
         };
 
-        let manifest = control_manifest_from_ctx(&ctx).expect("control manifest should resolve");
-        assert_eq!(manifest, control_manifest);
+        let mut dispatcher = ToolDispatcher::new(std::time::Duration::from_secs(5));
+        dispatcher.register_with_category(Box::new(EchoTool), ToolCategory::Pure);
+
+        let mut extensions = Extensions::new();
+        extensions.insert(Arc::new(dispatcher));
+        let ctx = ToolContext {
+            task_id: "test-task".to_string(),
+            tenant_id: uuid::Uuid::nil().to_string(),
+            call_id: String::new(),
+            extensions,
+        };
+
+        let result = TypedToolExecutor::execute(&tool, input, &ctx)
+            .await
+            .expect("execute should not fail");
+
+        assert_eq!(
+            result.error.as_deref(),
+            Some("execute_code: AuthIdentity extension missing")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_code_runs_simple_rhai_script() {
+        let tool = ExecuteCodeTool;
+        let input = ExecuteCodeInput {
+            language: ExecuteCodeLanguage::Rhai,
+            code: r#"
+                let out = call_tool("echo_json", #{ message: "hello" });
+                print(out["message"]);
+            "#
+            .to_string(),
+        };
+        let result = TypedToolExecutor::execute(&tool, input, &test_ctx_with_dispatcher())
+            .await
+            .expect("execute should not fail");
+
+        assert!(result.is_success(), "script should succeed: {result:?}");
+        let output: ExecuteCodeOutput = serde_json::from_value(result.output.clone()).unwrap();
+        assert_eq!(output.status, ExecuteCodeStatus::Success);
+        assert!(output.output.contains("hello"));
     }
 }

@@ -98,6 +98,7 @@ const fn event_type_name(event: &SessionEvent) -> &'static str {
         SessionEvent::ControllerRolledBack { .. } => "controller_rolled_back",
         SessionEvent::SafetyIntervention { .. } => "safety_intervention",
         SessionEvent::EdgeTransportDegraded { .. } => "edge_degraded",
+        SessionEvent::McpServerDegraded { .. } => "mcp_server_degraded",
         SessionEvent::ReasoningTrace { .. } => "reasoning_trace",
         SessionEvent::ContextCompacted { .. } => "context_compacted",
         SessionEvent::ModelCallCompleted { .. } => "model_call",
@@ -107,6 +108,8 @@ const fn event_type_name(event: &SessionEvent) -> &'static str {
         SessionEvent::MemoryRead { .. } => "memory_read",
         SessionEvent::MemoryWrite { .. } => "memory_write",
         SessionEvent::SensorRepositioned { .. } => "sensor_repositioned",
+        SessionEvent::SkillCrystallized { .. } => "skill_crystallized",
+        SessionEvent::SkillLoaded { .. } => "skill_loaded",
         SessionEvent::ContactStateChanged { .. } => "contact_state_changed",
         SessionEvent::FeedbackReceived { .. } => "feedback_received",
     }

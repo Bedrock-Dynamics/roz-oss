@@ -13,6 +13,10 @@ fn is_false(v: &bool) -> bool {
 ///
 /// Pure tools are side-effect-free computations (math, string processing, lookups)
 /// that can safely be dispatched concurrently without safety checks.
+///
+/// Code-sandbox tools are session-owned script runtimes that may dispatch nested
+/// tools. They must remain non-concurrent even though they are not direct
+/// physical actuation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolCategory {
@@ -21,6 +25,8 @@ pub enum ToolCategory {
     Physical,
     /// Pure computation -- no physical side effects, safe to run concurrently.
     Pure,
+    /// Session-owned code sandbox -- non-concurrent and approval-aware.
+    CodeSandbox,
 }
 
 /// A request to invoke a named tool with JSON parameters.
@@ -208,18 +214,27 @@ mod tests {
         assert_eq!(json, "\"pure\"");
         let deserialized: ToolCategory = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, ToolCategory::Pure);
+
+        let code_sandbox = ToolCategory::CodeSandbox;
+        let json = serde_json::to_string(&code_sandbox).unwrap();
+        assert_eq!(json, "\"code_sandbox\"");
+        let deserialized: ToolCategory = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, ToolCategory::CodeSandbox);
     }
 
     #[test]
     fn tool_category_equality() {
         assert_eq!(ToolCategory::Physical, ToolCategory::Physical);
         assert_eq!(ToolCategory::Pure, ToolCategory::Pure);
+        assert_eq!(ToolCategory::CodeSandbox, ToolCategory::CodeSandbox);
         assert_ne!(ToolCategory::Physical, ToolCategory::Pure);
+        assert_ne!(ToolCategory::Physical, ToolCategory::CodeSandbox);
+        assert_ne!(ToolCategory::Pure, ToolCategory::CodeSandbox);
     }
 
     #[test]
     fn tool_category_clone_and_copy() {
-        let cat = ToolCategory::Pure;
+        let cat = ToolCategory::CodeSandbox;
         let cloned = cat.clone();
         let copied = cat;
         assert_eq!(cat, cloned);

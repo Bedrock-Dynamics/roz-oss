@@ -35,7 +35,7 @@ pub enum ToolChoiceStrategy {
     None,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompletionRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<roz_core::tools::ToolSchema>,
@@ -43,6 +43,15 @@ pub struct CompletionRequest {
     /// Tool choice strategy for this request. `None` means the provider
     /// uses its default behavior (typically `Auto`).
     pub tool_choice: Option<ToolChoiceStrategy>,
+    /// Optional JSON Schema for structured output. Providers map this to their
+    /// native mechanism:
+    ///   - OpenAI Chat wire: `response_format = {type:"json_schema", ...}`
+    ///   - OpenAI Responses wire: `text.format = {type:"json_schema", strict:true, name:"roz_output_schema", schema}`
+    ///   - Anthropic: synthetic "respond" tool + forced `tool_choice`
+    ///   - Gemini: `generationConfig.responseSchema` + `responseMimeType: "application/json"`
+    ///
+    /// See `.planning/phases/19-open-weight-model-path/19-RESEARCH.md` §3.
+    pub response_schema: Option<Value>,
 }
 
 /// A content block within a message or completion response.
@@ -877,6 +886,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1000,
             tool_choice: None,
+            response_schema: None,
         };
 
         let resp1 = model.complete(&req).await.unwrap();
@@ -897,6 +907,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1000,
             tool_choice: None,
+            response_schema: None,
         };
 
         let resp = model.complete(&req).await.unwrap();
@@ -963,6 +974,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1000,
             tool_choice: None,
+            response_schema: None,
         };
 
         let mut stream = model.stream(&req).await.unwrap();
@@ -1015,6 +1027,7 @@ mod tests {
             tools: vec![],
             max_tokens: 1000,
             tool_choice: None,
+            response_schema: None,
         };
 
         let resp = model.complete(&req).await.unwrap();
@@ -1083,5 +1096,38 @@ mod tests {
             let debug = format!("{strategy:?}");
             assert!(!debug.is_empty());
         }
+    }
+
+    // ---------------------------------------------------------------
+    // CompletionRequest::response_schema (Plan 19-01)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn completion_request_default_response_schema_is_none() {
+        let req = CompletionRequest::default();
+        assert!(req.response_schema.is_none());
+    }
+
+    #[test]
+    fn completion_request_response_schema_roundtrips() {
+        // Build a request with a JSON Schema attached.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "x": { "type": "integer" } },
+            "required": ["x"],
+        });
+        let req = CompletionRequest {
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 32,
+            tool_choice: None,
+            response_schema: Some(schema.clone()),
+        };
+        // The field is preserved through clone + (manual) serialization of the
+        // value. CompletionRequest itself is not serde, but the schema Value
+        // is — round-trip the embedded schema.
+        let rt: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(req.response_schema.as_ref().unwrap()).unwrap()).unwrap();
+        assert_eq!(rt, schema);
     }
 }

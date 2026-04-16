@@ -56,10 +56,10 @@ fn websocket_url(base_url: &str, path: &str) -> String {
 pub fn build_all_tools(project_dir: &Path) -> (ToolDispatcher, Vec<(ToolSchema, ToolCategory)>) {
     let mut dispatcher = ToolDispatcher::new(Duration::from_secs(120));
 
-    // CLI built-ins: Physical tools have real-world side effects.
+    // CLI built-ins with direct mutation or command effects.
     dispatcher.register(Box::new(BashTool));
     dispatcher.register(Box::new(WriteFileTool));
-    dispatcher.register(Box::new(ExecuteCodeTool));
+    dispatcher.register_with_category(Box::new(ExecuteCodeTool), ToolCategory::CodeSandbox);
 
     // CLI built-ins: Pure tools are read-only / side-effect-free.
     dispatcher.register_with_category(Box::new(ReadFileTool), ToolCategory::Pure);
