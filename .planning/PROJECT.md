@@ -23,9 +23,21 @@ Platform now has:
 - Typed `skill_loaded` / `skill_crystallized` gRPC payloads with cloud, worker-relay, and local cloud-TUI correlation coverage
 - An explicit skill freshness contract: `skills_context` freezes at session start while `skills_list` and `skill_view` remain the live mid-session surfaces
 
-## Current Focus
+## Current Milestone: v3.0 Production Robotics
 
-Define the next milestone after closing the v2.2 carryover runtime-event work. The immediate skill-event completeness gaps from the v2.1 ship review are now closed.
+**Goal:** Close the field-survivability gap so roz is deployable on a real Pixhawk-class drone end-to-end as a **single-binary deployment** — no companion bridge process. copper talks MAVLink directly to the flight controller via a new native backend; substrate-sim-bridge remains the Gazebo SITL backend.
+
+**Target features:**
+- Integration policy published — native-vs-bridge decision rule rooted in copper's I/O trait contract, so future robot families (Franka, Spot, ROS2) inherit the framework.
+- Native MAVLink backend in `crates/roz-mavlink` — implements copper's `SensorSource` + `ActuatorSink` traits for PX4 / ArduPilot over serial + UDP, covers MAVLink v2 compliance and signing.
+- Edge-enforced safety policies — wire `roz_safety_policies` CRUD into worker/copper enforcement; deadman watchdog is **worker-local** (not broker-dependent) so NATS partition doesn't cause false trips.
+- Transport resilience — extend the existing worker WAL to store-and-forward telemetry + replay in-flight tasks across disconnects.
+- Two-direction signed dispatch using the existing per-device Ed25519 trust path — server signs outgoing task dispatch, worker verifies before execution; worker signs outgoing telemetry/results, server verifies.
+- `bridge.proto` compliance clean-up so substrate-sim-bridge stays MAVLink-semantics-accurate (MAV_RESULT enum, MAV_FRAME tagging) — contract gated on `substrate.sim.v2` for breaking changes.
+- Unified MCAP observability — session events + task lifecycle + copper frames in one per-session stream. **Transform-at-write, not duplicate-on-disk**: copper's native `TimestampedTransform` / pose data is projected directly into Foxglove's published schemas (`foxglove.FrameTransform` on `/tf`, `foxglove.PoseInFrame`, `foxglove.Log` as unified text timeline); roz-semantic channels remain only for events with no Foxglove analog (SessionEvent, TaskLifecycle, ToolCall). Foxglove Studio renders 3D + timeline panels out of the box with a shipped layout JSON.
+- Nightly PX4 SITL CI via substrate-ide's `px4-gazebo-humble` container + HITL / companion-setup docs + end-to-end Pixhawk deployment quickstart (single-binary, no bridge to install).
+
+**Key context:** Codebase audit (2026-04-16) showed v3.0 is not about building new primitives — most are already scaffolded (WAL, device trust, safety-policy CRUD, copper actuator sink, MCAP export). The gaps are all about **wiring, enforcement, and end-to-end validation**. The mid-research pivot confirmed that Pixhawk deployment doesn't need a companion-bridge process — direct MAVLink fits copper's trait contract and eliminates a whole category of deployment friction.
 
 ## Requirements
 
