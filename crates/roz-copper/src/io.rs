@@ -1,6 +1,6 @@
 //! Pluggable IO traits for the controller loop.
 //!
-//! Backend-choice policy: see `docs/integration-policy.md`.
+//! Backend-choice policy: see `docs/robot-policy.md`.
 
 use roz_core::command::CommandFrame;
 use roz_core::embodiment::FrameSnapshotInput;

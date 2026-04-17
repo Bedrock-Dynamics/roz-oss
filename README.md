@@ -74,7 +74,7 @@ Examples under `examples/` show the expected project shape. In particular:
 
 ## Documentation
 
-- [Integration policy](docs/integration-policy.md) — decision authority for native-vs-bridge backends (MAVLink, Gazebo, Spot, Franka, ROS2).
+- [Robot policy](docs/robot-policy.md) — decision authority for native-vs-bridge backends (MAVLink, Gazebo, Spot, Franka, ROS2).
 
 ## Status
 

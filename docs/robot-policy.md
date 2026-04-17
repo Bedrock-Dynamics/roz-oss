@@ -1,4 +1,4 @@
-# Integration Policy: Native vs Bridge Backends
+# Robot Policy: Native vs Bridge Backends
 
 > Everything terminates at copper's I/O traits. Native backend when the vendor API satisfies copper's sync non-blocking 100 Hz tick; bridge backend when it can't (language boundary, SDK availability, stricter timing).
 

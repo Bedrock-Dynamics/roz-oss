@@ -1,1 +1,1 @@
-- [ ] If this PR adds or changes a vendor backend, it cites `docs/integration-policy.md` in the description.
+- [ ] If this PR adds or changes a vendor backend, it cites `docs/robot-policy.md` in the description.
