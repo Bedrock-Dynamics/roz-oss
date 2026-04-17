@@ -72,6 +72,10 @@ Examples under `examples/` show the expected project shape. In particular:
 - `examples/reachy-mini/embodiment.toml` is the canonical Reachy Mini manifest
 - `examples/reachy-mini/AGENTS.md` shows the expected embodied tool guidance shape
 
+## Documentation
+
+- [Integration policy](docs/integration-policy.md) — decision authority for native-vs-bridge backends (MAVLink, Gazebo, Spot, Franka, ROS2).
+
 ## Status
 
 The OSS repo is aimed at:
