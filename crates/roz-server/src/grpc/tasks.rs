@@ -190,7 +190,7 @@ fn parse_phase_specs(phases: Vec<prost_types::Struct>) -> Result<Vec<roz_core::p
         .map_err(|e| Status::invalid_argument(format!("invalid phases: {e}")))
 }
 
-fn normalize_nonempty(field_name: &str, value: String) -> Result<String, Status> {
+fn normalize_nonempty(field_name: &str, value: &str) -> Result<String, Status> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(Status::invalid_argument(format!("{field_name} is required")));
@@ -198,7 +198,7 @@ fn normalize_nonempty(field_name: &str, value: String) -> Result<String, Status>
     Ok(trimmed.to_string())
 }
 
-fn schedule_err_to_status(field_name: &str, error: ScheduleError) -> Status {
+fn schedule_err_to_status(field_name: &str, error: &ScheduleError) -> Status {
     Status::invalid_argument(format!("invalid {field_name}: {error}"))
 }
 
@@ -212,7 +212,7 @@ struct ResolvedSchedule {
 fn resolve_schedule(
     nl_schedule: Option<String>,
     parsed_cron: Option<String>,
-    timezone: String,
+    timezone: &str,
     require_nl_schedule: bool,
 ) -> Result<ResolvedSchedule, Status> {
     let timezone = normalize_nonempty("timezone", timezone)?;
@@ -236,12 +236,12 @@ fn resolve_schedule(
         .as_deref()
         .map(parse_natural_language_schedule)
         .transpose()
-        .map_err(|error| schedule_err_to_status("nl_schedule", error))?;
+        .map_err(|error| schedule_err_to_status("nl_schedule", &error))?;
     let canonical_from_request = parsed_cron
         .as_deref()
         .map(canonicalize_cron)
         .transpose()
-        .map_err(|error| schedule_err_to_status("parsed_cron", error))?;
+        .map_err(|error| schedule_err_to_status("parsed_cron", &error))?;
 
     let parsed_cron = match (canonical_from_nl, canonical_from_request) {
         (Some(from_nl), Some(from_request)) => {
@@ -255,7 +255,7 @@ fn resolve_schedule(
         (None, None) => unreachable!("validated above"),
     };
     let definition = ScheduleDefinition::parse(&parsed_cron, &timezone)
-        .map_err(|error| schedule_err_to_status("parsed_cron", error))?;
+        .map_err(|error| schedule_err_to_status("parsed_cron", &error))?;
 
     Ok(ResolvedSchedule {
         nl_schedule,
@@ -265,7 +265,7 @@ fn resolve_schedule(
     })
 }
 
-fn parse_catch_up_policy(value: String) -> Result<CatchUpPolicy, Status> {
+fn parse_catch_up_policy(value: &str) -> Result<CatchUpPolicy, Status> {
     CatchUpPolicy::from_str(value.trim())
         .map_err(|error| Status::invalid_argument(format!("invalid catch_up_policy: {error}")))
 }
@@ -472,15 +472,15 @@ impl TaskService for TaskServiceImpl {
     ) -> Result<Response<ScheduledTask>, Status> {
         let tenant_id = auth_ext::tenant_from_extensions(&request)?;
         let body = request.into_inner();
-        let name = normalize_nonempty("name", body.name)?;
+        let name = normalize_nonempty("name", &body.name)?;
         let task_template = body
             .task_template
             .ok_or_else(|| Status::invalid_argument("task_template is required"))?;
-        let stored_template = StoredScheduledTaskTemplate::from_proto(task_template)?;
-        let schedule = resolve_schedule(Some(body.nl_schedule), Some(body.parsed_cron), body.timezone, true)?;
-        let catch_up_policy = parse_catch_up_policy(body.catch_up_policy)?;
+        let stored_template = StoredScheduledTaskTemplate::from_proto(task_template).map_err(|error| *error)?;
+        let schedule = resolve_schedule(Some(body.nl_schedule), Some(body.parsed_cron), &body.timezone, true)?;
+        let catch_up_policy = parse_catch_up_policy(&body.catch_up_policy)?;
         let next_fire_at = next_fire_from_schedule(&schedule.definition, body.enabled)?;
-        let task_template_json = stored_template.to_json_value()?;
+        let task_template_json = stored_template.to_json_value().map_err(|error| *error)?;
 
         let mut tx = self.pool.begin().await.map_err(|error| db_err_to_status(&error))?;
         roz_db::set_tenant_context(&mut *tx, &tenant_id)
@@ -611,23 +611,24 @@ impl TaskService for TaskServiceImpl {
 
         let name = body
             .name
-            .map(|value| normalize_nonempty("name", value))
+            .map(|value| normalize_nonempty("name", &value))
             .transpose()?
             .unwrap_or(existing.name.clone());
         let stored_template = match body.task_template {
-            Some(template) => StoredScheduledTaskTemplate::from_proto(template)?,
+            Some(template) => StoredScheduledTaskTemplate::from_proto(template).map_err(|error| *error)?,
             None => StoredScheduledTaskTemplate::from_json_value(existing.task_template.clone())
                 .map_err(|error| Status::internal(format!("invalid persisted task_template: {error}")))?,
         };
         let schedule = resolve_schedule(
             body.nl_schedule.or(Some(existing.nl_schedule.clone())),
             body.parsed_cron.or(Some(existing.parsed_cron.clone())),
-            body.timezone.unwrap_or(existing.timezone.clone()),
+            &body.timezone.unwrap_or(existing.timezone.clone()),
             true,
         )?;
         let enabled = body.enabled.unwrap_or(existing.enabled);
         let catch_up_policy = body
             .catch_up_policy
+            .as_deref()
             .map(parse_catch_up_policy)
             .transpose()?
             .unwrap_or_else(|| {
@@ -642,7 +643,7 @@ impl TaskService for TaskServiceImpl {
                 nl_schedule: schedule.nl_schedule.unwrap_or_else(|| existing.nl_schedule.clone()),
                 parsed_cron: schedule.parsed_cron,
                 timezone: schedule.timezone,
-                task_template: stored_template.to_json_value()?,
+                task_template: stored_template.to_json_value().map_err(|error| *error)?,
                 enabled,
                 catch_up_policy,
                 next_fire_at: next_fire_from_schedule(&schedule.definition, enabled)?,
@@ -753,7 +754,7 @@ impl TaskService for TaskServiceImpl {
         request: Request<PreviewScheduleRequest>,
     ) -> Result<Response<PreviewScheduleResponse>, Status> {
         let body = request.into_inner();
-        let schedule = resolve_schedule(body.nl_schedule, body.parsed_cron, body.timezone, false)?;
+        let schedule = resolve_schedule(body.nl_schedule, body.parsed_cron, &body.timezone, false)?;
         let response = preview_response_from_schedule(schedule.nl_schedule, &schedule.definition, Utc::now())?;
         Ok(Response::new(response))
     }

@@ -11,10 +11,6 @@ pub(crate) enum ApprovalGateResult {
     Rejected(roz_core::tools::ToolResult),
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "approval gating needs the request context, signal sink, and cancellation state"
-)]
 pub(crate) async fn gate_tool_call_for_human_approval(
     call: &roz_core::tools::ToolCall,
     reason: &str,

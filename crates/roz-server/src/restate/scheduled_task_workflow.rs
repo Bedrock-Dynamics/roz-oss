@@ -112,7 +112,7 @@ pub struct ScheduledTaskWorkflowImpl;
 impl ScheduledTaskWorkflow for ScheduledTaskWorkflowImpl {
     async fn run(
         &self,
-        mut ctx: WorkflowContext<'_>,
+        ctx: WorkflowContext<'_>,
         input: Json<ScheduledTaskWorkflowInput>,
     ) -> Result<Json<ScheduledTaskWorkflowOutcome>, HandlerError> {
         let input = input.into_inner();
@@ -157,7 +157,6 @@ impl ScheduledTaskWorkflow for ScheduledTaskWorkflowImpl {
             }
 
             let wait_reason = match &snapshot {
-                ScheduledTaskSnapshot::Present { enabled: false, .. } => "refresh".to_string(),
                 ScheduledTaskSnapshot::Present {
                     enabled: true,
                     next_fire_at: Some(_),
@@ -176,7 +175,7 @@ impl ScheduledTaskWorkflow for ScheduledTaskWorkflowImpl {
                 )),
             );
 
-            let wait_token = next_wait_token(&mut ctx).await?;
+            let wait_token = next_wait_token(&ctx).await?;
             ctx.set("wait_token", wait_token.clone());
 
             let rechecked_snapshot: Json<ScheduledTaskSnapshot> = ctx
@@ -287,7 +286,7 @@ impl ScheduledTaskWorkflow for ScheduledTaskWorkflowImpl {
     }
 }
 
-async fn next_wait_token(ctx: &mut WorkflowContext<'_>) -> Result<String, HandlerError> {
+async fn next_wait_token(ctx: &WorkflowContext<'_>) -> Result<String, HandlerError> {
     let next_seq = ctx.get::<u64>("wait_seq").await?.unwrap_or(0) + 1;
     ctx.set("wait_seq", next_seq);
     Ok(next_seq.to_string())
@@ -398,19 +397,18 @@ async fn execute_iteration(
             .last()
             .map(|occurrence| occurrence.fire_at_utc)
             .or(row.last_fire_at);
-        match roz_db::scheduled_tasks::record_fire_progress(&mut *tx, row.id, last_fire_at, resolution.next_fire_at_utc)
-            .await?
-        {
-            Some(updated) => updated,
-            None => {
-                tx.commit().await?;
-                return Ok(ScheduledTaskIterationResult {
-                    snapshot: ScheduledTaskSnapshot::Missing,
-                    dispatched_task_ids,
-                    dispatch_errors,
-                });
-            }
-        }
+        let Some(updated) =
+            roz_db::scheduled_tasks::record_fire_progress(&mut *tx, row.id, last_fire_at, resolution.next_fire_at_utc)
+                .await?
+        else {
+            tx.commit().await?;
+            return Ok(ScheduledTaskIterationResult {
+                snapshot: ScheduledTaskSnapshot::Missing,
+                dispatched_task_ids,
+                dispatch_errors,
+            });
+        };
+        updated
     } else {
         row
     };

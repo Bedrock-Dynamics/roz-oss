@@ -106,10 +106,10 @@ pub async fn exchange_callback(
         .map(|duration| Utc::now() + duration);
 
     Ok(OAuthTokenMaterial {
-        access_token: SecretString::new(token.access_token().secret().to_string().into_boxed_str()),
+        access_token: SecretString::new(Box::from(token.access_token().secret().as_str())),
         refresh_token: token
             .refresh_token()
-            .map(|token| SecretString::new(token.secret().to_string().into_boxed_str())),
+            .map(|token| SecretString::new(Box::from(token.secret().as_str()))),
         expires_at,
     })
 }

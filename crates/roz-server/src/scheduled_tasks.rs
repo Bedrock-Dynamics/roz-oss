@@ -22,18 +22,22 @@ pub struct StoredScheduledTaskTemplate {
 }
 
 impl StoredScheduledTaskTemplate {
-    pub fn from_proto(template: ScheduledTaskTemplate) -> Result<Self, Status> {
-        let environment_id = Uuid::parse_str(&template.environment_id)
-            .map_err(|_| Status::invalid_argument("task_template.environment_id is not a valid UUID"))?;
+    pub fn from_proto(template: ScheduledTaskTemplate) -> Result<Self, Box<Status>> {
+        let environment_id = Uuid::parse_str(&template.environment_id).map_err(|_| {
+            Box::new(Status::invalid_argument(
+                "task_template.environment_id is not a valid UUID",
+            ))
+        })?;
         let host_id = template.host_id.trim().to_string();
         if host_id.is_empty() {
-            return Err(Status::invalid_argument("task_template.host_id is required"));
+            return Err(Box::new(Status::invalid_argument("task_template.host_id is required")));
         }
 
         let timeout_secs = template
             .timeout_secs
             .map(|value| {
-                i32::try_from(value).map_err(|_| Status::invalid_argument("task_template.timeout_secs is too large"))
+                i32::try_from(value)
+                    .map_err(|_| Box::new(Status::invalid_argument("task_template.timeout_secs is too large")))
             })
             .transpose()?;
         let control_interface_manifest = template
@@ -42,26 +46,39 @@ impl StoredScheduledTaskTemplate {
             .map(serde_json::from_value::<ControlInterfaceManifest>)
             .transpose()
             .map_err(|error| {
-                Status::invalid_argument(format!("invalid task_template.control_interface_manifest: {error}"))
+                Box::new(Status::invalid_argument(format!(
+                    "invalid task_template.control_interface_manifest: {error}"
+                )))
             })?;
         let delegation_scope = template
             .delegation_scope
             .map(prost_struct_to_json)
             .map(serde_json::from_value::<DelegationScope>)
             .transpose()
-            .map_err(|error| Status::invalid_argument(format!("invalid task_template.delegation_scope: {error}")))?;
+            .map_err(|error| {
+                Box::new(Status::invalid_argument(format!(
+                    "invalid task_template.delegation_scope: {error}"
+                )))
+            })?;
         let phases = template
             .phases
             .into_iter()
             .map(prost_struct_to_json)
             .map(serde_json::from_value::<PhaseSpec>)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| Status::invalid_argument(format!("invalid task_template.phases: {error}")))?;
+            .map_err(|error| {
+                Box::new(Status::invalid_argument(format!(
+                    "invalid task_template.phases: {error}"
+                )))
+            })?;
         let parent_task_id = template
             .parent_task_id
             .map(|value| {
-                Uuid::parse_str(&value)
-                    .map_err(|_| Status::invalid_argument("task_template.parent_task_id is not a valid UUID"))
+                Uuid::parse_str(&value).map_err(|_| {
+                    Box::new(Status::invalid_argument(
+                        "task_template.parent_task_id is not a valid UUID",
+                    ))
+                })
             })
             .transpose()?;
 
@@ -81,9 +98,9 @@ impl StoredScheduledTaskTemplate {
         serde_json::from_value(value)
     }
 
-    pub fn to_json_value(&self) -> Result<serde_json::Value, Status> {
+    pub fn to_json_value(&self) -> Result<serde_json::Value, Box<Status>> {
         serde_json::to_value(self)
-            .map_err(|error| Status::internal(format!("failed to serialize task_template: {error}")))
+            .map_err(|error| Box::new(Status::internal(format!("failed to serialize task_template: {error}"))))
     }
 
     pub fn to_proto(&self) -> ScheduledTaskTemplate {

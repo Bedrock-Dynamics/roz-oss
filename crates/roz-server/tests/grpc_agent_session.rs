@@ -187,7 +187,8 @@ impl roz_mcp::McpClientBackend for FakeMcpBackend {
     ) -> Result<roz_core::tools::ToolResult, roz_mcp::McpClientError> {
         let mut count = self.call_count.lock().expect("fake mcp call count lock");
         *count += 1;
-        match self.mode.lock().expect("fake mcp mode lock").clone() {
+        let mode = self.mode.lock().expect("fake mcp mode lock").clone();
+        match mode {
             FakeMcpMode::AlwaysSuccess(text) => Ok(roz_core::tools::ToolResult::success(serde_json::json!(text))),
             FakeMcpMode::AlwaysFail(message) => Err(roz_mcp::McpClientError::ToolCallFailed(message.clone())),
         }
@@ -220,7 +221,7 @@ async fn register_fake_mcp_server(
     tx.commit().await.expect("commit fake mcp server");
 
     let _ = registry.upsert_with_backend(
-        roz_mcp::McpServerConfig {
+        &roz_mcp::McpServerConfig {
             tenant_id,
             name: name.to_string(),
             transport: roz_mcp::McpTransport::StreamableHttp,

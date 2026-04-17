@@ -5,10 +5,10 @@ use quick_js::{Arguments, Context as JsContext, JsValue};
 
 use super::bridge::{SandboxBridge, SandboxOutcome};
 
-pub fn run(code: &str, bridge: SandboxBridge) -> SandboxOutcome {
+pub fn run(code: &str, bridge: &SandboxBridge) -> SandboxOutcome {
     let context = match JsContext::new() {
         Ok(context) => context,
-        Err(error) => return runtime_error_outcome(&bridge, format!("quickjs init failed: {error}")),
+        Err(error) => return runtime_error_outcome(bridge, format!("quickjs init failed: {error}")),
     };
 
     let print_bridge = AssertUnwindSafe(bridge.clone());
@@ -22,7 +22,7 @@ pub fn run(code: &str, bridge: SandboxBridge) -> SandboxOutcome {
         print_bridge.0.print(rendered);
         JsValue::Undefined
     }) {
-        return runtime_error_outcome(&bridge, format!("quickjs print binding failed: {error}"));
+        return runtime_error_outcome(bridge, format!("quickjs print binding failed: {error}"));
     }
 
     let call_bridge = AssertUnwindSafe(bridge.clone());
@@ -45,12 +45,12 @@ pub fn run(code: &str, bridge: SandboxBridge) -> SandboxOutcome {
             .map_err(|err| err.to_string())?;
         json_to_js(output).map_err(|err| err.to_string())
     }) {
-        return runtime_error_outcome(&bridge, format!("quickjs call_tool binding failed: {error}"));
+        return runtime_error_outcome(bridge, format!("quickjs call_tool binding failed: {error}"));
     }
 
     match context.eval(code) {
         Ok(_) => bridge.success_outcome(),
-        Err(error) => runtime_error_outcome(&bridge, format!("quickjs runtime error: {error}")),
+        Err(error) => runtime_error_outcome(bridge, format!("quickjs runtime error: {error}")),
     }
 }
 

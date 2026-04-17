@@ -152,8 +152,8 @@ impl TypedToolExecutor for ExecuteCodeTool {
         let code = input.code;
 
         let outcome = tokio::task::spawn_blocking(move || match input.language {
-            ExecuteCodeLanguage::JavascriptQjs => quickjs::run(&code, bridge),
-            ExecuteCodeLanguage::Rhai => rhai::run(&code, bridge),
+            ExecuteCodeLanguage::JavascriptQjs => quickjs::run(&code, &bridge),
+            ExecuteCodeLanguage::Rhai => rhai::run(&code, &bridge),
         })
         .await;
 

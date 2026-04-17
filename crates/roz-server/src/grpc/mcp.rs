@@ -511,6 +511,10 @@ async fn build_auth_material(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "OAuth completion task owns its full context: DB pool, key provider, registry, session bus, tenant/session IDs, approval ID, registration fields (name, transport, URL, enabled), the pending flow, and the decision receiver; splitting into a struct would merely rename the same parameters"
+)]
 async fn complete_oauth_registration(
     pool: PgPool,
     key_provider: Arc<dyn KeyProvider>,
@@ -665,6 +669,10 @@ async fn complete_oauth_registration(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "persistence requires DB pool, key provider, registry, tenant ID, registration fields (name, transport_db, runtime_transport, URL, enabled), and the OAuth token material; these are all distinct required inputs"
+)]
 async fn persist_oauth_registration(
     pool: &PgPool,
     key_provider: &dyn KeyProvider,
@@ -785,7 +793,7 @@ fn health_status_from_row(row: &roz_db::mcp_servers::McpServerRow) -> McpHealthS
 fn timestamp_from_chrono(value: chrono::DateTime<chrono::Utc>) -> Timestamp {
     Timestamp {
         seconds: value.timestamp(),
-        nanos: value.timestamp_subsec_nanos() as i32,
+        nanos: i32::try_from(value.timestamp_subsec_nanos()).unwrap_or(i32::MAX),
     }
 }
 

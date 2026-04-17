@@ -118,13 +118,17 @@ impl Registry {
     }
 
     #[must_use]
-    pub fn upsert(&self, config: McpServerConfig) -> RegisteredServer {
-        self.upsert_internal(config.clone(), SharedClientHandle::new(&config), None, None)
+    pub fn upsert(&self, config: &McpServerConfig) -> RegisteredServer {
+        self.upsert_internal(config.clone(), SharedClientHandle::new(config), None, None)
     }
 
     #[must_use]
-    pub fn upsert_with_backend(&self, config: McpServerConfig, backend: Arc<dyn McpClientBackend>) -> RegisteredServer {
-        self.upsert_internal(config.clone(), SharedClientHandle::new(&config), Some(backend), None)
+    pub fn upsert_with_backend(
+        &self,
+        config: &McpServerConfig,
+        backend: Arc<dyn McpClientBackend>,
+    ) -> RegisteredServer {
+        self.upsert_internal(config.clone(), SharedClientHandle::new(config), Some(backend), None)
     }
 
     fn upsert_internal(
@@ -671,9 +675,9 @@ mod tests {
         let tenant_id = Uuid::new_v4();
         let registry = Registry::new();
 
-        let _ = registry.upsert(server("healthy", tenant_id, true));
-        let _ = registry.upsert(server("disabled", tenant_id, false));
-        let _ = registry.upsert(server("degraded", tenant_id, true));
+        let _ = registry.upsert(&server("healthy", tenant_id, true));
+        let _ = registry.upsert(&server("disabled", tenant_id, false));
+        let _ = registry.upsert(&server("degraded", tenant_id, true));
         registry.mark_degraded_local(tenant_id, "degraded", "down");
 
         let names: Vec<String> = registry
@@ -689,7 +693,7 @@ mod tests {
     fn record_failure_marks_server_degraded_once_threshold_is_hit() {
         let tenant_id = Uuid::new_v4();
         let registry = Registry::new();
-        let _ = registry.upsert(server("warehouse", tenant_id, true));
+        let _ = registry.upsert(&server("warehouse", tenant_id, true));
 
         let first = registry
             .record_failure(tenant_id, "warehouse", "boom-1")
@@ -722,7 +726,7 @@ mod tests {
             }],
         });
 
-        let registered = registry.upsert_with_backend(server("warehouse", tenant_id, true), backend);
+        let registered = registry.upsert_with_backend(&server("warehouse", tenant_id, true), backend);
         assert_eq!(registered.config.name, "warehouse");
     }
 }

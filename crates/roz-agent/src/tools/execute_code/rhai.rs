@@ -2,7 +2,7 @@ use rhai::{Dynamic, Engine, EvalAltResult, Position};
 
 use super::bridge::{SandboxBridge, SandboxOutcome};
 
-pub fn run(code: &str, bridge: SandboxBridge) -> SandboxOutcome {
+pub fn run(code: &str, bridge: &SandboxBridge) -> SandboxOutcome {
     let mut engine = Engine::new();
 
     let print_bridge = bridge.clone();
@@ -34,7 +34,7 @@ pub fn run(code: &str, bridge: SandboxBridge) -> SandboxOutcome {
 
     match engine.run(code) {
         Ok(()) => bridge.success_outcome(),
-        Err(error) => runtime_error_outcome(&bridge, format!("rhai runtime error: {error}")),
+        Err(error) => runtime_error_outcome(bridge, format!("rhai runtime error: {error}")),
     }
 }
 

@@ -1307,11 +1307,10 @@ async fn run_session_loop(
                         .unwrap_or(ToolCategory::Physical);
                     if category == ToolCategory::CodeSandbox && tool.name == EXECUTE_CODE_TOOL_NAME {
                         dispatcher.register_with_category(Box::new(ExecuteCodeTool), ToolCategory::CodeSandbox);
-                    } else if let Some(mcp_tool) = server_owned_mcp
-                        .lock()
-                        .expect("mcp surface lock poisoned")
-                        .get(&tool.name)
-                    {
+                    } else if let Some(mcp_tool) = {
+                        let guard = server_owned_mcp.lock().expect("mcp surface lock poisoned");
+                        guard.get(&tool.name)
+                    } {
                         dispatcher.register_with_category(
                             Box::new(ServerMcpToolExecutor {
                                 schema: tool.clone(),
@@ -2204,6 +2203,10 @@ async fn spawn_webrtc_signaling_relay(
 #[expect(
     clippy::too_many_lines,
     reason = "sequential session initialization with auth + DB + placement"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "session start requires response tx, DB pool, default model, auth identity, start payload, session slot, MCP registry, and key provider; splitting would create a parameter struct without improving clarity"
 )]
 async fn handle_start(
     tx: &mpsc::Sender<Result<SessionResponse, Status>>,

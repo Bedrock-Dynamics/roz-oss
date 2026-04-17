@@ -61,16 +61,16 @@ impl From<TaskDispatchError> for tonic::Status {
             TaskDispatchError::Database(error) => {
                 if matches!(&error, sqlx::Error::PoolTimedOut) {
                     tracing::error!("database pool timed out");
-                    tonic::Status::unavailable("service temporarily unavailable")
+                    Self::unavailable("service temporarily unavailable")
                 } else {
                     tracing::error!(error = %error, "database error");
-                    tonic::Status::internal("database error")
+                    Self::internal("database error")
                 }
             }
-            TaskDispatchError::BadRequest(message) => tonic::Status::invalid_argument(message),
-            TaskDispatchError::NotFound(message) => tonic::Status::not_found(message),
-            TaskDispatchError::TrustRejected => tonic::Status::failed_precondition("host trust posture not satisfied"),
-            TaskDispatchError::Internal(message) => tonic::Status::internal(message),
+            TaskDispatchError::BadRequest(message) => Self::invalid_argument(message),
+            TaskDispatchError::NotFound(message) => Self::not_found(message),
+            TaskDispatchError::TrustRejected => Self::failed_precondition("host trust posture not satisfied"),
+            TaskDispatchError::Internal(message) => Self::internal(message),
         }
     }
 }

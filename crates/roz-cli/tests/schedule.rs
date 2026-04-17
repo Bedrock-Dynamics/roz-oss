@@ -54,13 +54,13 @@ fn parse_schedule_subcommands() {
 #[test]
 fn schedule_preview_and_create_requests_match_proto_contract() {
     let path = write_template_file(
-        r#"
+        r"
 prompt: run diagnostics
 environment_id: 11111111-1111-1111-1111-111111111111
 host_id: 22222222-2222-2222-2222-222222222222
 timeout_secs: 300
 phases: []
-"#,
+",
         "yaml",
     );
     let task_template: ScheduledTaskTemplate = load_task_template_file(&path).expect("load task template");
