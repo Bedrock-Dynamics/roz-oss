@@ -71,7 +71,7 @@ Plans:
 - **CI runner posture:** GitHub Actions free runners are sufficient for nightly SITL CI in v3.0. No self-hosted GPU runner, no visual SITL validation, no PREEMPT_RT requirement — the free-runner budget absorbs the full scenario suite within 600 s (see `.planning/research/DEEP-RD.md`).
 - **Downstream signing dependency:** FS-04 (Phase 23) establishes the Ed25519 verification path that every later phase's CI harness exercises. Worker enrollment in RD-01 / RD-03 presumes the Phase 23 provisioning endpoint is live.
 
-### Phase 22: Integration policy doc as decision authority for native-vs-bridge backends
+### Phase 22: Integration policy doc as decision authority for native-vs-bridge backends (COMPLETE 2026-04-17)
 
 **Goal**: Publish the single-rule doc that every later v3.0 phase PR and every future robot-family integration cites as its decision authority, rooted in copper's I/O trait contract.
 **Depends on**: None (first v3.0 phase — foundational doc)
