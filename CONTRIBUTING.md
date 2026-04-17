@@ -29,6 +29,12 @@ cargo test --workspace --exclude roz-db --exclude roz-server
 - All domain types in `roz-core` with `Serialize`/`Deserialize` derives
 - Error handling via `thiserror` for libraries, `anyhow` sparingly for binaries
 
+## Backend integrations
+
+PRs that add or change a vendor backend (MAVLink, Gazebo, Spot, Franka, ROS2, or any new robot family) must cite `docs/integration-policy.md` in the PR description and justify the native-vs-bridge choice against the rubric documented there.
+
+New backends are evaluated per the rubric in `docs/integration-policy.md`: Rust bindings availability, copper's 10 ms non-blocking tick compatibility, and vendor timing requirements.
+
 ## Testing
 
 - `cargo test --workspace --exclude roz-db --exclude roz-server` for local tests
