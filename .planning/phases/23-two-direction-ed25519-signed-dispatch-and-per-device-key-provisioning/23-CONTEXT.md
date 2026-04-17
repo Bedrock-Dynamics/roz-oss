@@ -26,9 +26,10 @@ Out of scope:
 **Why:** Zero payload-shape change — existing consumers keep deserializing `TaskInvocation` / `TaskResult` / telemetry structs unchanged. New verifiers read the header. Matches `.planning/research/DEEP-SIGN.md §2` recommendation.
 **Header name:** `roz-sig-v1` (single header, base64-encoded JCS of envelope fields + raw 64-byte signature appended).
 
-### D-02 — Canonicalization (JCS via `jcs` crate)
-[auto] Signed-fields bundle is serialized using RFC 8785 JCS before hashing. Adds `jcs = "0.1"` (or latest compatible) to workspace dependencies in `roz-core`.
+### D-02 — Canonicalization (JCS via `serde_json_canonicalizer` crate)
+[auto, corrected 2026-04-17 via research agent] Signed-fields bundle is serialized using RFC 8785 JCS before hashing. Adds `serde_json_canonicalizer = "0.3"` to workspace dependencies in `roz-core`.
 **Why:** Signer and verifier may run different Rust versions / dependency SHAs. JCS removes any dependency on `serde_json`'s map ordering or whitespace. Same `.planning/research/DEEP-SIGN.md §2` recommendation.
+**Correction:** Initial draft cited `jcs = "0.1"` which does not exist on crates.io. The actively maintained RFC 8785 Rust crate is `serde_json_canonicalizer`.
 
 ### D-03 — Signed fields (mandatory set)
 [auto] Every envelope signs the 6-field set recommended in research:
@@ -53,7 +54,7 @@ Signature binds: `JCS({direction, tenant_id, host_id, task_id|stream_id, timesta
 ### D-05 — Per-device key storage (encrypted file, not TPM)
 [auto] Worker stores private key at `/etc/roz/device-key.pem` (mode `0600`, owner `roz-worker`) in production. Dev/sim workers use `${ROZ_DATA_DIR}/device-key.pem` (falls back to `~/.config/roz/device-key.pem`).
 **Why:** Pixhawk companions (typical SBC) rarely ship with TPM exposed to userland. Encrypted file + OS access control is the pragmatic minimum. A future hardening phase can add a TPM/enclave `KeyProvider` behind the same trait surface without changing the signing code.
-**Crate:** `aes-gcm` (already a workspace dep — added for Phase 17/v2.1 MCP credentials) encrypts the key at rest with a master key derived from `ROZ_KEY_ENCRYPTION_KEY` env (which already gates MCP credential storage).
+**Crate:** `aes-gcm` (already a workspace dep — added for Phase 17/v2.1 MCP credentials) encrypts the key at rest with the master key sourced from `ROZ_ENCRYPTION_KEY` env (the existing var that already gates MCP credential storage — see `crates/roz-core/src/key_provider.rs`). Reuses the existing `KeyProvider` trait — no new env var.
 
 ### D-06 — Bootstrap attestation (reuse per-host `ROZ_API_KEY`)
 [auto] First-time enrollment: worker posts `POST /v1/device/provision-key` with `Authorization: Bearer ${ROZ_API_KEY}` header (the per-host key the worker already has from Phase 17 registration). Server validates the API key belongs to a registered host, generates an Ed25519 keypair, stores public key + `key_version=1` in new `roz_device_keys` table, returns private key **once** in the response.
@@ -83,6 +84,23 @@ Signature binds: `JCS({direction, tenant_id, host_id, task_id|stream_id, timesta
 ### D-12 — Migration (envelope optional during rollout)
 [auto] New `SIGNED_DISPATCH_ENFORCEMENT` env var on the server: `off` (warn but accept unsigned), `audit` (require signed but don't reject), `strict` (reject unsigned — production default after v3.0 ships). Workers always sign once provisioned. This gives a rollout window where existing workers can be upgraded phase-by-phase without a fleet-wide simultaneous cutover.
 **Default:** `strict` for fresh deployments; v3.0 shipped workers default to signing. The gate is only relevant for pre-v3.0 workers still in the fleet during upgrade.
+
+### D-13 — Signing transport scope (NATS only, Restate deferred)
+[auto, added 2026-04-17 from research agent Q1] Phase 23 signs and verifies envelopes on **NATS hops only**. Task results that travel via HTTP to Restate (`signal_result` in `crates/roz-worker/src/dispatch.rs`) are NOT in scope for this phase — they stay on the existing transport trust path. Restate signing is deferred to a post-v3.0 hardening phase if needed.
+**Why:** The primary threat model for v3.0 is cross-tenant message injection into NATS. Restate traffic is server-to-server over TLS inside the control plane and not directly exposed. Including Restate doubles the surface area of this phase. Keep the phase focused and ship.
+**Boundary test:** FS-04 acceptance criteria require every NATS publish to be signed. HTTP paths are not subject to FS-04.
+
+### D-14 — Server-side signing state (separate table from device keys)
+[auto, added 2026-04-17 from research agent finding #3] Outbound server-signed envelopes use a server-managed signing keypair + sequence counter, stored separately from the per-device verifying keys. Add a `roz_server_signing_state` table in the same migration as `roz_device_keys`, holding one row per `(tenant_id, direction)` with: `signing_key_id`, `sequence_number`, `rotated_at`. The server signs every outbound `server→worker` envelope with this state; worker verifies with a server public key fetched at bootstrap.
+**Why:** Reusing the worker's `roz_device_keys.sequence_number_offset` column would mix verify-state and sign-state, creating ambiguity and a race on rotation. Separate tables, separate keypairs, separate counters.
+
+### D-15 — Server public key distribution (piggyback on provision response)
+[auto, added 2026-04-17 from research agent Q3] When a worker calls `POST /v1/device/provision-key` or `POST /v1/device/rotate-key`, the response body returns the server's current outbound signing public key alongside the worker's new private key. Worker caches this server verifying key locally and uses it to verify inbound server→worker envelopes.
+**Why:** One round-trip enrollment. No separate bootstrap for server-trust material. Server-key rotation goes through the same endpoint pair, so worker naturally sees updates during rotation cycles.
+**Server-key rotation handling:** If worker sees an envelope signed with a `key_version` it doesn't have cached, worker refetches via rotation endpoint before retrying verification (bounded: one refetch per envelope, then fail).
+
+### D-16 — Rotation DDL fix (relax partial index to allow 24h overlap)
+[auto, added 2026-04-17 from research agent finding #2] DEEP-SIGN.md §4 proposes `CREATE INDEX idx_device_keys_active ON roz_device_keys(host_id) WHERE revoked_at IS NULL AND rotated_at IS NULL;` — but this silently breaks the 24 h overlap window in D-07, because the instant rotation starts the old key is excluded from the index and verification fails. Corrected DDL: `CREATE INDEX idx_device_keys_active ON roz_device_keys(host_id) WHERE revoked_at IS NULL;`. Verifier selects rows by `(host_id, key_version)` explicitly, and both overlap keys remain visible during the 24 h window.
 
 ### Claude's Discretion
 
