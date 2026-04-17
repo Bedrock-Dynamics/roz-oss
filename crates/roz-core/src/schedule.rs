@@ -162,7 +162,7 @@ impl ScheduleDefinition {
             next_fire_at_utc
         };
         let window_truncated = next_fire_at_utc < window_start;
-        let due_runs = self.occurrences_between(due_start, now_utc)?;
+        let due_runs = self.occurrences_between(due_start, now_utc);
 
         let due_runs = match policy {
             CatchUpPolicy::SkipMissed => Vec::new(),
@@ -184,22 +184,20 @@ impl ScheduleDefinition {
         &self,
         start_inclusive_utc: DateTime<Utc>,
         end_inclusive_utc: DateTime<Utc>,
-    ) -> Result<Vec<ScheduledOccurrence>, ScheduleError> {
+    ) -> Vec<ScheduledOccurrence> {
         if start_inclusive_utc > end_inclusive_utc {
-            return Ok(Vec::new());
+            return Vec::new();
         }
 
         let cursor_local = (start_inclusive_utc - Duration::seconds(1)).with_timezone(&self.timezone);
-        let occurrences = self
-            .schedule
+        self.schedule
             .after(&cursor_local)
             .take_while(|fire_at_local| fire_at_local.with_timezone(&Utc) <= end_inclusive_utc)
             .map(|fire_at_local| ScheduledOccurrence {
                 fire_at_utc: fire_at_local.with_timezone(&Utc),
                 fire_at_local,
             })
-            .collect();
-        Ok(occurrences)
+            .collect()
     }
 }
 
