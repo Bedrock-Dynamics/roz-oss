@@ -81,7 +81,16 @@ async fn mode_switches_when_sim_connects() {
     // Build a model factory that always creates a fresh real Claude model.
     let key = api_key.clone();
     let mut runtime = LocalRuntime::with_model_factory(dir.path(), move || {
-        create_model("claude-sonnet-4-6", "", "", 120, "anthropic", Some(&key))
+        create_model(
+            "claude-sonnet-4-6",
+            "",
+            "",
+            120,
+            "anthropic",
+            Some(&key),
+            &roz_core::auth::TenantId::new(uuid::Uuid::nil()),
+            std::sync::Arc::new(roz_core::model_endpoint::EndpointRegistry::empty()),
+        )
     })
     .unwrap();
     runtime.set_permission_mode(PermissionMode::Auto);

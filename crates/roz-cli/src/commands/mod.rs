@@ -9,6 +9,7 @@ pub mod interactive;
 pub mod media;
 pub mod non_interactive;
 pub mod recording;
+pub mod schedule;
 pub mod setup;
 pub mod sim;
 pub mod skill;

@@ -1,918 +1,250 @@
+//! Phase 18 SKILL-01: per-tenant skill library CRUD over the composite-PK `roz_skills` table.
+//!
+//! Replaces the Phase 4 surrogate-key shape (verified to have no production
+//! write path — see RESEARCH §Runtime State Inventory).
+//!
+//! All functions are generic over `E: sqlx::Executor<'e, Database = sqlx::Postgres>`
+//! per CLAUDE.md DB conventions. Tenant scoping is enforced by the RLS policy
+//! `tenant_isolation` defined in migration 031; callers MUST invoke
+//! `crate::set_tenant_context(&mut *tx, &tenant_id).await?` before any query.
+
+use chrono::{DateTime, Utc};
+use semver::Version;
+use serde::{Deserialize, Serialize};
+use sqlx::FromRow;
 use uuid::Uuid;
 
-// ---------------------------------------------------------------------------
-// Row types
-// ---------------------------------------------------------------------------
-
-/// Row type matching the `roz_skills` schema exactly (Phase 4 enhanced).
-#[derive(Debug, Clone, sqlx::FromRow)]
+/// Full row from `roz_skills` (composite PK: `(tenant_id, name, version)`).
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
 pub struct SkillRow {
-    pub id: Uuid,
     pub tenant_id: Uuid,
     pub name: String,
-    pub description: String,
-    pub kind: String,
-    pub tags: Vec<String>,
-    pub platform: Vec<String>,
-    pub requires_confirmation: bool,
-    pub parameters: serde_json::Value,
-    pub safety_overrides: Option<serde_json::Value>,
-    pub environment_constraints: serde_json::Value,
-    pub allowed_tools: Vec<String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
-}
-
-/// Row type matching the `roz_skill_versions` schema exactly (Phase 4 enhanced).
-#[derive(Debug, Clone, sqlx::FromRow)]
-pub struct SkillVersionRow {
-    pub id: Uuid,
-    pub skill_id: Uuid,
-    pub tenant_id: Uuid,
     pub version: String,
-    pub content: String,
-    pub content_hash: Option<String>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub body_md: String,
+    pub frontmatter: serde_json::Value,
+    pub source: String,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
-// ---------------------------------------------------------------------------
-// Skill CRUD
-// ---------------------------------------------------------------------------
-
-/// Insert a new skill and return the created row.
-pub async fn create<'e, E>(executor: E, tenant_id: Uuid, name: &str, description: &str) -> Result<SkillRow, sqlx::Error>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
-{
-    sqlx::query_as::<_, SkillRow>(
-        "INSERT INTO roz_skills (tenant_id, name, description) VALUES ($1, $2, $3) RETURNING *",
-    )
-    .bind(tenant_id)
-    .bind(name)
-    .bind(description)
-    .fetch_one(executor)
-    .await
+/// Tier-0 PromptAssembler projection — small enough for the N=20 @ ≤3 KB block
+/// budget defined in CONTEXT D-12.
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct SkillSummary {
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub created_at: DateTime<Utc>,
+    pub created_by: String,
 }
 
-/// Fetch a single skill by primary key, or `None` if not found.
-pub async fn get_by_id<'e, E>(executor: E, id: Uuid) -> Result<Option<SkillRow>, sqlx::Error>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
-{
-    sqlx::query_as::<_, SkillRow>("SELECT * FROM roz_skills WHERE id = $1")
-        .bind(id)
-        .fetch_optional(executor)
-        .await
-}
-
-/// List skills for a tenant with limit/offset pagination.
-/// Includes `tenant_id` filter for defense-in-depth (don't rely solely on RLS).
-pub async fn list<'e, E>(executor: E, tenant_id: Uuid, limit: i64, offset: i64) -> Result<Vec<SkillRow>, sqlx::Error>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
-{
-    sqlx::query_as::<_, SkillRow>(
-        "SELECT * FROM roz_skills WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
-    )
-    .bind(tenant_id)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(executor)
-    .await
-}
-
-/// Partially update a skill. Only non-`None` fields are changed.
-/// Returns `None` when the row does not exist.
-pub async fn update<'e, E>(
+/// SKILL-01: insert a new skill version.
+///
+/// Caller MUST have invoked `crate::set_tenant_context(&mut *tx, &tenant_id)`.
+/// Composite-PK collision returns `sqlx::Error::Database` with constraint
+/// `roz_skills_pkey`; the gRPC layer (PLAN-05) maps to `Status::already_exists`
+/// (D-06 — npm/crates.io immutability).
+///
+/// Defense-in-depth: `tenant_id` is read from `current_setting('rls.tenant_id')`
+/// (NOT from a caller param) so an RLS-disabled connection refuses to misroute
+/// cross-tenant (T-18-03-01 mitigation).
+///
+/// # Errors
+///
+/// Returns `sqlx::Error` on PK collision, CHECK-constraint violation
+/// (`name` regex, `description` length, `name` length) or RLS rejection.
+pub async fn insert_skill<'e, E>(
     executor: E,
-    id: Uuid,
-    name: Option<&str>,
-    description: Option<&str>,
-) -> Result<Option<SkillRow>, sqlx::Error>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
-{
-    sqlx::query_as::<_, SkillRow>(
-        "UPDATE roz_skills \
-         SET name        = COALESCE($2, name), \
-             description = COALESCE($3, description), \
-             updated_at  = now() \
-         WHERE id = $1 \
-         RETURNING *",
-    )
-    .bind(id)
-    .bind(name)
-    .bind(description)
-    .fetch_optional(executor)
-    .await
-}
-
-/// Delete a skill by id. Returns `true` when a row was actually removed.
-pub async fn delete<'e, E>(executor: E, id: Uuid) -> Result<bool, sqlx::Error>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
-{
-    let result = sqlx::query("DELETE FROM roz_skills WHERE id = $1")
-        .bind(id)
-        .execute(executor)
-        .await?;
-    Ok(result.rows_affected() > 0)
-}
-
-// ---------------------------------------------------------------------------
-// Skill version CRUD
-// ---------------------------------------------------------------------------
-
-/// Create a new version for a skill. Derives `tenant_id` from the parent skill
-/// to prevent cross-tenant mismatches.
-pub async fn create_version<'e, E>(
-    executor: E,
-    skill_id: Uuid,
-    version: &str,
-    content: &str,
-) -> Result<SkillVersionRow, sqlx::Error>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
-{
-    sqlx::query_as::<_, SkillVersionRow>(
-        "INSERT INTO roz_skill_versions (skill_id, tenant_id, version, content) \
-         SELECT $1, tenant_id, $2, $3 FROM roz_skills WHERE id = $1 \
-         RETURNING *",
-    )
-    .bind(skill_id)
-    .bind(version)
-    .bind(content)
-    .fetch_one(executor)
-    .await
-}
-
-/// Get a specific version of a skill.
-pub async fn get_version<'e, E>(
-    executor: E,
-    skill_id: Uuid,
-    version: &str,
-) -> Result<Option<SkillVersionRow>, sqlx::Error>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
-{
-    sqlx::query_as::<_, SkillVersionRow>("SELECT * FROM roz_skill_versions WHERE skill_id = $1 AND version = $2")
-        .bind(skill_id)
-        .bind(version)
-        .fetch_optional(executor)
-        .await
-}
-
-/// List all versions for a skill, ordered by creation time (newest first).
-pub async fn list_versions<'e, E>(executor: E, skill_id: Uuid) -> Result<Vec<SkillVersionRow>, sqlx::Error>
-where
-    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
-{
-    sqlx::query_as::<_, SkillVersionRow>(
-        "SELECT * FROM roz_skill_versions WHERE skill_id = $1 ORDER BY created_at DESC",
-    )
-    .bind(skill_id)
-    .fetch_all(executor)
-    .await
-}
-
-// ---------------------------------------------------------------------------
-// Enhanced skill queries (Phase 4)
-// ---------------------------------------------------------------------------
-
-/// Create a skill with all Phase 4 metadata fields.
-#[allow(clippy::too_many_arguments)]
-pub async fn create_with_metadata<'e, E>(
-    executor: E,
-    tenant_id: Uuid,
     name: &str,
-    description: &str,
-    kind: &str,
-    tags: &[String],
-    platform: &[String],
-    requires_confirmation: bool,
-    parameters: &serde_json::Value,
-    safety_overrides: Option<&serde_json::Value>,
-    environment_constraints: &serde_json::Value,
-    allowed_tools: &[String],
+    version: &str,
+    body_md: &str,
+    frontmatter: &serde_json::Value,
+    source: &str,
+    created_by: &str,
 ) -> Result<SkillRow, sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
     sqlx::query_as::<_, SkillRow>(
         "INSERT INTO roz_skills \
-             (tenant_id, name, description, kind, tags, platform, \
-              requires_confirmation, parameters, safety_overrides, \
-              environment_constraints, allowed_tools) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
-         RETURNING *",
+             (tenant_id, name, version, body_md, frontmatter, source, created_by) \
+         VALUES (current_setting('rls.tenant_id')::uuid, $1, $2, $3, $4, $5, $6) \
+         RETURNING tenant_id, name, version, body_md, frontmatter, source, \
+                   created_by, created_at, updated_at",
     )
-    .bind(tenant_id)
     .bind(name)
-    .bind(description)
-    .bind(kind)
-    .bind(tags)
-    .bind(platform)
-    .bind(requires_confirmation)
-    .bind(parameters)
-    .bind(safety_overrides)
-    .bind(environment_constraints)
-    .bind(allowed_tools)
+    .bind(version)
+    .bind(body_md)
+    .bind(frontmatter)
+    .bind(source)
+    .bind(created_by)
     .fetch_one(executor)
     .await
 }
 
-/// List skills filtered by kind (`ai` or `execution`) for a tenant.
-pub async fn list_by_kind<'e, E>(
-    executor: E,
-    tenant_id: Uuid,
-    kind: &str,
-    limit: i64,
-    offset: i64,
-) -> Result<Vec<SkillRow>, sqlx::Error>
+/// D-12 / SKILL-05: most-recent N skills for the tier-0 PromptAssembler block.
+///
+/// Returns rows ordered by `created_at DESC`. Tenant scoping is enforced by RLS
+/// (caller invokes `set_tenant_context` first). `description` is extracted from
+/// `frontmatter->>'description'` and defaults to `""` if absent (CHECK on the
+/// table forbids empty descriptions, so `""` only surfaces for rows that
+/// pre-existed without a description — defensive).
+///
+/// # Errors
+///
+/// Returns `sqlx::Error` on RLS mismatch or connection failure.
+pub async fn list_recent<'e, E>(executor: E, limit: i64) -> Result<Vec<SkillSummary>, sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
-    sqlx::query_as::<_, SkillRow>(
-        "SELECT * FROM roz_skills \
-         WHERE tenant_id = $1 AND kind = $2 \
-         ORDER BY created_at DESC LIMIT $3 OFFSET $4",
+    sqlx::query_as::<_, SkillSummary>(
+        "SELECT name, version, \
+                COALESCE(frontmatter->>'description', '') AS description, \
+                created_at, created_by \
+         FROM roz_skills \
+         ORDER BY created_at DESC \
+         LIMIT $1",
     )
-    .bind(tenant_id)
-    .bind(kind)
     .bind(limit)
-    .bind(offset)
     .fetch_all(executor)
     .await
 }
 
-/// List skills that contain a specific tag (uses `@>` array containment).
-pub async fn list_by_tag<'e, E>(
-    executor: E,
-    tenant_id: Uuid,
-    tag: &str,
-    limit: i64,
-    offset: i64,
-) -> Result<Vec<SkillRow>, sqlx::Error>
+/// Fetch one row by the full composite key component `(name, version)` inside
+/// the current tenant (RLS). Returns `None` when absent.
+///
+/// # Errors
+///
+/// Returns `sqlx::Error` on RLS mismatch or connection failure.
+pub async fn get_by_name_version<'e, E>(executor: E, name: &str, version: &str) -> Result<Option<SkillRow>, sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
     sqlx::query_as::<_, SkillRow>(
-        "SELECT * FROM roz_skills \
-         WHERE tenant_id = $1 AND tags @> ARRAY[$2]::text[] \
-         ORDER BY created_at DESC LIMIT $3 OFFSET $4",
+        "SELECT tenant_id, name, version, body_md, frontmatter, source, \
+                created_by, created_at, updated_at \
+         FROM roz_skills \
+         WHERE name = $1 AND version = $2",
     )
-    .bind(tenant_id)
-    .bind(tag)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(executor)
+    .bind(name)
+    .bind(version)
+    .fetch_optional(executor)
     .await
 }
 
-/// Get a skill by name within a tenant, or `None` if not found.
-pub async fn get_by_name<'e, E>(executor: E, tenant_id: Uuid, name: &str) -> Result<Option<SkillRow>, sqlx::Error>
+/// RESEARCH OQ #2: client-side semver sort over up to 50 candidate rows.
+///
+/// We fetch the 50 most-recent versions of `name` and pick the one with the
+/// maximum `semver::Version`. Rows with unparseable `version` strings sort
+/// below valid ones (via the `max_by` ordering tiebreak below). Returns `None`
+/// if no rows match `name` inside the current tenant (RLS).
+///
+/// # Errors
+///
+/// Returns `sqlx::Error` on RLS mismatch or connection failure.
+pub async fn get_latest_by_semver<'e, E>(executor: E, name: &str) -> Result<Option<SkillRow>, sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
-    sqlx::query_as::<_, SkillRow>("SELECT * FROM roz_skills WHERE tenant_id = $1 AND name = $2")
-        .bind(tenant_id)
-        .bind(name)
-        .fetch_optional(executor)
-        .await
+    let rows = sqlx::query_as::<_, SkillRow>(
+        "SELECT tenant_id, name, version, body_md, frontmatter, source, \
+                created_by, created_at, updated_at \
+         FROM roz_skills \
+         WHERE name = $1 \
+         ORDER BY created_at DESC \
+         LIMIT 50",
+    )
+    .bind(name)
+    .fetch_all(executor)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .max_by(|a, b| match (Version::parse(&a.version), Version::parse(&b.version)) {
+            (Ok(va), Ok(vb)) => va.cmp(&vb),
+            (Ok(_), Err(_)) => std::cmp::Ordering::Greater,
+            (Err(_), Ok(_)) => std::cmp::Ordering::Less,
+            (Err(_), Err(_)) => std::cmp::Ordering::Equal,
+        }))
 }
 
-/// Search skills by name or description using case-insensitive pattern matching.
-pub async fn search<'e, E>(
-    executor: E,
-    tenant_id: Uuid,
-    query: &str,
-    limit: i64,
-    offset: i64,
-) -> Result<Vec<SkillRow>, sqlx::Error>
+/// SKILL-07 + D-15: CLI-only delete. `version: None` deletes every version of
+/// `name` inside the current tenant (RLS); `version: Some(v)` deletes exactly
+/// one row. Returns the number of rows removed.
+///
+/// gRPC layer (PLAN-05) gates `Delete` on `Permissions::can_write_skills`; this
+/// DB helper is not exposed to the agent (T-18-03-05 mitigation).
+///
+/// # Errors
+///
+/// Returns `sqlx::Error` on RLS mismatch or connection failure.
+pub async fn delete_skill<'e, E>(executor: E, name: &str, version: Option<&str>) -> Result<u64, sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
-    let pattern = format!("%{query}%");
-    sqlx::query_as::<_, SkillRow>(
-        "SELECT * FROM roz_skills \
-         WHERE tenant_id = $1 AND (name ILIKE $2 OR description ILIKE $2) \
-         ORDER BY created_at DESC LIMIT $3 OFFSET $4",
-    )
-    .bind(tenant_id)
-    .bind(&pattern)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(executor)
-    .await
+    let result = match version {
+        Some(v) => {
+            sqlx::query("DELETE FROM roz_skills WHERE name = $1 AND version = $2")
+                .bind(name)
+                .bind(v)
+                .execute(executor)
+                .await?
+        }
+        None => {
+            sqlx::query("DELETE FROM roz_skills WHERE name = $1")
+                .bind(name)
+                .execute(executor)
+                .await?
+        }
+    };
+    Ok(result.rows_affected())
+}
+
+/// Pure helper isolated for unit-test (no DB needed). Client-side semver sort
+/// mirroring [`get_latest_by_semver`]'s max-by predicate so the sort invariant
+/// is test-covered without a live database.
+#[must_use]
+pub fn pick_latest_semver(versions: &[String]) -> Option<String> {
+    versions
+        .iter()
+        .filter_map(|v| Version::parse(v).ok().map(|p| (p, v.clone())))
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, raw)| raw)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use sqlx::PgPool;
-    async fn setup() -> PgPool {
-        crate::shared_test_pool().await
+    use super::pick_latest_semver;
+
+    #[test]
+    fn latest_by_semver_picks_max_prerelease_aware() {
+        let versions: Vec<String> = ["1.2.3", "1.2.3-dev.1", "1.2.3-dev.10", "1.2.4-rc.1", "1.2.2"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        // Semver precedence: 1.2.4-rc.1 wins because (1,2,4) > (1,2,3).
+        // Proves the helper inherits semver::Version ordering.
+        assert_eq!(pick_latest_semver(&versions).as_deref(), Some("1.2.4-rc.1"));
     }
 
-    async fn create_test_tenant(pool: &PgPool) -> Uuid {
-        let slug = format!("test-{}", Uuid::new_v4());
-        crate::tenant::create_tenant(pool, "Test", &slug, "personal")
-            .await
-            .expect("Failed to create tenant")
-            .id
+    #[test]
+    fn latest_by_semver_handles_empty() {
+        let empty: Vec<String> = Vec::new();
+        assert!(pick_latest_semver(&empty).is_none());
     }
 
-    #[tokio::test]
-    async fn create_and_get_skill() {
-        let pool = setup().await;
-        let tenant_id = create_test_tenant(&pool).await;
-
-        let skill = create(&pool, tenant_id, "pick-and-place", "Picks up objects and places them")
-            .await
-            .expect("Failed to create skill");
-
-        assert_eq!(skill.tenant_id, tenant_id);
-        assert_eq!(skill.name, "pick-and-place");
-        assert_eq!(skill.description, "Picks up objects and places them");
-
-        let fetched = get_by_id(&pool, skill.id)
-            .await
-            .expect("Failed to get skill")
-            .expect("Skill should exist");
-
-        assert_eq!(fetched.id, skill.id);
-        assert_eq!(fetched.name, "pick-and-place");
+    #[test]
+    fn latest_by_semver_skips_unparseable() {
+        let versions: Vec<String> = vec!["not-a-version".into(), "1.0.0".into()];
+        assert_eq!(pick_latest_semver(&versions).as_deref(), Some("1.0.0"));
     }
 
-    #[tokio::test]
-    async fn list_skills() {
-        let pool = setup().await;
-        let tenant_id = create_test_tenant(&pool).await;
-
-        create(&pool, tenant_id, "skill-1", "desc-1")
-            .await
-            .expect("Failed to create skill-1");
-        create(&pool, tenant_id, "skill-2", "desc-2")
-            .await
-            .expect("Failed to create skill-2");
-
-        let skills = list(&pool, tenant_id, 100, 0).await.expect("Failed to list skills");
-        assert!(skills.len() >= 2, "expected at least 2, got {}", skills.len());
-        assert!(skills.iter().all(|s| s.tenant_id == tenant_id));
-    }
-
-    #[tokio::test]
-    async fn update_skill() {
-        let pool = setup().await;
-        let tenant_id = create_test_tenant(&pool).await;
-
-        let skill = create(&pool, tenant_id, "old-name", "old-desc")
-            .await
-            .expect("Failed to create skill");
-
-        let updated = update(&pool, skill.id, Some("new-name"), None)
-            .await
-            .expect("Failed to update skill")
-            .expect("Skill should exist");
-
-        assert_eq!(updated.name, "new-name");
-        assert_eq!(updated.description, "old-desc"); // unchanged
-    }
-
-    #[tokio::test]
-    async fn delete_skill() {
-        let pool = setup().await;
-        let tenant_id = create_test_tenant(&pool).await;
-
-        let skill = create(&pool, tenant_id, "to-delete", "gone soon")
-            .await
-            .expect("Failed to create skill");
-
-        let deleted = delete(&pool, skill.id).await.expect("Failed to delete");
-        assert!(deleted);
-
-        let gone = get_by_id(&pool, skill.id).await.expect("Failed to get");
-        assert!(gone.is_none());
-    }
-
-    #[tokio::test]
-    async fn create_and_get_version() {
-        let pool = setup().await;
-        let tenant_id = create_test_tenant(&pool).await;
-
-        let skill = create(&pool, tenant_id, "nav-skill", "Navigation skill")
-            .await
-            .expect("Failed to create skill");
-
-        let v1 = create_version(&pool, skill.id, "1.0.0", "def navigate(): pass")
-            .await
-            .expect("Failed to create version");
-
-        assert_eq!(v1.skill_id, skill.id);
-        assert_eq!(v1.tenant_id, tenant_id);
-        assert_eq!(v1.version, "1.0.0");
-        assert_eq!(v1.content, "def navigate(): pass");
-
-        let fetched = get_version(&pool, skill.id, "1.0.0")
-            .await
-            .expect("Failed to get version")
-            .expect("Version should exist");
-
-        assert_eq!(fetched.id, v1.id);
-        assert_eq!(fetched.version, "1.0.0");
-    }
-
-    #[tokio::test]
-    async fn list_skill_versions() {
-        let pool = setup().await;
-        let tenant_id = create_test_tenant(&pool).await;
-
-        let skill = create(&pool, tenant_id, "versioned-skill", "has versions")
-            .await
-            .expect("Failed to create skill");
-
-        create_version(&pool, skill.id, "1.0.0", "v1 code")
-            .await
-            .expect("Failed to create v1");
-        create_version(&pool, skill.id, "1.1.0", "v1.1 code")
-            .await
-            .expect("Failed to create v1.1");
-        create_version(&pool, skill.id, "2.0.0", "v2 code")
-            .await
-            .expect("Failed to create v2");
-
-        let versions = list_versions(&pool, skill.id).await.expect("Failed to list versions");
-        assert_eq!(versions.len(), 3);
-        // Newest first
-        assert_eq!(versions[0].version, "2.0.0");
-    }
-
-    #[tokio::test]
-    async fn rls_tenant_isolation_skills() {
-        let pool = setup().await;
-        let tenant_a = create_test_tenant(&pool).await;
-        let tenant_b = create_test_tenant(&pool).await;
-
-        create(&pool, tenant_a, "skill-a", "tenant A skill")
-            .await
-            .expect("Failed to create skill-a");
-        create(&pool, tenant_b, "skill-b", "tenant B skill")
-            .await
-            .expect("Failed to create skill-b");
-
-        let test_role = format!("roz_test_{}", Uuid::new_v4().to_string().replace('-', ""));
-
-        sqlx::query(&format!("CREATE ROLE {test_role} NOLOGIN"))
-            .execute(&pool)
-            .await
-            .expect("Failed to create test role");
-        crate::grant_public_schema_usage_for_test_role(&pool, &test_role)
-            .await
-            .expect("Failed to grant schema usage");
-        sqlx::query(&format!("GRANT SELECT ON roz_skills TO {test_role}"))
-            .execute(&pool)
-            .await
-            .expect("Failed to grant select");
-
-        // As tenant A: should only see skill-a
-        let mut tx = pool.begin().await.expect("Failed to begin tx");
-        sqlx::query(&format!("SET LOCAL ROLE {test_role}"))
-            .execute(&mut *tx)
-            .await
-            .expect("Failed to set role");
-        sqlx::query("SELECT set_config('rls.tenant_id', $1, true)")
-            .bind(tenant_a.to_string())
-            .execute(&mut *tx)
-            .await
-            .expect("Failed to set tenant context");
-
-        let skills: Vec<(String,)> = sqlx::query_as("SELECT name FROM roz_skills")
-            .fetch_all(&mut *tx)
-            .await
-            .expect("Failed to query skills");
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].0, "skill-a");
-        tx.rollback().await.expect("Failed to rollback");
-
-        // As tenant B: should only see skill-b
-        let mut tx = pool.begin().await.expect("Failed to begin tx");
-        sqlx::query(&format!("SET LOCAL ROLE {test_role}"))
-            .execute(&mut *tx)
-            .await
-            .expect("Failed to set role");
-        sqlx::query("SELECT set_config('rls.tenant_id', $1, true)")
-            .bind(tenant_b.to_string())
-            .execute(&mut *tx)
-            .await
-            .expect("Failed to set tenant context");
-        let skills: Vec<(String,)> = sqlx::query_as("SELECT name FROM roz_skills")
-            .fetch_all(&mut *tx)
-            .await
-            .expect("Failed to query skills");
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].0, "skill-b");
-        tx.rollback().await.expect("Failed to rollback");
-
-        // Cleanup
-        sqlx::query(&format!("REVOKE ALL ON roz_skills FROM {test_role}"))
-            .execute(&pool)
-            .await
-            .ok();
-        sqlx::query(&format!("REVOKE USAGE ON SCHEMA public FROM {test_role}"))
-            .execute(&pool)
-            .await
-            .ok();
-        sqlx::query(&format!("DROP ROLE IF EXISTS {test_role}"))
-            .execute(&pool)
-            .await
-            .ok();
-    }
-
-    #[tokio::test]
-    async fn rls_tenant_isolation_skill_versions() {
-        let pool = setup().await;
-        let tenant_a = create_test_tenant(&pool).await;
-        let tenant_b = create_test_tenant(&pool).await;
-
-        let skill_a = create(&pool, tenant_a, "sv-skill-a", "a")
-            .await
-            .expect("Failed to create skill-a");
-        let skill_b = create(&pool, tenant_b, "sv-skill-b", "b")
-            .await
-            .expect("Failed to create skill-b");
-
-        create_version(&pool, skill_a.id, "1.0.0", "code-a")
-            .await
-            .expect("Failed to create version-a");
-        create_version(&pool, skill_b.id, "1.0.0", "code-b")
-            .await
-            .expect("Failed to create version-b");
-
-        let test_role = format!("roz_test_{}", Uuid::new_v4().to_string().replace('-', ""));
-
-        sqlx::query(&format!("CREATE ROLE {test_role} NOLOGIN"))
-            .execute(&pool)
-            .await
-            .expect("Failed to create test role");
-        crate::grant_public_schema_usage_for_test_role(&pool, &test_role)
-            .await
-            .expect("Failed to grant schema usage");
-        sqlx::query(&format!("GRANT SELECT ON roz_skill_versions TO {test_role}"))
-            .execute(&pool)
-            .await
-            .expect("Failed to grant select");
-
-        // As tenant A: should only see version-a
-        let mut tx = pool.begin().await.expect("Failed to begin tx");
-        sqlx::query(&format!("SET LOCAL ROLE {test_role}"))
-            .execute(&mut *tx)
-            .await
-            .expect("Failed to set role");
-        sqlx::query("SELECT set_config('rls.tenant_id', $1, true)")
-            .bind(tenant_a.to_string())
-            .execute(&mut *tx)
-            .await
-            .expect("Failed to set tenant context");
-
-        let versions: Vec<(String,)> = sqlx::query_as("SELECT content FROM roz_skill_versions")
-            .fetch_all(&mut *tx)
-            .await
-            .expect("Failed to query versions");
-        assert_eq!(versions.len(), 1);
-        assert_eq!(versions[0].0, "code-a");
-        tx.rollback().await.expect("Failed to rollback");
-
-        // As tenant B: should only see version-b
-        let mut tx = pool.begin().await.expect("Failed to begin tx");
-        sqlx::query(&format!("SET LOCAL ROLE {test_role}"))
-            .execute(&mut *tx)
-            .await
-            .expect("Failed to set role");
-        sqlx::query("SELECT set_config('rls.tenant_id', $1, true)")
-            .bind(tenant_b.to_string())
-            .execute(&mut *tx)
-            .await
-            .expect("Failed to set tenant context");
-        let versions: Vec<(String,)> = sqlx::query_as("SELECT content FROM roz_skill_versions")
-            .fetch_all(&mut *tx)
-            .await
-            .expect("Failed to query versions");
-        assert_eq!(versions.len(), 1);
-        assert_eq!(versions[0].0, "code-b");
-        tx.rollback().await.expect("Failed to rollback");
-
-        // Cleanup
-        sqlx::query(&format!("REVOKE ALL ON roz_skill_versions FROM {test_role}"))
-            .execute(&pool)
-            .await
-            .ok();
-        sqlx::query(&format!("REVOKE USAGE ON SCHEMA public FROM {test_role}"))
-            .execute(&pool)
-            .await
-            .ok();
-        sqlx::query(&format!("DROP ROLE IF EXISTS {test_role}"))
-            .execute(&pool)
-            .await
-            .ok();
-    }
-
-    // -----------------------------------------------------------------------
-    // Phase 4: enhanced skill query tests
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn create_with_metadata_full() {
-        let pool = setup().await;
-        let tenant_id = create_test_tenant(&pool).await;
-
-        let params = serde_json::json!([{"name": "speed", "type": "float"}]);
-        let overrides = serde_json::json!({"max_velocity": 1.5});
-        let env_constraints = serde_json::json!([{"key": "indoor", "value": true}]);
-
-        let skill = create_with_metadata(
-            &pool,
-            tenant_id,
-            "assembly-task",
-            "Assembles parts on a workcell",
-            "execution",
-            &["manufacturing".to_owned(), "assembly".to_owned()],
-            &["ur5e".to_owned()],
-            true,
-            &params,
-            Some(&overrides),
-            &env_constraints,
-            &["gripper".to_owned(), "camera".to_owned()],
-        )
-        .await
-        .expect("Failed to create skill with metadata");
-
-        assert_eq!(skill.tenant_id, tenant_id);
-        assert_eq!(skill.name, "assembly-task");
-        assert_eq!(skill.kind, "execution");
-        assert_eq!(skill.tags, vec!["manufacturing", "assembly"]);
-        assert_eq!(skill.platform, vec!["ur5e"]);
-        assert!(skill.requires_confirmation);
-        assert_eq!(skill.parameters, params);
-        assert_eq!(skill.safety_overrides, Some(overrides));
-        assert_eq!(skill.environment_constraints, env_constraints);
-        assert_eq!(skill.allowed_tools, vec!["gripper", "camera"]);
-    }
-
-    #[tokio::test]
-    async fn create_with_metadata_defaults() {
-        let pool = setup().await;
-        let tenant_id = create_test_tenant(&pool).await;
-
-        let skill = create_with_metadata(
-            &pool,
-            tenant_id,
-            "simple-ai-skill",
-            "Uses defaults",
-            "ai",
-            &[],
-            &[],
-            false,
-            &serde_json::json!([]),
-            None,
-            &serde_json::json!([]),
-            &[],
-        )
-        .await
-        .expect("Failed to create skill with defaults");
-
-        assert_eq!(skill.kind, "ai");
-        assert!(skill.tags.is_empty());
-        assert!(skill.platform.is_empty());
-        assert!(!skill.requires_confirmation);
-        assert_eq!(skill.parameters, serde_json::json!([]));
-        assert!(skill.safety_overrides.is_none());
-        assert!(skill.allowed_tools.is_empty());
-    }
-
-    #[tokio::test]
-    async fn list_by_kind_filters() {
-        let pool = setup().await;
-        let tenant_id = create_test_tenant(&pool).await;
-
-        create_with_metadata(
-            &pool,
-            tenant_id,
-            "ai-skill-1",
-            "AI skill",
-            "ai",
-            &[],
-            &[],
-            false,
-            &serde_json::json!([]),
-            None,
-            &serde_json::json!([]),
-            &[],
-        )
-        .await
-        .expect("Failed to create ai skill");
-
-        create_with_metadata(
-            &pool,
-            tenant_id,
-            "exec-skill-1",
-            "Execution skill",
-            "execution",
-            &[],
-            &[],
-            false,
-            &serde_json::json!([]),
-            None,
-            &serde_json::json!([]),
-            &[],
-        )
-        .await
-        .expect("Failed to create execution skill");
-
-        let ai_skills = list_by_kind(&pool, tenant_id, "ai", 100, 0)
-            .await
-            .expect("Failed to list ai skills");
-        assert!(ai_skills.iter().all(|s| s.kind == "ai"));
-        assert!(ai_skills.iter().any(|s| s.name == "ai-skill-1"));
-
-        let exec_skills = list_by_kind(&pool, tenant_id, "execution", 100, 0)
-            .await
-            .expect("Failed to list execution skills");
-        assert!(exec_skills.iter().all(|s| s.kind == "execution"));
-        assert!(exec_skills.iter().any(|s| s.name == "exec-skill-1"));
-    }
-
-    #[tokio::test]
-    async fn list_by_tag_filters() {
-        let pool = setup().await;
-        let tenant_id = create_test_tenant(&pool).await;
-
-        create_with_metadata(
-            &pool,
-            tenant_id,
-            "tagged-skill-a",
-            "Has navigation tag",
-            "ai",
-            &["navigation".to_owned(), "outdoor".to_owned()],
-            &[],
-            false,
-            &serde_json::json!([]),
-            None,
-            &serde_json::json!([]),
-            &[],
-        )
-        .await
-        .expect("Failed to create tagged skill a");
-
-        create_with_metadata(
-            &pool,
-            tenant_id,
-            "tagged-skill-b",
-            "Has manipulation tag",
-            "ai",
-            &["manipulation".to_owned()],
-            &[],
-            false,
-            &serde_json::json!([]),
-            None,
-            &serde_json::json!([]),
-            &[],
-        )
-        .await
-        .expect("Failed to create tagged skill b");
-
-        let nav_skills = list_by_tag(&pool, tenant_id, "navigation", 100, 0)
-            .await
-            .expect("Failed to list by tag");
-        assert!(!nav_skills.is_empty());
-        assert!(nav_skills.iter().all(|s| s.tags.contains(&"navigation".to_owned())));
-        assert!(nav_skills.iter().any(|s| s.name == "tagged-skill-a"));
-
-        let manip_skills = list_by_tag(&pool, tenant_id, "manipulation", 100, 0)
-            .await
-            .expect("Failed to list by manipulation tag");
-        assert!(manip_skills.iter().any(|s| s.name == "tagged-skill-b"));
-        assert!(!manip_skills.iter().any(|s| s.name == "tagged-skill-a"));
-    }
-
-    #[tokio::test]
-    async fn get_by_name_found_and_missing() {
-        let pool = setup().await;
-        let tenant_id = create_test_tenant(&pool).await;
-
-        create(&pool, tenant_id, "unique-name-test", "desc")
-            .await
-            .expect("Failed to create skill");
-
-        let found = get_by_name(&pool, tenant_id, "unique-name-test")
-            .await
-            .expect("Failed to get by name")
-            .expect("Skill should exist");
-        assert_eq!(found.name, "unique-name-test");
-        assert_eq!(found.tenant_id, tenant_id);
-
-        let missing = get_by_name(&pool, tenant_id, "nonexistent-skill")
-            .await
-            .expect("Failed to get by name");
-        assert!(missing.is_none());
-    }
-
-    #[tokio::test]
-    async fn get_by_name_tenant_isolation() {
-        let pool = setup().await;
-        let tenant_a = create_test_tenant(&pool).await;
-        let tenant_b = create_test_tenant(&pool).await;
-
-        create(&pool, tenant_a, "shared-name", "tenant A version")
-            .await
-            .expect("Failed to create skill for tenant A");
-        create(&pool, tenant_b, "shared-name", "tenant B version")
-            .await
-            .expect("Failed to create skill for tenant B");
-
-        let found_a = get_by_name(&pool, tenant_a, "shared-name")
-            .await
-            .expect("Failed to get by name")
-            .expect("Skill should exist for tenant A");
-        assert_eq!(found_a.tenant_id, tenant_a);
-        assert_eq!(found_a.description, "tenant A version");
-
-        let found_b = get_by_name(&pool, tenant_b, "shared-name")
-            .await
-            .expect("Failed to get by name")
-            .expect("Skill should exist for tenant B");
-        assert_eq!(found_b.tenant_id, tenant_b);
-        assert_eq!(found_b.description, "tenant B version");
-    }
-
-    #[tokio::test]
-    async fn search_by_name_and_description() {
-        let pool = setup().await;
-        let tenant_id = create_test_tenant(&pool).await;
-
-        create(&pool, tenant_id, "pick-and-place", "Grasps objects and moves them")
-            .await
-            .expect("Failed to create pick-and-place");
-        create(&pool, tenant_id, "navigate-corridor", "Navigates through corridors")
-            .await
-            .expect("Failed to create navigate-corridor");
-        create(&pool, tenant_id, "inspect-weld", "Inspects weld quality with a camera")
-            .await
-            .expect("Failed to create inspect-weld");
-
-        // Search by name substring
-        let results = search(&pool, tenant_id, "navigate", 100, 0)
-            .await
-            .expect("Failed to search");
-        assert!(results.iter().any(|s| s.name == "navigate-corridor"));
-        assert!(!results.iter().any(|s| s.name == "pick-and-place"));
-
-        // Search by description substring
-        let results = search(&pool, tenant_id, "camera", 100, 0)
-            .await
-            .expect("Failed to search by description");
-        assert!(results.iter().any(|s| s.name == "inspect-weld"));
-
-        // Case insensitivity
-        let results = search(&pool, tenant_id, "NAVIGATE", 100, 0)
-            .await
-            .expect("Failed to search case-insensitive");
-        assert!(results.iter().any(|s| s.name == "navigate-corridor"));
-
-        // No results for unrelated query
-        let results = search(&pool, tenant_id, "zzz-no-match-zzz", 100, 0)
-            .await
-            .expect("Failed to search no match");
-        assert!(results.is_empty());
-    }
-
-    #[tokio::test]
-    async fn search_respects_pagination() {
-        let pool = setup().await;
-        let tenant_id = create_test_tenant(&pool).await;
-
-        for i in 0..5 {
-            create(
-                &pool,
-                tenant_id,
-                &format!("paginated-skill-{i}"),
-                "Paginated test skill",
-            )
-            .await
-            .unwrap_or_else(|_| panic!("Failed to create paginated-skill-{i}"));
-        }
-
-        let page1 = search(&pool, tenant_id, "paginated-skill", 2, 0)
-            .await
-            .expect("Failed to search page 1");
-        assert_eq!(page1.len(), 2);
-
-        let page2 = search(&pool, tenant_id, "paginated-skill", 2, 2)
-            .await
-            .expect("Failed to search page 2");
-        assert_eq!(page2.len(), 2);
-
-        // No overlap
-        let page1_ids: Vec<Uuid> = page1.iter().map(|s| s.id).collect();
-        assert!(page2.iter().all(|s| !page1_ids.contains(&s.id)));
+    #[test]
+    fn latest_by_semver_numeric_prerelease_ordering() {
+        // Proves we use semver::Version::cmp (numeric prerelease) not lexical —
+        // lexical ordering would return "dev.1" as larger than "dev.10".
+        let versions: Vec<String> = vec!["1.2.3-dev.1".into(), "1.2.3-dev.10".into()];
+        assert_eq!(pick_latest_semver(&versions).as_deref(), Some("1.2.3-dev.10"));
     }
 }

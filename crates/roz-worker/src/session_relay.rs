@@ -86,6 +86,7 @@ impl EdgeToolDefinition {
     fn category(&self) -> ToolCategory {
         match self.category.as_deref() {
             Some("pure") => ToolCategory::Pure,
+            Some("code_sandbox") => ToolCategory::CodeSandbox,
             _ => ToolCategory::Physical,
         }
     }
@@ -287,11 +288,14 @@ fn edge_turn_prompt_state(
                 } else {
                     "require_confirmation".into()
                 },
-                category: Some(if matches!(category, ToolCategory::Pure) {
-                    "pure".into()
-                } else {
-                    "physical".into()
-                }),
+                category: Some(
+                    match category {
+                        ToolCategory::Pure => "pure",
+                        ToolCategory::CodeSandbox => "code_sandbox",
+                        ToolCategory::Physical => "physical",
+                    }
+                    .into(),
+                ),
                 reason: None,
             })
             .collect()
@@ -370,6 +374,7 @@ struct EdgeTurnExecutor {
     estop_rx: tokio::sync::watch::Receiver<bool>,
     pending_results: PendingResults,
     approval_runtime: ApprovalRuntimeHandle,
+    event_emitter: roz_agent::session_runtime::EventEmitter,
     turn_tools: Vec<EdgeToolDefinition>,
     turn_cancel: CancellationToken,
 }
@@ -393,6 +398,7 @@ impl EdgeTurnExecutor {
         spatial_provider: Arc<PrimedWorldStateProvider>,
         pending_results: PendingResults,
         approval_runtime: ApprovalRuntimeHandle,
+        event_emitter: roz_agent::session_runtime::EventEmitter,
         turn_tools: Vec<EdgeToolDefinition>,
     ) -> Result<(AgentLoop, Option<mpsc::Receiver<RemoteToolCall>>), Box<dyn std::error::Error + Send + Sync>> {
         let model = crate::model_factory::build_model(config, Some(model_name)).map_err(|error| {
@@ -400,6 +406,7 @@ impl EdgeTurnExecutor {
         })?;
         let mut dispatcher = ToolDispatcher::new(Duration::from_secs(30));
         let mut extensions = Extensions::new();
+        extensions.insert(event_emitter);
         register_edge_camera_tools(
             &mut dispatcher,
             &mut extensions,
@@ -452,6 +459,7 @@ impl StreamingTurnExecutor for EdgeTurnExecutor {
         let spatial_provider = Arc::clone(&self.spatial_provider);
         let pending_results = self.pending_results.clone();
         let approval_runtime = self.approval_runtime.clone();
+        let event_emitter = self.event_emitter.clone();
         let turn_tools = self.turn_tools.clone();
         let session_id = self.session_id.clone();
         let tenant_id = self.tenant_id.clone();
@@ -472,6 +480,7 @@ impl StreamingTurnExecutor for EdgeTurnExecutor {
             Arc::clone(&spatial_provider),
             pending_results.clone(),
             approval_runtime.clone(),
+            event_emitter,
             turn_tools,
         ) {
             Ok((agent, tool_call_rx)) => (Some(agent), tool_call_rx, None),
@@ -752,6 +761,7 @@ async fn handle_edge_session(
         estop_rx: estop_rx.clone(),
         pending_results: Arc::new(std::sync::Mutex::new(HashMap::new())),
         approval_runtime: session_runtime.approval_handle(),
+        event_emitter: session_runtime.event_emitter(),
         turn_tools: Vec::new(),
         turn_cancel: CancellationToken::new(),
     };

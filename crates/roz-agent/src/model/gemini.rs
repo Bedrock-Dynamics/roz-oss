@@ -9,6 +9,7 @@ use super::types::{
     CompletionRequest, CompletionResponse, ContentPart, Message, MessageRole, Model, ModelCapability, StopReason,
     TokenUsage, ToolChoiceStrategy,
 };
+use crate::error::AgentError;
 
 // ---------------------------------------------------------------------------
 // Request types
@@ -98,6 +99,15 @@ pub struct FunctionDeclaration {
 pub struct GenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
+    /// Plan 19-12: per-call structured-output schema. Serializes as
+    /// `responseSchema` on the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_schema: Option<Value>,
+    /// Plan 19-12: when `response_schema` is set, also pin the response MIME
+    /// type to `application/json` (Gemini server-side native structured-output
+    /// contract). Serializes as `responseMimeType`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_mime_type: Option<String>,
 }
 
 /// Tool configuration for controlling function calling behavior.
@@ -360,6 +370,78 @@ impl Model for GeminiProvider {
         &self,
         req: &CompletionRequest,
     ) -> Result<CompletionResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let api_req = self.build_request(req);
+        let resp = self.send_request(&api_req).await?;
+        let mut converted = Self::convert_response(resp);
+
+        // Plan 19-12: when a response_schema is set, treat the assistant text as
+        // JSON and run the shared parse/repair pipeline.
+        let Some(schema) = req.response_schema.as_ref() else {
+            return Ok(converted);
+        };
+
+        let raw1 = converted.text().unwrap_or_default();
+        let response2_cell: std::sync::Mutex<Option<CompletionResponse>> = std::sync::Mutex::new(None);
+        let parsed = {
+            let response2_cell_ref = &response2_cell;
+            let retry = |raw: String, instruction: String| async move {
+                let mut retry_req = req.clone();
+                retry_req.messages.push(Message::assistant_text(raw));
+                retry_req.messages.push(Message::user(instruction));
+                // Preserve response_schema on the retry so the schema is still attached.
+                let retry_api_req = self.build_request(&retry_req);
+                let resp2 = self
+                    .send_request(&retry_api_req)
+                    .await
+                    .map_err(|e| AgentError::Model(Box::<dyn std::error::Error + Send + Sync>::from(e.to_string())))?;
+                let converted2 = Self::convert_response(resp2);
+                let raw2 = converted2.text().unwrap_or_default();
+                *response2_cell_ref.lock().expect("response2 mutex poisoned") = Some(converted2);
+                Ok::<_, AgentError>(raw2)
+            };
+            crate::model::structured_output::apply_repair_loop(raw1, schema, retry)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+        };
+
+        // If the retry fired, sum usage and adopt response2 as the canonical shell.
+        if let Some(converted2) = response2_cell.into_inner().expect("response2 mutex poisoned") {
+            let summed = TokenUsage {
+                input_tokens: converted
+                    .usage
+                    .input_tokens
+                    .saturating_add(converted2.usage.input_tokens),
+                output_tokens: converted
+                    .usage
+                    .output_tokens
+                    .saturating_add(converted2.usage.output_tokens),
+                cache_read_tokens: converted
+                    .usage
+                    .cache_read_tokens
+                    .saturating_add(converted2.usage.cache_read_tokens),
+                cache_creation_tokens: converted
+                    .usage
+                    .cache_creation_tokens
+                    .saturating_add(converted2.usage.cache_creation_tokens),
+            };
+            converted = converted2;
+            converted.usage = summed;
+        }
+
+        let canonical = serde_json::to_string(&parsed).unwrap_or_default();
+        replace_or_set_text(&mut converted, canonical);
+        Ok(converted)
+    }
+}
+
+impl GeminiProvider {
+    /// Build the wire `GeminiRequest` body shared by `complete` and the
+    /// response_schema repair-retry path.
+    ///
+    /// Honors `CompletionRequest::response_schema` by setting
+    /// `generationConfig.responseSchema` + `responseMimeType =
+    /// "application/json"` (Plan 19-12).
+    fn build_request(&self, req: &CompletionRequest) -> GeminiRequest {
         let (system, mut contents) = Self::convert_messages(&req.messages);
 
         // Gemini doesn't have a separate system field; prepend to first user message
@@ -375,9 +457,12 @@ impl Model for GeminiProvider {
         }
 
         let tools = Self::convert_tools(&req.tools);
-
         let has_tools = !tools.is_empty();
-        let api_req = GeminiRequest {
+        let (response_schema, response_mime_type) = req.response_schema.as_ref().map_or((None, None), |s| {
+            (Some(s.clone()), Some("application/json".to_string()))
+        });
+
+        GeminiRequest {
             contents,
             tools: if has_tools { Some(tools) } else { None },
             tool_config: if has_tools {
@@ -387,22 +472,41 @@ impl Model for GeminiProvider {
             },
             generation_config: Some(GenerationConfig {
                 max_output_tokens: Some(req.max_tokens),
+                response_schema,
+                response_mime_type,
             }),
-        };
+        }
+    }
 
+    /// Send a built `GeminiRequest` and deserialize the response.
+    async fn send_request(
+        &self,
+        api_req: &GeminiRequest,
+    ) -> Result<GeminiResponse, Box<dyn std::error::Error + Send + Sync>> {
         let resp = self
             .client
             .post(self.api_url())
             .header("authorization", format!("Bearer {}", self.config.api_key))
-            .json(&api_req)
+            .json(api_req)
             .send()
             .await?
             .error_for_status()?
             .json::<GeminiResponse>()
             .await?;
-
-        Ok(Self::convert_response(resp))
+        Ok(resp)
     }
+}
+
+/// Replace the first `ContentPart::Text` in `resp.parts` with `text`, or push
+/// one if none exists.
+fn replace_or_set_text(resp: &mut CompletionResponse, text: String) {
+    for part in &mut resp.parts {
+        if let ContentPart::Text { text: t } = part {
+            *t = text;
+            return;
+        }
+    }
+    resp.parts.push(ContentPart::Text { text });
 }
 
 #[cfg(test)]
@@ -429,6 +533,8 @@ mod tests {
             tool_config: None,
             generation_config: Some(GenerationConfig {
                 max_output_tokens: Some(4096),
+                response_schema: None,
+                response_mime_type: None,
             }),
         };
 

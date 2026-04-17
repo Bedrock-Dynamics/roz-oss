@@ -1,0 +1,8 @@
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_o1","type":"function","function":{"name":"move_arm","arguments":""}}]},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"x\":1}"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+

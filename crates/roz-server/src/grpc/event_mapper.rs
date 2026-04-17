@@ -355,6 +355,17 @@ fn typed_event_proto(event: &SessionEvent) -> Option<roz_v1::session_event_envel
                 affected_capabilities: affected_capabilities.clone(),
             },
         )),
+        SessionEvent::McpServerDegraded {
+            server_name,
+            failure_count,
+            last_error,
+        } => Some(roz_v1::session_event_envelope::TypedEvent::McpServerDegraded(
+            roz_v1::McpServerDegradedPayload {
+                server_name: server_name.clone(),
+                failure_count: *failure_count,
+                last_error: last_error.clone(),
+            },
+        )),
         SessionEvent::ReasoningTrace {
             turn_index,
             cycle_index,
@@ -447,6 +458,19 @@ fn typed_event_proto(event: &SessionEvent) -> Option<roz_v1::session_event_envel
                 operator_comment: operator_comment.clone(),
             },
         )),
+        SessionEvent::SkillLoaded { name, version } => Some(roz_v1::session_event_envelope::TypedEvent::SkillLoaded(
+            roz_v1::SkillLoadedPayload {
+                name: name.clone(),
+                version: version.clone(),
+            },
+        )),
+        SessionEvent::SkillCrystallized { name, version, source } => Some(
+            roz_v1::session_event_envelope::TypedEvent::SkillCrystallized(roz_v1::SkillCrystallizedPayload {
+                name: name.clone(),
+                version: version.clone(),
+                source: source.clone(),
+            }),
+        ),
         SessionEvent::ContextCompacted {
             level,
             messages_affected,
@@ -1129,6 +1153,49 @@ mod tests {
                     assert_eq!(outcome["type"], "approved");
                 }
                 other => panic!("expected typed feedback_received payload, got {other:?}"),
+            },
+            other => panic!("expected SessionEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn canonical_session_event_to_response_wraps_typed_skill_events() {
+        let loaded = canonical_session_event_to_response(
+            SessionEvent::SkillLoaded {
+                name: "warehouse-skill".into(),
+                version: "0.1.0".into(),
+            },
+            CorrelationId("corr-skill-loaded".into()),
+        );
+
+        match loaded {
+            session_response::Response::SessionEvent(event) => match event.typed_event {
+                Some(roz_v1::session_event_envelope::TypedEvent::SkillLoaded(payload)) => {
+                    assert_eq!(payload.name, "warehouse-skill");
+                    assert_eq!(payload.version, "0.1.0");
+                }
+                other => panic!("expected typed skill_loaded payload, got {other:?}"),
+            },
+            other => panic!("expected SessionEvent, got {other:?}"),
+        }
+
+        let crystallized = canonical_session_event_to_response(
+            SessionEvent::SkillCrystallized {
+                name: "warehouse-skill".into(),
+                version: "0.2.0".into(),
+                source: "local".into(),
+            },
+            CorrelationId("corr-skill-crystallized".into()),
+        );
+
+        match crystallized {
+            session_response::Response::SessionEvent(event) => match event.typed_event {
+                Some(roz_v1::session_event_envelope::TypedEvent::SkillCrystallized(payload)) => {
+                    assert_eq!(payload.name, "warehouse-skill");
+                    assert_eq!(payload.version, "0.2.0");
+                    assert_eq!(payload.source, "local");
+                }
+                other => panic!("expected typed skill_crystallized payload, got {other:?}"),
             },
             other => panic!("expected SessionEvent, got {other:?}"),
         }

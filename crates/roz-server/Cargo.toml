@@ -9,8 +9,10 @@ authors.workspace      = true
 [dependencies]
 roz-core = { path = "../roz-core" }
 roz-db = { path = "../roz-db" }
+roz-mcp = { path = "../roz-mcp" }
 roz-nats = { path = "../roz-nats" }
 roz-agent = { path = "../roz-agent" }
+roz-openai = { path = "../roz-openai" }
 axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
@@ -46,6 +48,13 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 eventsource-stream = "0.2"
 hickory-resolver = { workspace = true }
+object_store = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+tempfile = { workspace = true }
+semver = { workspace = true }
+serde_yaml = { workspace = true }
+secrecy = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }
@@ -60,6 +69,8 @@ roz-proto = { path = "../roz-proto" }
 nkeys = { workspace = true }
 proptest = "1.6"
 image = { workspace = true }
+serial_test = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

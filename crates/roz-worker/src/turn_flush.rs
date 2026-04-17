@@ -11,7 +11,9 @@
 //! 2. Calling `cancel.cancel()` + `handle.await` on every exit path to
 //!    drain the flush task before `execute_task` returns.
 
+use roz_agent::agent_loop::turn_emitter::TurnEnvelope;
 use roz_agent::agent_loop::{TurnEmitter, run_flush_task};
+use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -23,6 +25,16 @@ pub struct TurnFlushBundle {
     pub emitter: Option<TurnEmitter>,
     pub handle: Option<JoinHandle<()>>,
     pub cancel: CancellationToken,
+    /// Shared PgPool used by the flush task. Cloned into
+    /// `ToolContext::extensions` so the MEM-07 Pure tools (session_search,
+    /// memory_read, memory_write, user_model_query) reach Postgres without
+    /// opening a parallel pool. `None` on fail-closed paths.
+    pub pool: Option<sqlx::PgPool>,
+    /// MEM-03: fan-out receiver for the fact extractor. `None` when
+    /// persistence is off (no DB). Worker bootstrap (`main.rs`) spawns
+    /// `run_fact_extractor_task` against this receiver when an aux-LLM is
+    /// available.
+    pub fact_rx: Option<Receiver<TurnEnvelope>>,
 }
 
 impl TurnFlushBundle {
@@ -48,6 +60,8 @@ pub async fn build_turn_flush(config: &WorkerConfig) -> TurnFlushBundle {
             emitter: None,
             handle: None,
             cancel,
+            pool: None,
+            fact_rx: None,
         };
     };
 
@@ -62,20 +76,27 @@ pub async fn build_turn_flush(config: &WorkerConfig) -> TurnFlushBundle {
                 emitter: None,
                 handle: None,
                 cancel,
+                pool: None,
+                fact_rx: None,
             };
         }
     };
 
-    let (emitter, rx) = TurnEmitter::new();
+    // MEM-03: fan out the emitter so the fact-extractor (spawned by the
+    // worker bootstrap) receives an independent stream of envelopes.
+    let (emitter, rx, fact_rx) = TurnEmitter::with_fact_extractor(roz_agent::agent_loop::TURN_BUFFER_CAPACITY);
     let flush_cancel = cancel.clone();
+    let flush_pool = pool.clone();
     let handle = tokio::spawn(async move {
-        run_flush_task(rx, pool, flush_cancel).await;
+        run_flush_task(rx, flush_pool, flush_cancel).await;
     });
 
     TurnFlushBundle {
         emitter: Some(emitter),
         handle: Some(handle),
         cancel,
+        pool: Some(pool),
+        fact_rx: Some(fact_rx),
     }
 }
 

@@ -65,6 +65,33 @@ pub struct AppState {
     /// creation / NATS publish. Fail-closed: see `trust::load_trust_policy_from_env`
     /// for defaults.
     pub trust_policy: Arc<roz_core::device_trust::evaluator::TrustPolicy>,
+    /// Phase 18 SKILL-01: pluggable object store for skill bundled assets.
+    ///
+    /// Constructed once at boot from `LocalFileSystem::new_with_prefix(skill_store_root)`
+    /// (`crates/roz-server/src/main.rs`) and injected into `SkillsServiceImpl` plus
+    /// the `Arc<dyn ObjectStore>` extension on every `AgentLoop` `ToolContext`.
+    /// Cloud backends (S3/GCS/Azure) live behind Cargo features per CONTEXT D-01.
+    pub object_store: Arc<dyn object_store::ObjectStore>,
+    /// Phase 19 Plan 11: registry of OpenAI-compat endpoints for `create_model`.
+    ///
+    /// Concrete struct (NOT a trait object) per 19-CONTEXT §Area 1 — cloud will
+    /// replace or wrap this struct when it needs async DB-backed per-tenant
+    /// resolution. OSS loads from `ROZ_ENDPOINTS_CONFIG` at boot, or defaults
+    /// to [`roz_core::EndpointRegistry::empty()`] when unset.
+    pub endpoint_registry: Arc<roz_core::EndpointRegistry>,
+    /// Phase 19 Plan 11: AES-256-GCM key provider for at-rest credential
+    /// encryption/decryption. OSS defaults to
+    /// [`roz_core::key_provider::StaticKeyProvider`] backed by `ROZ_ENCRYPTION_KEY`,
+    /// falling back to [`roz_openai::auth::null_key::NullKeyProvider`] when the
+    /// env var is unset (endpoints with `auth_mode='api_key'` are rejected at
+    /// bootstrap in that case).
+    pub key_provider: Arc<dyn roz_core::key_provider::KeyProvider>,
+    /// Phase 20 Plan 05: shared in-process MCP registry used by the control
+    /// plane and later session-start tool exposure.
+    pub mcp_registry: Arc<roz_mcp::Registry>,
+    /// Phase 20 Plan 07: cross-RPC session coordinator for MCP OAuth
+    /// approval-style flows.
+    pub session_bus: Arc<crate::grpc::session_bus::SessionBus>,
 }
 
 impl FromRef<AppState> for PgPool {

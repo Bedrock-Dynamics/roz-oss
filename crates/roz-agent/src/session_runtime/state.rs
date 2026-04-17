@@ -2,9 +2,12 @@
 
 #![allow(clippy::map_unwrap_or, clippy::missing_const_for_fn)]
 
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use roz_core::blueprint::RuntimeBlueprint;
 use roz_core::edge_health::EdgeTransportHealth;
+use roz_core::memory::MemoryEntry;
 use roz_core::session::activity::{RuntimeActivity, RuntimeFailureKind, SafePauseState};
 use roz_core::session::control::{CognitionMode, ControlMode, SessionMode};
 use roz_core::session::event::SessionPermissionRule;
@@ -13,7 +16,7 @@ use roz_core::spatial::WorldState;
 use roz_core::trust::TrustPosture;
 use serde::{Deserialize, Serialize};
 
-use crate::memory_store::MemoryStore;
+use crate::memory_store::{InMemoryMemoryStore, MemoryStore};
 
 /// Configuration for creating a new session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,8 +223,23 @@ pub(crate) struct SessionState {
     pub edge_state: EdgeTransportHealth,
     pub world_state: Option<WorldState>,
     pub world_state_note: Option<String>,
+    /// Scope key for the frozen memory snapshot read at session start (MEM-05).
     pub memory_scope_key: String,
-    pub memory_store: MemoryStore,
+    /// Optional peer id filter for the memory read (D-01 subject_id).
+    pub memory_subject_id: Option<uuid::Uuid>,
+    /// Pluggable memory backend — in-memory for tests/local, Postgres for cloud.
+    pub memory_store: Arc<dyn MemoryStore>,
+    /// Frozen session-start snapshot (MEM-05 Hermes parity). Read exactly once
+    /// in `SessionRuntime::new_with_memory_store` and referenced by every turn.
+    pub memory_snapshot: Vec<MemoryEntry>,
+    /// Phase 18 SKILL-05 / D-12 frozen tier-0 skill snapshot. Loaded by the
+    /// bootstrap site (PLAN-08 wires both `crates/roz-server/src/grpc/agent.rs`
+    /// and `crates/roz-worker/src/main.rs`) via
+    /// [`crate::session_runtime::SessionRuntime::set_skill_snapshot`] before the
+    /// first turn. Mid-session writes are NOT visible — the agent uses
+    /// `skills_list` to discover skills crystallized mid-session (RESEARCH OQ
+    /// #4). Defaults to empty for in-memory / test sessions.
+    pub skill_snapshot: Vec<roz_db::skills::SkillSummary>,
     pub snapshot: SessionSnapshot,
     pub messages: Vec<crate::model::types::Message>,
     pub failure: Option<RuntimeFailureKind>,
@@ -285,8 +303,11 @@ impl SessionState {
             edge_state: EdgeTransportHealth::Healthy,
             world_state: None,
             world_state_note: None,
-            memory_scope_key: format!("session:{}", config.session_id),
-            memory_store: MemoryStore::default(),
+            memory_scope_key: "agent".to_string(),
+            memory_subject_id: None,
+            memory_store: Arc::new(InMemoryMemoryStore::default()),
+            memory_snapshot: Vec::new(),
+            skill_snapshot: Vec::new(),
             snapshot,
             messages: config.initial_history.clone(),
             failure: None,

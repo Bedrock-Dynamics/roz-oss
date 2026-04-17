@@ -352,8 +352,17 @@ fn tool_categories_are_correct_for_all_tools() {
                     schema.name
                 );
             }
+            "execute_code" => {
+                assert_eq!(
+                    *category,
+                    ToolCategory::CodeSandbox,
+                    "{} should be CodeSandbox, got {:?}",
+                    schema.name,
+                    category
+                );
+            }
             // Physical tools: actuation / real-world side effects
-            "bash" | "write_file" | "execute_code" | "move_to" | "set_motors" | "play_animation" => {
+            "bash" | "write_file" | "move_to" | "set_motors" | "play_animation" => {
                 assert_eq!(
                     *category,
                     ToolCategory::Physical,
@@ -392,12 +401,13 @@ fn dispatcher_categories_match_schema_categories() {
     // Spot-check: get_robot_state must be Pure, move_to must be Physical
     assert_eq!(dispatcher.category("get_robot_state"), ToolCategory::Pure);
     assert_eq!(dispatcher.category("move_to"), ToolCategory::Physical);
+    assert_eq!(dispatcher.category("execute_code"), ToolCategory::CodeSandbox);
 }
 
-/// Verify that all Physical-category tools would be logged (not just bash/write_file/execute_code).
+/// Verify that Physical-category tools stay distinct from the code sandbox tool.
 ///
-/// This test documents the set of Physical tools so any future additions
-/// are caught and verified.
+/// This test documents the set of Physical tools and ensures `execute_code`
+/// does not regress back into that bucket.
 #[test]
 fn physical_tool_set_matches_expectations() {
     use roz_core::tools::ToolCategory;
@@ -416,10 +426,6 @@ fn physical_tool_set_matches_expectations() {
     // All actuation/destructive tools must be Physical
     assert!(physical_names.contains(&"bash"), "bash should be Physical");
     assert!(physical_names.contains(&"write_file"), "write_file should be Physical");
-    assert!(
-        physical_names.contains(&"execute_code"),
-        "execute_code should be Physical"
-    );
     assert!(physical_names.contains(&"move_to"), "move_to should be Physical");
     assert!(physical_names.contains(&"set_motors"), "set_motors should be Physical");
     assert!(
@@ -441,6 +447,27 @@ fn physical_tool_set_matches_expectations() {
         "list_files should NOT be Physical"
     );
     assert!(!physical_names.contains(&"search"), "search should NOT be Physical");
+    assert!(
+        !physical_names.contains(&"execute_code"),
+        "execute_code should NOT be Physical"
+    );
+}
+
+#[test]
+fn code_sandbox_tool_set_matches_expectations() {
+    use roz_core::tools::ToolCategory;
+
+    let dir = TempDir::new().unwrap();
+    write_embodiment_manifest(&dir, REACHY_MINI_EMBODIMENT_TOML);
+
+    let (_dispatcher, schemas) = tools::build_all_tools(dir.path());
+    let code_sandbox_names: Vec<&str> = schemas
+        .iter()
+        .filter(|(_, cat)| *cat == ToolCategory::CodeSandbox)
+        .map(|(s, _)| s.name.as_str())
+        .collect();
+
+    assert_eq!(code_sandbox_names, vec!["execute_code"]);
 }
 
 // ---------------------------------------------------------------------------

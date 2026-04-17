@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::error::AppError;
 use crate::extractors::pagination::ValidatedPagination;
 use crate::middleware::tx::Tx;
+use crate::routes::task_dispatch::{TaskDispatchRequest, TaskDispatchServices, dispatch_task};
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -31,23 +32,6 @@ pub struct CreateTaskRequest {
     pub control_interface_manifest: Option<roz_core::embodiment::binding::ControlInterfaceManifest>,
     /// Optional inherited delegation scope forwarded to the worker invocation.
     pub delegation_scope: Option<roz_core::tasks::DelegationScope>,
-}
-
-fn mode_from_phases(phases: &[PhaseSpec]) -> roz_nats::dispatch::ExecutionMode {
-    match phases.first().map(|phase| phase.mode) {
-        Some(roz_core::phases::PhaseMode::OodaReAct) => roz_nats::dispatch::ExecutionMode::OodaReAct,
-        Some(roz_core::phases::PhaseMode::React) | None => roz_nats::dispatch::ExecutionMode::React,
-    }
-}
-
-fn validate_child_task_delegation_scope(
-    parent_task_id: Option<Uuid>,
-    delegation_scope: Option<&roz_core::tasks::DelegationScope>,
-) -> Result<(), AppError> {
-    if parent_task_id.is_some() && delegation_scope.is_none() {
-        return Err(AppError::bad_request("child tasks require delegation_scope"));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -100,111 +84,28 @@ pub async fn create(
     let tenant_id = *auth.tenant_id().as_uuid();
     tracing::Span::current().record("tenant_id", tracing::field::display(tenant_id));
 
-    validate_child_task_delegation_scope(body.parent_task_id, body.delegation_scope.as_ref())?;
-    let host_id_str = body
-        .host_id
-        .as_deref()
-        .ok_or_else(|| AppError::bad_request("host_id is required until deferred assignment is implemented"))?;
-    let host_uuid = Uuid::parse_str(host_id_str).map_err(|_| AppError::bad_request("host_id is not a valid UUID"))?;
-    let host = roz_db::hosts::get_by_id(&mut **tx, host_uuid)
-        .await
-        .map_err(|e| AppError::internal(format!("failed to look up host: {e}")))?
-        .ok_or_else(|| AppError::not_found(format!("host {host_id_str} not found")))?;
-
-    // ENF-01: device trust gate — MUST run BEFORE task row creation / Restate
-    // workflow / NATS publish so untrusted requests never touch durable state.
-    // Also runs BEFORE the NATS-availability check: trust rejection is a
-    // first-class wire response (409) and must not be masked by a 500 from
-    // downstream infrastructure being unconfigured.
-    // Detailed reason stays server-side via tracing::warn!; wire response is
-    // opaque 409 per CONTEXT D-04.
-    if let Err(rejection) = crate::trust::check_host_trust(&state.pool, tenant_id, host_uuid, &state.trust_policy).await
-    {
-        tracing::warn!(
-            %tenant_id,
-            %host_uuid,
-            reason = %rejection.reason,
-            "task dispatch rejected: host trust posture not satisfied"
-        );
-        return Err(AppError::trust_rejected());
-    }
-
-    let nats = state
-        .nats_client
-        .as_ref()
-        .ok_or_else(|| AppError::internal("task dispatch unavailable: NATS is not configured"))?;
-
-    // Serialise phases to JSONB. An empty array is a valid default (single React phase).
-    let phases_json = serde_json::to_value(&body.phases)
-        .map_err(|e| AppError::internal(format!("failed to serialise phases: {e}")))?;
-
-    let task = roz_db::tasks::create(
+    let task = dispatch_task(
         &mut **tx,
-        tenant_id,
-        &body.prompt,
-        body.environment_id,
-        body.timeout_secs,
-        phases_json,
-        body.parent_task_id,
+        TaskDispatchServices {
+            pool: &state.pool,
+            http_client: &state.http_client,
+            restate_ingress_url: &state.restate_ingress_url,
+            nats_client: state.nats_client.as_ref(),
+            trust_policy: state.trust_policy.as_ref(),
+        },
+        TaskDispatchRequest {
+            tenant_id,
+            prompt: body.prompt,
+            environment_id: body.environment_id,
+            timeout_secs: body.timeout_secs,
+            host_id: body.host_id,
+            phases: body.phases,
+            parent_task_id: body.parent_task_id,
+            control_interface_manifest: body.control_interface_manifest,
+            delegation_scope: body.delegation_scope,
+        },
     )
     .await?;
-    let task = roz_db::tasks::assign_host(&mut **tx, task.id, host_uuid)
-        .await?
-        .ok_or_else(|| AppError::internal("created task disappeared before host assignment"))?;
-
-    // Start Restate workflow (fire-and-forget -- workflow manages its own lifecycle).
-    // The workflow must be registered before NATS publish so the worker can signal back.
-    let workflow_input = crate::restate::task_workflow::TaskInput {
-        task_id: task.id,
-        environment_id: task.environment_id,
-        prompt: task.prompt.clone(),
-        host_id: body.host_id.clone(),
-        safety_level: roz_core::safety::SafetyLevel::Normal,
-        parent_task_id: body.parent_task_id,
-    };
-
-    let restate_url = format!("{}/TaskWorkflow/{}/run/send", state.restate_ingress_url, task.id,);
-    match state.http_client.post(&restate_url).json(&workflow_input).send().await {
-        Ok(resp) => {
-            if let Err(e) = resp.error_for_status() {
-                let _ = roz_db::tasks::update_status(&mut **tx, task.id, "failed").await;
-                return Err(AppError::internal(format!("failed to start workflow: {e}")));
-            }
-        }
-        Err(e) => {
-            let _ = roz_db::tasks::update_status(&mut **tx, task.id, "failed").await;
-            return Err(AppError::internal(format!("failed to start Restate workflow: {e}")));
-        }
-    }
-
-    let invocation = roz_nats::dispatch::TaskInvocation {
-        task_id: task.id,
-        tenant_id: tenant_id.to_string(),
-        prompt: task.prompt.clone(),
-        environment_id: task.environment_id,
-        safety_policy_id: None,
-        host_id: host_uuid,
-        timeout_secs: body.timeout_secs.map_or(300, |t| u32::try_from(t).unwrap_or(300)),
-        mode: mode_from_phases(&body.phases),
-        parent_task_id: body.parent_task_id,
-        restate_url: state.restate_ingress_url.clone(),
-        traceparent: roz_nats::dispatch::current_traceparent(),
-        phases: body.phases.clone(),
-        control_interface_manifest: body.control_interface_manifest.clone(),
-        delegation_scope: body.delegation_scope.clone(),
-    };
-    let subject = roz_nats::subjects::Subjects::invoke(&host.name, &task.id.to_string())
-        .map_err(|e| AppError::bad_request(format!("invalid NATS subject: {e}")))?;
-    let payload = serde_json::to_vec(&invocation)
-        .map_err(|e| AppError::internal(format!("failed to serialize task invocation: {e}")))?;
-    if let Err(e) = nats.publish(subject, payload.into()).await {
-        let _ = roz_db::tasks::update_status(&mut **tx, task.id, "failed").await;
-        return Err(AppError::internal(format!("failed to publish task invocation: {e}")));
-    }
-
-    let task = roz_db::tasks::update_status(&mut **tx, task.id, "queued")
-        .await?
-        .ok_or_else(|| AppError::internal("task disappeared after dispatch"))?;
 
     Ok((StatusCode::CREATED, Json(json!({"data": task}))))
 }
@@ -407,24 +308,6 @@ mod tests {
     }
 
     #[test]
-    fn mode_from_phases_defaults_to_react() {
-        assert_eq!(super::mode_from_phases(&[]), roz_nats::dispatch::ExecutionMode::React);
-    }
-
-    #[test]
-    fn mode_from_phases_uses_first_phase_mode() {
-        let phases = vec![PhaseSpec {
-            mode: PhaseMode::OodaReAct,
-            tools: ToolSetFilter::All,
-            trigger: PhaseTrigger::Immediate,
-        }];
-        assert_eq!(
-            super::mode_from_phases(&phases),
-            roz_nats::dispatch::ExecutionMode::OodaReAct
-        );
-    }
-
-    #[test]
     fn create_task_request_control_interface_manifest_populated() {
         let json = serde_json::json!({
             "prompt": "follow control contract",
@@ -486,21 +369,6 @@ mod tests {
             scope.trust_posture.edge_transport_trust,
             roz_core::trust::TrustLevel::High
         );
-    }
-
-    #[test]
-    fn child_tasks_require_delegation_scope() {
-        let result = validate_child_task_delegation_scope(Some(Uuid::nil()), None);
-        assert!(
-            result.is_err(),
-            "child task without delegation scope should be rejected"
-        );
-    }
-
-    #[test]
-    fn root_tasks_do_not_require_delegation_scope() {
-        let result = validate_child_task_delegation_scope(None, None);
-        assert!(result.is_ok(), "root tasks should be allowed without delegation scope");
     }
 
     #[test]

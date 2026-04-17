@@ -18,7 +18,10 @@ path = "src/main.rs"
 roz-core = { path = "../roz-core" }
 roz-agent = { path = "../roz-agent" }
 roz-local = { path = "../roz-local" }
+roz-openai = { path = "../roz-openai" }
 roz-copper = { path = "../roz-copper", default-features = false }
+chrono = { workspace = true }
+secrecy = { workspace = true }
 arc-swap.workspace = true
 clap = { workspace = true, features = ["env"] }
 tokio = { workspace = true, features = ["full"] }
@@ -56,12 +59,16 @@ tonic = { workspace = true, features = ["channel", "transport", "tls-ring", "tls
 prost.workspace = true
 prost-types.workspace = true
 tokio-stream.workspace = true
+tar.workspace = true
+flate2.workspace = true
+walkdir = "2"
 
 [build-dependencies]
 tonic-build.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+serial_test = { workspace = true }
 
 [lints]
 workspace = true

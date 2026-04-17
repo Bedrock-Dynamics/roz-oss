@@ -109,6 +109,18 @@ pub struct WorkerConfig {
     /// URLs in dev).
     #[serde(default)]
     pub database_url: Option<String>,
+
+    /// Phase 18 SKILL-01: object-store root for skill bundled assets (mirrors
+    /// `crates/roz-server/src/config.rs::Config::skill_store_root`). Set via
+    /// `ROZ_SKILL_STORE_ROOT`.
+    ///
+    /// When unset on workers, the `skill_read_file` tool returns an
+    /// "ObjectStore extension missing" error to the model — the cloud server is
+    /// the canonical skill-bundle origin in worker contexts that don't ship
+    /// skills locally (per RESEARCH OQ #3, worker is NOT the skill-write entry
+    /// point either; `Permissions::can_write_skills` is forced false).
+    #[serde(default)]
+    pub skill_store_root: Option<std::path::PathBuf>,
 }
 
 /// Camera subsystem configuration for the worker.
@@ -233,6 +245,15 @@ impl WorkerConfig {
             || Ok(roz_copper::wasm_signature::TrustedKeys::new()),
             |raw| roz_copper::wasm_signature::TrustedKeys::from_env_str(raw),
         )
+    }
+
+    /// Resolve the effective `skill_store_root` path (Phase 18 SKILL-01).
+    /// Returns `None` when unset — callers MUST treat `None` as "no object
+    /// store available on the worker" and skip skill_read_file extension
+    /// injection rather than synthesising a default path.
+    #[must_use]
+    pub fn resolved_skill_store_root(&self) -> Option<std::path::PathBuf> {
+        self.skill_store_root.clone()
     }
 }
 

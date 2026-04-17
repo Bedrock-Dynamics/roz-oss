@@ -188,12 +188,38 @@ impl ApprovalRuntimeHandle {
         self.pending_approvals.clone()
     }
 
-    /// Replace the underlying `PendingApprovals` map.
+    /// Replace the underlying `PendingApprovals` contents.
+    ///
+    /// Takes `&self` because the field is `Arc<Mutex<HashMap<...>>>` —
+    /// interior mutability is the design. Swaps the inner Mutex contents so
+    /// every clone of `ApprovalRuntimeHandle` (which shares one `Arc`) sees
+    /// the new map. Rebinding the field (the old `&mut self` impl) silently
+    /// left other clones pointing at the abandoned `Arc` — see MEM-08 in
+    /// `.planning/phases/17-durable-agent-memory/17-RESEARCH.md`.
+    ///
+    /// Regression test: `replace_pending_approvals_is_visible_from_all_clones`
+    /// in this module's `#[cfg(test)]` block.
     ///
     /// `#[doc(hidden)] pub` for integration-test reachability (Plan 12-02).
     #[doc(hidden)]
-    pub fn replace_pending_approvals(&mut self, pending_approvals: PendingApprovals) {
-        self.pending_approvals = pending_approvals;
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "taking PendingApprovals by value matches caller ergonomics; we only use the Arc to access its Mutex contents before dropping"
+    )]
+    pub fn replace_pending_approvals(&self, pending_approvals: PendingApprovals) {
+        // Drain the incoming Arc's Mutex under its own lock, then overwrite
+        // ours. Two locks are acquired in a single direction each time — no
+        // cross-handle deadlock because we never nest them.
+        let new_map: std::collections::HashMap<
+            String,
+            tokio::sync::oneshot::Sender<crate::dispatch::remote::ApprovalDecision>,
+        > = pending_approvals
+            .lock()
+            .expect("pending approvals mutex poisoned")
+            .drain()
+            .collect();
+        let mut guard = self.pending_approvals.lock().expect("pending approvals mutex poisoned");
+        *guard = new_map;
     }
 
     pub fn clear_pending_approvals(&self) {
@@ -436,6 +462,12 @@ impl SessionRuntime {
     }
 
     /// Create a new session runtime from a `SessionConfig`.
+    ///
+    /// This constructor uses the default in-memory `MemoryStore` and an empty
+    /// frozen snapshot. Production call sites should prefer
+    /// [`Self::new_with_memory_store`] so the Postgres-backed
+    /// [`crate::memory_store::MemoryStore`] is wired in and the MEM-05 frozen
+    /// snapshot is read at session start.
     #[must_use]
     pub fn new(config: &SessionConfig) -> Self {
         let state = SessionState::new(config);
@@ -451,6 +483,72 @@ impl SessionRuntime {
             approval_runtime,
             recovery_config,
         }
+    }
+
+    /// Create a new session runtime bound to a concrete `MemoryStore` backend
+    /// and populate the MEM-05 frozen session-start snapshot.
+    ///
+    /// Takes exactly one `MemoryStore::read` at session construction, stores
+    /// the result on `SessionState::memory_snapshot`, and passes the snapshot
+    /// to `PromptAssembler` on every turn. Mid-session writes via
+    /// [`Self::write_memory`] are NOT reflected in the frozen block — this is
+    /// deliberate for Anthropic/Gemini prefix cache stability (Hermes parity).
+    ///
+    /// **Fail-open on read error:** if the backend returns an error or the
+    /// `tenant_id` is not a valid UUID (local/dev mode), the snapshot stays
+    /// empty and the session continues. `MemoryStore::read` is expected to
+    /// enforce tenant RLS, so an empty snapshot degrades prompt quality only.
+    pub async fn new_with_memory_store(
+        config: &SessionConfig,
+        memory_store: std::sync::Arc<dyn crate::memory_store::MemoryStore>,
+    ) -> Self {
+        let mut runtime = Self::new(config);
+        runtime.state.memory_store = memory_store;
+
+        let tenant_uuid = uuid::Uuid::parse_str(&runtime.state.tenant_id).ok();
+        let memory_snapshot = if let Some(tenant_uuid) = tenant_uuid {
+            match runtime
+                .state
+                .memory_store
+                .read(
+                    tenant_uuid,
+                    &runtime.state.memory_scope_key,
+                    runtime.state.memory_subject_id,
+                    1_000, // MEM-05: ≤4KB budget (≈1000 tokens)
+                )
+                .await
+            {
+                Ok(entries) => entries,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        tenant_id = %runtime.state.tenant_id,
+                        scope = %runtime.state.memory_scope_key,
+                        "memory snapshot read failed; continuing with empty snapshot"
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            tracing::debug!(
+                tenant_id = %runtime.state.tenant_id,
+                "memory snapshot skipped: tenant_id is not a UUID (local/dev mode)"
+            );
+            Vec::new()
+        };
+        runtime.state.memory_snapshot = memory_snapshot;
+        runtime
+    }
+
+    /// Phase 18 SKILL-05 / PLAN-08: install the frozen session-start tier-0
+    /// skill snapshot. Bootstrap sites in `crates/roz-server/src/grpc/agent.rs`
+    /// and `crates/roz-worker/src/main.rs` call this once per session after
+    /// loading rows via `roz_db::skills::list_recent` under tenant RLS.
+    /// Mid-session writes do NOT mutate this prompt snapshot — the agent uses
+    /// `skills_list` for live discovery and `skill_view` for live
+    /// body/version loads until the next session refreshes the snapshot.
+    pub fn set_skill_snapshot(&mut self, skills: Vec<roz_db::skills::SkillSummary>) {
+        self.state.skill_snapshot = skills;
     }
 
     /// Rehydrate a runtime from a portable bootstrap plus local prompt-state inputs.
@@ -705,7 +803,10 @@ impl SessionRuntime {
     }
 
     fn assemble_system_blocks(&self, input: &TurnInput, volatile_blocks: Vec<String>) -> Vec<SystemBlock> {
-        let memory_entries = self.state.memory_store.read(&self.state.memory_scope_key, 2_000);
+        // MEM-05: memory block references the frozen session-start snapshot.
+        // No mid-session re-read — snapshot was populated in
+        // `new_with_memory_store` and stays stable for cache parity.
+        let memory_entries: &[roz_core::memory::MemoryEntry] = &self.state.memory_snapshot;
         let mut custom_blocks = self.state.project_context.clone();
         custom_blocks.extend(input.custom_context.clone());
         let mut volatile_blocks = volatile_blocks;
@@ -725,7 +826,11 @@ impl SessionRuntime {
             tool_schemas: &self.state.tool_schemas,
             trust_posture: &self.state.trust,
             edge_state: &self.state.edge_state,
-            memory_entries: &memory_entries,
+            memory_entries,
+            // Phase 18 SKILL-05 / PLAN-08: skill_entries reads the frozen
+            // session-start snapshot loaded by the bootstrap site via
+            // `SessionRuntime::set_skill_snapshot` (defaults to empty).
+            skill_entries: &self.state.skill_snapshot,
             custom_blocks,
             volatile_blocks,
         })
@@ -865,8 +970,30 @@ impl SessionRuntime {
     }
 
     /// Persist a memory entry into the runtime-owned store.
-    pub fn write_memory(&mut self, entry: roz_core::memory::MemoryEntry) {
-        self.state.memory_store.write(entry);
+    ///
+    /// Writes go to the underlying `Arc<dyn MemoryStore>`. Note per MEM-05 /
+    /// Hermes parity: writes made mid-session are NOT visible in the frozen
+    /// memory block (block 1) until the next session — the snapshot taken at
+    /// `SessionRuntime::new_with_memory_store` stays stable for cache prefix
+    /// reasons.
+    ///
+    /// # Errors
+    /// Returns [`crate::memory_store::MemoryStoreError`] when the backend
+    /// rejects the write (RLS, threat-scan, driver error).
+    pub async fn write_memory(
+        &self,
+        entry: roz_core::memory::MemoryEntry,
+    ) -> Result<(), crate::memory_store::MemoryStoreError> {
+        let tenant_uuid = uuid::Uuid::parse_str(&self.state.tenant_id).unwrap_or_else(|_| uuid::Uuid::nil());
+        self.state
+            .memory_store
+            .write(
+                tenant_uuid,
+                &self.state.memory_scope_key,
+                self.state.memory_subject_id,
+                entry,
+            )
+            .await
     }
 
     fn activity_state_from_signal(state: ActivityState) -> RuntimeActivity {
@@ -1920,8 +2047,10 @@ mod tests {
             .begin_turn(&test_turn_input("hello"), Vec::new())
             .expect("begin_turn should succeed");
 
-        assert!(prepared.system_blocks[4].content.contains("## Spatial Context"));
-        assert!(prepared.system_blocks[4].content.contains("Entities observed: 1"));
+        // Phase 18 SKILL-05: volatile context moved from block[4] to block[5]
+        // when block_skills_context was inserted at position 2 (PLAN-07).
+        assert!(prepared.system_blocks[5].content.contains("## Spatial Context"));
+        assert!(prepared.system_blocks[5].content.contains("Entities observed: 1"));
         assert!(rt.world_state().is_some());
     }
 
@@ -1939,13 +2068,15 @@ mod tests {
             .begin_turn(&test_turn_input("hello"), Vec::new())
             .expect("begin_turn should succeed");
 
-        assert!(prepared.system_blocks[4].content.contains("## Turn Context"));
+        // Phase 18 SKILL-05: volatile context moved from block[4] to block[5]
+        // when block_skills_context was inserted at position 2 (PLAN-07).
+        assert!(prepared.system_blocks[5].content.contains("## Turn Context"));
         assert!(
-            prepared.system_blocks[4]
+            prepared.system_blocks[5]
                 .content
                 .contains("Runtime-owned spatial bootstrap captured at turn start.")
         );
-        assert!(!prepared.system_blocks[4].content.contains("## Spatial Context"));
+        assert!(!prepared.system_blocks[5].content.contains("## Spatial Context"));
     }
 
     #[tokio::test]
@@ -2444,5 +2575,34 @@ mod tests {
         let decision = rx.await.expect("approval decision should resolve");
         assert!(decision.approved);
         assert_eq!(decision.modifier, Some(json!({"speed": 0.25})));
+    }
+}
+
+#[cfg(test)]
+mod mem08_regression {
+    use super::{ApprovalRuntimeHandle, PendingApprovals};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::oneshot;
+
+    #[test]
+    fn replace_pending_approvals_is_visible_from_all_clones() {
+        let handle_a = ApprovalRuntimeHandle::default();
+        let handle_b = handle_a.clone();
+
+        // Replace with an initially-empty fresh map via handle_a.
+        let new_map: PendingApprovals = Arc::new(Mutex::new(HashMap::new()));
+        handle_a.replace_pending_approvals(new_map);
+
+        // Register an approval via handle_a.
+        let (tx, _rx) = oneshot::channel();
+        handle_a.register_pending_approval("apr-1", tx);
+
+        // Before fix: handle_b's Arc diverged — remove returns false.
+        // After fix: handle_b and handle_a share the same Arc — remove returns true.
+        assert!(
+            handle_b.remove_pending_approval("apr-1"),
+            "MEM-08: cloned handle must see approvals registered by its sibling"
+        );
     }
 }

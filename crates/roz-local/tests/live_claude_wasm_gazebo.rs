@@ -434,7 +434,17 @@ async fn full_vertical_claude_wasm_gazebo() {
     let embodiment_runtime = compile_test_embodiment_runtime(&control_manifest);
 
     // 4. Ask Claude for the raw WAT source.
-    let model = roz_agent::model::create_model("claude-sonnet-4-6", "", "", 120, "anthropic", Some(&api_key)).unwrap();
+    let model = roz_agent::model::create_model(
+        "claude-sonnet-4-6",
+        "",
+        "",
+        120,
+        "anthropic",
+        Some(&api_key),
+        &roz_core::auth::TenantId::new(uuid::Uuid::nil()),
+        std::sync::Arc::new(roz_core::model_endpoint::EndpointRegistry::empty()),
+    )
+    .unwrap();
     let safety = SafetyStack::new(vec![]);
     let spatial = Box::new(MockSpatialContextProvider::empty());
     let mut agent = AgentLoop::new(model, ToolDispatcher::new(Duration::from_secs(30)), safety, spatial);

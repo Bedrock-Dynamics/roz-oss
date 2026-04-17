@@ -1,8 +1,23 @@
 pub mod builtin;
 pub mod discovery;
+pub mod frontmatter;
 pub mod parser;
 pub mod template;
 pub mod validate;
+
+// Phase 18: agentskills.io-compatible frontmatter parser + threat-scan re-export.
+//
+// NOTE: the Phase 18 `SkillFrontmatter` lives at
+// `roz_core::skills::frontmatter::SkillFrontmatter`. It is NOT re-exported here
+// because this module already defines a legacy Phase 4 `SkillFrontmatter` type
+// below. Callers of the Phase 18 loader must import the submodule path
+// explicitly. See `.planning/phases/18-skills-as-artifacts/18-02-SUMMARY.md`.
+pub use frontmatter::{FrontmatterError, parse_skill_md};
+
+/// D-08: `skill_manage` write paths reuse the memory threat-scan verbatim.
+/// Zero new scan code — one `pub use` re-export.
+pub use crate::memory::threat_scan::MemoryThreatKind as SkillThreatKind;
+pub use crate::memory::threat_scan::scan_memory_content as scan_skill_content;
 
 use serde::{Deserialize, Serialize};
 

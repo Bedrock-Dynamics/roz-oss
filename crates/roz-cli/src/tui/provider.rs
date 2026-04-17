@@ -299,6 +299,7 @@ pub fn classify_error_message(msg: &str, config: &ProviderConfig) -> String {
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
 
@@ -350,8 +351,27 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn detect_no_credentials_fallback() {
+        // Serial: this is the only ProviderConfig::detect test that falls
+        // through to CliConfig::load_provider_credential (which reads HOME).
+        // Plan 19-15 Task 2 added tests that mutate HOME under serial_test::serial;
+        // this test joins that serial group so it does not race with them.
+        //
+        // Additionally isolate HOME to an empty tempdir so any stray
+        // credentials.toml under the real HOME cannot influence the assertion.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let original = std::env::var_os("HOME");
+        // SAFETY: serialised via #[serial_test::serial].
+        unsafe { std::env::set_var("HOME", tmp.path()) };
         let config = ProviderConfig::detect(None, None, None);
+        // SAFETY: same serial-test contract.
+        unsafe {
+            match original {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
         assert_eq!(config.provider, Provider::Anthropic);
         assert!(config.api_key.is_none());
     }

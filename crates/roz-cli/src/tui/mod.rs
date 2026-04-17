@@ -986,6 +986,16 @@ fn agent_error_to_turn_execution_failure(error: AgentError) -> TurnExecutionFail
 }
 
 fn build_local_model(config: &ProviderConfig) -> Result<Box<dyn Model>, String> {
+    // Plan 19-15: Provider::Openai has a dedicated dispatch arm that builds an
+    // ephemeral ModelEndpoint from the stored ChatGPT OAuth credentials and
+    // constructs an OpenAiProvider directly. This activates the "dead wire"
+    // that `create_model` cannot reach because the OSS EndpointRegistry is
+    // empty for CLI users (no endpoints.toml on disk) and the bare model name
+    // does not match claude-* / gemini-* prefixes.
+    if config.provider == Provider::Openai {
+        return build_openai_tui_model(&config.model);
+    }
+
     let Some(api_key) = config.api_key.as_deref() else {
         return Err("No API key configured".to_string());
     };
@@ -995,8 +1005,71 @@ fn build_local_model(config: &ProviderConfig) -> Result<Box<dyn Model>, String> 
         "anthropic"
     };
 
-    roz_agent::model::create_model(&config.model, "", "", 120, proxy_provider, Some(api_key))
-        .map_err(|error| format!("Failed to create model: {error}"))
+    let tenant_id = roz_core::auth::TenantId::new(uuid::Uuid::nil());
+    let registry = std::sync::Arc::new(roz_core::model_endpoint::EndpointRegistry::empty());
+    roz_agent::model::create_model(
+        &config.model,
+        "",
+        "",
+        120,
+        proxy_provider,
+        Some(api_key),
+        &tenant_id,
+        registry,
+    )
+    .map_err(|error| format!("Failed to create model: {error}"))
+}
+
+/// Plan 19-15 Task 2: build an [`roz_agent::model::openai::OpenAiProvider`]
+/// directly from stored ChatGPT OAuth credentials.
+///
+/// This is the TUI's `Provider::Openai` model-construction arm. It reads
+/// credentials via [`crate::config::CliConfig::load_provider_credential_full`],
+/// synthesizes an ephemeral [`roz_core::model_endpoint::OAuthCredentials`]
+/// (auth_mode=OauthChatgpt, wire_api=Responses, base_url=api.openai.com/v1),
+/// wires the Codex-compatibility transform hook (Plan 19-08), and returns the
+/// boxed provider.
+pub(crate) fn build_openai_tui_model(model_name: &str) -> Result<Box<dyn Model>, String> {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use secrecy::SecretString;
+
+    let creds = crate::config::CliConfig::load_provider_credential_full("openai")
+        .ok_or_else(|| "No OpenAI credentials - run `roz auth login openai` first".to_string())?;
+
+    let refresh_token = creds.refresh_token.clone().ok_or_else(|| {
+        "Stored OpenAI credentials missing refresh_token - re-run `roz auth login openai`".to_string()
+    })?;
+
+    let oauth_creds = roz_core::model_endpoint::OAuthCredentials {
+        access_token: Arc::new(SecretString::from(creds.access_token.clone())),
+        refresh_token: Arc::new(SecretString::from(refresh_token)),
+        expires_at: creds.expires_at,
+        account_id: creds.account_id.clone(),
+    };
+
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+
+    let auth = Arc::new(roz_openai::auth::oauth::OAuthAuth::new(oauth_creds, http.clone()));
+    let normalized_model = roz_openai::transform::normalize_model_name(model_name).to_string();
+    let codex_instructions = roz_openai::prompts::codex_instructions(&normalized_model);
+
+    let transform_hook: roz_openai::client::ResponsesTransformHook = Arc::new(move |req| {
+        roz_openai::transform::apply_chatgpt_backend_transforms(req, codex_instructions);
+    });
+
+    let client = roz_openai::client::OpenAiClient::new("https://api.openai.com/v1", auth, http)
+        .with_transform_hook(transform_hook);
+
+    Ok(Box::new(roz_agent::model::openai::OpenAiProvider::new(
+        Arc::new(client),
+        normalized_model,
+        roz_agent::model::openai::WireApi::Responses,
+    )))
 }
 
 struct TuiStreamingTurnExecutor<'a> {
@@ -1098,10 +1171,12 @@ impl LocalByokRuntimeSession {
 
         let runtime = SessionRuntime::new(&session_config);
         let approval_handle = runtime.approval_handle();
+        let mut extensions = all_tools.extensions;
+        extensions.insert(runtime.event_emitter());
         let safety = SafetyStack::new(vec![]);
         let spatial = Box::new(NullWorldStateProvider);
         let agent_loop = AgentLoop::new(model, all_tools.dispatcher, safety, spatial)
-            .with_extensions(all_tools.extensions)
+            .with_extensions(extensions)
             .with_approval_runtime(approval_handle);
 
         Self {
@@ -1289,6 +1364,115 @@ async fn provider_loop(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod openai_dispatch_tests {
+    //! Plan 19-15 Task 2: unit tests for the TUI `Provider::Openai` arm.
+    //!
+    //! A full wiremock-backed end-to-end test would require either pointing
+    //! the `OpenAiClient` at a mock URL (the base is hard-coded in the arm)
+    //! or extracting an env-override layer. Since the arm intentionally
+    //! centralises base_url (api.openai.com/v1) per Plan 19-15 spec, we
+    //! cover the observable behaviour at function-boundary level: missing
+    //! credentials surface a helpful error; present credentials produce a
+    //! boxed Model with no panics.
+
+    #![allow(unsafe_code)]
+
+    use super::*;
+
+    fn with_home<F: FnOnce()>(home: &std::path::Path, body: F) {
+        // Save + restore HOME so other tests (e.g. provider::tests reading
+        // `~/.roz/credentials.toml` via CliConfig::load_provider_credential)
+        // are not contaminated when our tempdir goes out of scope.
+        let original = std::env::var_os("HOME");
+        // SAFETY: tests under #[serial_test::serial] block do not race HOME.
+        unsafe { std::env::set_var("HOME", home) };
+        body();
+        // SAFETY: mirror image of the set above; still inside the serial guard.
+        unsafe {
+            match original {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn openai_arm_errors_when_no_credentials() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        with_home(tmp.path(), || {
+            let err = match build_openai_tui_model("gpt-5.2") {
+                Ok(_) => panic!("must error with no creds"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("roz auth login openai"),
+                "error should instruct user to log in: {err}"
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn openai_arm_errors_when_refresh_token_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        with_home(tmp.path(), || {
+            // Save access_token only (no refresh_token) via v2 saver.
+            crate::config::CliConfig::save_provider_credential_v2(
+                "openai",
+                "at-only",
+                None,
+                Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                Some("acct-test"),
+            )
+            .expect("save v2");
+            let err = match build_openai_tui_model("gpt-5.2") {
+                Ok(_) => panic!("must error without refresh"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("refresh_token"),
+                "error should mention refresh_token: {err}"
+            );
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn openai_arm_constructs_model_with_full_credentials() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        with_home(tmp.path(), || {
+            crate::config::CliConfig::save_provider_credential_v2(
+                "openai",
+                "at-xyz",
+                Some("rt-xyz"),
+                Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                Some("acct-42"),
+            )
+            .expect("save v2");
+            let result = build_openai_tui_model("gpt-5.2");
+            // Smoke: we got a boxed Model. No panic, no network I/O.
+            assert!(result.is_ok(), "expected Ok(_), got err");
+            drop(result);
+        });
+    }
+
+    #[test]
+    fn normalize_model_name_used_in_arm_is_stable() {
+        // Sanity check that the arm's normalization matches upstream prompts.
+        assert_eq!(
+            roz_openai::transform::normalize_model_name("gpt-5.2-codex"),
+            "gpt-5.2-codex"
+        );
+        // normalize_model_name falls back to "gpt-5.1" for unknown names.
+        assert_eq!(
+            roz_openai::transform::normalize_model_name("unknown-model-name"),
+            "gpt-5.1"
+        );
     }
 }
 

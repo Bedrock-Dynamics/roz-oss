@@ -237,6 +237,14 @@ pub fn build_prompt_state(inv: &TaskInvocation, dispatcher: &ToolDispatcher) -> 
 
 /// Derive coarse permission rules for the session start metadata from the
 /// worker's actual registered dispatcher inventory.
+fn tool_category_policy_name(category: ToolCategory) -> &'static str {
+    match category {
+        ToolCategory::Pure => "pure",
+        ToolCategory::CodeSandbox => "code_sandbox",
+        ToolCategory::Physical => "physical",
+    }
+}
+
 #[must_use]
 pub fn derive_session_permissions(dispatcher: &ToolDispatcher) -> Vec<SessionPermissionRule> {
     let tool_names = dispatcher.tool_names();
@@ -260,7 +268,8 @@ pub fn derive_session_permissions(dispatcher: &ToolDispatcher) -> Vec<SessionPer
     tool_names
         .into_iter()
         .map(|tool_name| {
-            let is_pure = matches!(dispatcher.category(&tool_name), ToolCategory::Pure);
+            let category = dispatcher.category(&tool_name);
+            let is_pure = matches!(category, ToolCategory::Pure);
             SessionPermissionRule {
                 tool_pattern: tool_name,
                 policy: if is_pure {
@@ -268,7 +277,7 @@ pub fn derive_session_permissions(dispatcher: &ToolDispatcher) -> Vec<SessionPer
                 } else {
                     "require_confirmation".into()
                 },
-                category: Some(if is_pure { "pure".into() } else { "physical".into() }),
+                category: Some(tool_category_policy_name(category).into()),
                 reason: None,
             }
         })
@@ -318,6 +327,7 @@ pub fn apply_trust_posture(dispatcher: &mut ToolDispatcher, posture: &TrustPostu
             _ => match dispatcher.category(&tool_name) {
                 ToolCategory::Physical => ExecutionCapabilityClass::PhysicalLowRisk,
                 ToolCategory::Pure => ExecutionCapabilityClass::ReadOnly,
+                ToolCategory::CodeSandbox => ExecutionCapabilityClass::SandboxedMutation,
             },
         };
 

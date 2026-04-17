@@ -1,10 +1,129 @@
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use roz_core::auth::{ApiKeyScope, AuthIdentity, TenantId};
+use roz_core::auth::{ApiKeyScope, AuthIdentity, Permissions, Role, TenantId};
 use serde_json::json;
 use sqlx::PgPool;
 use std::sync::Arc;
+
+/// Derive a [`Permissions`] bag from an [`AuthIdentity`]'s scopes or role.
+///
+/// Phase 18-12 follow-up: closes the gap where the production gRPC auth
+/// middleware never populated a `Permissions` extension, making every gated
+/// RPC (e.g. `SkillsService/Delete`) permanently unreachable.
+///
+/// Current policy (intentionally narrow; finer-grain scopes like
+/// `"skills:write"` can be wired in later without touching the call sites):
+///
+/// * `AuthIdentity::ApiKey` carrying [`ApiKeyScope::Admin`] → all write
+///   permissions granted.
+/// * `AuthIdentity::User` with role [`Role::Admin`] or [`Role::Owner`] → all
+///   write permissions granted.
+/// * `AuthIdentity::Worker` → read-only (workers do not perform control-plane
+///   writes through this path).
+/// * Everything else → [`Permissions::default`] (all flags false).
+pub fn permissions_for_identity(identity: &AuthIdentity) -> Permissions {
+    match identity {
+        AuthIdentity::ApiKey { scopes, .. } => {
+            let is_admin = scopes.contains(&ApiKeyScope::Admin);
+            Permissions {
+                can_write_memory: is_admin,
+                can_write_skills: is_admin,
+                can_manage_mcp_servers: is_admin,
+            }
+        }
+        AuthIdentity::User { role, .. } => {
+            let is_admin = matches!(role, Role::Admin | Role::Owner);
+            Permissions {
+                can_write_memory: is_admin,
+                can_write_skills: is_admin,
+                can_manage_mcp_servers: is_admin,
+            }
+        }
+        AuthIdentity::Worker { .. } => Permissions::default(),
+    }
+}
+
+#[cfg(test)]
+mod permissions_tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn tenant() -> TenantId {
+        TenantId::new(Uuid::nil())
+    }
+
+    #[test]
+    fn admin_scoped_api_key_grants_write_skills_and_memory() {
+        let identity = AuthIdentity::ApiKey {
+            key_id: Uuid::nil(),
+            tenant_id: tenant(),
+            scopes: vec![ApiKeyScope::Admin],
+        };
+        let perms = permissions_for_identity(&identity);
+        assert!(perms.can_write_skills);
+        assert!(perms.can_write_memory);
+        assert!(perms.can_manage_mcp_servers);
+    }
+
+    #[test]
+    fn non_admin_scoped_api_key_is_read_only() {
+        let identity = AuthIdentity::ApiKey {
+            key_id: Uuid::nil(),
+            tenant_id: tenant(),
+            scopes: vec![ApiKeyScope::ReadTasks, ApiKeyScope::ReadStreams],
+        };
+        let perms = permissions_for_identity(&identity);
+        assert!(!perms.can_write_skills);
+        assert!(!perms.can_write_memory);
+        assert!(!perms.can_manage_mcp_servers);
+    }
+
+    #[test]
+    fn empty_scopes_fall_back_to_default() {
+        let identity = AuthIdentity::ApiKey {
+            key_id: Uuid::nil(),
+            tenant_id: tenant(),
+            scopes: vec![],
+        };
+        assert_eq!(permissions_for_identity(&identity), Permissions::default());
+    }
+
+    #[test]
+    fn admin_role_user_grants_write_skills() {
+        let identity = AuthIdentity::User {
+            user_id: "u".into(),
+            org_id: None,
+            tenant_id: tenant(),
+            role: Role::Admin,
+        };
+        let perms = permissions_for_identity(&identity);
+        assert!(perms.can_write_skills);
+        assert!(perms.can_write_memory);
+        assert!(perms.can_manage_mcp_servers);
+    }
+
+    #[test]
+    fn viewer_role_user_is_read_only() {
+        let identity = AuthIdentity::User {
+            user_id: "u".into(),
+            org_id: None,
+            tenant_id: tenant(),
+            role: Role::Viewer,
+        };
+        assert_eq!(permissions_for_identity(&identity), Permissions::default());
+    }
+
+    #[test]
+    fn worker_identity_is_read_only() {
+        let identity = AuthIdentity::Worker {
+            worker_id: "w".into(),
+            tenant_id: tenant(),
+            host_id: "h".into(),
+        };
+        assert_eq!(permissions_for_identity(&identity), Permissions::default());
+    }
+}
 
 #[derive(Debug)]
 pub struct AuthError(pub String);

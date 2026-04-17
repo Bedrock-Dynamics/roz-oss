@@ -158,6 +158,11 @@ pub async fn start_server_with_fetcher(
         Arc::new(roz_agent::meter::NoOpMeter),
         media_backend,
         media_fetcher,
+        Arc::new(object_store::memory::InMemory::new()),
+        Arc::new(roz_core::EndpointRegistry::empty()),
+        Arc::new(roz_mcp::Registry::new()),
+        Arc::new(roz_core::key_provider::StaticKeyProvider::from_key_bytes([7u8; 32])),
+        Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
     );
 
     spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);

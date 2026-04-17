@@ -42,7 +42,13 @@ pub async fn grpc_auth_middleware(
 
     match state.auth.authenticate(&state.pool, auth_header.as_deref()).await {
         Ok(identity) => {
+            // 18-12 gap closure: derive `Permissions` from the authenticated
+            // identity and attach it alongside `AuthIdentity`, so gated RPCs
+            // (e.g. `SkillsService/Delete`) can read a real value instead of
+            // silently falling through to `Permissions::default()`.
+            let perms = crate::auth::permissions_for_identity(&identity);
             req.extensions_mut().insert(identity);
+            req.extensions_mut().insert(perms);
             next.run(req).await
         }
         Err(_auth_error) => {

@@ -253,10 +253,12 @@ async fn execute_local_with_model(
     };
 
     let mut runtime = SessionRuntime::new(&session_config);
+    let mut extensions = all_tools.extensions;
+    extensions.insert(runtime.event_emitter());
     let mut executor = HeadlessTurnExecutor {
         model: Some(model),
         dispatcher: Some(all_tools.dispatcher),
-        extensions: Some(all_tools.extensions),
+        extensions: Some(extensions),
     };
 
     let output = match runtime
@@ -297,7 +299,18 @@ async fn execute_local(config: &ProviderConfig, task: &str) -> anyhow::Result<He
         _ => "anthropic",
     };
 
-    let model = match roz_agent::model::create_model(&config.model, "", "", 120, proxy_provider, Some(api_key)) {
+    let tenant_id = roz_core::auth::TenantId::new(uuid::Uuid::nil());
+    let registry = std::sync::Arc::new(roz_core::model_endpoint::EndpointRegistry::empty());
+    let model = match roz_agent::model::create_model(
+        &config.model,
+        "",
+        "",
+        120,
+        proxy_provider,
+        Some(api_key),
+        &tenant_id,
+        registry,
+    ) {
         Ok(model) => model,
         Err(error) => return Ok(HeadlessExecution::Error(error.to_string())),
     };

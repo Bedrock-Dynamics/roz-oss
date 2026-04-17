@@ -6,10 +6,15 @@ import "google/protobuf/timestamp.proto";
 
 service TaskService {
   rpc CreateTask(CreateTaskRequest) returns (Task);
+  rpc CreateScheduledTask(CreateScheduledTaskRequest) returns (ScheduledTask);
   rpc GetTask(GetTaskRequest) returns (Task);
   rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+  rpc ListScheduledTasks(ListScheduledTasksRequest) returns (ListScheduledTasksResponse);
   rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
+  rpc UpdateScheduledTask(UpdateScheduledTaskRequest) returns (ScheduledTask);
+  rpc DeleteScheduledTask(DeleteScheduledTaskRequest) returns (DeleteScheduledTaskResponse);
   rpc ApproveToolUse(ApproveToolUseRequest) returns (Task);
+  rpc PreviewSchedule(PreviewScheduleRequest) returns (PreviewScheduleResponse);
   rpc StreamTaskStatus(StreamTaskStatusRequest) returns (stream TaskStatusUpdate);
 }
 
@@ -43,6 +48,68 @@ message CancelTaskRequest {
 
 message CancelTaskResponse {}
 
+message ScheduledTaskTemplate {
+  string prompt = 1;
+  string environment_id = 2;
+  string host_id = 3;
+  optional uint32 timeout_secs = 4;
+  optional google.protobuf.Struct control_interface_manifest = 5;
+  optional google.protobuf.Struct delegation_scope = 6;
+  repeated google.protobuf.Struct phases = 7;
+  optional string parent_task_id = 8;
+}
+
+message ScheduledTask {
+  string id = 1;
+  string name = 2;
+  string nl_schedule = 3;
+  string parsed_cron = 4;
+  string timezone = 5;
+  ScheduledTaskTemplate task_template = 6;
+  bool enabled = 7;
+  string catch_up_policy = 8;
+  optional google.protobuf.Timestamp next_fire_at = 9;
+  optional google.protobuf.Timestamp last_fire_at = 10;
+  google.protobuf.Timestamp created_at = 11;
+  google.protobuf.Timestamp updated_at = 12;
+}
+
+message CreateScheduledTaskRequest {
+  string name = 1;
+  string nl_schedule = 2;
+  string parsed_cron = 3;
+  string timezone = 4;
+  ScheduledTaskTemplate task_template = 5;
+  bool enabled = 6;
+  string catch_up_policy = 7;
+}
+
+message UpdateScheduledTaskRequest {
+  string id = 1;
+  optional string name = 2;
+  optional string nl_schedule = 3;
+  optional string parsed_cron = 4;
+  optional string timezone = 5;
+  ScheduledTaskTemplate task_template = 6;
+  optional bool enabled = 7;
+  optional string catch_up_policy = 8;
+}
+
+message DeleteScheduledTaskRequest {
+  string id = 1;
+}
+
+message DeleteScheduledTaskResponse {}
+
+message ListScheduledTasksRequest {
+  int64 limit = 1;
+  int64 offset = 2;
+}
+
+message ListScheduledTasksResponse {
+  repeated ScheduledTask data = 1;
+}
+
 message ApproveToolUseRequest {
   string task_id = 1;
   string approval_id = 2;
@@ -52,6 +119,24 @@ message ApproveToolUseRequest {
 
 message StreamTaskStatusRequest {
   string task_id = 1;
+}
+
+message PreviewScheduleRequest {
+  optional string nl_schedule = 1;
+  optional string parsed_cron = 2;
+  string timezone = 3;
+}
+
+message ScheduledFireTime {
+  google.protobuf.Timestamp fire_at = 1;
+  string local_time = 2;
+}
+
+message PreviewScheduleResponse {
+  optional string nl_schedule = 1;
+  string parsed_cron = 2;
+  string timezone = 3;
+  repeated ScheduledFireTime next_fires = 4;
 }
 
 message Task {

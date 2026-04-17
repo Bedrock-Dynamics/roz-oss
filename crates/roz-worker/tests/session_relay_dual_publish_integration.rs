@@ -22,7 +22,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::DateTime;
 use futures::StreamExt;
-use roz_core::session::event::{CorrelationId, EventEnvelope, EventId, SessionEvent};
+use roz_core::session::event::{
+    CanonicalSessionEventEnvelope, CorrelationId, EventEnvelope, EventId, SessionEvent, canonical_event_type_name,
+};
 use roz_core::transport::{DualPublishTransport, SessionTransport};
 use roz_worker::session_relay::publish_event_envelope_for_test;
 use roz_worker::transport_nats::NatsSessionTransport;
@@ -50,6 +52,19 @@ fn fixture_envelope() -> EventEnvelope {
         parent_event_id: None,
         timestamp: DateTime::from_timestamp(1_767_225_600, 0).unwrap(), // 2026-01-01T00:00:00Z
         event: SessionEvent::TurnStarted { turn_index: 7 },
+    }
+}
+
+fn skill_loaded_fixture() -> EventEnvelope {
+    EventEnvelope {
+        event_id: EventId("evt-21-1-skill-loaded".into()),
+        correlation_id: CorrelationId("corr-21-1-skill-loaded".into()),
+        parent_event_id: None,
+        timestamp: DateTime::from_timestamp(1_776_297_600, 0).unwrap(), // 2026-04-16T00:00:00Z
+        event: SessionEvent::SkillLoaded {
+            name: "warehouse-skill".into(),
+            version: "0.1.0".into(),
+        },
     }
 }
 
@@ -131,4 +146,57 @@ async fn none_event_transport_preserves_nats_only_path() {
         .expect("nats msg");
     let got_env: EventEnvelope = serde_json::from_slice(&msg.payload).expect("decode");
     assert_eq!(got_env.event_id.0, "evt-15-fixture");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skill_event_publish_preserves_correlation_across_worker_relay_legs() {
+    let nats_url = roz_test::nats_url().await;
+    let nats = async_nats::connect(nats_url).await.expect("nats connect");
+
+    let count = Arc::new(AtomicUsize::new(0));
+    let captured = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let capturing = CapturingTransport {
+        count: count.clone(),
+        captured: captured.clone(),
+    };
+    let nats_transport = NatsSessionTransport::new(nats.clone());
+    let dual: Arc<dyn SessionTransport> = Arc::new(DualPublishTransport::new(nats_transport, capturing));
+
+    let env = skill_loaded_fixture();
+    let response_subject = "roz.v1.session.test.skill.response";
+    let event_subject = roz_worker::event_nats::event_subject("roz.v1", "corr-21-1-skill-loaded", &env.event);
+    let mut response_sub = nats.subscribe(response_subject).await.expect("response sub");
+    let mut event_sub = nats.subscribe(event_subject).await.expect("event sub");
+
+    publish_event_envelope_for_test(&nats, "corr-21-1-skill-loaded", response_subject, &env, Some(&dual))
+        .await
+        .expect("publish");
+
+    let canonical_msg = tokio::time::timeout(Duration::from_secs(3), response_sub.next())
+        .await
+        .expect("canonical recv timeout")
+        .expect("canonical msg");
+    let canonical: CanonicalSessionEventEnvelope =
+        serde_json::from_slice(&canonical_msg.payload).expect("decode canonical");
+    assert_eq!(canonical.correlation_id, "corr-21-1-skill-loaded");
+    assert_eq!(canonical.event_type, "skill_loaded");
+
+    let event_msg = tokio::time::timeout(Duration::from_secs(3), event_sub.next())
+        .await
+        .expect("event recv timeout")
+        .expect("event msg");
+    let relayed: EventEnvelope = serde_json::from_slice(&event_msg.payload).expect("decode event envelope");
+    assert_eq!(relayed.correlation_id.0, "corr-21-1-skill-loaded");
+    assert_eq!(canonical_event_type_name(&relayed.event), "skill_loaded");
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "capturing transport must still be invoked for the skill event"
+    );
+    let captured_snapshot: Vec<EventEnvelope> = captured.lock().clone();
+    assert_eq!(captured_snapshot.len(), 1);
+    assert_eq!(captured_snapshot[0].correlation_id.0, "corr-21-1-skill-loaded");
+    assert_eq!(canonical_event_type_name(&captured_snapshot[0].event), "skill_loaded");
 }

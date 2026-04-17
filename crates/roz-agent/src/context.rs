@@ -56,7 +56,11 @@ impl ContextManager {
     }
 
     /// Fraction of the token budget currently used by the given messages.
-    fn fraction_used(&self, messages: &[Message]) -> f64 {
+    ///
+    /// Exposed for MEM-06 rolling-compaction trigger in
+    /// `agent_loop::core::run_streaming_core`.
+    #[must_use]
+    pub fn fraction_used(&self, messages: &[Message]) -> f64 {
         f64::from(Self::message_tokens(messages)) / f64::from(self.max_tokens)
     }
 
@@ -159,6 +163,7 @@ impl ContextManager {
             tools: vec![],
             max_tokens: 1024,
             tool_choice: None,
+            response_schema: None,
         };
 
         let response = model.complete(&summary_req).await.map_err(AgentError::Model)?;

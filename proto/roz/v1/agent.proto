@@ -21,6 +21,141 @@ service AgentService {
   rpc AnalyzeMedia(AnalyzeMediaRequest) returns (stream AnalyzeMediaChunk);
 }
 
+service McpServerService {
+  rpc Register(RegisterMcpServerRequest) returns (RegisterMcpServerResponse);
+  rpc List(ListMcpServersRequest) returns (ListMcpServersResponse);
+  rpc Get(GetMcpServerRequest) returns (McpServerDetail);
+  rpc Delete(DeleteMcpServerRequest) returns (DeleteMcpServerResponse);
+  rpc HealthCheck(HealthCheckMcpServerRequest) returns (HealthCheckMcpServerResponse);
+}
+
+enum McpTransport {
+  MCP_TRANSPORT_UNSPECIFIED = 0;
+  MCP_TRANSPORT_STREAMABLE_HTTP = 1;
+}
+
+enum McpAuthKind {
+  MCP_AUTH_KIND_UNSPECIFIED = 0;
+  MCP_AUTH_KIND_NONE = 1;
+  MCP_AUTH_KIND_BEARER = 2;
+  MCP_AUTH_KIND_STATIC_HEADER = 3;
+  MCP_AUTH_KIND_OAUTH = 4;
+}
+
+enum McpHealthStatus {
+  MCP_HEALTH_STATUS_UNSPECIFIED = 0;
+  MCP_HEALTH_STATUS_HEALTHY = 1;
+  MCP_HEALTH_STATUS_DEGRADED = 2;
+}
+
+message McpNoAuth {}
+
+message McpBearerAuth {
+  string token = 1;
+}
+
+message McpStaticHeaderAuth {
+  string header_name = 1;
+  string header_value = 2;
+}
+
+message McpOauthAuth {
+  repeated string scopes = 1;
+  optional string client_name = 2;
+  optional string client_metadata_url = 3;
+}
+
+message McpAuthConfig {
+  oneof config {
+    McpNoAuth no_auth = 1;
+    McpBearerAuth bearer = 2;
+    McpStaticHeaderAuth static_header = 3;
+    McpOauthAuth oauth = 4;
+  }
+}
+
+message McpServerSummary {
+  string name = 1;
+  McpTransport transport = 2;
+  string url = 3;
+  bool enabled = 4;
+  McpAuthKind auth_kind = 5;
+  McpHealthStatus health_status = 6;
+  uint32 failure_count = 7;
+  google.protobuf.Timestamp degraded_at = 8;
+  optional string last_error = 9;
+}
+
+message McpServerDetail {
+  string name = 1;
+  McpTransport transport = 2;
+  string url = 3;
+  bool enabled = 4;
+  McpAuthKind auth_kind = 5;
+  McpHealthStatus health_status = 6;
+  uint32 failure_count = 7;
+  google.protobuf.Timestamp degraded_at = 8;
+  optional string last_error = 9;
+  bool has_credentials = 10;
+}
+
+message RegisterMcpServerRequest {
+  string name = 1;
+  McpTransport transport = 2;
+  string url = 3;
+  bool enabled = 4;
+  optional McpAuthConfig auth = 5;
+  optional string session_id = 6;
+}
+
+enum McpOauthPendingStatus {
+  MCP_OAUTH_PENDING_STATUS_UNSPECIFIED = 0;
+  MCP_OAUTH_PENDING_STATUS_PENDING = 1;
+}
+
+message McpOauthPendingApproval {
+  string approval_id = 1;
+  string authorization_url = 2;
+  McpOauthPendingStatus status = 3;
+}
+
+message RegisterMcpServerResponse {
+  oneof result {
+    McpServerDetail server = 1;
+    McpOauthPendingApproval oauth_pending = 2;
+  }
+}
+
+message ListMcpServersRequest {}
+
+message ListMcpServersResponse {
+  repeated McpServerSummary servers = 1;
+}
+
+message GetMcpServerRequest {
+  string name = 1;
+}
+
+message DeleteMcpServerRequest {
+  string name = 1;
+}
+
+message DeleteMcpServerResponse {
+  bool deleted = 1;
+}
+
+message HealthCheckMcpServerRequest {
+  string name = 1;
+}
+
+message HealthCheckMcpServerResponse {
+  string name = 1;
+  McpHealthStatus health_status = 2;
+  uint32 failure_count = 3;
+  google.protobuf.Timestamp degraded_at = 4;
+  optional string last_error = 5;
+}
+
 // --- Client → Server ---
 
 message SessionRequest {
@@ -259,6 +394,9 @@ message SessionEventEnvelope {
     SensorRepositionedPayload sensor_repositioned = 41;
     ContactStateChangedPayload contact_state_changed = 42;
     FeedbackReceivedPayload feedback_received = 43;
+    McpServerDegradedPayload mcp_server_degraded = 44;
+    SkillLoadedPayload skill_loaded = 45;
+    SkillCrystallizedPayload skill_crystallized = 46;
   }
 }
 
@@ -414,6 +552,12 @@ message EdgeTransportDegradedPayload {
   repeated string affected_capabilities = 3;
 }
 
+message McpServerDegradedPayload {
+  string server_name = 1;
+  uint32 failure_count = 2;
+  string last_error = 3;
+}
+
 message VerificationStartedPayload {
   string target = 1;
   string verifier_kind = 2;
@@ -497,6 +641,17 @@ message FeedbackReceivedPayload {
   optional string operator_comment = 4;
 }
 
+message SkillLoadedPayload {
+  string name = 1;
+  string version = 2;
+}
+
+message SkillCrystallizedPayload {
+  string name = 1;
+  string version = 2;
+  string source = 3;
+}
+
 message ContextCompacted {
   string level = 1;
   uint32 messages_before = 2;
@@ -518,6 +673,7 @@ enum ToolCategoryHint {
   TOOL_CATEGORY_UNSPECIFIED = 0;
   TOOL_CATEGORY_PHYSICAL = 1;
   TOOL_CATEGORY_PURE = 2;
+  TOOL_CATEGORY_CODE_SANDBOX = 3;
 }
 
 message ToolSchema {

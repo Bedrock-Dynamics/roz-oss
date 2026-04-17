@@ -46,7 +46,12 @@ pub enum Role {
 // ---------------------------------------------------------------------------
 
 /// Fine-grained capability attached to an API key.
+///
+/// Serialized in `kebab-case` (e.g. `"admin"`, `"read-tasks"`) to match the
+/// string form stored in the `roz_api_keys.scopes TEXT[]` column and emitted
+/// by the server bootstrap paths in `crates/roz-server/src/main.rs`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ApiKeyScope {
     ReadTasks,
     WriteTasks,
@@ -90,6 +95,35 @@ impl AuthIdentity {
             Self::User { tenant_id, .. } | Self::ApiKey { tenant_id, .. } | Self::Worker { tenant_id, .. } => tenant_id,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Permissions
+// ---------------------------------------------------------------------------
+
+/// Permissions bag carried alongside `AuthIdentity` in `ToolContext::extensions`.
+///
+/// Phase 17 introduces this pattern for `can_write_memory` (D-08). Phase 18
+/// will extend with `can_write_skills`. Lives in `roz-core` so both the
+/// gRPC auth middleware and the agent dispatch layer reach it without a
+/// cross-crate dependency.
+///
+/// # Defaults
+/// `Permissions::default()` sets every flag to `false` — cloud-safe. Owner CLI
+/// sessions construct `Permissions { can_write_memory: true, ..Default::default() }`
+/// at bootstrap time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Permissions {
+    /// MEM-07 / D-08: permits `memory_write` tool dispatch to succeed.
+    /// Cloud default `false`; owner CLI default `true`.
+    pub can_write_memory: bool,
+    /// SKILL-04 / Phase 18 D-10: permits `skill_manage` write-path tool
+    /// dispatch (import/delete/crystallize). Cloud default `false`; owner
+    /// CLI default `true`. Mirrors `can_write_memory` exactly.
+    pub can_write_skills: bool,
+    /// MCP-03 / Phase 20: permits operator-facing MCP registration and delete
+    /// RPCs. Cloud default `false`; admin/owner identities opt in via auth.
+    pub can_manage_mcp_servers: bool,
 }
 
 // ===========================================================================
@@ -178,6 +212,22 @@ mod tests {
             let back: ApiKeyScope = serde_json::from_str(&json).unwrap();
             assert_eq!(*scope, back);
         }
+    }
+
+    #[test]
+    fn api_key_scope_serializes_as_kebab_case() {
+        // 18-12 gap closure: the `roz_api_keys.scopes TEXT[]` column stores the
+        // kebab-case form, and the gRPC auth middleware parses each element
+        // through `serde_json::from_value::<ApiKeyScope>`. If this changes,
+        // production API keys will silently drop all scopes and every gated
+        // RPC (e.g. `SkillsService/Delete`) becomes unreachable.
+        assert_eq!(serde_json::to_string(&ApiKeyScope::Admin).unwrap(), "\"admin\"");
+        assert_eq!(
+            serde_json::to_string(&ApiKeyScope::ReadTasks).unwrap(),
+            "\"read-tasks\""
+        );
+        let back: ApiKeyScope = serde_json::from_str("\"admin\"").unwrap();
+        assert_eq!(back, ApiKeyScope::Admin);
     }
 
     #[test]
@@ -289,5 +339,31 @@ mod tests {
         let c = TenantId::new(Uuid::new_v4());
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    // -----------------------------------------------------------------------
+    // Permissions (Phase 17 MEM-07 / Phase 18 SKILL-04)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn permissions_default_denies_skill_write() {
+        // Cloud-safe default: every flag is false.
+        let perms = Permissions::default();
+        assert!(!perms.can_write_skills);
+        assert!(!perms.can_write_memory);
+        assert!(!perms.can_manage_mcp_servers);
+    }
+
+    #[test]
+    fn permissions_owner_cli_can_be_constructed() {
+        // Owner CLI bootstrap sets both flags true; construct explicitly.
+        let perms = Permissions {
+            can_write_memory: true,
+            can_write_skills: true,
+            can_manage_mcp_servers: true,
+        };
+        assert!(perms.can_write_skills);
+        assert!(perms.can_write_memory);
+        assert!(perms.can_manage_mcp_servers);
     }
 }

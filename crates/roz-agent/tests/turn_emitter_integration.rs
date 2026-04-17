@@ -78,6 +78,7 @@ async fn run_flush_task_persists_turns() {
             role: "user",
             content: json!({ "i": i }),
             token_usage: None,
+            kind: TurnEnvelope::KIND_TURN,
         });
     }
 
@@ -111,6 +112,7 @@ async fn run_flush_task_drop_newest_preserves_earlier() {
             role: "user",
             content: json!({ "i": i }),
             token_usage: None,
+            kind: TurnEnvelope::KIND_TURN,
         });
     }
 
@@ -162,6 +164,7 @@ async fn resume_seeds_turn_index() {
             role: "assistant",
             content: json!({ "i": i }),
             token_usage: None,
+            kind: TurnEnvelope::KIND_TURN,
         });
     }
 

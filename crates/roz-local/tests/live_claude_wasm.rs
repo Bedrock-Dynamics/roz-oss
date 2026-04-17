@@ -322,7 +322,17 @@ async fn real_claude_writes_wat_and_deploys_controller() {
     extensions.insert(embodiment_runtime);
 
     // 3. Create real Claude model
-    let model = roz_agent::model::create_model("claude-sonnet-4-6", "", "", 120, "anthropic", Some(&api_key)).unwrap();
+    let model = roz_agent::model::create_model(
+        "claude-sonnet-4-6",
+        "",
+        "",
+        120,
+        "anthropic",
+        Some(&api_key),
+        &roz_core::auth::TenantId::new(uuid::Uuid::nil()),
+        std::sync::Arc::new(roz_core::model_endpoint::EndpointRegistry::empty()),
+    )
+    .unwrap();
 
     // 4. Robot context in system prompt
     let robot_context = constant_controller_prompt(control_manifest.channels.len());
@@ -507,7 +517,17 @@ async fn real_claude_writes_stateful_wat_and_flips_controller_output() {
     extensions.insert(control_manifest.clone());
     extensions.insert(embodiment_runtime);
 
-    let model = roz_agent::model::create_model("claude-sonnet-4-6", "", "", 120, "anthropic", Some(&api_key)).unwrap();
+    let model = roz_agent::model::create_model(
+        "claude-sonnet-4-6",
+        "",
+        "",
+        120,
+        "anthropic",
+        Some(&api_key),
+        &roz_core::auth::TenantId::new(uuid::Uuid::nil()),
+        std::sync::Arc::new(roz_core::model_endpoint::EndpointRegistry::empty()),
+    )
+    .unwrap();
     let safety = roz_agent::safety::SafetyStack::new(vec![]);
     let spatial = Box::new(roz_agent::spatial_provider::MockSpatialContextProvider::empty());
     let mut agent = roz_agent::agent_loop::AgentLoop::new(

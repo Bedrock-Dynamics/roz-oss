@@ -69,6 +69,7 @@ async fn worker_flush_task_persists_turns() {
             role,
             content: json!({ "i": i }),
             token_usage: None,
+            kind: TurnEnvelope::KIND_TURN,
         });
     }
     sleep(Duration::from_millis(250)).await;

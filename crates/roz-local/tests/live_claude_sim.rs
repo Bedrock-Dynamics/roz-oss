@@ -34,7 +34,17 @@ async fn real_claude_moves_arm_via_mcp() {
     }
 
     // 2. Create real Claude model
-    let model = roz_agent::model::create_model("claude-sonnet-4-6", "", "", 120, "anthropic", Some(&api_key)).unwrap();
+    let model = roz_agent::model::create_model(
+        "claude-sonnet-4-6",
+        "",
+        "",
+        120,
+        "anthropic",
+        Some(&api_key),
+        &roz_core::auth::TenantId::new(uuid::Uuid::nil()),
+        std::sync::Arc::new(roz_core::model_endpoint::EndpointRegistry::empty()),
+    )
+    .unwrap();
 
     // 3. Create dispatcher with MCP tools
     let mut dispatcher = roz_agent::dispatch::ToolDispatcher::new(std::time::Duration::from_secs(30));

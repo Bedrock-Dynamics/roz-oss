@@ -436,6 +436,10 @@ async fn execute_task(
     };
 
     let mut dispatcher = roz_agent::dispatch::ToolDispatcher::new(Duration::from_secs(30));
+    dispatcher.register_with_category(
+        Box::new(roz_agent::tools::execute_code::ExecuteCodeTool),
+        roz_core::tools::ToolCategory::CodeSandbox,
+    );
     let guards: Vec<Box<dyn roz_agent::safety::SafetyGuard>> = vec![Box::new(
         roz_agent::safety::guards::VelocityLimiter::new(task_config.max_velocity.unwrap_or(1.5)),
     )];
@@ -570,8 +574,99 @@ async fn execute_task(
         project_context: prompt_state.project_context,
         initial_history: Vec::new(),
     };
-    let mut session_runtime = SessionRuntime::new(&session_config);
+
+    // DEBT-03 / MEM-04: build turn-flush BEFORE the SessionRuntime so the same
+    // PgPool can back both the write-behind turn emitter AND the
+    // PostgresMemoryStore that feeds the frozen memory snapshot (MEM-05).
+    // `mut` because MEM-03 takes `fact_rx` by value below.
+    let mut turn_flush = roz_worker::turn_flush::build_turn_flush(&task_config).await;
+
+    // MEM-03: spawn the fact extractor when pool + aux-LLM + fact_rx are all
+    // available. Fall-open on any missing dep — the emitter's try_send on the
+    // fact channel logs & drops when the receiver is gone.
+    if let (Some(pool), Some(fact_rx), Some(aux)) = (
+        turn_flush.pool.clone(),
+        turn_flush.fact_rx.take(),
+        roz_agent::aux_llm::GeminiFlashAuxLlm::from_env(),
+    ) {
+        let fact_cancel = task_sidecars_cancel.clone();
+        let aux_arc: std::sync::Arc<dyn roz_agent::aux_llm::AuxLlm> = std::sync::Arc::new(aux);
+        let cfg = roz_agent::agent_loop::fact_extractor::FactExtractorConfig {
+            observed_peer_id: invocation.tenant_id.clone(),
+            ..Default::default()
+        };
+        tokio::spawn(async move {
+            roz_agent::agent_loop::fact_extractor::run_fact_extractor_task(fact_rx, pool, aux_arc, cfg, fact_cancel)
+                .await;
+        });
+    } else if turn_flush.pool.is_some() {
+        tracing::info!("MEM-03: fact extraction disabled (ROZ_GEMINI_API_KEY not set)");
+    }
+
+    // MEM-04 / MEM-05: wire the Postgres-backed MemoryStore when a pool is
+    // available; fall back to the in-memory store on fail-closed paths
+    // (local/dev without ROZ_DATABASE_URL). The snapshot is frozen at
+    // construction time inside `SessionRuntime::new_with_memory_store`.
+    let memory_store: std::sync::Arc<dyn roz_agent::memory_store::MemoryStore> = match &turn_flush.pool {
+        Some(pool) => std::sync::Arc::new(roz_agent::memory_store::PostgresMemoryStore::new(pool.clone())),
+        None => std::sync::Arc::new(roz_agent::memory_store::InMemoryMemoryStore::new()),
+    };
+
+    // Phase 18 SKILL-05 / PLAN-08: load the frozen tier-0 skill snapshot once
+    // per session under tenant RLS (mirrors cloud handle_start in
+    // crates/roz-server/src/grpc/agent.rs). Fail-open: empty Vec when the
+    // worker has no DB pool, when set_tenant_context fails, or when the
+    // tenant_id from the invocation isn't a UUID.
+    let frozen_skills: Vec<roz_db::skills::SkillSummary> =
+        if let (Some(pool), Ok(tenant_uuid)) = (turn_flush.pool.as_ref(), invocation.tenant_id.parse::<Uuid>()) {
+            match pool.begin().await {
+                Ok(mut db_tx) => {
+                    if let Err(err) = roz_db::set_tenant_context(&mut *db_tx, &tenant_uuid).await {
+                        tracing::warn!(
+                            error = %err,
+                            tenant_id = %tenant_uuid,
+                            "skills snapshot set_tenant_context failed; continuing with empty snapshot"
+                        );
+                        Vec::new()
+                    } else {
+                        match roz_db::skills::list_recent(&mut *db_tx, 20).await {
+                            Ok(rows) => {
+                                let _ = db_tx.commit().await;
+                                rows
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    tenant_id = %tenant_uuid,
+                                    "skills snapshot list_recent failed; continuing with empty snapshot"
+                                );
+                                Vec::new()
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        tenant_id = %tenant_uuid,
+                        "skills snapshot tx begin failed; continuing with empty snapshot"
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+    let mut session_runtime = SessionRuntime::new_with_memory_store(&session_config, memory_store).await;
+    // Phase 18 SKILL-05 / PLAN-08: install the frozen tier-0 skill snapshot
+    // (loaded above) so every turn's AssemblyContext.skill_entries reads from
+    // the same stable Vec. Mid-session writes do NOT mutate this prompt
+    // snapshot — the agent uses `skills_list` for live discovery and
+    // `skill_view` for live body/version loads until the next session.
+    session_runtime.set_skill_snapshot(frozen_skills);
     let approval_runtime = session_runtime.approval_handle();
+    extensions.insert(session_runtime.event_emitter());
 
     if let Some(parent_task_id) = invocation.parent_task_id {
         // Child task: consume inbound resolutions from parent, relay outbound requests up.
@@ -607,9 +702,81 @@ async fn execute_task(
         ));
     }
 
-    // DEBT-03: worker-side turn persistence. Opt-in via ROZ_DATABASE_URL.
-    // Fail-closed when unset: bundle is inert and the agent runs as before.
-    let turn_flush = roz_worker::turn_flush::build_turn_flush(&task_config).await;
+    // MEM-07 + PLAN-17-07 Task 3 + Phase 18 PLAN-08: register the four memory
+    // tools (Phase 17) and four skill tools (Phase 18). Workers default to
+    // `can_write_memory: false` AND `can_write_skills: false` per RESEARCH
+    // OQ #3 — workers are NOT the canonical skill-write entry point; the CLI
+    // (PLAN-09) and cloud server are.
+    dispatcher.register_phase17_memory_tools();
+    dispatcher.register_phase18_skill_tools();
+
+    // Workers run on behalf of a single authenticated tenant; permission is
+    // derived from the invocation's trust posture. Default deny until explicit
+    // upgrade. `can_write_skills` is forced false here regardless of any future
+    // can_write_memory upgrade so an accidental delegation_scope flip cannot
+    // grant skill-write rights to workers (T-18-08-02 mitigation).
+    // TODO(phase 18+): compute `can_write_memory` from delegation_scope /
+    // trust_posture once owner-trust is modeled at the worker level.
+    extensions.insert(roz_core::auth::Permissions {
+        can_write_skills: false,
+        ..roz_core::auth::Permissions::default()
+    });
+    match invocation.tenant_id.parse::<Uuid>() {
+        Ok(tenant_uuid) => {
+            extensions.insert(roz_core::auth::AuthIdentity::Worker {
+                worker_id: task_config.worker_id.clone(),
+                tenant_id: roz_core::auth::TenantId::new(tenant_uuid),
+                host_id: invocation.host_id.to_string(),
+            });
+        }
+        Err(error) => {
+            tracing::warn!(
+                tenant_id = %invocation.tenant_id,
+                %error,
+                "worker auth identity unavailable: tenant_id is not a valid UUID"
+            );
+        }
+    }
+
+    // MEM-07 + PLAN-17-07 Task 3: inject PgPool for the four Pure tools.
+    // Worker may run without a DB (local/dev mode). When unset, the tools
+    // return a typed "PgPool extension missing" error to the model — no panic.
+    if let Some(ref pool) = turn_flush.pool {
+        extensions.insert(pool.clone());
+    }
+
+    // Phase 18 SKILL-01 / PLAN-08: inject Arc<dyn ObjectStore> when the
+    // operator has configured ROZ_SKILL_STORE_ROOT. When unset, the
+    // skill_read_file tool returns "ObjectStore extension missing" — workers
+    // typically rely on the cloud server as the canonical skill-bundle origin.
+    if let Some(skill_root) = task_config.resolved_skill_store_root() {
+        match std::fs::create_dir_all(&skill_root) {
+            Ok(()) => match object_store::local::LocalFileSystem::new_with_prefix(&skill_root) {
+                Ok(fs) => {
+                    let store: std::sync::Arc<dyn object_store::ObjectStore> = std::sync::Arc::new(fs);
+                    extensions.insert(store);
+                    tracing::info!(
+                        skill_store_root = %skill_root.display(),
+                        "worker skill object store registered"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        skill_store_root = %skill_root.display(),
+                        "failed to construct LocalFileSystem object store; skill_read_file tool will return errors"
+                    );
+                }
+            },
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    skill_store_root = %skill_root.display(),
+                    "failed to create ROZ_SKILL_STORE_ROOT; skill_read_file tool will return errors"
+                );
+            }
+        }
+    }
 
     let agent = AgentLoop::new(model, dispatcher, safety, spatial)
         .with_extensions(extensions)

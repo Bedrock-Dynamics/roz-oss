@@ -9,6 +9,15 @@ use super::types::{
     CompletionRequest, CompletionResponse, ContentPart, Message, MessageRole, Model, ModelCapability, StopReason,
     StreamChunk, StreamResponse, TokenUsage, ToolChoiceStrategy,
 };
+use crate::error::AgentError;
+
+/// Synthetic tool name used to force Anthropic to emit structured output.
+///
+/// Plan 19-12: when `CompletionRequest.response_schema = Some(schema)`, the
+/// provider injects a tool with this name + the caller's schema as its
+/// `input_schema` and pins `tool_choice` to forcing this tool. The model's
+/// `tool_use.input` is then the structured payload.
+const RESPOND_TOOL_NAME: &str = "respond";
 
 /// Helper for `#[serde(skip_serializing_if)]` on bool fields.
 /// Serde requires `&T` signature; clippy wants by-value for trivially-copyable types.
@@ -37,7 +46,7 @@ pub struct AnthropicRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<ToolChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub thinking: Option<ThinkingConfig>,
+    pub thinking: Option<AnthropicThinkingConfig>,
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
@@ -139,10 +148,14 @@ pub enum ToolChoice {
     Tool { name: String },
 }
 
-/// Thinking/reasoning configuration.
+/// Anthropic-specific thinking/reasoning configuration.
+///
+/// Renamed from `ThinkingConfig` in Plan 19-01 to free the canonical name for
+/// `roz_core::thinking::ThinkingConfig` (which models the cross-provider
+/// reasoning tagging contract — Signed / UnsignedTagged / None).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum ThinkingConfig {
+pub enum AnthropicThinkingConfig {
     Adaptive,
 }
 
@@ -249,7 +262,7 @@ pub struct AnthropicConfig {
     pub model: String,
     /// Optional thinking/reasoning configuration. Set to `None` for models that
     /// don't support extended thinking.
-    pub thinking: Option<ThinkingConfig>,
+    pub thinking: Option<AnthropicThinkingConfig>,
     /// HTTP request timeout. Prevents a hung upstream server from blocking the
     /// agent loop indefinitely.
     pub timeout: Duration,
@@ -661,6 +674,100 @@ impl AnthropicProvider {
             req.header("authorization", format!("Bearer {}", self.config.api_key))
         }
     }
+
+    /// Build the wire `AnthropicRequest` body shared by `complete` (`stream=false`)
+    /// and the response_schema repair-retry path.
+    ///
+    /// Honors `CompletionRequest::response_schema` by injecting a synthetic
+    /// `respond` tool + pinning `tool_choice` to forcing that tool (Plan 19-12).
+    #[allow(
+        clippy::option_if_let_else,
+        reason = "if-let arm pushes to tools_vec; map_or_else closure form is harder to read"
+    )]
+    fn build_api_request(config: &AnthropicConfig, req: &CompletionRequest, stream: bool) -> AnthropicRequest {
+        let (system, messages) = Self::convert_messages(&req.messages);
+        let mut tools_vec: Vec<ToolDefinition> = if req.tools.is_empty() {
+            Vec::new()
+        } else {
+            Self::convert_tools(&req.tools)
+        };
+
+        // Structured-output via tool-forcing (Plan 19-12). The `respond` tool
+        // override takes precedence over any caller-provided tool_choice.
+        let tool_choice = if let Some(schema) = req.response_schema.as_ref() {
+            // Ensure schema has "type":"object" — Anthropic requires this.
+            let mut input_schema = schema.clone();
+            if let Value::Object(map) = &mut input_schema {
+                map.entry("type").or_insert_with(|| Value::String("object".into()));
+            }
+            tools_vec.push(ToolDefinition {
+                name: RESPOND_TOOL_NAME.to_string(),
+                description: "Return structured output matching the requested schema.".to_string(),
+                input_schema,
+            });
+            Some(ToolChoice::Tool {
+                name: RESPOND_TOOL_NAME.to_string(),
+            })
+        } else if req.tools.is_empty() {
+            None
+        } else {
+            Some(Self::map_tool_choice(req.tool_choice.as_ref()))
+        };
+
+        let tools = if tools_vec.is_empty() { None } else { Some(tools_vec) };
+
+        AnthropicRequest {
+            model: config.model.clone(),
+            max_tokens: req.max_tokens,
+            system,
+            messages,
+            tools,
+            tool_choice,
+            thinking: config.thinking.clone(),
+            stream,
+            metadata: None,
+        }
+    }
+
+    /// Send a built `AnthropicRequest` and deserialize the response.
+    ///
+    /// Factored out of `complete` so the response_schema retry can reuse it.
+    async fn send_messages_request(
+        &self,
+        api_req: &AnthropicRequest,
+    ) -> Result<AnthropicResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let response = self.base_request().json(api_req).send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            tracing::error!(status = %status, body = %body, "anthropic API error");
+            return Err(format!("Anthropic API error {status}: {body}").into());
+        }
+        let resp = response.json::<AnthropicResponse>().await?;
+        Ok(resp)
+    }
+}
+
+/// Locate the forced `respond` tool_use in an Anthropic response and return
+/// its `input` serialized as a JSON string for the repair pipeline.
+fn extract_respond_tool_input(resp: &AnthropicResponse) -> Option<String> {
+    resp.content.iter().find_map(|block| match block {
+        ContentBlock::ToolUse { name, input, .. } if name == RESPOND_TOOL_NAME => Some(input.to_string()),
+        _ => None,
+    })
+}
+
+/// Replace the first `ContentPart::Text` in `resp.parts` with `text`, or push
+/// one if none exists. Mirrors `openai::replace_primary_text` but kept local so
+/// each provider stays self-contained.
+fn replace_or_set_text(resp: &mut CompletionResponse, text: String) {
+    for part in &mut resp.parts {
+        if let ContentPart::Text { text: t } = part {
+            *t = text;
+            return;
+        }
+    }
+    resp.parts.push(ContentPart::Text { text });
 }
 
 #[async_trait]
@@ -673,40 +780,75 @@ impl Model for AnthropicProvider {
         &self,
         req: &CompletionRequest,
     ) -> Result<CompletionResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let (system, messages) = Self::convert_messages(&req.messages);
-        let tools = if req.tools.is_empty() {
-            None
-        } else {
-            Some(Self::convert_tools(&req.tools))
+        let api_req = Self::build_api_request(&self.config, req, false);
+        let resp = self.send_messages_request(&api_req).await?;
+        let mut converted = Self::convert_response(&resp);
+
+        // Structured-output (response_schema): the synthetic `respond` tool
+        // forced the model to emit a tool_use block whose `input` is the
+        // structured payload. Extract it and replace the assistant text so
+        // downstream consumers see uniform JSON regardless of provider.
+        let Some(schema) = req.response_schema.as_ref() else {
+            return Ok(converted);
         };
 
-        let api_req = AnthropicRequest {
-            model: self.config.model.clone(),
-            max_tokens: req.max_tokens,
-            system,
-            messages,
-            tools,
-            tool_choice: if req.tools.is_empty() {
-                None
-            } else {
-                Some(Self::map_tool_choice(req.tool_choice.as_ref()))
-            },
-            thinking: self.config.thinking.clone(),
-            stream: false,
-            metadata: None,
+        let raw1 = extract_respond_tool_input(&resp).ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+            Box::new(AgentError::StructuredOutputParse {
+                raw: "<no forced tool_use found>".to_string(),
+                err: "anthropic: forced respond tool absent from response".to_string(),
+            })
+        })?;
+
+        // Capture second response if retry fires.
+        let response2_cell: std::sync::Mutex<Option<AnthropicResponse>> = std::sync::Mutex::new(None);
+        let parsed = {
+            let response2_cell_ref = &response2_cell;
+            let retry = |raw: String, instruction: String| async move {
+                // Build a retry request that appends the malformed assistant turn
+                // + the synthetic repair instruction, re-using the forced-respond
+                // tool path so the next attempt is also schema-anchored.
+                let mut retry_req = req.clone();
+                retry_req.messages.push(Message::assistant_text(raw));
+                retry_req.messages.push(Message::user(instruction));
+                let retry_api_req = Self::build_api_request(&self.config, &retry_req, false);
+                let resp2 = self
+                    .send_messages_request(&retry_api_req)
+                    .await
+                    .map_err(|e| AgentError::Model(Box::<dyn std::error::Error + Send + Sync>::from(e.to_string())))?;
+                let raw2 = extract_respond_tool_input(&resp2).unwrap_or_default();
+                *response2_cell_ref.lock().expect("response2 mutex poisoned") = Some(resp2);
+                Ok::<_, AgentError>(raw2)
+            };
+            crate::model::structured_output::apply_repair_loop(raw1, schema, retry)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
         };
 
-        let response = self.base_request().json(&api_req).send().await?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            tracing::error!(status = %status, body = %body, "anthropic API error");
-            return Err(format!("Anthropic API error {status}: {body}").into());
+        // If the retry fired, sum usage and use response2's metadata.
+        if let Some(resp2) = response2_cell.into_inner().expect("response2 mutex poisoned") {
+            let mut converted2 = Self::convert_response(&resp2);
+            converted2.usage.input_tokens = converted
+                .usage
+                .input_tokens
+                .saturating_add(converted2.usage.input_tokens);
+            converted2.usage.output_tokens = converted
+                .usage
+                .output_tokens
+                .saturating_add(converted2.usage.output_tokens);
+            converted2.usage.cache_read_tokens = converted
+                .usage
+                .cache_read_tokens
+                .saturating_add(converted2.usage.cache_read_tokens);
+            converted2.usage.cache_creation_tokens = converted
+                .usage
+                .cache_creation_tokens
+                .saturating_add(converted2.usage.cache_creation_tokens);
+            converted = converted2;
         }
 
-        let resp = response.json::<AnthropicResponse>().await?;
-
-        Ok(Self::convert_response(&resp))
+        let canonical = serde_json::to_string(&parsed).unwrap_or_default();
+        replace_or_set_text(&mut converted, canonical);
+        Ok(converted)
     }
 
     async fn stream(
@@ -854,7 +996,7 @@ mod tests {
                 }),
             }]),
             tool_choice: Some(ToolChoice::Auto),
-            thinking: Some(ThinkingConfig::Adaptive),
+            thinking: Some(AnthropicThinkingConfig::Adaptive),
             stream: true,
             metadata: None,
         };

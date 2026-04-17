@@ -130,6 +130,8 @@ pub enum Commands {
     Env(commands::env::EnvArgs),
     /// Trigger management.
     Trigger(commands::trigger::TriggerArgs),
+    /// Scheduled task management.
+    Schedule(commands::schedule::ScheduleArgs),
     /// Skill management.
     Skill(commands::skill::SkillArgs),
     /// Stream management.
