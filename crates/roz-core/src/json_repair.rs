@@ -28,11 +28,11 @@ pub enum JsonRepairError {
 /// Strip a leading/trailing markdown code fence, including an optional
 /// `json` / `JSON` language tag on the opener.
 ///
-/// ```text
+/// ````text
 /// ```json
 /// {"a":1}
 /// ```
-/// ```
+/// ````
 ///
 /// becomes `{"a":1}`. If `input` does not begin with a triple-backtick, the
 /// input is returned unchanged.
