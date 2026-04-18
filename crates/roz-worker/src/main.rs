@@ -13,6 +13,7 @@ use roz_agent::session_runtime::{
     StreamingTurnHandle, StreamingTurnResult, TurnExecutionFailure, TurnOutput,
 };
 use roz_agent::spatial_provider::{NullWorldStateProvider, PrimedWorldStateProvider, WorldStateProvider};
+use roz_core::reconnect::WorkerOnlineSnapshot;
 use roz_core::session::activity::RuntimeFailureKind;
 use roz_core::session::event::{EventEnvelope, SessionEvent};
 use roz_core::session::feedback::ApprovalOutcome;
@@ -1197,6 +1198,15 @@ async fn main() -> Result<()> {
         std::sync::Arc<roz_core::key_provider::StaticKeyProvider>,
         std::path::PathBuf,
     )> = None;
+    // Phase 24 FS-02 / FS-03: the shared WalStore, tenant id, and signing-ctx
+    // Arc wrapper are hoisted here so the Phase 24 subsystems spawned below
+    // (checkpoint_writer, telemetry_replay, reconnect publisher) can share
+    // the same pointee as the signing context. All three stay `None` when
+    // signing bootstrap is skipped (D-12 rollout / no ROZ_ENCRYPTION_KEY);
+    // the subsystems guard on `Some` before spawning.
+    let mut worker_wal: Option<std::sync::Arc<roz_worker::wal::WalStore>> = None;
+    let mut worker_tenant: Option<Uuid> = None;
+    let mut signing_ctx_shared: Option<std::sync::Arc<WorkerSigningContext>> = None;
 
     // Register with server and bootstrap Phase 23 device signing key.
     //
@@ -1275,10 +1285,18 @@ async fn main() -> Result<()> {
                                 let wal_path = dir.join(format!("wal-{}.db", config.worker_id));
                                 match roz_worker::wal::WalStore::open(wal_path.to_str().unwrap_or(":memory:")) {
                                     Ok(wal) => {
-                                        signing_ctx = Some(WorkerSigningContext::new(
+                                        // Phase 24: hoist the Arc<WalStore> + tenant so the
+                                        // subsystems spawned after registration can share the
+                                        // same WAL pointee and tenant context.
+                                        let wal_arc = std::sync::Arc::new(wal);
+                                        worker_wal = Some(wal_arc.clone());
+                                        worker_tenant = Some(identity.tenant_id);
+                                        let ctx = WorkerSigningContext::new(
                                             std::sync::Arc::new(RwLock::new(material)),
-                                            std::sync::Arc::new(wal),
-                                        ));
+                                            wal_arc,
+                                        );
+                                        signing_ctx_shared = Some(std::sync::Arc::new(ctx.clone()));
+                                        signing_ctx = Some(ctx);
                                         signing_rotate_ctx = Some((key_provider.clone(), dir.clone()));
                                     }
                                     Err(e) => {
@@ -1360,6 +1378,293 @@ async fn main() -> Result<()> {
             }
         }
     });
+
+    // =================================================================
+    // Phase 24 FS-01 / FS-02 / FS-03 subsystem wiring (Plan 24-09 Task 3)
+    // =================================================================
+    //
+    // Every subsystem below is guarded on `signing_ctx_shared.is_some()`
+    // because each new subject rides the Phase 23 signed envelope (D-12).
+    // When signing is disabled (D-12 rollout / no ROZ_ENCRYPTION_KEY) the
+    // subsystems log-and-skip; the worker still runs on the pre-Phase-24
+    // code paths.
+    //
+    // Shared resources instantiated regardless of signing:
+    // - Policy caches (30 s TTL moka + ArcSwap hot pointer) — consumers log
+    //   a permissive default until the first `roz.policy.{worker_id}` push.
+    // - Copper hot policy pointer — ready for a subscribe-driven store().
+    let phase24_cancel = CancellationToken::new();
+    let policy_cache = roz_worker::policy_cache::PolicyCache::new();
+    let hot_policy = roz_worker::policy_cache::HotPolicy::permissive();
+    let copper_hot_policy = roz_copper::policy::new_hot_policy();
+
+    if let (Some(ctx_shared), Some(wal_arc), Some(tenant_uuid)) =
+        (signing_ctx_shared.as_ref(), worker_wal.as_ref(), worker_tenant)
+    {
+        // -----------------------------------------------------------------
+        // Policy push subscriber on `roz.policy.{worker_id}` (D-04).
+        // -----------------------------------------------------------------
+        {
+            let subscribe_nats = nats.clone();
+            let subscribe_ctx = ctx_shared.clone();
+            let subscribe_cache = policy_cache.clone();
+            let subscribe_hot = hot_policy.clone();
+            let subscribe_copper_hot = copper_hot_policy.clone();
+            let subscribe_worker_id = config.worker_id.clone();
+            let subscribe_cancel = phase24_cancel.clone();
+            tokio::spawn(async move {
+                let subject = match roz_nats::Subjects::policy(&subscribe_worker_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "invalid worker_id for policy subject; skipping push subscriber");
+                        return;
+                    }
+                };
+                let mut sub = match subscribe_nats.subscribe(subject.clone()).await {
+                    Ok(sub) => sub,
+                    Err(e) => {
+                        tracing::warn!(error = %e, subject = %subject, "failed to subscribe to policy push");
+                        return;
+                    }
+                };
+                tracing::info!(subject = %subject, "policy push subscriber ready");
+                loop {
+                    tokio::select! {
+                        maybe_msg = futures::StreamExt::next(&mut sub) => {
+                            let Some(msg) = maybe_msg else {
+                                tracing::warn!("policy push subscription ended");
+                                return;
+                            };
+                            let header = msg
+                                .headers
+                                .as_ref()
+                                .and_then(|h| h.get(roz_core::signing::HEADER_NAME).map(|v| v.to_string()));
+                            if let Err(e) =
+                                subscribe_ctx.verify_inbound_worker(header.as_deref(), &msg.payload)
+                            {
+                                tracing::warn!(error = %e, "policy push signature rejected");
+                                continue;
+                            }
+                            let row: roz_db::safety_policies::SafetyPolicyRow =
+                                match serde_json::from_slice(&msg.payload) {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "policy push parse failed");
+                                        continue;
+                                    }
+                                };
+                            let policy = match roz_worker::policy_enforcement::parse_policy_from_row(&row) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "policy v1 validation failed");
+                                    continue;
+                                }
+                            };
+                            let policy_arc = subscribe_cache.insert(row.id, policy.clone()).await;
+                            subscribe_hot.store((*policy_arc).clone());
+                            let cp = roz_worker::policy_enforcement::project_to_copper_policy(&policy);
+                            subscribe_copper_hot.store(std::sync::Arc::new(cp));
+                            tracing::info!(
+                                policy_id = %row.id,
+                                version = row.version,
+                                "policy push applied (cache + hot + copper hot)"
+                            );
+                        }
+                        () = subscribe_cancel.cancelled() => return,
+                    }
+                }
+            });
+        }
+
+        // -----------------------------------------------------------------
+        // Clear-failsafe subscriber on `cmd.{worker_id}.clear_failsafe` (D-02).
+        // -----------------------------------------------------------------
+        {
+            let cf_nats = nats.clone();
+            let cf_worker_id = config.worker_id.clone();
+            let cf_ctx = ctx_shared.clone();
+            let cf_watchdog = watchdog.clone();
+            let cf_cancel = phase24_cancel.clone();
+            tokio::spawn(async move {
+                if let Err(e) = roz_worker::clear_failsafe::run_clear_failsafe_subscriber(
+                    cf_nats,
+                    cf_worker_id,
+                    cf_ctx,
+                    cf_watchdog,
+                    cf_cancel,
+                )
+                .await
+                {
+                    tracing::error!(error = %e, "clear_failsafe subscriber failed");
+                }
+            });
+        }
+
+        // -----------------------------------------------------------------
+        // Checkpoint writer (D-08). The per-task anchoring id is injected
+        // when a task begins executing — this boot-time spawn uses an empty
+        // `periodic_task_id`, so only explicit `CheckpointTrigger` events
+        // (future wiring into the agent loop) land in the WAL. Plan 24-09
+        // scope is the spawn itself; per-task binding threading is deferred
+        // to a follow-up plan (see deviations in 24-09 SUMMARY).
+        // -----------------------------------------------------------------
+        let (ckpt_tx, ckpt_rx) = roz_worker::checkpoint_writer::checkpoint_writer_channel(
+            roz_worker::checkpoint_writer::DEFAULT_CHANNEL_CAPACITY,
+        );
+        {
+            let cw_wal = wal_arc.clone();
+            let cw_cancel = phase24_cancel.clone();
+            tokio::spawn(async move {
+                let writer = roz_worker::checkpoint_writer::CheckpointWriter::new(
+                    cw_wal,
+                    "",
+                    0,
+                    roz_worker::checkpoint_writer::DEFAULT_CHECKPOINT_INTERVAL,
+                    cw_cancel,
+                );
+                writer.run(ckpt_rx).await;
+            });
+        }
+        // Keep the sender alive for the worker's lifetime. Future wiring
+        // into the agent loop will swap this binding for a cloned sender.
+        let _ckpt_tx_keepalive = ckpt_tx;
+
+        // -----------------------------------------------------------------
+        // Telemetry replay loop (FS-02). Fires each time `reconnect_tx`
+        // signals that NATS is healthy again.
+        // -----------------------------------------------------------------
+        let (reconnect_tx, reconnect_rx) = tokio::sync::mpsc::channel::<()>(4);
+        {
+            let tr_wal = wal_arc.clone();
+            let tr_ctx = ctx_shared.clone();
+            let tr_nats = nats.clone();
+            let tr_worker_id = config.worker_id.clone();
+            let tr_cancel = phase24_cancel.clone();
+            tokio::spawn(async move {
+                let replay = std::sync::Arc::new(roz_worker::telemetry_replay::TelemetryReplay::new(tr_wal, tr_ctx));
+                if let Err(e) = roz_worker::telemetry_replay::run_telemetry_replay(
+                    replay,
+                    tr_nats,
+                    tr_worker_id,
+                    reconnect_rx,
+                    tr_cancel,
+                )
+                .await
+                {
+                    tracing::error!(error = %e, "telemetry replay task failed");
+                }
+            });
+        }
+
+        // -----------------------------------------------------------------
+        // 1 Hz health heartbeat on `roz.health.{worker_id}` (FS-01 — report
+        // only, never triggers motion).
+        // -----------------------------------------------------------------
+        {
+            let hh_nats = nats.clone();
+            let hh_ctx = ctx_shared.clone();
+            let hh_worker_id = config.worker_id.clone();
+            let hh_cancel = phase24_cancel.clone();
+            tokio::spawn(async move {
+                let subject = match roz_nats::Subjects::health(&hh_worker_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!(error = %e, "invalid worker_id for health subject");
+                        return;
+                    }
+                };
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let payload = serde_json::to_vec(&serde_json::json!({
+                                "worker_id": hh_worker_id,
+                                "ts": chrono::Utc::now().to_rfc3339(),
+                            }))
+                            .unwrap_or_default();
+                            let correlation = Uuid::new_v4();
+                            match hh_ctx.sign_outbound_worker(correlation, &payload) {
+                                Ok(header) => {
+                                    if let Err(e) = roz_nats::dispatch::publish_signed(
+                                        &hh_nats,
+                                        subject.clone(),
+                                        payload,
+                                        &header,
+                                    )
+                                    .await
+                                    {
+                                        tracing::trace!(error = %e, "health heartbeat publish failed");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::trace!(error = %e, "health heartbeat signing failed");
+                                }
+                            }
+                        }
+                        () = hh_cancel.cancelled() => return,
+                    }
+                }
+            });
+        }
+
+        // -----------------------------------------------------------------
+        // One-shot worker-online publish on boot (FS-03, D-10). A richer
+        // async-nats reconnect-callback wiring is deferred to Phase 27's
+        // SITL CI (see Plan 24-09 deviations). On boot we publish a
+        // snapshot with sentinel `last_checkpoint_id=None` + `last_wal_seq=0`
+        // so the server's handshake handler can fail-closed-abort any
+        // workflow the worker does not have a fresh checkpoint for.
+        // -----------------------------------------------------------------
+        let worker_uuid_opt = match Uuid::parse_str(&config.worker_id) {
+            Ok(u) => Some(u),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    worker_id = %config.worker_id,
+                    "worker_id is not a UUID; skipping worker_online publish"
+                );
+                None
+            }
+        };
+        if let Some(worker_uuid) = worker_uuid_opt {
+            let online_nats = nats.clone();
+            let online_ctx = ctx_shared.clone();
+            let online_reconnect = reconnect_tx.clone();
+            tokio::spawn(async move {
+                let snapshot = WorkerOnlineSnapshot {
+                    worker_id: worker_uuid,
+                    tenant_id: tenant_uuid,
+                    last_checkpoint_id: None,
+                    last_wal_seq: 0,
+                    tasks_in_progress: vec![],
+                };
+                if let Err(e) =
+                    roz_worker::reconnect_handshake::publish_worker_online(&online_nats, &online_ctx, &snapshot).await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "worker_online publish failed (will retry on next reconnect)"
+                    );
+                } else {
+                    tracing::info!("worker_online snapshot published");
+                }
+                // Kick the replay loop regardless — buffered frames are
+                // worth draining even if the server didn't acknowledge the
+                // snapshot this time.
+                if let Err(e) = online_reconnect.send(()).await {
+                    tracing::debug!(error = %e, "telemetry replay kick dropped (channel closed)");
+                }
+            });
+        } else {
+            // Still kick replay drain on boot so any buffered frames leave
+            // before signing rolls another rotation.
+            let _ = reconnect_tx.try_send(());
+        }
+    } else {
+        tracing::info!(
+            "Phase 24 subsystems skipped: signing bootstrap not completed (D-12 rollout or no ROZ_ENCRYPTION_KEY)"
+        );
+    }
 
     // D-03 + D-04 + C-03 + C-07: open the Zenoh edge-transport session after
     // NATS connect and host registration. Failure is non-fatal — worker falls

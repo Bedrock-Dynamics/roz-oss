@@ -1,7 +1,12 @@
 use uuid::Uuid;
 
 /// Row type matching the `roz_safety_policies` schema exactly.
-#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+///
+/// Phase 24 (Plan 24-09): `Deserialize` is required so the worker's
+/// `roz.policy.{worker_id}` push subscriber can parse the signed payload —
+/// the server publishes this row shape verbatim per the enforcement flow
+/// in Plan 24-05.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, sqlx::FromRow)]
 pub struct SafetyPolicyRow {
     pub id: Uuid,
     pub tenant_id: Uuid,
