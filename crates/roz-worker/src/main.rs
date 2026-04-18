@@ -1028,26 +1028,103 @@ async fn main() -> Result<()> {
             }
         });
 
-    // Register with server
+    // Register with server and bootstrap Phase 23 device signing key.
+    //
+    // `register_host` now returns `HostIdentity { host_id, tenant_id }` —
+    // both are needed by `bootstrap_device_key` because `tenant_id` is a
+    // signed field in every `roz-sig-v1` envelope.
+    //
+    // D-09: device-key bootstrap is a hard-stop gate. If the server is
+    // reachable but returns an error for provision/rotate, or if the
+    // on-disk key is present but corrupt/undecryptable, the worker exits
+    // with EX_CONFIG (78) so systemd and ops dashboards page immediately.
+    // Host registration failure (the outer `register_host` Err arm) stays
+    // on the existing log-and-continue path so workers without API access
+    // can still come up in local/test modes.
     if !config.api_key.is_empty() {
         match roz_worker::registration::register_host(&http, &config.api_url, &config.api_key, &config.worker_id).await
         {
-            Ok(host_id) => {
-                tracing::info!(host_id = %host_id, "registered with server");
+            Ok(identity) => {
+                tracing::info!(
+                    host_id = %identity.host_id,
+                    tenant_id = %identity.tenant_id,
+                    "registered with server"
+                );
                 // Upload embodiment runtime if available (D-04: log-and-continue; runtime now passed per STRM-02)
                 if let Some(ref rt) = embodiment_runtime {
                     match roz_worker::registration::upload_embodiment(
                         &http,
                         &config.api_url,
                         &config.api_key,
-                        host_id,
+                        identity.host_id,
                         &rt.model,
                         Some(rt),
                     )
                     .await
                     {
-                        Ok(()) => tracing::info!(host_id = %host_id, "embodiment runtime uploaded"),
-                        Err(e) => tracing::warn!(host_id = %host_id, error = %e, "embodiment upload failed"),
+                        Ok(()) => tracing::info!(host_id = %identity.host_id, "embodiment runtime uploaded"),
+                        Err(e) => {
+                            tracing::warn!(host_id = %identity.host_id, error = %e, "embodiment upload failed");
+                        }
+                    }
+                }
+
+                // Phase 23: provision / load / rotate the device signing key.
+                // Only attempt when ROZ_ENCRYPTION_KEY is configured —
+                // without it, the worker cannot encrypt the seed at rest.
+                // Missing key in non-signed-dispatch environments is a
+                // log-and-continue (the worker still runs; 23-08 will gate
+                // signed publishes on `_signing_material` being Some).
+                match roz_core::key_provider::StaticKeyProvider::from_env() {
+                    Ok(provider) => {
+                        let key_provider = std::sync::Arc::new(provider);
+                        let dir = roz_worker::signing_key::data_dir();
+                        match roz_worker::registration::bootstrap_device_key(
+                            &http,
+                            &config.api_url,
+                            &config.api_key,
+                            &key_provider,
+                            identity,
+                            &dir,
+                        )
+                        .await
+                        {
+                            Ok(material) => {
+                                tracing::info!(
+                                    host_id = %identity.host_id,
+                                    key_version = material.key_version,
+                                    "device signing key ready"
+                                );
+                                // Stash in scope so Plan 23-08 can thread it
+                                // through the publish sites. The underscore
+                                // prefix silences the unused-variable warning
+                                // until 23-08 wires the consumers.
+                                let _signing_material = material;
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    error = ?e,
+                                    host_id = %identity.host_id,
+                                    "device signing key bootstrap failed; hard-stop (exit 78 EX_CONFIG, D-09)"
+                                );
+                                std::process::exit(78);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // D-12 rollout window: a KEK-less worker cannot encrypt
+                        // its device key at rest, so we skip Phase 23
+                        // enrollment. Any server running with
+                        // SIGNED_DISPATCH_ENFORCEMENT=strict will reject this
+                        // worker's publishes in-flight. Surface this loudly so
+                        // ops dashboards page before messages start dropping.
+                        tracing::warn!(
+                            error = %e,
+                            host_id = %identity.host_id,
+                            signed_dispatch = "disabled",
+                            "ROZ_ENCRYPTION_KEY not configured; signed dispatch DISABLED for this worker — \
+                             production enforcement (SIGNED_DISPATCH_ENFORCEMENT=strict) will reject publishes"
+                        );
                     }
                 }
             }

@@ -1,25 +1,51 @@
 //! Worker auto-registration with the roz API server.
 //!
 //! On startup the worker calls the server's REST API to ensure a host record
-//! exists for its `worker_id` and sets its status to `online`.
+//! exists for its `worker_id`, captures the host's `tenant_id` from the
+//! response body, and sets its status to `online`. The returned
+//! `(host_id, tenant_id)` pair is consumed downstream by
+//! [`bootstrap_device_key`] for Phase 23 signed-dispatch enrollment.
+
+use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use roz_core::key_provider::StaticKeyProvider;
 use uuid::Uuid;
 
-/// Register the worker as a host with the server, returning the host UUID.
+use crate::signing_key::{self, SigningKeyMaterial};
+
+/// Identity of the registered host as returned by the server.
+#[derive(Debug, Clone, Copy)]
+pub struct HostIdentity {
+    pub host_id: Uuid,
+    pub tenant_id: Uuid,
+}
+
+/// Register the worker as a host with the server, returning the host UUID
+/// and the tenant UUID it belongs to.
 ///
 /// 1. `GET /v1/hosts` — look for a host whose `name` matches `worker_id`.
-/// 2. If found: `PATCH /v1/hosts/{id}/status` with `{"status": "online"}`, return id.
+/// 2. If found: `PATCH /v1/hosts/{id}/status` with `{"status": "online"}`, return identity.
 /// 3. If not found: `POST /v1/hosts` with `{"name": worker_id, "host_type": "edge"}`,
-///    then `PATCH` status to `online`, return id.
-pub async fn register_host(client: &reqwest::Client, api_url: &str, api_key: &str, worker_id: &str) -> Result<Uuid> {
+///    then `PATCH` status to `online`, return identity.
+///
+/// The `tenant_id` field is required downstream by Phase 23 signed-dispatch
+/// (`roz-sig-v1` envelopes carry `tenant_id` as a signed field); capturing it
+/// at registration avoids a second round-trip.
+pub async fn register_host(
+    client: &reqwest::Client,
+    api_url: &str,
+    api_key: &str,
+    worker_id: &str,
+) -> Result<HostIdentity> {
     let base = api_url.trim_end_matches('/');
 
     // 1. List hosts and find matching name (paginated)
-    let host_id = find_host_paginated(client, base, api_key, worker_id).await?;
+    let existing = find_host_paginated(client, base, api_key, worker_id).await?;
 
-    let id = if let Some(existing_id) = host_id {
-        existing_id
+    let identity = if let Some(id) = existing {
+        id
     } else {
         // 3. Create host
         let create_body = serde_json::json!({
@@ -44,14 +70,14 @@ pub async fn register_host(client: &reqwest::Client, api_url: &str, api_key: &st
                 .error_for_status()
                 .context("POST /v1/hosts returned error status")?;
             let body: serde_json::Value = resp.json().await.context("failed to parse POST /v1/hosts response")?;
-            parse_host_id(&body).context("POST /v1/hosts response missing host id")?
+            parse_host_identity(&body).context("POST /v1/hosts response missing host id or tenant_id")?
         }
     };
 
     // Set status to online
     let status_body = serde_json::json!({"status": "online"});
     client
-        .patch(format!("{base}/v1/hosts/{id}/status"))
+        .patch(format!("{base}/v1/hosts/{}/status", identity.host_id))
         .bearer_auth(api_key)
         .json(&status_body)
         .send()
@@ -60,7 +86,60 @@ pub async fn register_host(client: &reqwest::Client, api_url: &str, api_key: &st
         .error_for_status()
         .context("PATCH host status returned error status")?;
 
-    Ok(id)
+    Ok(identity)
+}
+
+/// Bootstrap the worker's Phase 23 device key material.
+///
+/// Called after [`register_host`] returns the `(host_id, tenant_id)` pair.
+/// On first run, calls `POST /v1/device/provision-key` to mint a fresh
+/// Ed25519 keypair and persists the returned seed + server verifying key
+/// locally. On subsequent runs, loads the existing key from disk.
+///
+/// Additionally performs a D-07 age check: if the active key is older than
+/// 90 days, calls `POST /v1/device/rotate-key` to rotate it. Rotation
+/// failures are logged but non-fatal — the current key remains valid for
+/// up to 24 h of overlap window.
+///
+/// The returned [`SigningKeyMaterial`] is consumed by Plan 23-08 when
+/// wiring signing into every worker publish site.
+pub async fn bootstrap_device_key(
+    http: &reqwest::Client,
+    api_url: &str,
+    api_key: &str,
+    key_provider: &Arc<StaticKeyProvider>,
+    identity: HostIdentity,
+    dir: &Path,
+) -> Result<SigningKeyMaterial> {
+    let current = signing_key::load_or_enroll(
+        dir,
+        http,
+        api_url,
+        api_key,
+        key_provider,
+        identity.tenant_id,
+        identity.host_id,
+    )
+    .await
+    .context("device key enrollment failed")?;
+
+    // D-07: 90-day age check + rotate.
+    match signing_key::rotate_if_due(&current, dir, http, api_url, key_provider).await {
+        Ok(Some(new_mat)) => {
+            tracing::info!(
+                old_version = current.key_version,
+                new_version = new_mat.key_version,
+                host_id = %identity.host_id,
+                "device key rotated (age > 90d)"
+            );
+            Ok(new_mat)
+        }
+        Ok(None) => Ok(current),
+        Err(e) => {
+            tracing::error!(err = %e, "rotate-if-due failed; keeping current key");
+            Ok(current)
+        }
+    }
 }
 
 /// Paginate through `GET /v1/hosts` looking for a host whose `name` matches `worker_id`.
@@ -69,7 +148,7 @@ async fn find_host_paginated(
     base: &str,
     api_key: &str,
     worker_id: &str,
-) -> Result<Option<Uuid>> {
+) -> Result<Option<HostIdentity>> {
     const MAX_PAGES: usize = 200; // 200 * 50 = 10 000 hosts
     let limit: usize = 50;
     let mut offset: usize = 0;
@@ -91,8 +170,8 @@ async fn find_host_paginated(
 
         let body: serde_json::Value = resp.json().await.context("failed to parse GET /v1/hosts response")?;
 
-        if let Some(id) = find_host_by_name(&body, worker_id) {
-            return Ok(Some(id));
+        if let Some(identity) = find_host_by_name(&body, worker_id) {
+            return Ok(Some(identity));
         }
 
         // Check if we've exhausted the last page.
@@ -109,12 +188,16 @@ async fn find_host_paginated(
 }
 
 /// Search the `{"data": [...]}` response for a host whose `name` matches `worker_id`.
-fn find_host_by_name(body: &serde_json::Value, worker_id: &str) -> Option<Uuid> {
+fn find_host_by_name(body: &serde_json::Value, worker_id: &str) -> Option<HostIdentity> {
     let hosts = body.get("data")?.as_array()?;
     for host in hosts {
         if host.get("name")?.as_str()? == worker_id {
             let id_str = host.get("id")?.as_str()?;
-            return Uuid::parse_str(id_str).ok();
+            let tenant_str = host.get("tenant_id")?.as_str()?;
+            return Some(HostIdentity {
+                host_id: Uuid::parse_str(id_str).ok()?,
+                tenant_id: Uuid::parse_str(tenant_str).ok()?,
+            });
         }
     }
     None
@@ -164,10 +247,16 @@ pub async fn upload_embodiment(
     Ok(())
 }
 
-/// Extract the host UUID from a `{"data": {"id": "..."}}` response.
-fn parse_host_id(body: &serde_json::Value) -> Option<Uuid> {
-    let id_str = body.get("data")?.get("id")?.as_str()?;
-    Uuid::parse_str(id_str).ok()
+/// Extract the `(host_id, tenant_id)` pair from a
+/// `{"data": {"id": "...", "tenant_id": "..."}}` response.
+fn parse_host_identity(body: &serde_json::Value) -> Option<HostIdentity> {
+    let data = body.get("data")?;
+    let id_str = data.get("id")?.as_str()?;
+    let tenant_str = data.get("tenant_id")?.as_str()?;
+    Some(HostIdentity {
+        host_id: Uuid::parse_str(id_str).ok()?,
+        tenant_id: Uuid::parse_str(tenant_str).ok()?,
+    })
 }
 
 #[cfg(test)]
@@ -175,22 +264,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn find_host_by_name_returns_matching_id() {
+    fn find_host_by_name_returns_matching_identity() {
         let body = serde_json::json!({
             "data": [
-                {"id": "00000000-0000-0000-0000-000000000001", "name": "worker-a"},
-                {"id": "00000000-0000-0000-0000-000000000002", "name": "worker-b"},
+                {"id": "00000000-0000-0000-0000-000000000001",
+                 "tenant_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                 "name": "worker-a"},
+                {"id": "00000000-0000-0000-0000-000000000002",
+                 "tenant_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                 "name": "worker-b"},
             ]
         });
-        let id = find_host_by_name(&body, "worker-b").unwrap();
-        assert_eq!(id, Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap());
+        let identity = find_host_by_name(&body, "worker-b").unwrap();
+        assert_eq!(
+            identity.host_id,
+            Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap()
+        );
+        assert_eq!(
+            identity.tenant_id,
+            Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").unwrap()
+        );
     }
 
     #[test]
     fn find_host_by_name_returns_none_when_absent() {
         let body = serde_json::json!({
             "data": [
-                {"id": "00000000-0000-0000-0000-000000000001", "name": "worker-a"},
+                {"id": "00000000-0000-0000-0000-000000000001",
+                 "tenant_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                 "name": "worker-a"},
             ]
         });
         assert!(find_host_by_name(&body, "missing-worker").is_none());
@@ -203,18 +305,47 @@ mod tests {
     }
 
     #[test]
-    fn parse_host_id_extracts_uuid() {
+    fn find_host_by_name_returns_none_when_tenant_id_missing() {
         let body = serde_json::json!({
-            "data": {"id": "00000000-0000-0000-0000-000000000042", "name": "test"}
+            "data": [
+                {"id": "00000000-0000-0000-0000-000000000001", "name": "worker-a"},
+            ]
         });
-        let id = parse_host_id(&body).unwrap();
-        assert_eq!(id, Uuid::parse_str("00000000-0000-0000-0000-000000000042").unwrap());
+        assert!(find_host_by_name(&body, "worker-a").is_none());
     }
 
     #[test]
-    fn parse_host_id_returns_none_for_missing_data() {
+    fn parse_host_identity_extracts_both_fields() {
+        let body = serde_json::json!({
+            "data": {
+                "id": "00000000-0000-0000-0000-000000000042",
+                "tenant_id": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+                "name": "test",
+            }
+        });
+        let identity = parse_host_identity(&body).unwrap();
+        assert_eq!(
+            identity.host_id,
+            Uuid::parse_str("00000000-0000-0000-0000-000000000042").unwrap()
+        );
+        assert_eq!(
+            identity.tenant_id,
+            Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_host_identity_returns_none_for_missing_data() {
         let body = serde_json::json!({"error": "not found"});
-        assert!(parse_host_id(&body).is_none());
+        assert!(parse_host_identity(&body).is_none());
+    }
+
+    #[test]
+    fn parse_host_identity_returns_none_for_missing_tenant_id() {
+        let body = serde_json::json!({
+            "data": {"id": "00000000-0000-0000-0000-000000000042", "name": "test"}
+        });
+        assert!(parse_host_identity(&body).is_none());
     }
 
     #[test]
