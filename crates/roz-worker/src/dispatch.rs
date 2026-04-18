@@ -7,15 +7,18 @@ use roz_agent::error::AgentError;
 use roz_agent::session_runtime::{TurnInput, TurnOutput};
 use roz_agent::trust_evaluator::TrustEvaluator;
 use roz_core::session::control::CognitionMode;
-use roz_core::session::event::SessionPermissionRule;
+use roz_core::session::event::{SessionEvent, SessionPermissionRule};
 use roz_core::tools::ToolCategory;
 use roz_core::trust::{ExecutionCapabilityClass, TrustPosture};
 use roz_nats::dispatch::{
     ExecutionMode, TaskInvocation, TaskResult, TaskStatusEvent, TaskTerminalStatus, TokenUsage, publish_signed,
     task_status_subject,
 };
+use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::policy_cache::{HotPolicy, PolicyCache};
+use crate::policy_enforcement::{EnforcementOutcome, PolicyEnforcementError, PolicyV1, enforce_invocation};
 use crate::signing_hooks::WorkerSigningContext;
 
 /// Default maximum agent loop cycles.
@@ -402,6 +405,178 @@ pub async fn signal_result(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Plan 24-05: Pre-dispatch policy gate (FS-01).
+//
+// `pre_dispatch_check` is called by the worker execute-task flow BEFORE the
+// agent loop runs. It resolves the invocation's policy (cache → hot), runs
+// the synchronous enforcement gate, and reports back whether the cached
+// policy is stale (D-01). The caller emits session events + writes audit rows
+// via the helpers below.
+// ---------------------------------------------------------------------------
+
+/// The fraction of an enforcement outcome that a caller observes: what the
+/// gate decided, plus whether the policy came from a stale (D-01) path.
+#[derive(Debug)]
+pub struct PreDispatchDecision {
+    pub outcome: PreDispatchOutcome,
+    /// `true` when the invocation declared a `safety_policy_id` but the
+    /// policy cache did not contain it, so enforcement fell back to the
+    /// `HotPolicy` container. Per D-01 the caller writes a `policy_stale`
+    /// audit row (severity=warning) and continues execution.
+    pub stale: bool,
+    /// UUID of the policy that produced the outcome (either the cached
+    /// policy or the hot-policy fallback). Used for audit rows and session
+    /// events so operators can trace back to the offending row.
+    pub policy_id: Uuid,
+}
+
+/// Pre-dispatch outcome vocabulary. Mirrors
+/// [`crate::policy_enforcement::EnforcementOutcome`] but exposed here so
+/// callers importing only this module do not need to pull the enforcement
+/// internals. The `Clamp` variant carries the projection details for audit.
+#[derive(Debug)]
+pub enum PreDispatchOutcome {
+    Allow,
+    Clamp { clamped_details: serde_json::Value },
+    Reject(PolicyEnforcementError),
+    Halt(PolicyEnforcementError),
+}
+
+impl From<EnforcementOutcome> for PreDispatchOutcome {
+    fn from(outcome: EnforcementOutcome) -> Self {
+        match outcome {
+            EnforcementOutcome::Allow => Self::Allow,
+            EnforcementOutcome::Clamp { clamped_details } => Self::Clamp { clamped_details },
+            EnforcementOutcome::Reject(err) => Self::Reject(err),
+            EnforcementOutcome::Halt(err) => Self::Halt(err),
+        }
+    }
+}
+
+/// Run the pre-dispatch policy gate for a task invocation.
+///
+/// Resolution order (per D-04):
+/// 1. If `invocation.safety_policy_id` is present and the `PolicyCache` has it
+///    fresh, use the cached policy.
+/// 2. If `safety_policy_id` is present but the cache missed, mark `stale=true`
+///    per D-01 and fall back to the `HotPolicy` container. Caller writes a
+///    `policy_stale` audit row + continues.
+/// 3. If no `safety_policy_id` was declared, use the `HotPolicy` — this is the
+///    boot path before the first push arrives and the "inherited" path where
+///    the invocation does not override the worker's active policy.
+///
+/// `declared_velocity_*` are the optional declared motion parameters lifted
+/// from the invocation payload — v3.0 task invocations do NOT yet surface
+/// these fields; Plan 24-09 wires them. Until then the caller passes `None`
+/// and the gate falls through to Allow on the pass path.
+pub async fn pre_dispatch_check(
+    cache: &PolicyCache,
+    hot: &HotPolicy,
+    invocation: &TaskInvocation,
+    declared_velocity_linear: Option<f64>,
+    declared_velocity_angular: Option<f64>,
+) -> PreDispatchDecision {
+    let (policy, stale) = resolve_policy(cache, hot, invocation.safety_policy_id).await;
+    let outcome = enforce_invocation(&policy, declared_velocity_linear, declared_velocity_angular);
+    PreDispatchDecision {
+        outcome: outcome.into(),
+        stale,
+        policy_id: policy.policy_id,
+    }
+}
+
+async fn resolve_policy(cache: &PolicyCache, hot: &HotPolicy, safety_policy_id: Option<Uuid>) -> (Arc<PolicyV1>, bool) {
+    if let Some(pid) = safety_policy_id {
+        if let Some(cached) = cache.get(&pid).await {
+            return (cached, false);
+        }
+        // D-01: declared policy_id but cache miss → stale. Fall back to hot.
+        let hot_arc = Arc::clone(&*hot.load());
+        return (hot_arc, true);
+    }
+    // No declared policy_id → hot policy is authoritative (boot/inherited path).
+    let hot_arc = Arc::clone(&*hot.load());
+    (hot_arc, false)
+}
+
+/// Emit a `SessionEvent::SafetyViolation` on the provided channel. Best-effort
+/// (`try_send`) so a full channel does not block the dispatch path — lost
+/// violation events are also captured in the audit log write.
+pub fn emit_violation_event(
+    session_event_tx: &tokio::sync::mpsc::Sender<SessionEvent>,
+    policy_id: Uuid,
+    violation_kind: &str,
+    enforcement_action: &str,
+    details: serde_json::Value,
+) {
+    let event = SessionEvent::SafetyViolation {
+        policy_id: policy_id.to_string(),
+        violation_kind: violation_kind.to_string(),
+        enforcement_action: enforcement_action.to_string(),
+        details,
+    };
+    if let Err(err) = session_event_tx.try_send(event) {
+        tracing::warn!(error = %err, %policy_id, "dropped SafetyViolation session event (channel full/closed)");
+    }
+}
+
+/// Map a `PolicyEnforcementError` to the canonical `violation_kind` string
+/// used by session events and `roz_safety_audit_log.details`.
+#[must_use]
+pub fn enforcement_error_kind(err: &PolicyEnforcementError) -> &'static str {
+    match err {
+        PolicyEnforcementError::LimitExceeded { .. } => "limit_exceeded",
+        PolicyEnforcementError::GeofenceBreach { .. } => "geofence_breach",
+        PolicyEnforcementError::InterlockMissing { .. } => "interlock_missing",
+        PolicyEnforcementError::PolicyParse(_) => "policy_parse",
+        PolicyEnforcementError::PolicyStale { .. } => "policy_stale",
+    }
+}
+
+/// Write a safety-violation audit row via `roz_db::safety_audit::append`.
+///
+/// `source` is the logical emitter — `"worker-pre-dispatch"` for the gate,
+/// `"worker-policy-cache"` for the stale-cache audit, per 24-CONTEXT D-13.
+///
+/// Returns `Ok(())` on success, logs + discards on transport failure (the
+/// gate must not block dispatch on audit persistence).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "audit rows carry full provenance: tenant/host/task/policy/event_type/severity/source/details"
+)]
+pub async fn write_safety_audit(
+    pool: &sqlx::PgPool,
+    tenant_id: Uuid,
+    host_id: Option<Uuid>,
+    task_id: Option<Uuid>,
+    policy_id: Option<Uuid>,
+    event_type: &str,
+    severity: &str,
+    source: &str,
+    details: serde_json::Value,
+) {
+    if let Err(err) = roz_db::safety_audit::append(
+        pool, tenant_id, event_type, severity, source, &details, host_id, task_id, policy_id,
+    )
+    .await
+    {
+        tracing::error!(error = %err, %tenant_id, ?policy_id, event_type, "failed to write safety audit row");
+    }
+}
+
+/// Severity mapping for violation outcomes. `halt` / `reject` are
+/// operator-visible failures (severity=warning is conservative — `error` is
+/// reserved for system-level control-plane failures). Clamp is informational.
+#[must_use]
+pub const fn severity_for_action(enforcement_action: &str) -> &'static str {
+    match enforcement_action.as_bytes() {
+        b"halt" => "error",
+        b"reject" | b"clamp" => "warning",
+        _ => "info",
+    }
+}
+
 /// Publish a `TaskStatusEvent` on the internal task-status NATS subject with
 /// a `roz-sig-v1` signature header attached (Phase 23 FS-04).
 ///
@@ -506,7 +681,10 @@ mod tests {
         let hot = HotPolicy::new(policy_with_linear_limit(3.0, EnforcementMode::Reject));
         let inv = sample_invocation(ExecutionMode::React);
         let decision = pre_dispatch_check(&cache, &hot, &inv, Some(5.0), Some(0.0)).await;
-        assert!(matches!(decision.outcome, PreDispatchOutcome::Reject(_)), "{decision:?}");
+        assert!(
+            matches!(decision.outcome, PreDispatchOutcome::Reject(_)),
+            "{decision:?}"
+        );
     }
 
     #[tokio::test]
@@ -587,9 +765,7 @@ mod tests {
             "interlock_missing"
         );
         assert_eq!(
-            enforcement_error_kind(&PolicyEnforcementError::GeofenceBreach {
-                coords: "0,0".into()
-            }),
+            enforcement_error_kind(&PolicyEnforcementError::GeofenceBreach { coords: "0,0".into() }),
             "geofence_breach"
         );
         assert_eq!(
