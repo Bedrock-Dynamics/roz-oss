@@ -3,23 +3,23 @@ gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: Production Robotics
 status: executing
-last_updated: "2026-04-18T21:00:00.000Z"
-last_activity: 2026-04-18 -- Phase 24 Plan 05 complete
+last_updated: "2026-04-18T22:30:00Z"
+last_activity: 2026-04-18 -- Phase 24 Plan 09 complete (Phase 24 done)
 progress:
   total_phases: 7
-  completed_phases: 1
+  completed_phases: 2
   total_plans: 3
-  completed_plans: 8
+  completed_plans: 12
 ---
 
 # State
 
 ## Current Position
 
-Phase: 24 (edge-enforced-safety-policies-store-and-forward-telemetry-and-in-flight-task-wal-recovery) — EXECUTING
-Plan: 6 of 9
-Status: Executing Phase 24
-Last activity: 2026-04-18 -- Phase 24 Plan 05 complete (pre-dispatch policy gate in worker dispatch.rs + 100 Hz CopperPolicy filter in safety_filter.rs; enforce_invocation ~4 ns/call release, policy_clamp ~7 ns/call release — both 6 orders under their FS-01 budgets; D-01 stale-cache audit path wired into main.rs::execute_task with SafetyStop short-circuit)
+Phase: 24 (edge-enforced-safety-policies-store-and-forward-telemetry-and-in-flight-task-wal-recovery) — ALL PLANS COMPLETE (ready for /gsd-verify-phase 24)
+Plan: 9 of 9 — complete
+Status: Phase 24 complete
+Last activity: 2026-04-18 -- Phase 24 Plan 09 complete: decide_recovery extended to the full D-11 predicate with checkpoint_age < 3600 s; emit_recovery_pending helper produces the D-09 SessionEvent::RecoveryPending; crates/roz-worker/src/main.rs now spawns 6 Phase 24 subsystems (policy push subscriber, clear_failsafe subscriber, CheckpointWriter, TelemetryReplay, 1 Hz health heartbeat, one-shot publish_worker_online); 7 explicit branch_* tests in tests/recovery_three_branches.rs cover the resume-gate matrix + 2 edge cases; tests/phase24_e2e.rs ships phase24_deadman_survives_nats_outage + phase24_resume_path_with_fresh_checkpoint (deterministic) + phase24_induced_30s_nats_outage (#[ignore], full harness deferred to Phase 27 SITL per RD-01); 24-08 carryover landed as 3 new forged_worker_online_drops_before_restate_* tests with a CountingLookup proving call_count == 0 on every structural pre-verify drop path; SafetyPolicyRow gained serde::Deserialize for push-subscriber parsing; agent-loop checkpoint-trigger wiring deferred with writer spawned on empty periodic_task_id; async-nats reconnect-callback wiring deferred to Phase 27; project_to_copper_policy helper added on roz-worker; workspace build + clippy + fmt all green.
 
 ## Project Reference
 
