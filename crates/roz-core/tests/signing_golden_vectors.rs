@@ -44,7 +44,10 @@ fn jcs_canonical_bytes_golden_vector() {
         r#""tenant_id":"11111111-1111-1111-1111-111111111111","#,
         r#""timestamp":"2026-04-17T12:00:00Z"}"#,
     );
-    assert_eq!(s, expected, "JCS canonical output drifted — see signing_golden_vectors.rs");
+    assert_eq!(
+        s, expected,
+        "JCS canonical output drifted — see signing_golden_vectors.rs"
+    );
 }
 
 #[test]
