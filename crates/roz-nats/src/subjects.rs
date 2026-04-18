@@ -436,4 +436,63 @@ mod tests {
     fn camera_request_subject() {
         assert_eq!(Subjects::camera_request("robot1").unwrap(), "camera.robot1.request");
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 24 — FS-01 / FS-02 / FS-03 subjects (24-01-PLAN Task 2)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn policy_subject_builds() {
+        assert_eq!(Subjects::policy("host1").unwrap(), "roz.policy.host1");
+    }
+
+    #[test]
+    fn policy_subject_rejects_invalid() {
+        assert!(Subjects::policy("").is_err());
+        assert!(Subjects::policy("a.b").is_err());
+        assert!(Subjects::policy("a*").is_err());
+        assert!(Subjects::policy("a>").is_err());
+    }
+
+    #[test]
+    fn health_subject_builds() {
+        assert_eq!(Subjects::health("host1").unwrap(), "roz.health.host1");
+    }
+
+    #[test]
+    fn health_subject_rejects_invalid() {
+        assert!(Subjects::health("").is_err());
+    }
+
+    #[test]
+    fn safety_violation_subject_builds() {
+        assert_eq!(
+            Subjects::safety_violation("host1").unwrap(),
+            "safety.violation.host1"
+        );
+    }
+
+    #[test]
+    fn safety_violation_subject_rejects_invalid() {
+        assert!(Subjects::safety_violation("").is_err());
+    }
+
+    #[test]
+    fn state_worker_online_subject_is_static() {
+        assert_eq!(Subjects::state_worker_online(), "roz.state.worker_online");
+    }
+
+    #[test]
+    fn clear_failsafe_subject_builds() {
+        assert_eq!(
+            Subjects::clear_failsafe("host1").unwrap(),
+            "cmd.host1.clear_failsafe"
+        );
+    }
+
+    #[test]
+    fn clear_failsafe_subject_rejects_invalid() {
+        assert!(Subjects::clear_failsafe("").is_err());
+        assert!(Subjects::clear_failsafe("a.b").is_err());
+    }
 }
