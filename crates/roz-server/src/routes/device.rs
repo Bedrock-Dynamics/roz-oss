@@ -482,3 +482,503 @@ mod tests {
         let _ = err;
     }
 }
+
+// ===========================================================================
+// Integration tests
+// ===========================================================================
+//
+// Exercise the full enrollment + rotation flow against a real Postgres via
+// `roz_test::pg_container`. The tests drive requests through
+// [`roz_server::build_router`] using `tower::ServiceExt::oneshot` to avoid
+// binding an in-process listener — keeps the tests deterministic.
+//
+// All tests are `#[ignore]`-gated because they require Docker for the
+// Postgres testcontainer. CI runs them via `cargo test -- --include-ignored`.
+//
+// Run locally with:
+// ```
+// cargo test -p roz-server --lib routes::device::integration_tests -- --include-ignored
+// ```
+
+#[cfg(test)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "integration tests wire multi-step flows end-to-end"
+)]
+mod integration_tests {
+    use super::*;
+
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use chrono::Utc;
+    use ed25519_dalek::SigningKey;
+    use roz_core::signing::{SignedFields, sign_envelope};
+    use std::num::NonZeroU32;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    /// All the bits a single test needs.
+    struct Harness {
+        app: axum::Router,
+        pool: sqlx::PgPool,
+        api_key: String,
+        tenant_id: Uuid,
+        host_id: Uuid,
+        state: AppState,
+        _pg: roz_test::PgGuard,
+    }
+
+    async fn setup() -> Harness {
+        let pg = roz_test::pg_container().await;
+        let pool = roz_db::create_pool(pg.url()).await.expect("create pool");
+        roz_db::run_migrations(&pool).await.expect("run migrations");
+
+        let slug = format!("dev-key-{}", Uuid::new_v4().simple());
+        let tenant = roz_db::tenant::create_tenant(&pool, "device-key-test", &slug, "organization")
+            .await
+            .expect("create tenant");
+
+        let host = roz_db::hosts::create(&pool, tenant.id, "provision-host", "edge", &[], &serde_json::json!({}))
+            .await
+            .expect("create host");
+
+        let key = roz_db::api_keys::create_api_key(&pool, tenant.id, "device-test", &[], "test")
+            .await
+            .expect("create api key");
+
+        let rate_limiter =
+            crate::middleware::rate_limit::create_rate_limiter(&crate::middleware::rate_limit::RateLimitConfig {
+                requests_per_second: NonZeroU32::new(100).unwrap(),
+                burst_size: NonZeroU32::new(200).unwrap(),
+            });
+
+        let state = AppState {
+            pool: pool.clone(),
+            rate_limiter,
+            base_url: String::new(),
+            restate_ingress_url: String::new(),
+            http_client: reqwest::Client::new(),
+            operator_seed: None,
+            nats_client: None,
+            model_config: crate::state::ModelConfig {
+                gateway_url: String::new(),
+                api_key: String::new(),
+                default_model: String::new(),
+                timeout_secs: 30,
+                anthropic_provider: "anthropic".into(),
+                direct_api_key: None,
+                gemini_provider: "google-vertex".into(),
+                gemini_direct_api_key: None,
+            },
+            auth: Arc::new(crate::auth::ApiKeyAuth),
+            meter: Arc::new(roz_agent::meter::NoOpMeter),
+            trust_policy: Arc::new(crate::trust::permissive_policy_for_integration_tests()),
+            object_store: Arc::new(object_store::memory::InMemory::new()),
+            endpoint_registry: Arc::new(roz_core::EndpointRegistry::empty()),
+            // Real key provider with a deterministic test key (bytes don't matter
+            // — the at-rest ciphertext never crosses a process boundary in these
+            // tests; the round-trip is entirely local).
+            key_provider: Arc::new(roz_core::key_provider::StaticKeyProvider::from_key_bytes([7u8; 32])),
+            mcp_registry: Arc::new(roz_mcp::Registry::new()),
+            session_bus: Arc::new(crate::grpc::session_bus::SessionBus::default()),
+            verifying_key_cache: moka::future::Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(std::time::Duration::from_secs(60))
+                .build(),
+            signed_dispatch_enforcement: crate::config::SignedDispatchEnforcement::Strict,
+        };
+
+        let app = crate::build_router(state.clone());
+
+        Harness {
+            app,
+            pool,
+            api_key: key.full_key,
+            tenant_id: tenant.id,
+            host_id: host.id,
+            state,
+            _pg: pg,
+        }
+    }
+
+    fn post_json(_app: &axum::Router, path: &str, api_key: &str, body: &serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("authorization", format!("Bearer {api_key}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap()
+    }
+
+    async fn send(app: axum::Router, req: Request<Body>) -> (StatusCode, serde_json::Value) {
+        let resp = app.oneshot(req).await.expect("oneshot");
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("read body");
+        let json = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+        };
+        (status, json)
+    }
+
+    async fn count_device_keys(pool: &sqlx::PgPool, host_id: Uuid) -> i64 {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM roz_device_keys WHERE host_id = $1")
+            .bind(host_id)
+            .fetch_one(pool)
+            .await
+            .expect("count")
+    }
+
+    async fn count_server_signing(pool: &sqlx::PgPool, tenant_id: Uuid, host_id: Uuid) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM roz_server_signing_state WHERE tenant_id = $1 AND host_id = $2",
+        )
+        .bind(tenant_id)
+        .bind(host_id)
+        .fetch_one(pool)
+        .await
+        .expect("count")
+    }
+
+    /// Happy path: seed a host + API key, POST /provision-key, assert 200 +
+    /// response shape; assert `roz_device_keys` row exists at key_version=1
+    /// and `roz_server_signing_state` row lazy-created.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker for Postgres testcontainer"]
+    async fn provision_happy_path() {
+        let h = setup().await;
+
+        let req = post_json(
+            &h.app,
+            "/v1/device/provision-key",
+            &h.api_key,
+            &serde_json::json!({ "host_id": h.host_id.to_string() }),
+        );
+        let (status, body) = send(h.app.clone(), req).await;
+
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["key_version"], 1);
+        let seed_b64 = body["private_key_seed_b64"].as_str().expect("seed_b64");
+        let seed_bytes = B64.decode(seed_b64).expect("decode seed");
+        assert_eq!(seed_bytes.len(), 32, "seed MUST be 32 bytes");
+        let pub_b64 = body["server_verifying_key_b64"].as_str().expect("pub_b64");
+        let pub_bytes = B64.decode(pub_b64).expect("decode pub");
+        assert_eq!(pub_bytes.len(), 32, "server verifying key MUST be 32 bytes");
+
+        assert_eq!(count_device_keys(&h.pool, h.host_id).await, 1);
+        assert_eq!(count_server_signing(&h.pool, h.tenant_id, h.host_id).await, 1);
+    }
+
+    /// Bad bearer token → 401. Exercises the crate's auth middleware, not
+    /// the handler itself.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker for Postgres testcontainer"]
+    async fn provision_rejects_bad_bearer() {
+        let h = setup().await;
+
+        let req = post_json(
+            &h.app,
+            "/v1/device/provision-key",
+            "roz_sk_invalid_fake_key_for_test",
+            &serde_json::json!({ "host_id": h.host_id.to_string() }),
+        );
+        let (status, _body) = send(h.app.clone(), req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // No DB rows written.
+        assert_eq!(count_device_keys(&h.pool, h.host_id).await, 0);
+    }
+
+    /// Provision first, then craft a signed rotate request with the returned
+    /// key. Assert 200 + `key_version=2`, old row has `rotated_at IS NOT NULL`,
+    /// new row inserted.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker for Postgres testcontainer"]
+    async fn rotate_happy_path() {
+        let h = setup().await;
+
+        // Step 1: provision.
+        let req = post_json(
+            &h.app,
+            "/v1/device/provision-key",
+            &h.api_key,
+            &serde_json::json!({ "host_id": h.host_id.to_string() }),
+        );
+        let (status, body) = send(h.app.clone(), req).await;
+        assert_eq!(status, StatusCode::OK, "provision failed: {body}");
+
+        let seed_bytes = B64.decode(body["private_key_seed_b64"].as_str().unwrap()).unwrap();
+        let seed_array: [u8; 32] = seed_bytes.as_slice().try_into().unwrap();
+        let signing = SigningKey::from_bytes(&seed_array);
+
+        // Step 2: build a rotate request body + envelope.
+        let rotate_body = serde_json::json!({
+            "tenant_id": h.tenant_id.to_string(),
+            "host_id": h.host_id.to_string(),
+            "current_key_version": 1,
+        });
+        let rotate_bytes = serde_json::to_vec(&rotate_body).unwrap();
+
+        let fields = SignedFields {
+            direction: Direction::WorkerToServer,
+            tenant_id: h.tenant_id,
+            host_id: h.host_id,
+            correlation_id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            sequence_number: 1,
+            payload_hash: payload_sha256_hex(&rotate_bytes),
+            key_version: 1,
+        };
+        let envelope = sign_envelope(&fields, &signing).expect("sign");
+        let header_value = envelope.encode_header().expect("encode header");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/device/rotate-key")
+            .header("authorization", format!("Bearer {}", h.api_key))
+            .header("content-type", "application/json")
+            .header(HEADER_NAME, header_value)
+            .body(Body::from(rotate_bytes))
+            .unwrap();
+
+        let (status, body) = send(h.app.clone(), req).await;
+        assert_eq!(status, StatusCode::OK, "rotate failed: {body}");
+        assert_eq!(body["key_version"], 2);
+
+        // Old row rotated_at set.
+        let old: (Option<chrono::DateTime<chrono::Utc>>,) =
+            sqlx::query_as("SELECT rotated_at FROM roz_device_keys WHERE host_id = $1 AND key_version = 1")
+                .bind(h.host_id)
+                .fetch_one(&h.pool)
+                .await
+                .expect("select old");
+        assert!(old.0.is_some(), "old key must have rotated_at set");
+
+        // New row exists.
+        assert_eq!(count_device_keys(&h.pool, h.host_id).await, 2);
+    }
+
+    /// Tampered body: valid envelope signed over original bytes, but the
+    /// request body is then mutated → server recomputes payload_hash, sees a
+    /// mismatch, rejects with 401 BEFORE touching crypto.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker for Postgres testcontainer"]
+    async fn rotate_rejects_tampered_body() {
+        let h = setup().await;
+
+        // Provision first.
+        let req = post_json(
+            &h.app,
+            "/v1/device/provision-key",
+            &h.api_key,
+            &serde_json::json!({ "host_id": h.host_id.to_string() }),
+        );
+        let (_status, body) = send(h.app.clone(), req).await;
+        let seed_array: [u8; 32] = B64
+            .decode(body["private_key_seed_b64"].as_str().unwrap())
+            .unwrap()
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let signing = SigningKey::from_bytes(&seed_array);
+
+        // Build a valid envelope over the original body.
+        let rotate_body = serde_json::json!({
+            "tenant_id": h.tenant_id.to_string(),
+            "host_id": h.host_id.to_string(),
+            "current_key_version": 1,
+        });
+        let original_bytes = serde_json::to_vec(&rotate_body).unwrap();
+        let fields = SignedFields {
+            direction: Direction::WorkerToServer,
+            tenant_id: h.tenant_id,
+            host_id: h.host_id,
+            correlation_id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            sequence_number: 1,
+            payload_hash: payload_sha256_hex(&original_bytes),
+            key_version: 1,
+        };
+        let envelope = sign_envelope(&fields, &signing).expect("sign");
+        let header_value = envelope.encode_header().expect("encode header");
+
+        // Send TAMPERED body with the envelope that covers the ORIGINAL body.
+        // Flip one byte — choose the `current_key_version` value to keep the
+        // envelope-binding check satisfied and force the failure to come from
+        // the payload_hash mismatch path specifically.
+        let mut tampered = original_bytes.clone();
+        let needle = b"\"current_key_version\":1";
+        let pos = tampered
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("find needle");
+        // Replace the trailing '1' with '1 ' (space) — body is still valid
+        // JSON with current_key_version=1 but the raw bytes differ.
+        tampered.insert(pos + needle.len(), b' ');
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/device/rotate-key")
+            .header("authorization", format!("Bearer {}", h.api_key))
+            .header("content-type", "application/json")
+            .header(HEADER_NAME, header_value)
+            .body(Body::from(tampered))
+            .unwrap();
+
+        let (status, _body) = send(h.app.clone(), req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Revoke the provisioned key, then attempt to rotate with a valid
+    /// signature from the revoked key → 401 (T-23-20).
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker for Postgres testcontainer"]
+    async fn rotate_rejects_revoked_key() {
+        let h = setup().await;
+
+        // Provision.
+        let req = post_json(
+            &h.app,
+            "/v1/device/provision-key",
+            &h.api_key,
+            &serde_json::json!({ "host_id": h.host_id.to_string() }),
+        );
+        let (_status, body) = send(h.app.clone(), req).await;
+        let seed_array: [u8; 32] = B64
+            .decode(body["private_key_seed_b64"].as_str().unwrap())
+            .unwrap()
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let signing = SigningKey::from_bytes(&seed_array);
+
+        // Revoke the key out-of-band.
+        roz_db::device_keys::set_revoked(&h.pool, h.host_id, 1)
+            .await
+            .expect("revoke");
+
+        // Craft a valid-looking rotate request.
+        let rotate_body = serde_json::json!({
+            "tenant_id": h.tenant_id.to_string(),
+            "host_id": h.host_id.to_string(),
+            "current_key_version": 1,
+        });
+        let rotate_bytes = serde_json::to_vec(&rotate_body).unwrap();
+        let fields = SignedFields {
+            direction: Direction::WorkerToServer,
+            tenant_id: h.tenant_id,
+            host_id: h.host_id,
+            correlation_id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            sequence_number: 1,
+            payload_hash: payload_sha256_hex(&rotate_bytes),
+            key_version: 1,
+        };
+        let envelope = sign_envelope(&fields, &signing).expect("sign");
+        let header_value = envelope.encode_header().expect("encode header");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/device/rotate-key")
+            .header("authorization", format!("Bearer {}", h.api_key))
+            .header("content-type", "application/json")
+            .header(HEADER_NAME, header_value)
+            .body(Body::from(rotate_bytes))
+            .unwrap();
+        let (status, _body) = send(h.app.clone(), req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// `server_verifying_key_b64` decodes to exactly 32 bytes and is
+    /// non-empty. Repeated provision attempts from the SAME host return the
+    /// same server_verifying_key (per-`(tenant, host)` state is stable
+    /// across requests for the same pair).
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker for Postgres testcontainer"]
+    async fn provision_response_includes_server_verifying_key() {
+        let h = setup().await;
+
+        let req = post_json(
+            &h.app,
+            "/v1/device/provision-key",
+            &h.api_key,
+            &serde_json::json!({ "host_id": h.host_id.to_string() }),
+        );
+        let (status, body) = send(h.app.clone(), req).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let verifying = body["server_verifying_key_b64"].as_str().expect("field present");
+        let decoded = B64.decode(verifying).expect("decode");
+        assert_eq!(decoded.len(), 32, "verifying key MUST be 32 bytes");
+        assert!(decoded.iter().any(|b| *b != 0), "key MUST NOT be all zero");
+    }
+
+    /// Warm the cache with an old-version entry, call rotate, assert the
+    /// cache entry for `(tenant, host, old_version)` is gone afterwards.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker for Postgres testcontainer"]
+    async fn rotate_invalidates_verifying_key_cache() {
+        let h = setup().await;
+
+        // Provision to populate DB state.
+        let req = post_json(
+            &h.app,
+            "/v1/device/provision-key",
+            &h.api_key,
+            &serde_json::json!({ "host_id": h.host_id.to_string() }),
+        );
+        let (_status, body) = send(h.app.clone(), req).await;
+        let seed_array: [u8; 32] = B64
+            .decode(body["private_key_seed_b64"].as_str().unwrap())
+            .unwrap()
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let signing = SigningKey::from_bytes(&seed_array);
+        let verifying_key = signing.verifying_key();
+
+        // Warm the cache.
+        let cache_key = (h.tenant_id, h.host_id, 1u32);
+        h.state.verifying_key_cache.insert(cache_key, verifying_key).await;
+        assert!(h.state.verifying_key_cache.get(&cache_key).await.is_some());
+
+        // Build + send a valid rotate request.
+        let rotate_body = serde_json::json!({
+            "tenant_id": h.tenant_id.to_string(),
+            "host_id": h.host_id.to_string(),
+            "current_key_version": 1,
+        });
+        let rotate_bytes = serde_json::to_vec(&rotate_body).unwrap();
+        let fields = SignedFields {
+            direction: Direction::WorkerToServer,
+            tenant_id: h.tenant_id,
+            host_id: h.host_id,
+            correlation_id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            sequence_number: 1,
+            payload_hash: payload_sha256_hex(&rotate_bytes),
+            key_version: 1,
+        };
+        let envelope = sign_envelope(&fields, &signing).expect("sign");
+        let header_value = envelope.encode_header().expect("encode header");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/device/rotate-key")
+            .header("authorization", format!("Bearer {}", h.api_key))
+            .header("content-type", "application/json")
+            .header(HEADER_NAME, header_value)
+            .body(Body::from(rotate_bytes))
+            .unwrap();
+        let (status, _body) = send(h.app.clone(), req).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Cache entry for the old version is gone.
+        assert!(
+            h.state.verifying_key_cache.get(&cache_key).await.is_none(),
+            "cache entry for old key_version should be invalidated"
+        );
+    }
+}
