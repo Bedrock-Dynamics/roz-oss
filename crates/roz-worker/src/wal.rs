@@ -40,6 +40,11 @@ impl WalStore {
                 key     TEXT PRIMARY KEY,
                 result  BLOB NOT NULL,
                 expires TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS signing_sequence_counter (
+                key_version INTEGER PRIMARY KEY,
+                seq         INTEGER NOT NULL
             );",
         )?;
 
@@ -128,6 +133,40 @@ impl WalStore {
             Some(row) => Ok(Some(row.get(0)?)),
             None => Ok(None),
         }
+    }
+
+    /// Atomically allocate the next signing sequence number for a given
+    /// `key_version`.
+    ///
+    /// Returns `1` on the first call per `key_version`, `2` on the second,
+    /// and so on. Rotation (D-04) starts a fresh counter at 1 for the new
+    /// `key_version`.
+    ///
+    /// # Crash-safety
+    ///
+    /// `INSERT ... ON CONFLICT ... DO UPDATE ... RETURNING` runs as a single
+    /// SQLite statement inside WAL mode — the row's `seq` is incremented and
+    /// the new value returned atomically. A crash between `next_seq()` calls
+    /// leaves the counter at the last committed value, so the next restart
+    /// never replays a sequence number the server has already seen.
+    ///
+    /// # Errors
+    ///
+    /// Propagates `rusqlite::Error` on I/O or SQL errors. Converts the
+    /// stored `i64` into `u64` via a saturating cast — the counter would
+    /// have to overflow 2^63 increments (impossible in any realistic device
+    /// lifetime) before this matters.
+    pub fn next_seq(&self, key_version: u32) -> Result<u64, rusqlite::Error> {
+        let row: i64 = self.conn.query_row(
+            "INSERT INTO signing_sequence_counter (key_version, seq) VALUES (?1, 1)
+             ON CONFLICT(key_version) DO UPDATE SET seq = seq + 1
+             RETURNING seq",
+            params![key_version],
+            |r| r.get(0),
+        )?;
+        // Saturating cast: rusqlite exposes `seq` as `i64`; negative values are
+        // impossible because every write path only increments from 1.
+        Ok(u64::try_from(row).unwrap_or(u64::MAX))
     }
 }
 
@@ -257,6 +296,37 @@ mod tests {
 
         let cached = store.check_idempotency("nonexistent").unwrap();
         assert!(cached.is_none());
+    }
+
+    #[test]
+    fn next_seq_starts_at_one_and_monotonically_increases() {
+        let store = WalStore::open(":memory:").unwrap();
+        assert_eq!(store.next_seq(1).unwrap(), 1);
+        assert_eq!(store.next_seq(1).unwrap(), 2);
+        assert_eq!(store.next_seq(1).unwrap(), 3);
+    }
+
+    #[test]
+    fn next_seq_separate_per_key_version() {
+        let store = WalStore::open(":memory:").unwrap();
+        assert_eq!(store.next_seq(1).unwrap(), 1);
+        assert_eq!(store.next_seq(2).unwrap(), 1); // fresh counter for v2
+        assert_eq!(store.next_seq(1).unwrap(), 2); // v1 unchanged
+        assert_eq!(store.next_seq(2).unwrap(), 2);
+    }
+
+    #[test]
+    fn next_seq_survives_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("wal.db");
+        let path_str = path.to_str().unwrap();
+        {
+            let store = WalStore::open(path_str).unwrap();
+            assert_eq!(store.next_seq(1).unwrap(), 1);
+            assert_eq!(store.next_seq(1).unwrap(), 2);
+        }
+        let store = WalStore::open(path_str).unwrap();
+        assert_eq!(store.next_seq(1).unwrap(), 3);
     }
 
     #[test]
