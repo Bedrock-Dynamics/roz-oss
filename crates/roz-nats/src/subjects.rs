@@ -141,6 +141,29 @@ impl Subjects {
         Ok(format!("safety.trust_failure.{worker_id}"))
     }
 
+    /// Phase 23 (FS-04 / D-09) worker-scoped signature-verification failure
+    /// subject: `safety.signature_failure.{host_id}`.
+    ///
+    /// Publish-only. Emitted by the server-side verify gate when an inbound
+    /// worker->server envelope fails signature verification, so ops tooling
+    /// can subscribe by host. See `safety_signature_failure_server` for the
+    /// tenant-level fan-in subject.
+    pub fn safety_signature_failure_worker(host_id: &str) -> Result<String, RozError> {
+        validate_token("host_id", host_id)?;
+        Ok(format!("safety.signature_failure.{host_id}"))
+    }
+
+    /// Phase 23 (FS-04 / D-09) tenant-scoped signature-verification failure
+    /// subject: `safety.signature_failure.server.{tenant_id}`.
+    ///
+    /// Publish-only. Server-scoped fan-in so ops can subscribe per tenant
+    /// instead of per host. REQUIREMENTS.md section FS-04 requires both
+    /// worker and server scoped subjects.
+    pub fn safety_signature_failure_server(tenant_id: &str) -> Result<String, RozError> {
+        validate_token("tenant_id", tenant_id)?;
+        Ok(format!("safety.signature_failure.server.{tenant_id}"))
+    }
+
     /// Build a WebRTC offer subject: `webrtc.{worker_id}.{peer_id}.offer`.
     pub fn webrtc_offer(worker_id: &str, peer_id: &str) -> Result<String, RozError> {
         validate_token("worker_id", worker_id)?;
@@ -303,6 +326,30 @@ mod tests {
         assert!(Subjects::wasm_trust_failure("a*b").is_err(), "wildcards");
         assert!(Subjects::wasm_trust_failure("a>b").is_err(), "> is full-wildcard");
         assert!(Subjects::wasm_trust_failure("robot-1").is_ok());
+    }
+
+    #[test]
+    fn safety_signature_failure_worker_subject() {
+        assert_eq!(
+            Subjects::safety_signature_failure_worker("abc").unwrap(),
+            "safety.signature_failure.abc"
+        );
+        assert!(Subjects::safety_signature_failure_worker("bad.token").is_err());
+        assert!(Subjects::safety_signature_failure_worker("").is_err());
+        assert!(Subjects::safety_signature_failure_worker("star*worker").is_err());
+        assert!(Subjects::safety_signature_failure_worker("gt>worker").is_err());
+    }
+
+    #[test]
+    fn safety_signature_failure_server_subject() {
+        assert_eq!(
+            Subjects::safety_signature_failure_server("tenant-7").unwrap(),
+            "safety.signature_failure.server.tenant-7"
+        );
+        assert!(Subjects::safety_signature_failure_server("bad>token").is_err());
+        assert!(Subjects::safety_signature_failure_server("").is_err());
+        assert!(Subjects::safety_signature_failure_server("dot.tenant").is_err());
+        assert!(Subjects::safety_signature_failure_server("star*tenant").is_err());
     }
 
     #[test]

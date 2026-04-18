@@ -1,5 +1,6 @@
 pub mod auth_keys;
 pub mod commands;
+pub mod device;
 pub mod device_auth;
 pub mod environments;
 pub mod health;

@@ -116,6 +116,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/ws", get(ws::handler::ws_upgrade))
         // Device auth completion (requires auth)
         .route("/v1/auth/device/complete", post(routes::device_auth::complete_auth))
+        // Phase 23 (FS-04) device-key bootstrap + rotation. Plan 23-04
+        // scaffolds the routes returning 501; Plan 23-05 swaps the stubs.
+        .merge(routes::device::device_routes())
         // Tx middleware (innermost = runs after auth + rate limit)
         .layer(axum::middleware::from_fn(middleware::tx::tx_layer))
         // Rate limit middleware (middle = runs after auth, before tx_layer)
