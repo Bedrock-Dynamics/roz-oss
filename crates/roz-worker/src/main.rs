@@ -4,6 +4,7 @@ use std::time::Duration;
 use anyhow::Result;
 use async_nats::jetstream::Context as JetStreamContext;
 use futures::StreamExt;
+use parking_lot::RwLock;
 use roz_agent::agent_loop::{AgentInputSeed, AgentLoop, AgentOutput, PresenceSignal};
 use roz_agent::error::AgentError;
 use roz_agent::model::types::StreamChunk;
@@ -15,8 +16,10 @@ use roz_agent::spatial_provider::{NullWorldStateProvider, PrimedWorldStateProvid
 use roz_core::session::activity::RuntimeFailureKind;
 use roz_core::session::event::{EventEnvelope, SessionEvent};
 use roz_core::session::feedback::ApprovalOutcome;
+use roz_core::signing::{HEADER_NAME, SignatureError};
 use roz_core::team::{SequencedTeamEvent, TeamEvent};
 use roz_nats::dispatch::{TaskInvocation, TaskStatusEvent, TaskTerminalStatus};
+use roz_worker::signing_hooks::{WorkerSigningContext, WorkerSigningError};
 use tokio::sync::{Semaphore, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
@@ -1028,6 +1031,18 @@ async fn main() -> Result<()> {
             }
         });
 
+    // Phase 23 Plan 23-08: signing context, hoisted here so the invoke
+    // subscribe loop below can verify inbound server→worker envelopes.
+    // Populated by the provision/rotate/load path; stays `None` under D-12
+    // rollout when `ROZ_ENCRYPTION_KEY` is unset.
+    let mut signing_ctx: Option<WorkerSigningContext> = None;
+    // Hold onto the key provider + data dir for in-loop `force_rotate` on
+    // server-key rotation (D-15 bounded refetch).
+    let mut signing_rotate_ctx: Option<(
+        std::sync::Arc<roz_core::key_provider::StaticKeyProvider>,
+        std::path::PathBuf,
+    )> = None;
+
     // Register with server and bootstrap Phase 23 device signing key.
     //
     // `register_host` now returns `HostIdentity { host_id, tenant_id }` —
@@ -1095,11 +1110,32 @@ async fn main() -> Result<()> {
                                     key_version = material.key_version,
                                     "device signing key ready"
                                 );
-                                // Stash in scope so Plan 23-08 can thread it
-                                // through the publish sites. The underscore
-                                // prefix silences the unused-variable warning
-                                // until 23-08 wires the consumers.
-                                let _signing_material = material;
+                                // Plan 23-08 Task 3: construct the
+                                // WorkerSigningContext so the invoke subscribe
+                                // loop below can verify inbound server→worker
+                                // envelopes. The signing WAL path is
+                                // worker-specific so that `next_seq`'s SQLite
+                                // counter survives restarts (per
+                                // wal::tests::next_seq_survives_reopen).
+                                let wal_path = dir.join(format!("wal-{}.db", config.worker_id));
+                                match roz_worker::wal::WalStore::open(wal_path.to_str().unwrap_or(":memory:")) {
+                                    Ok(wal) => {
+                                        signing_ctx = Some(WorkerSigningContext::new(
+                                            std::sync::Arc::new(RwLock::new(material)),
+                                            std::sync::Arc::new(wal),
+                                        ));
+                                        signing_rotate_ctx = Some((key_provider.clone(), dir.clone()));
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            error = %e,
+                                            host_id = %identity.host_id,
+                                            wal_path = %wal_path.display(),
+                                            "failed to open WAL for signing; hard-stop (exit 78 EX_CONFIG, D-09)"
+                                        );
+                                        std::process::exit(78);
+                                    }
+                                }
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -1406,9 +1442,20 @@ async fn main() -> Result<()> {
 
     let restate_url = config.restate_url.clone();
 
+    // Worker-local counter of inbound signature verification failures.
+    // Bumped on every dropped message; tracing is the surface until a
+    // first-class metrics stack lands (scope of a later plan). Atomic because
+    // it's read via `.load()` in tests and incremented from the single
+    // subscribe loop today.
+    let inbound_verify_failures = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     while let Some(msg) = sub.next().await {
         watchdog.pet();
 
+        // 1. E-stop short-circuit (pre-existing). Must come BEFORE signature
+        //    verify per RESEARCH.md integration-point pitfall 2: a tripped
+        //    e-stop means we reject the message regardless of signature
+        //    validity to avoid racing the e-stop path with crypto work.
         if *estop_rx.borrow() {
             tracing::error!("E-STOP active — rejecting task invocation");
             continue;
@@ -1420,6 +1467,65 @@ async fn main() -> Result<()> {
             "received invocation"
         );
 
+        // 2. Phase 23 FS-04: signature verify.
+        //
+        // If signing is enabled for this worker, verify the `roz-sig-v1`
+        // header before any serde_json::from_slice on the payload — any
+        // tamper or unsigned-dispatch attack is caught here.
+        //
+        // D-15 bounded refetch: on first verify failure, attempt one
+        // `force_rotate` + retry. Covers the case where the server rotated
+        // its outbound key and this worker still has the stale cached copy.
+        if let Some(ctx) = signing_ctx.as_ref() {
+            let header_value = msg
+                .headers
+                .as_ref()
+                .and_then(|h| h.get(HEADER_NAME))
+                .map(async_nats::HeaderValue::as_str);
+
+            if let Err(err) = ctx.verify_inbound_worker(header_value, &msg.payload) {
+                // Attempt one bounded refetch + retry for signature failures
+                // that look like a server-key rotation.
+                let retry_ok = matches!(
+                    err,
+                    WorkerSigningError::Signature(SignatureError::InvalidSignature)
+                        | WorkerSigningError::UnknownServerKeyVersion(_)
+                ) && signing_rotate_ctx.is_some()
+                    && {
+                        let (key_provider, dir) = signing_rotate_ctx.as_ref().expect("checked above");
+                        let current = ctx.material.read().clone();
+                        match roz_worker::signing_key::force_rotate(&current, dir, &http, &config.api_url, key_provider)
+                            .await
+                        {
+                            Ok(new_mat) => {
+                                *ctx.material.write() = new_mat;
+                                ctx.verify_inbound_worker(header_value, &msg.payload).is_ok()
+                            }
+                            Err(rotate_err) => {
+                                tracing::warn!(
+                                    error = %rotate_err,
+                                    "force_rotate after inbound verify failure failed"
+                                );
+                                false
+                            }
+                        }
+                    };
+
+                if !retry_ok {
+                    inbound_verify_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::error!(
+                        err = ?err,
+                        subject = %msg.subject,
+                        total_failures = inbound_verify_failures.load(std::sync::atomic::Ordering::Relaxed),
+                        "inbound dispatch signature verification failed; dropping message"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        // 3. Deserialize — safe because (when signing is enabled) the payload
+        //    bytes have been bound by a verified signature.
         let invocation: TaskInvocation = match serde_json::from_slice(&msg.payload) {
             Ok(inv) => inv,
             Err(e) => {
