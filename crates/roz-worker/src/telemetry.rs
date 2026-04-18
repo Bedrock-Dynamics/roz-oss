@@ -242,6 +242,59 @@ mod tests {
     }
 
     #[test]
+    fn percent_full_rounds_down() {
+        assert_eq!(percent_full(0, 100), 0);
+        assert_eq!(percent_full(50, 100), 50);
+        assert_eq!(percent_full(100, 100), 100);
+        // Over-quota clamps to 100.
+        assert_eq!(percent_full(150, 100), 100);
+        assert_eq!(percent_full(90, 100), 90);
+        // Zero / negative quota degrades safe (saturates to 100).
+        assert_eq!(percent_full(1, 0), 100);
+    }
+
+    #[test]
+    fn drop_counter_logs_at_1_and_every_100() {
+        let dc = DropCounter::new();
+        // 1st drop always logs.
+        let (n, log) = dc.record_and_should_log();
+        assert_eq!(n, 1);
+        assert!(log, "first drop should always log");
+        // Drops 2..=99 do not log.
+        for _ in 0..98 {
+            let (_, should) = dc.record_and_should_log();
+            assert!(!should);
+        }
+        // 100th drop logs.
+        let (n, log) = dc.record_and_should_log();
+        assert_eq!(n, 100);
+        assert!(log);
+        // 101st drop does not log.
+        let (n, log) = dc.record_and_should_log();
+        assert_eq!(n, 101);
+        assert!(!log);
+    }
+
+    #[test]
+    fn drop_counter_logs_exactly_twice_for_101_drops() {
+        let dc = DropCounter::new();
+        let mut log_count = 0u64;
+        for _ in 0..101 {
+            let (_, should) = dc.record_and_should_log();
+            if should {
+                log_count += 1;
+            }
+        }
+        // n=1 and n=100 log; 2..=99 and 101 do not. Total = 2.
+        assert_eq!(log_count, 2);
+    }
+
+    #[test]
+    fn enforce_quota_constant_matches_spec() {
+        assert_eq!(ENFORCE_QUOTA_EVERY, 64);
+    }
+
+    #[test]
     #[allow(clippy::float_cmp)] // serde_json round-trips finite f64 exactly
     fn telemetry_msg_serde_roundtrip() {
         let msg = TelemetryPublisher::build_message("host1", "imu", json!({"x": 1.0}));
