@@ -20,6 +20,7 @@ roz-agent = { path = "../roz-agent" }
 roz-local = { path = "../roz-local" }
 roz-openai = { path = "../roz-openai" }
 roz-copper = { path = "../roz-copper", default-features = false }
+roz-worker = { path = "../roz-worker" }
 chrono = { workspace = true }
 secrecy = { workspace = true }
 arc-swap.workspace = true

@@ -49,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
             cli::Commands::Recording(args) => commands::recording::execute(&args.command, &config).await,
             cli::Commands::Sim(args) => commands::sim::execute(&args.action).await,
             cli::Commands::Trust(args) => commands::trust::execute(&args.command, &config).await,
+            cli::Commands::Device(args) => commands::device::execute(&args.command).await,
             cli::Commands::Config(args) => commands::config::execute(&args.command, &config).await,
             cli::Commands::Doctor => commands::doctor::execute(&config).await,
             cli::Commands::Estop { host } => commands::estop::execute(&config, &host).await,

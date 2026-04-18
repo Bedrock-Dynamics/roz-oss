@@ -144,6 +144,8 @@ pub enum Commands {
     Sim(commands::sim::SimArgs),
     /// Device trust management.
     Trust(commands::trust::TrustArgs),
+    /// Device signing-key management (Phase 23 FS-04).
+    Device(commands::device::DeviceArgs),
     /// Configuration.
     Config(commands::config::ConfigArgs),
     /// Run diagnostics.

@@ -142,6 +142,22 @@ pub async fn bootstrap_device_key(
     }
 }
 
+/// Look up a host's `(host_id, tenant_id)` by worker name without mutating
+/// status (unlike [`register_host`], which flips status to `online`).
+///
+/// Returns `Ok(None)` if no host matches. Used by read-only CLI commands
+/// such as `roz device rotate-key` (Plan 23-09) that need the signed
+/// `host_id`/`tenant_id` values without registering a new host.
+pub async fn lookup_host_identity(
+    client: &reqwest::Client,
+    api_url: &str,
+    api_key: &str,
+    worker_id: &str,
+) -> Result<Option<HostIdentity>> {
+    let base = api_url.trim_end_matches('/');
+    find_host_paginated(client, base, api_key, worker_id).await
+}
+
 /// Paginate through `GET /v1/hosts` looking for a host whose `name` matches `worker_id`.
 async fn find_host_paginated(
     client: &reqwest::Client,
