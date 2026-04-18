@@ -60,11 +60,14 @@ use rand::rngs::OsRng;
 use roz_core::auth::{AuthIdentity, TenantId};
 use roz_core::signing::{Direction, HEADER_NAME, SignatureEnvelope, payload_sha256_hex, verify_envelope};
 use roz_db::{device_keys, server_signing_state};
+use roz_nats::Subjects;
+use roz_nats::dispatch::publish_signed;
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::signing_gate::SigningGate;
 use crate::state::AppState;
 
 /// Request body for `POST /v1/device/provision-key`.
@@ -117,11 +120,38 @@ pub struct RotateKeyResponse {
     pub server_verifying_key_b64: String,
 }
 
-/// Assemble the Phase 23 device-key routes.
+/// Request body for `POST /v1/device/clear-failsafe` (Phase 24 FS-01 D-02).
+///
+/// Operator-initiated deadman re-arm. The bearer token identifies the
+/// tenant; `worker_id` selects the device by its registered host `name`.
+#[derive(Debug, Deserialize)]
+pub struct ClearFailsafeRequest {
+    /// Worker/host name scoped to the authenticated tenant. Maps to
+    /// [`roz_db::hosts::HostRow::name`].
+    pub worker_id: String,
+    /// Optional free-text reason recorded in the server audit log and
+    /// forwarded to the worker inside the signed envelope body.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Response body for `POST /v1/device/clear-failsafe`.
+///
+/// The handler has already published the signed NATS envelope by the time
+/// this returns — `correlation_id` lets the operator trace the message on
+/// the audit side.
+#[derive(Debug, Serialize)]
+pub struct ClearFailsafeResponse {
+    pub cleared_at: chrono::DateTime<chrono::Utc>,
+    pub correlation_id: Uuid,
+}
+
+/// Assemble the Phase 23 + Phase 24 device routes.
 pub fn device_routes() -> Router<AppState> {
     Router::new()
         .route("/v1/device/provision-key", post(provision_key))
         .route("/v1/device/rotate-key", post(rotate_key))
+        .route("/v1/device/clear-failsafe", post(clear_failsafe))
 }
 
 /// Bootstrap a new device key for `host_id` under the authenticated tenant.
@@ -335,6 +365,93 @@ pub async fn rotate_key(
     }))
 }
 
+/// Operator-initiated deadman re-arm (Phase 24 FS-01 D-02).
+///
+/// POST body: `{ "worker_id": "<host name>", "reason": "<optional>" }`.
+/// Auth: bearer `ROZ_API_KEY` (validated by the crate's auth middleware).
+///
+/// Flow:
+/// 1. Resolve `worker_id` → `host_id` scoped to the authenticated tenant.
+///    Unknown host → `404`, so enumeration of other tenants' worker names
+///    is not possible.
+/// 2. Build a JSON body carrying the optional `reason` + `operator`
+///    metadata, sign via [`SigningGate::sign_outbound`] (direction =
+///    server→worker, fresh monotonic sequence number).
+/// 3. Publish the signed envelope on `cmd.{worker_id}.clear_failsafe`.
+///    The worker's clear-failsafe subscriber (Plan 24-06 Task 2) verifies
+///    the signature and calls `CommandWatchdog::clear_failsafe`.
+///
+/// Failures to publish surface as `500` — the operator retries.
+///
+/// # Errors
+/// - `400` — bad request body.
+/// - `404` — worker not found under the authenticated tenant.
+/// - `500` — NATS unavailable, signing-state missing, or publish failure.
+#[tracing::instrument(
+    level = "info",
+    skip(state, auth, body),
+    fields(worker_id = %body.worker_id, tenant_id = %auth.tenant_id().as_uuid())
+)]
+pub async fn clear_failsafe(
+    State(state): State<AppState>,
+    Extension(auth): Extension<AuthIdentity>,
+    Json(body): Json<ClearFailsafeRequest>,
+) -> Result<Json<ClearFailsafeResponse>, AppError> {
+    let tenant_id = *auth.tenant_id().as_uuid();
+
+    // Tenant-scoped worker_id → host lookup. Worker id maps to host name
+    // per the registration flow (`roz_worker::registration::lookup_host_identity`).
+    let host = roz_db::hosts::find_by_name_for_tenant(&state.pool, tenant_id, &body.worker_id)
+        .await
+        .map_err(|e| AppError::internal(format!("lookup host by name: {e}")))?
+        .ok_or_else(|| AppError::not_found(format!("worker {} not found", body.worker_id)))?;
+
+    // Serialize the operator-metadata payload. The worker deserializes it
+    // into `roz_worker::clear_failsafe::ClearFailsafePayload`.
+    let operator_label = match &auth {
+        AuthIdentity::ApiKey { key_id, .. } => key_id.to_string(),
+        AuthIdentity::User { user_id, .. } => user_id.clone(),
+        AuthIdentity::Worker { worker_id, .. } => worker_id.clone(),
+    };
+    let payload_bytes = serde_json::to_vec(&serde_json::json!({
+        "reason": body.reason,
+        "operator": operator_label,
+    }))
+    .map_err(|e| AppError::internal(format!("serialize payload: {e}")))?;
+
+    let nats = state
+        .nats_client
+        .as_ref()
+        .ok_or_else(|| AppError::internal("NATS client unavailable".to_string()))?;
+
+    let correlation_id = Uuid::new_v4();
+    let gate = SigningGate::from_app_state(&state);
+    let header = gate
+        .sign_outbound(tenant_id, host.id, correlation_id, &payload_bytes)
+        .await
+        .map_err(|e| AppError::internal(format!("sign clear-failsafe envelope: {e}")))?;
+
+    let subject = Subjects::clear_failsafe(&body.worker_id)
+        .map_err(|e| AppError::bad_request(format!("invalid worker_id: {e}")))?;
+    publish_signed(nats, subject, payload_bytes, &header)
+        .await
+        .map_err(|e| AppError::internal(format!("publish clear-failsafe: {e}")))?;
+
+    let cleared_at = chrono::Utc::now();
+    tracing::info!(
+        tenant_id = %tenant_id,
+        host_id = %host.id,
+        worker_id = %body.worker_id,
+        correlation_id = %correlation_id,
+        "clear_failsafe_published"
+    );
+
+    Ok(Json(ClearFailsafeResponse {
+        cleared_at,
+        correlation_id,
+    }))
+}
+
 /// Lazy-create helper for the server's per-`(tenant, host)` signing state.
 ///
 /// Fetches the active signing row; on `None`, generates a fresh Ed25519
@@ -501,7 +618,10 @@ mod tests {
         };
         let v = serde_json::to_value(&resp).expect("serialize");
         assert!(v.get("cleared_at").is_some(), "response must carry cleared_at");
-        assert_eq!(v.get("correlation_id").and_then(serde_json::Value::as_str), Some("00000000-0000-0000-0000-000000000000"));
+        assert_eq!(
+            v.get("correlation_id").and_then(serde_json::Value::as_str),
+            Some("00000000-0000-0000-0000-000000000000")
+        );
     }
 }
 
