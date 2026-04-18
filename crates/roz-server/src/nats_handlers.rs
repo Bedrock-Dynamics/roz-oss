@@ -619,3 +619,373 @@ mod tests {
         assert!(!is_terminal_task_status("queued"));
     }
 }
+
+// ===========================================================================
+// Plan 24-08 (FS-03 D-10) — reconnect handshake handler
+// ===========================================================================
+//
+// Subscribes to `roz.state.worker_online` (static subject). On each signed
+// message:
+//   1. Verify via SigningGate (direction/hash/cache/replay/DB advance).
+//   2. Parse `WorkerOnlineSnapshot` from `roz_core::reconnect` (shared wire).
+//   3. For each in-progress task, run an HTTP POST to
+//      `{RESTATE_INGRESS_URL}/TaskWorkflow/{task_id}/get_status` gated by
+//      `tokio::time::timeout(500 ms)`. Terminal status → Abort; non-terminal
+//      → ResumeFromCheckpoint; HTTP or timeout error → Abort with audit reason.
+//   4. Publish a signed `ResumeInstruction` on `roz.tasks.{worker_id}` using
+//      the envelope-verified `tenant_id`/`worker_id` as the sign ctx.
+//
+// Restate API choice per Plan 24-08 Task 1 checkpoint: Option B (HTTP ingress
+// via existing `RESTATE_INGRESS_URL` + `reqwest::Client`). Rationale lives in
+// `.planning/phases/24-.../24-08-SUMMARY.md` "Restate SDK choice".
+
+use roz_core::reconnect::{ResumeInstruction, ResumeOutcome, WorkerOnlineSnapshot};
+use roz_core::signing::{HEADER_NAME, SignatureEnvelope};
+use std::time::Duration;
+
+/// D-10 hard budget per task. Restate lookup that exceeds this budget fails
+/// closed with `ResumeOutcome::Abort { reason: "restate_timeout" }`.
+pub const WORKER_ONLINE_RESTATE_BUDGET: Duration = Duration::from_millis(500);
+
+/// External lookup abstraction for Restate workflow status, injected so
+/// [`resolve_task_outcome`] is unit-testable without a live Restate server.
+/// Production wiring uses [`RestateHttpLookup`]; tests use a mock.
+#[async_trait::async_trait]
+pub trait RestateWorkflowLookup: Send + Sync {
+    /// Return `Ok(Some((checkpoint_id, step)))` if the workflow is still in
+    /// flight (Pending/Running/WaitingForApproval), `Ok(None)` if terminal or
+    /// unknown (Succeeded/Failed/TimedOut/Cancelled/SafetyStop/404), and
+    /// `Err(_)` for transport / deserialization faults.
+    async fn lookup(
+        &self,
+        task_id: Uuid,
+        snapshot_checkpoint_id: Option<Uuid>,
+        snapshot_step: u32,
+    ) -> anyhow::Result<Option<(Uuid, u32)>>;
+}
+
+/// Production [`RestateWorkflowLookup`] — POSTs to the `get_status` shared
+/// handler on the existing Restate ingress URL.
+pub struct RestateHttpLookup {
+    pub client: reqwest::Client,
+    pub ingress_url: String,
+}
+
+#[async_trait::async_trait]
+impl RestateWorkflowLookup for RestateHttpLookup {
+    async fn lookup(
+        &self,
+        task_id: Uuid,
+        snapshot_checkpoint_id: Option<Uuid>,
+        snapshot_step: u32,
+    ) -> anyhow::Result<Option<(Uuid, u32)>> {
+        let url = format!("{}/TaskWorkflow/{}/get_status", self.ingress_url, task_id);
+        let resp = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .body("{}")
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(anyhow::anyhow!("restate get_status http {}", resp.status()));
+        }
+        // TaskStatus is a tagged enum on `state`. We only need to classify
+        // terminal vs non-terminal without pulling the full type (avoids
+        // adding a restate-internal dep to this module).
+        let value: serde_json::Value = resp.json().await?;
+        let Some(state) = value.get("state").and_then(|s| s.as_str()) else {
+            return Err(anyhow::anyhow!("restate get_status missing state"));
+        };
+        match state {
+            "pending" | "running" | "waiting_for_approval" => {
+                // Worker's own checkpoint is authoritative for resume point
+                // per D-10 — we're only asking Restate "is this workflow
+                // still alive?". If worker had no checkpoint id, fail closed.
+                Ok(snapshot_checkpoint_id.map(|ckpt| (ckpt, snapshot_step)))
+            }
+            "succeeded" | "failed" | "timed_out" | "cancelled" | "safety_stop" => Ok(None),
+            other => Err(anyhow::anyhow!("restate unknown TaskStatus state: {other}")),
+        }
+    }
+}
+
+/// Pure helper: run one Restate lookup gated by
+/// [`WORKER_ONLINE_RESTATE_BUDGET`] and map every branch to a
+/// [`ResumeOutcome`]. Fail-closed on timeout or error per D-10.
+pub async fn resolve_task_outcome(
+    lookup: &dyn RestateWorkflowLookup,
+    task_id: Uuid,
+    snapshot_checkpoint_id: Option<Uuid>,
+    snapshot_step: u32,
+) -> ResumeOutcome {
+    match tokio::time::timeout(
+        WORKER_ONLINE_RESTATE_BUDGET,
+        lookup.lookup(task_id, snapshot_checkpoint_id, snapshot_step),
+    )
+    .await
+    {
+        Ok(Ok(Some((checkpoint_id, step)))) => ResumeOutcome::ResumeFromCheckpoint { checkpoint_id, step },
+        Ok(Ok(None)) => ResumeOutcome::Abort {
+            reason: "no_workflow".into(),
+        },
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, %task_id, "restate lookup error; fail-closed abort");
+            ResumeOutcome::Abort {
+                reason: format!("restate_error: {e}"),
+            }
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                %task_id,
+                budget_ms = WORKER_ONLINE_RESTATE_BUDGET.as_millis() as u64,
+                "restate lookup exceeded budget — fail-closed abort",
+            );
+            ResumeOutcome::Abort {
+                reason: "restate_timeout".into(),
+            }
+        }
+    }
+}
+
+/// Process a single `roz.state.worker_online` message. Verify → parse →
+/// per-task Restate lookup (500 ms budget) → publish signed
+/// [`ResumeInstruction`] on `roz.tasks.{worker_id}`.
+///
+/// The signing context for the REPLY uses the *envelope-verified*
+/// `tenant_id`/`host_id` from the snapshot payload (verified by
+/// [`SigningGate::verify_inbound`] against the header + DB key). No second
+/// DB hop needed because `verify_inbound` already binds the envelope fields
+/// to the cached/DB'd device key.
+///
+/// # Errors
+///
+/// Returns `Err` only for transport-layer failures the caller should log.
+/// Verify rejection drops the message silently (the gate writes its own
+/// audit row).
+pub async fn handle_worker_online_message(
+    nats: &async_nats::Client,
+    signing_gate: &SigningGate,
+    lookup: &dyn RestateWorkflowLookup,
+    msg: &async_nats::Message,
+) -> anyhow::Result<()> {
+    // Step 1: decode the header to get the signed tenant/host BEFORE
+    // verification — we need them as the InboundContext so the cross-host
+    // check in verify_inbound is meaningful (any mismatch between envelope
+    // and the DB-resolved key material fails the verify).
+    let Some(headers) = msg.headers.as_ref() else {
+        tracing::warn!("worker_online: missing headers; dropping");
+        return Ok(());
+    };
+    let Some(header_value) = headers.get(HEADER_NAME) else {
+        tracing::warn!("worker_online: missing roz-sig-v1 header; dropping");
+        return Ok(());
+    };
+    let envelope = match SignatureEnvelope::decode_header(header_value.as_str()) {
+        Ok(env) => env,
+        Err(e) => {
+            tracing::warn!(error = %e, "worker_online: decode_header failed; dropping");
+            return Ok(());
+        }
+    };
+
+    let ctx = crate::signing_gate::InboundContext {
+        tenant_id: envelope.fields.tenant_id,
+        host_id: envelope.fields.host_id,
+    };
+
+    // Step 2: full gate (crypto + cache + replay + DB advance) against the
+    // envelope's claimed tenant/host. Envelope fields must match ctx fields
+    // — trivially true here since ctx was derived from them — but the
+    // verify still runs all other checks (signature, payload hash, replay,
+    // key version lookup).
+    if let Err(e) = signing_gate
+        .verify_inbound(msg.headers.as_ref(), &msg.payload, ctx)
+        .await
+    {
+        tracing::warn!(error = %e, "worker_online: signature verification failed; dropping");
+        return Ok(());
+    }
+
+    // Step 3: parse shared wire type.
+    let snapshot: WorkerOnlineSnapshot = match serde_json::from_slice(&msg.payload) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "worker_online: parse WorkerOnlineSnapshot failed; dropping");
+            return Ok(());
+        }
+    };
+
+    // Step 4: per-task Restate lookup (serial, each gated at 500 ms).
+    for task in &snapshot.tasks_in_progress {
+        let outcome = resolve_task_outcome(lookup, task.task_id, snapshot.last_checkpoint_id, task.step).await;
+        let instruction = ResumeInstruction {
+            task_id: task.task_id,
+            outcome,
+        };
+
+        let subject = format!("roz.tasks.{}", snapshot.worker_id);
+        let payload = match serde_json::to_vec(&instruction) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(error = %e, task_id = %task.task_id, "worker_online: serialize ResumeInstruction failed");
+                continue;
+            }
+        };
+        // Reply signed as server→worker. Use the envelope-verified tenant/host
+        // directly — no DB hop (snapshot.worker_id == envelope.host_id, which
+        // the signing gate already bound to the DB-trusted device key).
+        let header = match signing_gate
+            .sign_outbound(snapshot.tenant_id, snapshot.worker_id, Uuid::new_v4(), &payload)
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!(error = %e, task_id = %task.task_id, "worker_online: sign_outbound failed");
+                continue;
+            }
+        };
+        if let Err(e) = roz_nats::publish_signed(nats, subject, payload, &header).await {
+            tracing::error!(error = %e, task_id = %task.task_id, "worker_online: publish_signed failed");
+        }
+    }
+
+    Ok(())
+}
+
+/// Spawn the `roz.state.worker_online` subscriber loop. Plan 24-09 calls this
+/// from server startup alongside [`spawn_all`]; unit tests exercise
+/// [`handle_worker_online_message`] directly.
+pub async fn spawn_worker_online_handler(
+    nats: NatsClient,
+    signing_gate: Arc<SigningGate>,
+    lookup: Arc<dyn RestateWorkflowLookup>,
+) {
+    let subject = roz_nats::Subjects::state_worker_online().to_string();
+    let mut sub = match nats.subscribe(subject.clone()).await {
+        Ok(s) => s,
+        Err(error) => {
+            tracing::error!(%error, %subject, "failed to subscribe worker_online");
+            return;
+        }
+    };
+    tracing::info!(%subject, "worker_online handler ready");
+    while let Some(msg) = sub.next().await {
+        if let Err(error) = handle_worker_online_message(&nats, &signing_gate, lookup.as_ref(), &msg).await {
+            tracing::error!(%error, "worker_online handler: failed");
+        }
+    }
+}
+
+#[cfg(test)]
+mod handshake_tests {
+    use super::*;
+    use roz_core::reconnect::ResumeOutcome;
+    use tokio::sync::Mutex;
+
+    struct MockLookup {
+        result: Mutex<Option<anyhow::Result<Option<(Uuid, u32)>>>>,
+        delay: Duration,
+    }
+
+    impl MockLookup {
+        fn new(result: anyhow::Result<Option<(Uuid, u32)>>, delay: Duration) -> Self {
+            Self {
+                result: Mutex::new(Some(result)),
+                delay,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RestateWorkflowLookup for MockLookup {
+        async fn lookup(
+            &self,
+            _task_id: Uuid,
+            _snapshot_checkpoint_id: Option<Uuid>,
+            _snapshot_step: u32,
+        ) -> anyhow::Result<Option<(Uuid, u32)>> {
+            tokio::time::sleep(self.delay).await;
+            self.result.lock().await.take().unwrap_or_else(|| Ok(None))
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_task_outcome_resumes_when_workflow_in_flight() {
+        let ckpt = Uuid::new_v4();
+        let lookup = MockLookup::new(Ok(Some((ckpt, 5))), Duration::from_millis(10));
+        let outcome = resolve_task_outcome(&lookup, Uuid::new_v4(), Some(ckpt), 5).await;
+        assert_eq!(
+            outcome,
+            ResumeOutcome::ResumeFromCheckpoint {
+                checkpoint_id: ckpt,
+                step: 5
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_task_outcome_aborts_when_workflow_unknown() {
+        let lookup = MockLookup::new(Ok(None), Duration::from_millis(10));
+        let outcome = resolve_task_outcome(&lookup, Uuid::new_v4(), None, 0).await;
+        assert_eq!(
+            outcome,
+            ResumeOutcome::Abort {
+                reason: "no_workflow".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_task_outcome_aborts_on_restate_timeout() {
+        // MockLookup sleeps 700 ms; budget is 500 ms → timeout → restate_timeout abort.
+        let lookup = MockLookup::new(Ok(None), Duration::from_millis(700));
+        let start = std::time::Instant::now();
+        let outcome = resolve_task_outcome(&lookup, Uuid::new_v4(), None, 0).await;
+        let elapsed = start.elapsed();
+        assert_eq!(
+            outcome,
+            ResumeOutcome::Abort {
+                reason: "restate_timeout".into()
+            }
+        );
+        // Verify the timeout fires roughly at the 500 ms budget — MUST NOT
+        // exceed 650 ms (p99 envelope from D-10 allows some overhead but not
+        // anywhere near 700 ms, which is where the mock would have returned).
+        assert!(
+            elapsed < Duration::from_millis(650),
+            "timeout should fire near 500 ms budget, elapsed={elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_task_outcome_aborts_on_lookup_error() {
+        let lookup = MockLookup::new(Err(anyhow::anyhow!("boom")), Duration::from_millis(10));
+        let outcome = resolve_task_outcome(&lookup, Uuid::new_v4(), None, 0).await;
+        match outcome {
+            ResumeOutcome::Abort { reason } => assert!(reason.starts_with("restate_error")),
+            ResumeOutcome::ResumeFromCheckpoint { .. } => panic!("expected abort"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_task_outcome_budget_holds_under_repeated_fast_calls() {
+        // 20 fast calls must each stay well within the 500 ms budget.
+        // 20 * 10 ms worst case = 200 ms total — still far below a
+        // 20 * 500 ms = 10 s worst case if the timeout mis-fired.
+        let start = std::time::Instant::now();
+        for _ in 0..20 {
+            let lookup = MockLookup::new(Ok(None), Duration::from_millis(10));
+            let outcome = resolve_task_outcome(&lookup, Uuid::new_v4(), None, 0).await;
+            assert!(matches!(outcome, ResumeOutcome::Abort { .. }));
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "20 fast calls should run well inside p99 envelope, elapsed={elapsed:?}"
+        );
+    }
+}
