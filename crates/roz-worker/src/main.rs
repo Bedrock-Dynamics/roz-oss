@@ -42,7 +42,27 @@ fn decode_team_event_payload(payload: &[u8]) -> Option<TeamEvent> {
     serde_json::from_slice::<TeamEvent>(payload).ok()
 }
 
-async fn publish_task_status(nats: &async_nats::Client, event: &TaskStatusEvent) {
+async fn publish_task_status(
+    nats: &async_nats::Client,
+    signing_ctx: Option<&WorkerSigningContext>,
+    event: &TaskStatusEvent,
+) {
+    // Phase 23 FS-04: when signing is enabled, route through the signed
+    // helper so every task-status NATS message carries a roz-sig-v1 header
+    // (plan 23-08 Task 2). When disabled (D-12 rollout window or local dev
+    // without ROZ_ENCRYPTION_KEY), fall back to the unsigned path.
+    if let Some(ctx) = signing_ctx {
+        if let Err(error) = roz_worker::dispatch::publish_task_status_signed(nats, ctx, event).await {
+            tracing::warn!(
+                %error,
+                task_id = %event.task_id,
+                status = %event.status,
+                "failed to publish signed task status"
+            );
+        }
+        return;
+    }
+
     let subject = roz_nats::dispatch::task_status_subject(event.task_id);
     match serde_json::to_vec(event) {
         Ok(payload) => {
@@ -357,6 +377,7 @@ async fn execute_task(
     restate_url: String,
     estop_rx: tokio::sync::watch::Receiver<bool>,
     camera_manager: Option<Arc<roz_worker::camera::CameraManager>>,
+    signing_ctx: Option<WorkerSigningContext>,
 ) {
     tracing::info!("starting task execution");
 
@@ -364,6 +385,7 @@ async fn execute_task(
         tracing::error!(task_id = %task_id, "child worker invocation missing delegation scope");
         publish_task_status(
             &task_nats,
+            signing_ctx.as_ref(),
             &TaskStatusEvent {
                 task_id,
                 status: "failed".into(),
@@ -391,6 +413,7 @@ async fn execute_task(
         tracing::error!(task_id = %task_id, %error, "invalid control interface manifest for task");
         publish_task_status(
             &task_nats,
+            signing_ctx.as_ref(),
             &TaskStatusEvent {
                 task_id,
                 status: "failed".into(),
@@ -419,6 +442,7 @@ async fn execute_task(
             tracing::error!(error = %e, "failed to build model for task, aborting");
             publish_task_status(
                 &task_nats,
+                signing_ctx.as_ref(),
                 &TaskStatusEvent {
                     task_id,
                     status: "failed".into(),
@@ -795,6 +819,7 @@ async fn execute_task(
     session_runtime.sync_world_state(primed_spatial_context);
     publish_task_status(
         &task_nats,
+        signing_ctx.as_ref(),
         &TaskStatusEvent {
             task_id,
             status: "running".into(),
@@ -858,6 +883,7 @@ async fn execute_task(
     let result = roz_worker::dispatch::build_task_result(task_id, terminal_status, output);
     publish_task_status(
         &task_nats,
+        signing_ctx.as_ref(),
         &TaskStatusEvent {
             task_id,
             status: terminal_status.as_str().into(),
@@ -928,23 +954,9 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Spawn telemetry publisher (10 Hz)
-    let telem_nats = nats.clone();
-    let telem_worker_id = config.worker_id.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(100));
-        loop {
-            interval.tick().await;
-            let state = serde_json::json!({
-                "timestamp": chrono::Utc::now().timestamp_millis(),
-                "joints": [],
-                "sensors": {}
-            });
-            if let Err(e) = roz_worker::telemetry::publish_state(&telem_nats, &telem_worker_id, &state).await {
-                tracing::trace!(error = %e, "telemetry publish failed");
-            }
-        }
-    });
+    // Telemetry publisher spawned LATER, after signing bootstrap, so it can
+    // route through the signed publish path (Phase 23 FS-04). See
+    // "Phase 23: spawn telemetry publisher after signing bootstrap" below.
 
     // Initialize camera system
     let camera_manager: Option<Arc<roz_worker::camera::CameraManager>> =
@@ -1167,6 +1179,44 @@ async fn main() -> Result<()> {
             Err(e) => tracing::warn!(error = %e, "host registration failed"),
         }
     }
+
+    // Phase 23 FS-04: spawn telemetry publisher (10 Hz) now that signing
+    // bootstrap has run. When signing is enabled, route through
+    // `publish_state_signed` so every telemetry frame carries a roz-sig-v1
+    // header. Otherwise fall back to the unsigned path (D-12 rollout).
+    // `correlation_id` for telemetry is a stable worker-lifetime UUID so
+    // the server's verifier can scope replay protection consistently across
+    // the continuous telemetry stream.
+    let telem_nats = nats.clone();
+    let telem_worker_id = config.worker_id.clone();
+    let telem_signing_ctx = signing_ctx.clone();
+    let telem_correlation_id = Uuid::new_v4();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            interval.tick().await;
+            let state = serde_json::json!({
+                "timestamp": chrono::Utc::now().timestamp_millis(),
+                "joints": [],
+                "sensors": {}
+            });
+            let publish_result = if let Some(ref ctx) = telem_signing_ctx {
+                roz_worker::telemetry::publish_state_signed(
+                    &telem_nats,
+                    ctx,
+                    &telem_worker_id,
+                    telem_correlation_id,
+                    &state,
+                )
+                .await
+            } else {
+                roz_worker::telemetry::publish_state(&telem_nats, &telem_worker_id, &state).await
+            };
+            if let Err(e) = publish_result {
+                tracing::trace!(error = %e, "telemetry publish failed");
+            }
+        }
+    });
 
     // D-03 + D-04 + C-03 + C-07: open the Zenoh edge-transport session after
     // NATS connect and host registration. Failure is non-fatal — worker falls
@@ -1552,6 +1602,10 @@ async fn main() -> Result<()> {
         let task_config = config.clone();
         let task_js = js.clone();
         let task_camera_mgr = camera_manager.clone();
+        // Phase 23 FS-04: clone the per-worker signing context into the
+        // per-task spawn so every publish_task_status inside execute_task
+        // goes through the signed path (plan 23-08 Task 2 integration).
+        let task_signing_ctx = signing_ctx.clone();
 
         let task_estop_rx = estop_rx.clone();
         let Ok(task_permit) = task_slots.clone().try_acquire_owned() else {
@@ -1566,6 +1620,7 @@ async fn main() -> Result<()> {
             );
             publish_task_status(
                 &task_nats,
+                task_signing_ctx.as_ref(),
                 &TaskStatusEvent {
                     task_id,
                     status: "failed".into(),
@@ -1600,6 +1655,7 @@ async fn main() -> Result<()> {
                     restate_url,
                     task_estop_rx,
                     task_camera_mgr,
+                    task_signing_ctx,
                 )
                 .await;
             }
