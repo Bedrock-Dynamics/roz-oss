@@ -282,13 +282,7 @@ mod tests {
         let wal = wal();
         let cancel = CancellationToken::new();
         let (tx, rx) = checkpoint_writer_channel(8);
-        let writer = CheckpointWriter::new(
-            Arc::clone(&wal),
-            "",
-            0,
-            Duration::from_secs(3600),
-            cancel.clone(),
-        );
+        let writer = CheckpointWriter::new(Arc::clone(&wal), "", 0, Duration::from_secs(3600), cancel.clone());
         let handle = tokio::spawn(writer.run(rx));
         tx.send(CheckpointTrigger::ToolCallStarted {
             task_id: "task-ev".into(),
