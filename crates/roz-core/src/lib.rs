@@ -39,6 +39,8 @@ pub mod recovery;
 pub mod safety;
 pub mod schedule;
 pub mod session;
+pub mod signing;
+pub use signing::{Direction, HEADER_NAME, SignatureEnvelope, SignatureError, SignedFields};
 pub mod sim2real;
 pub mod skills;
 pub mod spatial;

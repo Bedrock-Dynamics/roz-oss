@@ -171,6 +171,9 @@ secrecy = { version = "0.10", features = ["serde"] }
 aes-gcm = "0.10"
 zeroize = "1"
 serial_test = "3"
+
+# Phase 23 — Signed dispatch (RFC 8785 JCS canonicalization)
+serde_json_canonicalizer = "0.3"
 # Phase 19 Plan 19-05 — roz-openai crate scaffold
 url = "2"
 wiremock = "0.6"

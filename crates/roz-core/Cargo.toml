@@ -44,6 +44,9 @@ base64 = { workspace = true }
 # Phase 19 Plan 04 — EndpointRegistry (TOML config loader)
 figment = { workspace = true }
 
+# Phase 23 — Signed dispatch (JCS canonicalization for Ed25519 envelopes)
+serde_json_canonicalizer = { workspace = true }
+
 [dev-dependencies]
 crc32fast = { workspace = true }
 sha2 = { workspace = true }
