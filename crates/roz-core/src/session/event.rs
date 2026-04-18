@@ -161,6 +161,8 @@ pub const fn canonical_event_type_name(event: &SessionEvent) -> &'static str {
         SessionEvent::ControllerPromoted { .. } => "controller_promoted",
         SessionEvent::ControllerRolledBack { .. } => "controller_rolled_back",
         SessionEvent::SafetyIntervention { .. } => "safety_intervention",
+        SessionEvent::SafetyViolation { .. } => "safety_violation",
+        SessionEvent::RecoveryPending { .. } => "recovery_pending",
         SessionEvent::EdgeTransportDegraded { .. } => "edge_degraded",
         SessionEvent::McpServerDegraded { .. } => "mcp_server_degraded",
         SessionEvent::ReasoningTrace { .. } => "reasoning_trace",
@@ -335,6 +337,34 @@ pub enum SessionEvent {
         raw_value: f64,
         clamped_value: f64,
         kind: crate::controller::intervention::InterventionKind,
+        reason: String,
+    },
+
+    // -- Phase 24 — edge-enforced safety policy violations & recovery gating --
+    /// Policy violation detected by pre-dispatch gate (<10 ms) or copper safety filter (<5 ms).
+    /// Emitted in tandem with a `roz_safety_audit_log` row (FS-01, D-13).
+    SafetyViolation {
+        /// Policy UUID that was violated (stringified for transport neutrality).
+        policy_id: String,
+        /// Categorizes the violation — one of:
+        /// `"geofence_breach"`, `"limit_exceeded"`, `"interlock_missing"`, `"policy_stale"`.
+        violation_kind: String,
+        /// Enforcement mode selected from the policy — one of:
+        /// `"reject"`, `"clamp"`, `"halt"` (mirrors policy JSON `enforcement_mode`).
+        enforcement_action: String,
+        /// Structured violation details (coordinates, clamped values, interlock name).
+        details: serde_json::Value,
+    },
+    /// Emitted when `decide_recovery` denies resume on reconnect and the worker
+    /// enters `SafeStateWait` awaiting operator intervention (D-09, D-11).
+    /// Session-event-only: no NATS subject (D-13 explicit).
+    RecoveryPending {
+        /// Task that cannot resume safely.
+        task_id: String,
+        /// Last checkpoint id (string form of the `task_checkpoints.checkpoint_id` column).
+        checkpoint_id: String,
+        /// Human-readable reason — one of:
+        /// `"physical_state_ambiguous"`, `"checkpoint_stale"`, `"missing_checkpoint"`, `"missing_wal_seq"`.
         reason: String,
     },
 

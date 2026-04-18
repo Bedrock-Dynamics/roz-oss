@@ -97,6 +97,8 @@ const fn event_type_name(event: &SessionEvent) -> &'static str {
         SessionEvent::ControllerPromoted { .. } => "controller_promoted",
         SessionEvent::ControllerRolledBack { .. } => "controller_rolled_back",
         SessionEvent::SafetyIntervention { .. } => "safety_intervention",
+        SessionEvent::SafetyViolation { .. } => "safety_violation",
+        SessionEvent::RecoveryPending { .. } => "recovery_pending",
         SessionEvent::EdgeTransportDegraded { .. } => "edge_degraded",
         SessionEvent::McpServerDegraded { .. } => "mcp_server_degraded",
         SessionEvent::ReasoningTrace { .. } => "reasoning_trace",

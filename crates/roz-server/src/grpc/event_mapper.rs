@@ -484,6 +484,11 @@ fn typed_event_proto(event: &SessionEvent) -> Option<roz_v1::session_event_envel
                 tokens_after: *tokens_after,
             },
         )),
+        // Phase 24 (FS-01 / FS-03) — SafetyViolation and RecoveryPending have
+        // no proto TypedEvent yet. Downstream plans (24-05, 24-09) will add the
+        // projections. Canonical-envelope consumers receive the event_type name
+        // and serde-JSON payload via `event_payload` on the canonical envelope.
+        SessionEvent::SafetyViolation { .. } | SessionEvent::RecoveryPending { .. } => None,
     }
 }
 
