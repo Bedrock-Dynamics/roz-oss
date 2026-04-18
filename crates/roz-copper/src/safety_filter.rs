@@ -28,6 +28,12 @@ pub struct SafetyFilterTask {
     position_limits: Option<Vec<(f64, f64)>>, // (lower, upper) per joint
     prev_velocities: Vec<f64>,                // previous tick's clamped velocities
     current_positions: Vec<f64>,              // latest known joint positions
+    /// Phase 24 FS-01 policy-aware filter extension. `None` keeps the static
+    /// `max_velocity` path above as the sole enforcement layer. `Some` adds a
+    /// lock-free read of the hot-swap policy pointer on every `policy_clamp`
+    /// call — worker-side code updates the pointer on each `roz.policy.{worker_id}`
+    /// push (Plan 24-09 wires the actual publisher).
+    policy: Option<crate::policy::HotCopperPolicy>,
 }
 
 /// Safety margin for position limits (~3 degrees in radians).
@@ -173,7 +179,53 @@ impl SafetyFilterTask {
             position_limits,
             prev_velocities: Vec::new(),
             current_positions: Vec::new(),
+            policy: None,
         })
+    }
+
+    /// Attach a hot-swap policy pointer. Once attached, [`policy_clamp`]
+    /// reads the current `CopperPolicy` via `ArcSwap::load` (lock-free) and
+    /// layers the policy limits on top of the static `max_velocity` path.
+    ///
+    /// The worker updates the pointer on every `roz.policy.{worker_id}`
+    /// push. Swaps are visible to the next reader immediately without any
+    /// barrier coordination.
+    #[must_use]
+    pub fn with_policy(mut self, policy: crate::policy::HotCopperPolicy) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// Apply the current hot policy to a `(linear, angular)` velocity pair.
+    /// Returns the possibly-modified velocities plus a `bool` indicating
+    /// whether enforcement fired.
+    ///
+    /// Behaviour:
+    /// - No policy attached → passthrough (returns the inputs unchanged with
+    ///   `clamped=false`).
+    /// - Policy attached and `enforcement_mode == Clamp` → project each axis
+    ///   into the policy's limits.
+    /// - Policy attached and `enforcement_mode == Halt` or `Reject` → if any
+    ///   axis is outside the limits, force both axes to zero.
+    ///
+    /// Hot path (100 Hz). No allocation; single `ArcSwap::load` + up to two
+    /// `f64::clamp` calls.
+    #[must_use]
+    pub fn policy_clamp(&self, linear: f64, angular: f64) -> (f64, f64, bool) {
+        let Some(hot) = &self.policy else {
+            return (linear, angular, false);
+        };
+        let guard = hot.load();
+        let (c_lin, c_ang, clamped) = guard.clamp_velocity(linear, angular);
+        match guard.enforcement_mode {
+            crate::policy::CopperEnforcementMode::Clamp => (c_lin, c_ang, clamped),
+            // Halt / Reject on the 100 Hz hot path fail safe by zeroing both
+            // axes — there is no task invocation to reject mid-tick.
+            crate::policy::CopperEnforcementMode::Halt | crate::policy::CopperEnforcementMode::Reject if clamped => {
+                (0.0, 0.0, true)
+            }
+            _ => (c_lin, c_ang, clamped),
+        }
     }
 
     /// Update the tick period used for acceleration limiting.
@@ -1251,14 +1303,14 @@ mod policy_tests {
     #[test]
     fn policy_swap_visible_to_reader_immediately() {
         let hot = new_hot_policy();
-        let f = SafetyFilterTask::new(2.0, 0.0, None)
-            .unwrap()
-            .with_policy(hot.clone());
-        // Default conservative: max_linear 1.0 → clamp at 1.0.
-        let (lin, _, clamped) = f.policy_clamp(2.0, 0.0);
+        let f = SafetyFilterTask::new(2.0, 0.0, None).unwrap().with_policy(hot.clone());
+        // Default conservative: max_linear 1.0 + Halt mode → over-limit
+        // request zeroes both axes (fail-safe on the 100 Hz hot path).
+        let (lin, ang, clamped) = f.policy_clamp(2.0, 0.0);
         assert!(clamped);
-        assert!((lin - 1.0).abs() < 1e-9);
-        // Swap to permissive.
+        assert!(lin.abs() < 1e-9);
+        assert!(ang.abs() < 1e-9);
+        // Swap to permissive clamp-mode policy; next read must see it.
         hot.store(Arc::new(CopperPolicy {
             max_linear_m_per_s: 5.0,
             max_angular_rad_per_s: 2.5,
