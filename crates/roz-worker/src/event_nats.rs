@@ -3,11 +3,20 @@
 //! Each event is routed to a hierarchical subject:
 //!   `{prefix}.session.{session_id}.events.{event_type}`
 //!
-//! The actual NATS publish call is left to the caller -- this module provides
-//! subject formatting and type-name extraction so the worker can route events
-//! without coupling NATS client details to the event model.
+//! # Signed publishes (Phase 23 FS-04)
+//!
+//! Production worker event publishes MUST go through [`publish_session_event_signed`],
+//! which attaches the `roz-sig-v1` header produced by
+//! [`crate::signing_hooks::WorkerSigningContext::sign_outbound_worker`]. The
+//! bare `event_subject` helper + a manual `nats.publish` is reserved for
+//! boot-time paths where the signing key is not yet available (D-12 rollout
+//! window).
 
 use roz_core::session::event::{SessionEvent, canonical_event_type_name};
+use roz_nats::dispatch::publish_signed;
+use uuid::Uuid;
+
+use crate::signing_hooks::WorkerSigningContext;
 
 /// Format a NATS subject for a session event.
 ///
@@ -34,6 +43,40 @@ pub fn event_subject(prefix: &str, session_id: &str, event: &SessionEvent) -> St
 #[must_use]
 pub const fn event_type_name(event: &SessionEvent) -> &'static str {
     canonical_event_type_name(event)
+}
+
+/// Publish a `SessionEvent` on its hierarchical subject with a `roz-sig-v1`
+/// signature header attached (Phase 23 FS-04).
+///
+/// The envelope's `correlation_id` is the session UUID (parsed from
+/// `session_id`) — per-session correlation matches how the server verifier
+/// scopes replay protection for session events.
+///
+/// # Errors
+///
+/// - `session_id` does not parse as a UUID.
+/// - JSON serialization of the event fails.
+/// - Signing fails (missing/corrupt device key → D-09 hard-stop handled at
+///   the caller).
+/// - NATS transport failure.
+pub async fn publish_session_event_signed(
+    nats: &async_nats::Client,
+    signing_ctx: &WorkerSigningContext,
+    prefix: &str,
+    session_id: &str,
+    event: &SessionEvent,
+) -> anyhow::Result<()> {
+    let subject = event_subject(prefix, session_id, event);
+    let correlation_id =
+        Uuid::parse_str(session_id).map_err(|e| anyhow::anyhow!("session_id must be a UUID ({session_id}): {e}"))?;
+    let payload = serde_json::to_vec(event)?;
+    let header = signing_ctx
+        .sign_outbound_worker(correlation_id, &payload)
+        .map_err(|e| anyhow::anyhow!("sign session event publish: {e}"))?;
+    publish_signed(nats, subject, payload, &header)
+        .await
+        .map_err(|e| anyhow::anyhow!("publish_signed session event: {e}"))?;
+    Ok(())
 }
 
 #[cfg(test)]

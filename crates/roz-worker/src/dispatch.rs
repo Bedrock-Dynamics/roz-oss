@@ -10,8 +10,13 @@ use roz_core::session::control::CognitionMode;
 use roz_core::session::event::SessionPermissionRule;
 use roz_core::tools::ToolCategory;
 use roz_core::trust::{ExecutionCapabilityClass, TrustPosture};
-use roz_nats::dispatch::{ExecutionMode, TaskInvocation, TaskResult, TaskTerminalStatus, TokenUsage};
+use roz_nats::dispatch::{
+    ExecutionMode, TaskInvocation, TaskResult, TaskStatusEvent, TaskTerminalStatus, TokenUsage, publish_signed,
+    task_status_subject,
+};
 use uuid::Uuid;
+
+use crate::signing_hooks::WorkerSigningContext;
 
 /// Default maximum agent loop cycles.
 const DEFAULT_MAX_CYCLES: u32 = 50;
@@ -381,6 +386,10 @@ fn signal_url(restate_url: &str, task_id: &str) -> String {
 /// Sends the task result to the Restate workflow's `deliver_result` signal endpoint.
 ///
 /// The endpoint format is `{restate_url}/TaskWorkflow/{task_id}/deliver_result/send`.
+///
+/// **Phase 23 D-13:** This HTTP path is explicitly NOT signed with
+/// `roz-sig-v1`. Only NATS hops carry the signature envelope in Phase 23;
+/// Restate signing is deferred to a post-v3.0 hardening phase.
 #[tracing::instrument(name = "worker.signal_result", skip(http, result))]
 pub async fn signal_result(
     http: &reqwest::Client,
@@ -390,6 +399,34 @@ pub async fn signal_result(
 ) -> Result<(), reqwest::Error> {
     let url = signal_url(restate_url, task_id);
     http.post(&url).json(result).send().await?.error_for_status()?;
+    Ok(())
+}
+
+/// Publish a `TaskStatusEvent` on the internal task-status NATS subject with
+/// a `roz-sig-v1` signature header attached (Phase 23 FS-04).
+///
+/// The envelope's `correlation_id` is the task UUID — task-status events are
+/// per-task, so task-level correlation matches the server verifier's replay
+/// scope.
+///
+/// # Errors
+///
+/// - JSON serialization failure.
+/// - Signing failure (missing/corrupt device key → D-09 hard-stop at caller).
+/// - NATS transport failure.
+pub async fn publish_task_status_signed(
+    nats: &async_nats::Client,
+    signing_ctx: &WorkerSigningContext,
+    event: &TaskStatusEvent,
+) -> anyhow::Result<()> {
+    let subject = task_status_subject(event.task_id);
+    let payload = serde_json::to_vec(event)?;
+    let header = signing_ctx
+        .sign_outbound_worker(event.task_id, &payload)
+        .map_err(|e| anyhow::anyhow!("sign task status: {e}"))?;
+    publish_signed(nats, subject, payload, &header)
+        .await
+        .map_err(|e| anyhow::anyhow!("publish_signed task status: {e}"))?;
     Ok(())
 }
 

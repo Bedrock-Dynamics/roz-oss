@@ -3,8 +3,12 @@ use std::time::Instant;
 
 use parking_lot::Mutex;
 use roz_core::messages::TelemetryMsg;
+use roz_nats::dispatch::publish_signed;
 use roz_nats::subjects::Subjects;
 use serde_json::Value;
+use uuid::Uuid;
+
+use crate::signing_hooks::WorkerSigningContext;
 
 /// Rate-limited telemetry publisher.
 ///
@@ -63,10 +67,16 @@ impl TelemetryPublisher {
     }
 }
 
-/// Publish a telemetry state message to NATS.
+/// Publish a telemetry state message to NATS (unsigned legacy path).
 ///
 /// Sends `data` on the `telemetry.{worker_id}.state` subject.
 /// Callers are responsible for rate limiting (e.g. via `TelemetryPublisher::should_publish`).
+///
+/// **Note (Phase 23 FS-04):** Production workers that have enrolled a device
+/// signing key should call [`publish_state_signed`] instead. This unsigned
+/// variant remains for boot-time paths where the signing key is not yet
+/// available, and for pre-v3.0 workers operating under
+/// `SIGNED_DISPATCH_ENFORCEMENT=off`.
 pub async fn publish_state(nats: &async_nats::Client, worker_id: &str, data: &serde_json::Value) -> anyhow::Result<()> {
     let subject = Subjects::telemetry_state(worker_id).map_err(|e| anyhow::anyhow!("invalid worker_id: {e}"))?;
     let payload = serde_json::to_vec(data)?;
@@ -74,10 +84,51 @@ pub async fn publish_state(nats: &async_nats::Client, worker_id: &str, data: &se
     Ok(())
 }
 
+/// Publish a telemetry state message with a `roz-sig-v1` signature header
+/// attached (Phase 23 FS-04).
+///
+/// Computes the signature via `signing_ctx.sign_outbound_worker(correlation_id,
+/// payload)` and publishes through `roz_nats::dispatch::publish_signed`. The
+/// `correlation_id` is the host's UUID for telemetry — per-host, per-stream
+/// correlation matches the server's verifier expectations.
+///
+/// # Errors
+///
+/// - Serialization failure on `data`.
+/// - Invalid `worker_id` (rejected by `Subjects::telemetry_state`).
+/// - Signing failure (missing/corrupt device key → D-09 worker hard-stop; the
+///   caller handles that at the top of the publish loop).
+/// - NATS transport failure.
+pub async fn publish_state_signed(
+    nats: &async_nats::Client,
+    signing_ctx: &WorkerSigningContext,
+    worker_id: &str,
+    correlation_id: Uuid,
+    data: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let subject = Subjects::telemetry_state(worker_id).map_err(|e| anyhow::anyhow!("invalid worker_id: {e}"))?;
+    let payload = serde_json::to_vec(data)?;
+    let header = signing_ctx
+        .sign_outbound_worker(correlation_id, &payload)
+        .map_err(|e| anyhow::anyhow!("sign telemetry publish: {e}"))?;
+    publish_signed(nats, subject, payload, &header)
+        .await
+        .map_err(|e| anyhow::anyhow!("publish_signed telemetry: {e}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signing_key::{load, save};
+    use crate::wal::WalStore;
+    use ed25519_dalek::SigningKey;
+    use parking_lot::RwLock;
+    use roz_core::key_provider::StaticKeyProvider;
+    use roz_core::signing::{HEADER_NAME, SignatureEnvelope};
     use serde_json::json;
+    use std::sync::Arc;
+    use tempfile::TempDir;
 
     #[test]
     fn rate_limiting_allows_first_publish() {
@@ -146,6 +197,48 @@ mod tests {
     fn subject_construction_validates_tokens() {
         let err = TelemetryPublisher::subject("", "imu");
         assert!(err.is_err());
+    }
+
+    async fn build_signing_ctx() -> (TempDir, WorkerSigningContext) {
+        let tmp = TempDir::new().unwrap();
+        let provider = Arc::new(StaticKeyProvider::from_key_bytes([7u8; 32]));
+        let tenant = Uuid::new_v4();
+        let host = Uuid::new_v4();
+        let server_signing = SigningKey::from_bytes(&[9u8; 32]);
+        let svk_bytes = server_signing.verifying_key().to_bytes();
+        save(tmp.path(), &provider, tenant, 1, &[7u8; 32], &svk_bytes)
+            .await
+            .unwrap();
+        let material = load(tmp.path(), &provider, tenant, host).await.unwrap().unwrap();
+        let wal = Arc::new(WalStore::open(":memory:").unwrap());
+        let ctx = WorkerSigningContext::new(Arc::new(RwLock::new(material)), wal);
+        (tmp, ctx)
+    }
+
+    #[tokio::test]
+    async fn publish_state_signed_produces_valid_header_for_payload() {
+        // Prove that what publish_state_signed WOULD send on the wire carries
+        // a roz-sig-v1 envelope whose payload_hash matches the actual payload
+        // bytes. We can't spin up NATS here; instead we reproduce the header
+        // construction path and assert the crypto invariants.
+        let (_tmp, ctx) = build_signing_ctx().await;
+        let worker_id = "host1";
+        let correlation = Uuid::new_v4();
+        let data = json!({"joints": [1.0, 2.0], "ts": 42});
+        let payload = serde_json::to_vec(&data).unwrap();
+        let header = ctx.sign_outbound_worker(correlation, &payload).unwrap();
+        let env = SignatureEnvelope::decode_header(&header).unwrap();
+        assert_eq!(env.fields.correlation_id, correlation);
+        // Recomputed payload hash matches.
+        assert_eq!(env.fields.payload_hash, roz_core::signing::payload_sha256_hex(&payload));
+        // Subject is computable (not part of the signature, but the publish
+        // site wires them together).
+        assert_eq!(
+            Subjects::telemetry_state(worker_id).unwrap(),
+            format!("telemetry.{worker_id}.state")
+        );
+        // Header name matches what roz-nats::dispatch::publish_signed uses.
+        assert_eq!(HEADER_NAME, "roz-sig-v1");
     }
 
     #[test]

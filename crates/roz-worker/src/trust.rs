@@ -1,7 +1,10 @@
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use roz_core::device_trust::{DeviceTrust, DeviceTrustPosture, FirmwareManifest, FlashPartition};
+use roz_nats::dispatch::publish_signed;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+use crate::signing_hooks::WorkerSigningContext;
 
 /// Reports device trust attestation on worker startup.
 pub struct TrustReporter {
@@ -101,6 +104,45 @@ impl TrustReporter {
             updated_at: now,
         }
     }
+}
+
+/// NATS subject for worker-published trust reports.
+///
+/// Phase 23 FS-04 binds this subject family under
+/// `publish_trust_report_signed`. The subject is formatted as
+/// `trust.host_report.{host_id}` so server-side subscribers can filter by
+/// host.
+#[must_use]
+pub fn trust_report_subject(host_id: Uuid) -> String {
+    format!("trust.host_report.{host_id}")
+}
+
+/// Publish a `DeviceTrust` attestation on NATS with a `roz-sig-v1`
+/// signature header attached (Phase 23 FS-04).
+///
+/// The envelope's `correlation_id` is the host UUID — trust reports are
+/// per-host (one report per attestation cycle), so host-level correlation
+/// matches the server's audit expectations.
+///
+/// # Errors
+///
+/// - JSON serialization of the trust report fails.
+/// - Signing fails (missing/corrupt device key → D-09 hard-stop at caller).
+/// - NATS transport failure.
+pub async fn publish_trust_report_signed(
+    nats: &async_nats::Client,
+    signing_ctx: &WorkerSigningContext,
+    trust: &DeviceTrust,
+) -> anyhow::Result<()> {
+    let subject = trust_report_subject(trust.host_id);
+    let payload = serde_json::to_vec(trust)?;
+    let header = signing_ctx
+        .sign_outbound_worker(trust.host_id, &payload)
+        .map_err(|e| anyhow::anyhow!("sign trust report: {e}"))?;
+    publish_signed(nats, subject, payload, &header)
+        .await
+        .map_err(|e| anyhow::anyhow!("publish_signed trust report: {e}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
