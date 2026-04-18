@@ -55,6 +55,10 @@ tempfile = { workspace = true }
 semver = { workspace = true }
 serde_yaml = { workspace = true }
 secrecy = { workspace = true }
+# Phase 23 Plan 23-04 — verifying-key LRU cache (D-11).
+moka = { workspace = true }
+# Phase 23 Plan 23-04 — VerifyingKey type held in the cache value slot.
+ed25519-dalek = { workspace = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }
