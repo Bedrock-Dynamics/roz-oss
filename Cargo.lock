@@ -7006,6 +7006,7 @@ dependencies = [
  "inotify",
  "logfire",
  "mcap",
+ "moka",
  "nix 0.29.0",
  "object_store",
  "openh264",

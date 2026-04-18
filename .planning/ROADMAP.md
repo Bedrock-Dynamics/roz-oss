@@ -112,7 +112,18 @@ Plans:
   3. New `telemetry_frames` table in the existing `WalStore` buffers up to 50 MB / 24 h FIFO on NATS disconnect; on reconnect, frames replay at original rate for <5 s partitions and 10× rate for longer partitions, with server-side sequence-number dedup and 90% / 95% backpressure signaling to copper tick (100 Hz → 50 Hz → 10 Hz).
   4. In-flight task state checkpoints to WAL every 5 s + on every state transition with idempotency key `"{task_id}:{step_counter}"`; on reconnect, worker publishes `roz.state.worker_online` with last-checkpoint digest and server responds with resume or abort within 500 ms.
   5. Resume gate honored: worker only resumes iff `(brakes_engaged OR joint_positions_known) AND checkpoint_age < 1 h`; otherwise enters `SafeStateWait` with a session event requesting operator intervention — verified by a test matrix covering all three recovery-decision branches.
-**Plans**: TBD
+**Plans:** 9 plans
+
+Plans:
+- [x] 24-01-PLAN.md — Wave 1 foundation: WalStore schema (telemetry_frames + task_checkpoints tables), new NATS subjects (policy, health, safety_violation, state_worker_online, clear_failsafe), SessionEvent variants (SafetyViolation + RecoveryPending), CopperHandle backpressure field
+- [x] 24-02-PLAN.md — Policy cache + push subscriber scaffolding: PolicyV1 serde (deny_unknown_fields), PolicyCache (moka 30 s TTL), HotPolicy (ArcSwap), server publish_policy_to_workers helper
+- [ ] 24-03-PLAN.md — Telemetry buffer primitives: WalStore append_telemetry_frame + list_unacked + ack_up_to + enforce_fifo_quota with O(1) running-total counter + TelemetryBackpressure AtomicU8 with hysteresis
+- [ ] 24-04-PLAN.md — Checkpoint writer: WalStore append_checkpoint (idempotent on task_id:step_counter) + latest_checkpoint + checkpoint_age_secs + CheckpointWriter tokio task with 4 trigger variants (no CopperMode regression) + CrashState extension
+- [ ] 24-05-PLAN.md — Enforcement gates: enforce_invocation + enforce_command (reject/clamp/halt modes), dispatch.rs pre-dispatch gate with audit-log + SessionEvent emission, copper safety_filter with CopperPolicy projection (<10 ms / <5 ms budgets)
+- [ ] 24-06-PLAN.md — Deadman extension + clear-failsafe: CommandWatchdog with on_expire callback + motion latch, clear_failsafe.rs signed subscriber, POST /v1/device/clear-failsafe server endpoint, roz device clear-failsafe CLI
+- [ ] 24-07-PLAN.md — Store-and-forward wiring: publish_state_signed_with_buffer (WAL-on-failure), TelemetryReplay with original/10x rate (500 Hz cap), server-side last_acked_seq dedup
+- [ ] 24-08-PLAN.md — Reconnect handshake: worker-side publish_worker_online, server-side handle_worker_online with 500 ms Restate lookup budget and fail-closed abort (checkpoint: verify Restate SDK 0.9 API)
+- [ ] 24-09-PLAN.md — Main.rs wiring + resume gate + 4-branch test matrix + phase24 e2e integration test (includes checkpoint: human-verify for final phase sign-off)
 
 ### Phase 25: Native MAVLink backend in `crates/roz-mavlink` plus bridge.proto semantics clean-up
 
@@ -179,7 +190,7 @@ v3.0 Production Robotics milestone is in the planning stage. Phase 22 is planned
 | 21.1. Runtime Event Contracts and Completeness | v2.2 | 3/3 | Complete | 2026-04-16 |
 | 22. Integration policy | v3.0 | 3/3 | Complete    | 2026-04-17 |
 | 23. Signed dispatch | v3.0 | 0/0 | Not started | — |
-| 24. Edge safety + WAL resilience | v3.0 | 0/0 | Not started | — |
+| 24. Edge safety + WAL resilience | v3.0 | 1/9 | In progress | — |
 | 25. Native MAVLink backend | v3.0 | 0/0 | Not started | — |
 | 26. Unified MCAP observability | v3.0 | 0/0 | Not started | — |
 | 27. Nightly PX4 SITL CI | v3.0 | 0/0 | Not started | — |

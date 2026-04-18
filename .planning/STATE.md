@@ -3,30 +3,30 @@ gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: Production Robotics
 status: executing
-last_updated: "2026-04-17T23:30:00.000Z"
-last_activity: 2026-04-17 -- Phase 22 complete; advancing to Phase 23 (signed dispatch)
+last_updated: "2026-04-18T18:00:00.000Z"
+last_activity: 2026-04-18 -- Phase 24 Plan 02 complete
 progress:
   total_phases: 7
   completed_phases: 1
   total_plans: 3
-  completed_plans: 3
+  completed_plans: 5
 ---
 
 # State
 
 ## Current Position
 
-Phase: 23
-Plan: Not started
-Status: Ready to discuss Phase 23 (Two-direction Ed25519 signed dispatch)
-Last activity: 2026-04-17
+Phase: 24 (edge-enforced-safety-policies-store-and-forward-telemetry-and-in-flight-task-wal-recovery) — EXECUTING
+Plan: 3 of 9
+Status: Executing Phase 24
+Last activity: 2026-04-18 -- Phase 24 Plan 02 complete (PolicyV1 serde, PolicyCache moka TTL, HotPolicy ArcSwap, publish_policy_to_workers helper)
 
 ## Project Reference
 
 See: `.planning/PROJECT.md` (updated 2026-04-16)
 
 **Core value:** A reliable, secure, and well-tested platform that operators trust for physical robot deployments.
-**Current focus:** Phase 22 — integration-policy-doc-as-decision-authority-for-native-vs-bridge-backends
+**Current focus:** Phase 24 — edge-enforced-safety-policies-store-and-forward-telemetry-and-in-flight-task-wal-recovery
 
 ## Accumulated Context
 
