@@ -60,20 +60,34 @@ impl TelemetryBackpressure {
     /// Current encoded state.
     #[must_use]
     pub fn state(&self) -> u8 {
-        todo!("Plan 24-03 Task 2 GREEN — state accessor not yet implemented")
+        self.state.load(Ordering::Relaxed)
     }
 
     /// Tick rate selector read by the copper loop. Lock-free, sub-nanosecond.
     #[must_use]
     pub fn tick_hz(&self) -> u32 {
-        todo!("Plan 24-03 Task 2 GREEN — tick_hz not yet implemented")
+        match self.state() {
+            BP_NORMAL => 100,
+            BP_DERATE_50HZ => 50,
+            _ => 10, // BP_DERATE_10HZ, or any unexpected value — fail-safe derate.
+        }
     }
 
     /// Update the state based on current buffer utilization (0..=100).
     /// Hysteresis bands prevent oscillation around exact thresholds. No-op if
     /// the state does not change.
-    pub fn update(&self, _usage_pct: u8) {
-        todo!("Plan 24-03 Task 2 GREEN — update not yet implemented")
+    pub fn update(&self, usage_pct: u8) {
+        let current = self.state.load(Ordering::Relaxed);
+        let next = match (current, usage_pct) {
+            (BP_NORMAL, p) if p >= 90 => BP_DERATE_50HZ,
+            (BP_DERATE_50HZ, p) if p >= 95 => BP_DERATE_10HZ,
+            (BP_DERATE_10HZ, p) if p < 92 => BP_DERATE_50HZ,
+            (BP_DERATE_50HZ, p) if p < 85 => BP_NORMAL,
+            (s, _) => s,
+        };
+        if next != current {
+            self.state.store(next, Ordering::Relaxed);
+        }
     }
 }
 
