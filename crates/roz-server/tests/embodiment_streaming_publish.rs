@@ -77,6 +77,11 @@ async fn start_server_with_nats() -> (String, String, uuid::Uuid, uuid::Uuid, ro
         key_provider: Arc::new(roz_openai::auth::null_key::NullKeyProvider),
         mcp_registry: Arc::new(roz_mcp::Registry::new()),
         session_bus: Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
+        verifying_key_cache: moka::future::Cache::builder()
+            .max_capacity(10_000)
+            .time_to_live(std::time::Duration::from_secs(60))
+            .build(),
+        signed_dispatch_enforcement: roz_server::config::SignedDispatchEnforcement::Strict,
     };
 
     let app = roz_server::build_router(state);

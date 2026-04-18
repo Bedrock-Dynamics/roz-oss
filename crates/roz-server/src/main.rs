@@ -430,6 +430,25 @@ async fn main() {
         std::process::exit(1);
     }
 
+    // Phase 23 Plan 23-04 (D-11): verifying-key LRU cache for inbound-signature
+    // verification. 10_000 entries + 60s TTL per the phase threat model
+    // (T-23-15 mitigation; rotation/revocation visibility lag <= 60s).
+    let verifying_key_cache: moka::future::Cache<(uuid::Uuid, uuid::Uuid, u32), ed25519_dalek::VerifyingKey> =
+        moka::future::Cache::builder()
+            .max_capacity(10_000)
+            .time_to_live(std::time::Duration::from_secs(60))
+            .build();
+
+    // Phase 23 Plan 23-04 (D-12): signed-dispatch rollout gate. Reads
+    // SIGNED_DISPATCH_ENFORCEMENT, falling back to dev/prod defaults.
+    let environment = std::env::var("ROZ_ENVIRONMENT").unwrap_or_else(|_| "development".into());
+    let signed_dispatch_enforcement = roz_server::config::SignedDispatchEnforcement::from_env(&environment);
+    tracing::info!(
+        enforcement = ?signed_dispatch_enforcement,
+        environment = %environment,
+        "signed dispatch enforcement initialized"
+    );
+
     let state = AppState {
         pool,
         rate_limiter,
@@ -447,6 +466,8 @@ async fn main() {
         key_provider,
         mcp_registry: Arc::new(roz_mcp::Registry::new()),
         session_bus: Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
+        verifying_key_cache,
+        signed_dispatch_enforcement,
     };
 
     // Spawn internal NATS request-reply handlers (e.g. spawn_worker tool bypass).
@@ -575,6 +596,11 @@ mod tests {
             key_provider: Arc::new(roz_openai::auth::null_key::NullKeyProvider),
             mcp_registry: Arc::new(roz_mcp::Registry::new()),
             session_bus: Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
+            verifying_key_cache: moka::future::Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(std::time::Duration::from_secs(60))
+                .build(),
+            signed_dispatch_enforcement: roz_server::config::SignedDispatchEnforcement::Strict,
         }
     }
 
@@ -2268,6 +2294,11 @@ mod tests {
             key_provider: Arc::new(roz_openai::auth::null_key::NullKeyProvider),
             mcp_registry: Arc::new(roz_mcp::Registry::new()),
             session_bus: Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
+            verifying_key_cache: moka::future::Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(std::time::Duration::from_secs(60))
+                .build(),
+            signed_dispatch_enforcement: roz_server::config::SignedDispatchEnforcement::Strict,
         }
     }
 

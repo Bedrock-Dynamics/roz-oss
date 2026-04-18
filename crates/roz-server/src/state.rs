@@ -1,9 +1,13 @@
 use axum::extract::FromRef;
 
 use crate::auth::RestAuth;
+use crate::config::SignedDispatchEnforcement;
 use crate::middleware::rate_limit::KeyedRateLimiter;
+use ed25519_dalek::VerifyingKey;
+use moka::future::Cache;
 use sqlx::PgPool;
 use std::sync::Arc;
+use uuid::Uuid;
 
 /// Model provider configuration loaded from environment variables.
 #[derive(Clone)]
@@ -92,6 +96,21 @@ pub struct AppState {
     /// Phase 20 Plan 07: cross-RPC session coordinator for MCP OAuth
     /// approval-style flows.
     pub session_bus: Arc<crate::grpc::session_bus::SessionBus>,
+    /// Phase 23 Plan 23-04 (D-11): LRU cache for per-device verifying keys
+    /// used during inbound-signature verification. Keyed by
+    /// `(tenant_id, host_id, key_version)`; value is the 32-byte Ed25519
+    /// verifying key material held as [`VerifyingKey`]. Capacity capped at
+    /// 10 000 entries (~400 KB resident — mitigates T-23-15 memory-exhaustion
+    /// DoS) and TTL 60 s so that rotation / revocation visibility lag never
+    /// exceeds one minute for passive expiry. Revocation clears affected
+    /// entries synchronously (implemented in 23-06).
+    pub verifying_key_cache: Cache<(Uuid, Uuid, u32), VerifyingKey>,
+    /// Phase 23 Plan 23-04 (D-12): rollout gate for two-direction signed
+    /// dispatch. Read from `SIGNED_DISPATCH_ENFORCEMENT` at boot; defaults
+    /// to [`SignedDispatchEnforcement::Audit`] in development and
+    /// [`SignedDispatchEnforcement::Strict`] everywhere else per the
+    /// Phase 23 Planner Discretion Q6.
+    pub signed_dispatch_enforcement: SignedDispatchEnforcement,
 }
 
 impl FromRef<AppState> for PgPool {
