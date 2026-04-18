@@ -326,4 +326,145 @@ mod tests {
         assert_eq!(parsed.policy_id, policy_id);
         assert_eq!(parsed.enforcement_mode, EnforcementMode::Reject);
     }
+
+    // ------------------------------------------------------------------
+    // Plan 24-05 Task 1: enforce_command / enforce_invocation tests.
+    // minimal_policy_json() has enforcement_mode=reject and
+    // max_velocity.linear_m_per_s=3.0, angular_rad_per_s=1.5, max_force=50 N.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn enforce_command_allow_under_limit() {
+        let p: PolicyV1 = serde_json::from_value(minimal_policy_json()).unwrap();
+        let out = enforce_command(&p, 1.5, 0.5, None, &[]);
+        assert!(matches!(out, EnforcementOutcome::Allow), "got {out:?}");
+    }
+
+    #[test]
+    fn enforce_command_reject_over_limit_in_reject_mode() {
+        let p: PolicyV1 = serde_json::from_value(minimal_policy_json()).unwrap();
+        let out = enforce_command(&p, 5.0, 0.0, None, &[]);
+        match out {
+            EnforcementOutcome::Reject(PolicyEnforcementError::LimitExceeded { channel, value, max }) => {
+                assert_eq!(channel, "linear_velocity");
+                assert!((value - 5.0).abs() < 1e-9);
+                assert!((max - 3.0).abs() < 1e-9);
+            }
+            other => panic!("expected Reject(LimitExceeded), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enforce_command_clamp_over_limit_in_clamp_mode() {
+        let mut v = minimal_policy_json();
+        v["enforcement_mode"] = serde_json::json!("clamp");
+        let p: PolicyV1 = serde_json::from_value(v).unwrap();
+        let out = enforce_command(&p, 5.0, 0.0, None, &[]);
+        match out {
+            EnforcementOutcome::Clamp { clamped_details } => {
+                assert_eq!(clamped_details["channel"], serde_json::json!("linear_velocity"));
+                assert!((clamped_details["clamped_to"].as_f64().unwrap() - 3.0).abs() < 1e-9);
+            }
+            other => panic!("expected Clamp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enforce_command_halt_over_limit_in_halt_mode() {
+        let mut v = minimal_policy_json();
+        v["enforcement_mode"] = serde_json::json!("halt");
+        let p: PolicyV1 = serde_json::from_value(v).unwrap();
+        let out = enforce_command(&p, 5.0, 0.0, None, &[]);
+        assert!(matches!(out, EnforcementOutcome::Halt(_)), "got {out:?}");
+    }
+
+    #[test]
+    fn enforce_command_angular_over_limit_in_reject_mode() {
+        let p: PolicyV1 = serde_json::from_value(minimal_policy_json()).unwrap();
+        let out = enforce_command(&p, 0.0, 3.0, None, &[]);
+        match out {
+            EnforcementOutcome::Reject(PolicyEnforcementError::LimitExceeded { channel, .. }) => {
+                assert_eq!(channel, "angular_velocity");
+            }
+            other => panic!("expected Reject(LimitExceeded), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enforce_command_force_over_limit_in_reject_mode() {
+        let p: PolicyV1 = serde_json::from_value(minimal_policy_json()).unwrap();
+        let out = enforce_command(&p, 0.0, 0.0, Some(100.0), &[]);
+        match out {
+            EnforcementOutcome::Reject(PolicyEnforcementError::LimitExceeded { channel, .. }) => {
+                assert_eq!(channel, "force");
+            }
+            other => panic!("expected Reject(LimitExceeded), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enforce_command_missing_interlock_halts() {
+        let mut v = minimal_policy_json();
+        v["interlocks"] = serde_json::json!([
+            {"name": "arm_safety", "required_states": ["gripper.closed"], "action_on_missing": "halt"}
+        ]);
+        let p: PolicyV1 = serde_json::from_value(v).unwrap();
+        let out = enforce_command(&p, 0.0, 0.0, None, &[]);
+        match out {
+            EnforcementOutcome::Halt(PolicyEnforcementError::InterlockMissing { name }) => {
+                assert_eq!(name, "arm_safety");
+            }
+            other => panic!("expected Halt(InterlockMissing), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enforce_command_satisfied_interlock_allows() {
+        let mut v = minimal_policy_json();
+        v["interlocks"] = serde_json::json!([
+            {"name": "arm_safety", "required_states": ["gripper.closed"], "action_on_missing": "halt"}
+        ]);
+        let p: PolicyV1 = serde_json::from_value(v).unwrap();
+        let out = enforce_command(&p, 0.0, 0.0, None, &["gripper.closed".to_string()]);
+        assert!(matches!(out, EnforcementOutcome::Allow), "got {out:?}");
+    }
+
+    #[test]
+    fn enforce_invocation_allow_when_under_limits() {
+        let p: PolicyV1 = serde_json::from_value(minimal_policy_json()).unwrap();
+        let out = enforce_invocation(&p, Some(1.0), Some(0.5));
+        assert!(matches!(out, EnforcementOutcome::Allow), "got {out:?}");
+    }
+
+    #[test]
+    fn enforce_invocation_reject_when_declared_over_limit() {
+        let p: PolicyV1 = serde_json::from_value(minimal_policy_json()).unwrap();
+        let out = enforce_invocation(&p, Some(5.0), Some(0.0));
+        assert!(matches!(out, EnforcementOutcome::Reject(_)), "got {out:?}");
+    }
+
+    #[test]
+    fn enforce_invocation_none_declared_is_allow() {
+        // Pre-dispatch only inspects declared parameters; with None both,
+        // the effective velocity is 0 → Allow.
+        let p: PolicyV1 = serde_json::from_value(minimal_policy_json()).unwrap();
+        let out = enforce_invocation(&p, None, None);
+        assert!(matches!(out, EnforcementOutcome::Allow), "got {out:?}");
+    }
+
+    #[test]
+    fn enforce_invocation_under_10ms_budget() {
+        // 10 000 iterations must complete well under 100 ms so per-call
+        // amortises to << 10 µs — leaves massive headroom under the 10 ms gate.
+        let p: PolicyV1 = serde_json::from_value(minimal_policy_json()).unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..10_000 {
+            let _ = enforce_invocation(&p, Some(1.0), Some(0.5));
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "enforce_invocation x10k should be << 100 ms, took {elapsed:?}"
+        );
+    }
 }
