@@ -455,6 +455,171 @@ mod tests {
         }
     }
 
+    // --- Plan 24-05 Task 2: pre-dispatch gate tests ------------------------
+
+    use crate::policy_cache::{HotPolicy, PolicyCache};
+    use crate::policy_enforcement::{
+        AccelerationLimits, DeadmanTimers, EnforcementMode, ForceLimits, OnBreachAction, PolicyLimits, PolicyV1,
+        VelocityLimits,
+    };
+    use roz_core::session::event::SessionEvent;
+
+    fn policy_with_linear_limit(linear: f64, mode: EnforcementMode) -> PolicyV1 {
+        PolicyV1 {
+            policy_id: Uuid::new_v4(),
+            version: 1,
+            enforcement_mode: mode,
+            limits: PolicyLimits {
+                max_velocity: VelocityLimits {
+                    linear_m_per_s: linear,
+                    angular_rad_per_s: 1.5,
+                },
+                max_acceleration: AccelerationLimits {
+                    linear_m_per_s2: 2.0,
+                    angular_rad_per_s2: 1.0,
+                },
+                max_force: ForceLimits { newtons: 50.0 },
+                joint_limits: Vec::new(),
+            },
+            geofences: Vec::new(),
+            interlocks: Vec::new(),
+            deadman_timers: DeadmanTimers {
+                command_timeout_ms: 5000,
+                on_expire: OnBreachAction::Halt,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_dispatch_check_allows_when_under_limits() {
+        let cache = PolicyCache::new();
+        let hot = HotPolicy::new(policy_with_linear_limit(3.0, EnforcementMode::Reject));
+        let inv = sample_invocation(ExecutionMode::React);
+        let decision = pre_dispatch_check(&cache, &hot, &inv, Some(1.0), Some(0.5)).await;
+        assert!(matches!(decision.outcome, PreDispatchOutcome::Allow), "{decision:?}");
+        assert!(!decision.stale);
+    }
+
+    #[tokio::test]
+    async fn pre_dispatch_check_rejects_when_declared_over_limit() {
+        let cache = PolicyCache::new();
+        let hot = HotPolicy::new(policy_with_linear_limit(3.0, EnforcementMode::Reject));
+        let inv = sample_invocation(ExecutionMode::React);
+        let decision = pre_dispatch_check(&cache, &hot, &inv, Some(5.0), Some(0.0)).await;
+        assert!(matches!(decision.outcome, PreDispatchOutcome::Reject(_)), "{decision:?}");
+    }
+
+    #[tokio::test]
+    async fn pre_dispatch_check_halts_under_halt_mode_when_over_limit() {
+        let cache = PolicyCache::new();
+        let hot = HotPolicy::new(policy_with_linear_limit(3.0, EnforcementMode::Halt));
+        let inv = sample_invocation(ExecutionMode::React);
+        let decision = pre_dispatch_check(&cache, &hot, &inv, Some(5.0), Some(0.0)).await;
+        assert!(matches!(decision.outcome, PreDispatchOutcome::Halt(_)), "{decision:?}");
+    }
+
+    #[tokio::test]
+    async fn pre_dispatch_check_stale_flag_when_policy_id_set_but_cache_miss() {
+        // D-01: policy_id declared but not in cache → treat as stale.
+        // The outcome still evaluates against the HotPolicy fall-through,
+        // and the caller writes a `policy_stale` audit row.
+        let cache = PolicyCache::new();
+        let hot = HotPolicy::new(policy_with_linear_limit(3.0, EnforcementMode::Reject));
+        let mut inv = sample_invocation(ExecutionMode::React);
+        inv.safety_policy_id = Some(Uuid::new_v4());
+        let decision = pre_dispatch_check(&cache, &hot, &inv, Some(1.0), Some(0.5)).await;
+        assert!(decision.stale, "stale flag should be set on cache miss with policy_id");
+        assert!(matches!(decision.outcome, PreDispatchOutcome::Allow), "{decision:?}");
+    }
+
+    #[tokio::test]
+    async fn pre_dispatch_check_hits_cache_is_not_stale() {
+        let cache = PolicyCache::new();
+        let hot = HotPolicy::new(policy_with_linear_limit(3.0, EnforcementMode::Reject));
+        let policy_id = Uuid::new_v4();
+        // Prime the cache with a matching policy.
+        let mut p = policy_with_linear_limit(3.0, EnforcementMode::Reject);
+        p.policy_id = policy_id;
+        cache.insert(policy_id, p).await;
+        let mut inv = sample_invocation(ExecutionMode::React);
+        inv.safety_policy_id = Some(policy_id);
+        let decision = pre_dispatch_check(&cache, &hot, &inv, Some(1.0), None).await;
+        assert!(!decision.stale);
+        assert!(matches!(decision.outcome, PreDispatchOutcome::Allow));
+    }
+
+    #[tokio::test]
+    async fn emit_violation_sends_safety_violation_session_event() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SessionEvent>(4);
+        let policy_id = Uuid::new_v4();
+        let details = serde_json::json!({"channel": "linear_velocity", "value": 5.0, "max": 3.0});
+        emit_violation_event(&tx, policy_id, "limit_exceeded", "reject", details.clone());
+        let ev = rx.try_recv().expect("session event was emitted");
+        match ev {
+            SessionEvent::SafetyViolation {
+                policy_id: pid,
+                violation_kind,
+                enforcement_action,
+                details: d,
+            } => {
+                assert_eq!(pid, policy_id.to_string());
+                assert_eq!(violation_kind, "limit_exceeded");
+                assert_eq!(enforcement_action, "reject");
+                assert_eq!(d, details);
+            }
+            other => panic!("expected SafetyViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enforcement_error_kind_maps_to_violation_kind() {
+        use crate::policy_enforcement::PolicyEnforcementError;
+        assert_eq!(
+            enforcement_error_kind(&PolicyEnforcementError::LimitExceeded {
+                channel: "x".into(),
+                value: 1.0,
+                max: 0.5
+            }),
+            "limit_exceeded"
+        );
+        assert_eq!(
+            enforcement_error_kind(&PolicyEnforcementError::InterlockMissing { name: "arm".into() }),
+            "interlock_missing"
+        );
+        assert_eq!(
+            enforcement_error_kind(&PolicyEnforcementError::GeofenceBreach {
+                coords: "0,0".into()
+            }),
+            "geofence_breach"
+        );
+        assert_eq!(
+            enforcement_error_kind(&PolicyEnforcementError::PolicyStale { age_secs: 45 }),
+            "policy_stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_dispatch_check_under_10ms_budget() {
+        let cache = PolicyCache::new();
+        let hot = HotPolicy::new(policy_with_linear_limit(3.0, EnforcementMode::Reject));
+        let inv = sample_invocation(ExecutionMode::React);
+        // Prime with 1 iteration to eliminate cold-start allocations.
+        let _ = pre_dispatch_check(&cache, &hot, &inv, Some(1.0), Some(0.5)).await;
+        let start = std::time::Instant::now();
+        for _ in 0..1_000 {
+            let _ = pre_dispatch_check(&cache, &hot, &inv, Some(1.0), Some(0.5)).await;
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "bench: pre_dispatch_check x1_000 = {elapsed:?} (~{} ns/call)",
+            elapsed.as_nanos() / 1_000
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "pre_dispatch_check x1000 should be << 100 ms, took {elapsed:?}"
+        );
+    }
+
     #[test]
     fn build_agent_input_maps_react_mode() {
         let inv = sample_invocation(ExecutionMode::React);
