@@ -45,6 +45,8 @@ hex.workspace = true
 crc32fast.workspace = true
 ed25519-dalek.workspace = true
 reqwest.workspace = true
+directories.workspace = true
+secrecy.workspace = true
 roz-copper = { path = "../roz-copper", default-features = false }
 roz-local = { path = "../roz-local" }
 roz-zenoh = { path = "../roz-zenoh", optional = true }
