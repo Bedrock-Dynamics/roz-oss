@@ -383,6 +383,94 @@ impl WalStore {
         tx.commit()?;
         Ok(ttl_count + quota_count)
     }
+
+    /// Append a task checkpoint row. The `checkpoint_id` is a fresh UUID v4.
+    /// The idempotency key is `"{task_id}:{step_counter}"` with a 24 h TTL per
+    /// REQUIREMENTS.md §FS-03 — duplicate calls with the same
+    /// `(task_id, step_counter)` return the already-persisted `checkpoint_id`
+    /// and DO NOT overwrite the row.
+    ///
+    /// Returns the `checkpoint_id` (as UUID string).
+    ///
+    /// # Errors
+    /// Propagates `rusqlite::Error`.
+    pub fn append_checkpoint(
+        &self,
+        task_id: &str,
+        step_counter: i64,
+        snapshot_json: &[u8],
+    ) -> Result<String, rusqlite::Error> {
+        let key = format!("{task_id}:{step_counter}");
+        // Idempotency check first — if we've already persisted this
+        // (task_id, step_counter) tuple, return the existing checkpoint_id
+        // unchanged so duplicate calls dedupe without touching the snapshot.
+        if let Some(existing) = self.check_idempotency(&key)?
+            && let Ok(s) = String::from_utf8(existing)
+        {
+            return Ok(s);
+        }
+        let checkpoint_id = uuid::Uuid::new_v4().to_string();
+        let created_at = Utc::now().to_rfc3339();
+        {
+            let conn = self.conn.lock();
+            conn.execute(
+                "INSERT INTO task_checkpoints (checkpoint_id, task_id, step_counter, snapshot_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![checkpoint_id, task_id, step_counter, snapshot_json, created_at],
+            )?;
+        }
+        // Record idempotency mapping (24 h TTL per FS-03).
+        self.cache_idempotency(&key, checkpoint_id.as_bytes(), Duration::from_secs(24 * 3600))?;
+        Ok(checkpoint_id)
+    }
+
+    /// Return the most-recent checkpoint for a task, ordered by `step_counter DESC`.
+    /// Returns `(checkpoint_id, task_id, step_counter, snapshot_json, created_at_rfc3339)`.
+    ///
+    /// # Errors
+    /// Propagates `rusqlite::Error`.
+    pub fn latest_checkpoint(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<(String, String, i64, Vec<u8>, String)>, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT checkpoint_id, task_id, step_counter, snapshot_json, created_at
+             FROM task_checkpoints WHERE task_id = ?1
+             ORDER BY step_counter DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![task_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, String>(4)?,
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    /// Return the integer seconds elapsed since the most-recent checkpoint for
+    /// `task_id`. Returns `None` if no checkpoint exists.
+    ///
+    /// # Errors
+    /// Propagates `rusqlite::Error` for SQL access. A `chrono::ParseError` on a
+    /// malformed `created_at` column surfaces as
+    /// `rusqlite::Error::FromSqlConversionFailure` so callers can treat
+    /// unparseable timestamps as "no checkpoint" for resume-gate purposes
+    /// (fail-closed).
+    pub fn checkpoint_age_secs(&self, task_id: &str) -> Result<Option<i64>, rusqlite::Error> {
+        let Some(latest) = self.latest_checkpoint(task_id)? else {
+            return Ok(None);
+        };
+        let ts_str = latest.4;
+        let ts = chrono::DateTime::parse_from_rfc3339(&ts_str)
+            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e)))?;
+        let age = Utc::now().signed_duration_since(ts.with_timezone(&Utc)).num_seconds();
+        Ok(Some(age.max(0)))
+    }
 }
 
 #[cfg(test)]
