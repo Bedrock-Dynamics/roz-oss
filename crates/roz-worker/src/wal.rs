@@ -1,4 +1,5 @@
 use chrono::Utc;
+use parking_lot::Mutex;
 use rusqlite::{Connection, params};
 use std::time::Duration;
 
@@ -7,8 +8,14 @@ use roz_core::wal::WalEntry;
 /// `SQLite` WAL-mode database for crash recovery.
 ///
 /// Stores WAL entries, worker state K/V pairs, and an idempotency cache.
+///
+/// The inner [`rusqlite::Connection`] is `Send` but not `Sync`, so the
+/// connection is wrapped in a [`parking_lot::Mutex`] to make `WalStore`
+/// itself `Sync`. This lets `Arc<WalStore>` be cloned across tokio tasks
+/// — required by the Phase 23 signing hooks (`signing_hooks.rs`), which
+/// call `next_seq` from every worker-side NATS publish site.
 pub struct WalStore {
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
 
 impl WalStore {
@@ -48,25 +55,26 @@ impl WalStore {
             );",
         )?;
 
-        Ok(Self { conn })
+        Ok(Self { conn: Mutex::new(conn) })
     }
 
     /// Append a WAL entry for a given task.
     pub fn append(&self, task_id: &str, entry: &WalEntry) -> Result<i64, rusqlite::Error> {
         let json = serde_json::to_vec(entry).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         let ts = Utc::now().to_rfc3339();
-        self.conn.execute(
+        let conn = self.conn.lock();
+        conn.execute(
             "INSERT INTO wal_entries (task_id, entry, ts) VALUES (?1, ?2, ?3)",
             params![task_id, json, ts],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(conn.last_insert_rowid())
     }
 
     /// Return all unacked entries for a given task, ordered by sequence.
     pub fn unacked(&self, task_id: &str) -> Result<Vec<(i64, WalEntry)>, rusqlite::Error> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT seq, entry FROM wal_entries WHERE task_id = ?1 AND acked = FALSE ORDER BY seq")?;
+        let conn = self.conn.lock();
+        let mut stmt =
+            conn.prepare("SELECT seq, entry FROM wal_entries WHERE task_id = ?1 AND acked = FALSE ORDER BY seq")?;
         let rows = stmt.query_map(params![task_id], |row| {
             let seq: i64 = row.get(0)?;
             let blob: Vec<u8> = row.get(1)?;
@@ -86,13 +94,14 @@ impl WalStore {
     /// Mark a WAL entry as acknowledged.
     pub fn ack(&self, seq: i64) -> Result<(), rusqlite::Error> {
         self.conn
+            .lock()
             .execute("UPDATE wal_entries SET acked = TRUE WHERE seq = ?1", params![seq])?;
         Ok(())
     }
 
     /// Set a key-value pair in the worker state store.
     pub fn set_state(&self, key: &str, value: &[u8]) -> Result<(), rusqlite::Error> {
-        self.conn.execute(
+        self.conn.lock().execute(
             "INSERT INTO worker_state (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],
@@ -102,7 +111,8 @@ impl WalStore {
 
     /// Get a value from the worker state store.
     pub fn get_state(&self, key: &str) -> Result<Option<Vec<u8>>, rusqlite::Error> {
-        let mut stmt = self.conn.prepare("SELECT value FROM worker_state WHERE key = ?1")?;
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT value FROM worker_state WHERE key = ?1")?;
         let mut rows = stmt.query(params![key])?;
         match rows.next()? {
             Some(row) => Ok(Some(row.get(0)?)),
@@ -114,7 +124,7 @@ impl WalStore {
     pub fn cache_idempotency(&self, key: &str, result: &[u8], ttl: Duration) -> Result<(), rusqlite::Error> {
         let expires = Utc::now() + chrono::Duration::from_std(ttl).unwrap_or_default();
         let expires_str = expires.to_rfc3339();
-        self.conn.execute(
+        self.conn.lock().execute(
             "INSERT INTO idempotency_cache (key, result, expires) VALUES (?1, ?2, ?3)
              ON CONFLICT(key) DO UPDATE SET result = excluded.result, expires = excluded.expires",
             params![key, result, expires_str],
@@ -125,9 +135,8 @@ impl WalStore {
     /// Check the idempotency cache. Returns `None` if the key is missing or expired.
     pub fn check_idempotency(&self, key: &str) -> Result<Option<Vec<u8>>, rusqlite::Error> {
         let now = Utc::now().to_rfc3339();
-        let mut stmt = self
-            .conn
-            .prepare("SELECT result FROM idempotency_cache WHERE key = ?1 AND expires > ?2")?;
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare("SELECT result FROM idempotency_cache WHERE key = ?1 AND expires > ?2")?;
         let mut rows = stmt.query(params![key, now])?;
         match rows.next()? {
             Some(row) => Ok(Some(row.get(0)?)),
@@ -157,7 +166,7 @@ impl WalStore {
     /// have to overflow 2^63 increments (impossible in any realistic device
     /// lifetime) before this matters.
     pub fn next_seq(&self, key_version: u32) -> Result<u64, rusqlite::Error> {
-        let row: i64 = self.conn.query_row(
+        let row: i64 = self.conn.lock().query_row(
             "INSERT INTO signing_sequence_counter (key_version, seq) VALUES (?1, 1)
              ON CONFLICT(key_version) DO UPDATE SET seq = seq + 1
              RETURNING seq",
@@ -180,20 +189,18 @@ mod tests {
     fn open_creates_tables() {
         let store = WalStore::open(":memory:").unwrap();
         // Verify tables exist by querying them
-        let count: i64 = store
-            .conn
+        let conn = store.conn.lock();
+        let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM wal_entries", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
 
-        let count: i64 = store
-            .conn
+        let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM worker_state", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
 
-        let count: i64 = store
-            .conn
+        let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM idempotency_cache", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
@@ -338,6 +345,7 @@ mod tests {
         let expired = (Utc::now() - chrono::Duration::seconds(10)).to_rfc3339();
         store
             .conn
+            .lock()
             .execute(
                 "INSERT INTO idempotency_cache (key, result, expires) VALUES (?1, ?2, ?3)",
                 params!["expired-key", b"old-data".to_vec(), expired],
