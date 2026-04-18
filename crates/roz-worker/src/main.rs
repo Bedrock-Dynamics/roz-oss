@@ -608,6 +608,149 @@ async fn execute_task(
     // `mut` because MEM-03 takes `fact_rx` by value below.
     let mut turn_flush = roz_worker::turn_flush::build_turn_flush(&task_config).await;
 
+    // Phase 24 FS-01: pre-dispatch policy gate. Runs enforce_invocation against
+    // the worker's active policy BEFORE the agent loop starts. On reject/halt,
+    // write a safety-violation audit row, signal `SafetyStop` back to Restate,
+    // and return early. On stale-cache (D-01) write a `policy_stale` warning
+    // audit row and continue.
+    //
+    // Plan 24-05 scope: the gate function is wired, runtime instances are
+    // locally constructed from the `permissive()` default. Plan 24-09 threads
+    // the live `PolicyCache` + `HotPolicy` from the worker main loop once the
+    // `roz.policy.{worker_id}` subscribe loop exists. Declared velocity fields
+    // also land on `TaskInvocation` in 24-09 — until then the gate evaluates
+    // against effective velocity=0 and trivially Allows.
+    {
+        let policy_cache = roz_worker::policy_cache::PolicyCache::new();
+        let hot_policy = roz_worker::policy_cache::HotPolicy::permissive();
+        let gate_start = std::time::Instant::now();
+        let decision =
+            roz_worker::dispatch::pre_dispatch_check(&policy_cache, &hot_policy, &invocation, None, None).await;
+        let gate_elapsed = gate_start.elapsed();
+        if gate_elapsed > Duration::from_millis(10) {
+            tracing::warn!(
+                gate_ms = gate_elapsed.as_millis() as u64,
+                task_id = %task_id,
+                "pre-dispatch policy gate exceeded 10 ms budget"
+            );
+        }
+
+        // D-01: stale-cache audit + continue.
+        if decision.stale {
+            if let (Some(pool), Ok(tenant_uuid)) = (turn_flush.pool.as_ref(), invocation.tenant_id.parse::<Uuid>()) {
+                roz_worker::dispatch::write_safety_audit(
+                    pool,
+                    tenant_uuid,
+                    Some(invocation.host_id),
+                    Some(task_id),
+                    Some(decision.policy_id),
+                    "policy_stale",
+                    "warning",
+                    "worker-policy-cache",
+                    serde_json::json!({
+                        "declared_policy_id": invocation.safety_policy_id,
+                        "note": "cache miss on declared policy_id; fell back to HotPolicy per D-01",
+                    }),
+                )
+                .await;
+            } else {
+                tracing::warn!(
+                    task_id = %task_id,
+                    policy_id = %decision.policy_id,
+                    "policy_stale audit skipped (no pool or unparseable tenant_id)"
+                );
+            }
+        }
+
+        // Violation branches: audit + SafetyStop + return.
+        match decision.outcome {
+            roz_worker::dispatch::PreDispatchOutcome::Allow => {
+                tracing::debug!(task_id = %task_id, policy_id = %decision.policy_id, "pre-dispatch gate: allow");
+            }
+            roz_worker::dispatch::PreDispatchOutcome::Clamp { clamped_details } => {
+                tracing::info!(
+                    task_id = %task_id,
+                    policy_id = %decision.policy_id,
+                    details = %clamped_details,
+                    "pre-dispatch gate: clamp (declared params projected to policy limits)"
+                );
+                if let (Some(pool), Ok(tenant_uuid)) = (turn_flush.pool.as_ref(), invocation.tenant_id.parse::<Uuid>())
+                {
+                    roz_worker::dispatch::write_safety_audit(
+                        pool,
+                        tenant_uuid,
+                        Some(invocation.host_id),
+                        Some(task_id),
+                        Some(decision.policy_id),
+                        "safety_violation",
+                        roz_worker::dispatch::severity_for_action("clamp"),
+                        "worker-pre-dispatch",
+                        clamped_details,
+                    )
+                    .await;
+                }
+            }
+            roz_worker::dispatch::PreDispatchOutcome::Reject(ref err)
+            | roz_worker::dispatch::PreDispatchOutcome::Halt(ref err) => {
+                let violation_kind = roz_worker::dispatch::enforcement_error_kind(err);
+                let enforcement_action = match &decision.outcome {
+                    roz_worker::dispatch::PreDispatchOutcome::Halt(_) => "halt",
+                    _ => "reject",
+                };
+                let details = serde_json::json!({
+                    "violation_kind": violation_kind,
+                    "enforcement_action": enforcement_action,
+                    "error": err.to_string(),
+                });
+                if let (Some(pool), Ok(tenant_uuid)) = (turn_flush.pool.as_ref(), invocation.tenant_id.parse::<Uuid>())
+                {
+                    roz_worker::dispatch::write_safety_audit(
+                        pool,
+                        tenant_uuid,
+                        Some(invocation.host_id),
+                        Some(task_id),
+                        Some(decision.policy_id),
+                        "safety_violation",
+                        roz_worker::dispatch::severity_for_action(enforcement_action),
+                        "worker-pre-dispatch",
+                        details.clone(),
+                    )
+                    .await;
+                }
+                tracing::warn!(
+                    task_id = %task_id,
+                    policy_id = %decision.policy_id,
+                    violation_kind,
+                    enforcement_action,
+                    error = %err,
+                    "pre-dispatch gate rejected invocation"
+                );
+                publish_task_status(
+                    &task_nats,
+                    signing_ctx.as_ref(),
+                    &TaskStatusEvent {
+                        task_id,
+                        status: "failed".into(),
+                        detail: Some(format!("policy violation ({violation_kind}): {err}")),
+                        host_id: Some(invocation.host_id),
+                    },
+                )
+                .await;
+                let result = roz_worker::dispatch::build_task_result(
+                    task_id,
+                    TaskTerminalStatus::SafetyStop,
+                    Err(roz_agent::error::AgentError::Safety(err.to_string())),
+                );
+                if let Err(sig_err) =
+                    roz_worker::dispatch::signal_result(&task_http, &restate_url, &task_id.to_string(), &result).await
+                {
+                    tracing::error!(error = %sig_err, "failed to signal policy-violation result to Restate");
+                }
+                return;
+            }
+        }
+    }
+
     // MEM-03: spawn the fact extractor when pool + aux-LLM + fact_rx are all
     // available. Fall-open on any missing dep — the emitter's try_send on the
     // fact channel logs & drops when the receiver is gone.
