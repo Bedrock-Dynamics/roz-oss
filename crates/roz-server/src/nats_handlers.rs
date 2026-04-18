@@ -468,26 +468,65 @@ async fn verify_task_status_if_enabled(
 }
 
 // ===========================================================================
-// Plan 24-07 Task 3 RED stub: server-side telemetry sequence dedup (FS-02)
-// GREEN commit wires the body.
+// Plan 24-07 Task 3: server-side telemetry sequence dedup (FS-02)
 // ===========================================================================
+//
+// `telemetry.{worker_id}.state` / `.sensors` frames arrive signed with a
+// monotonic `SignedFields::sequence_number` allocated by the worker WAL.
+// On reconnect, the worker replays buffered frames (Plan 24-07 Task 2),
+// each re-signed with a FRESH signing seq — so the server sees a strictly
+// monotonic stream per-worker. Any inbound frame whose signed seq is ≤ the
+// worker's high-water mark is a replay-duplicate and MUST be dropped.
+//
+// The dedup state is a per-server in-memory `Arc<Mutex<HashMap<String, u64>>>`
+// — contention is negligible (sub-kHz per worker, bounded concurrent worker
+// count). `dashmap` is not in the workspace; `parking_lot::Mutex` is used
+// nowhere else in this file, so the std `Mutex` matches existing server-side
+// conventions. Durability is not required: on server restart, the map starts
+// empty; the worst case is one round of replay-tolerant duplicates that the
+// downstream persistence path is already idempotent against (see FS-02
+// contract in `.planning/research/DEEP-FS.md`).
+//
+// Wiring: Plan 24-09 threads `TelemetryDedup` into the subscribe-loop that
+// consumes `telemetry.*.state` and calls [`check_telemetry_dedup`] BEFORE
+// persisting or fanning out the frame. The test-documented contract below
+// is stable and does not depend on the subscribe loop.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// Per-worker monotonic telemetry high-water mark (RED stub).
+/// Per-worker monotonic telemetry high-water mark. Drops any inbound frame
+/// whose signed `sequence_number` is ≤ the stored value.
 pub type TelemetryDedup = Arc<Mutex<HashMap<String, u64>>>;
 
-/// Construct a fresh dedup map (RED stub).
+/// Construct a fresh dedup map. Used by the subscribe-loop owner (Plan 24-09)
+/// during server boot.
 #[must_use]
 pub fn new_telemetry_dedup() -> TelemetryDedup {
-    todo!("Plan 24-07 Task 3 GREEN: allocate dedup map")
+    Arc::new(Mutex::new(HashMap::new()))
 }
 
-/// Check + advance the dedup high-water mark (RED stub).
+/// Check + advance the dedup high-water mark for one inbound envelope.
+///
+/// Returns `true` if the frame should be accepted (novel seq > high-water) and
+/// advances the stored value. Returns `false` if the frame is a duplicate
+/// (seq ≤ high-water) — caller drops without side effects.
+///
+/// # Panics
+///
+/// Propagates a poisoned mutex via `expect`. Poisoning would indicate a prior
+/// panic inside the dedup path, which is itself a logic bug — failing loud is
+/// preferred over silently accepting duplicates.
 #[must_use]
-pub fn check_telemetry_dedup(_map: &TelemetryDedup, _worker_id: &str, _seq: u64) -> bool {
-    todo!("Plan 24-07 Task 3 GREEN: advance high-water mark on novel seq")
+pub fn check_telemetry_dedup(map: &TelemetryDedup, worker_id: &str, seq: u64) -> bool {
+    let mut guard = map.lock().expect("telemetry dedup mutex poisoned");
+    let entry = guard.entry(worker_id.to_string()).or_insert(0);
+    if seq > *entry {
+        *entry = seq;
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -509,7 +548,9 @@ mod dedup_tests {
     fn dedup_drops_replayed_seq() {
         let m = fresh_map();
         assert!(check_telemetry_dedup(&m, "w1", 10));
+        // Replay of seq 10 (== high-water) → drop.
         assert!(!check_telemetry_dedup(&m, "w1", 10));
+        // Lower seq → drop.
         assert!(!check_telemetry_dedup(&m, "w1", 5));
         assert_eq!(*m.lock().unwrap().get("w1").unwrap(), 10);
     }
@@ -525,7 +566,7 @@ mod dedup_tests {
     #[test]
     fn dedup_state_per_worker_id() {
         let m = fresh_map();
-        check_telemetry_dedup(&m, "w1", 10);
+        assert!(check_telemetry_dedup(&m, "w1", 10));
         assert!(check_telemetry_dedup(&m, "w2", 5));
         let guard = m.lock().unwrap();
         assert_eq!(*guard.get("w1").unwrap(), 10);
