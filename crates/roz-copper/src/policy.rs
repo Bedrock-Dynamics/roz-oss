@@ -59,8 +59,7 @@ impl CopperPolicy {
     pub fn clamp_velocity(&self, linear: f64, angular: f64) -> (f64, f64, bool) {
         let c_lin = linear.clamp(-self.max_linear_m_per_s, self.max_linear_m_per_s);
         let c_ang = angular.clamp(-self.max_angular_rad_per_s, self.max_angular_rad_per_s);
-        let clamped =
-            (c_lin - linear).abs() > f64::EPSILON || (c_ang - angular).abs() > f64::EPSILON;
+        let clamped = (c_lin - linear).abs() > f64::EPSILON || (c_ang - angular).abs() > f64::EPSILON;
         (c_lin, c_ang, clamped)
     }
 }
