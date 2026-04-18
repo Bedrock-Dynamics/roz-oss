@@ -8,7 +8,7 @@
 //! authorize staged rollout. `shutdown()` stops everything cleanly.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -55,6 +55,12 @@ pub struct CopperHandle {
     /// through this channel when a WASM error or watchdog timeout occurs.
     /// The supervisor/adapter should drain this and call `emergency_stop` on hardware.
     estop_rx: Option<mpsc::Receiver<String>>,
+    /// Shared three-state telemetry-backpressure flag written by the worker's
+    /// store-and-forward buffer (FS-02, D-07) and read lock-free by the controller
+    /// loop tick-rate selector. Values: 0 = `BP_NORMAL` (100 Hz), 1 = `BP_DERATE_50HZ`
+    /// (50 Hz), 2 = `BP_DERATE_10HZ` (10 Hz). `Ordering::Relaxed` is sufficient for
+    /// both reads and writes (no cross-thread data dependency).
+    telemetry_backpressure: Arc<AtomicU8>,
 }
 
 impl CopperHandle {
@@ -180,6 +186,7 @@ impl CopperHandle {
             thread: Some(thread),
             bridge: Some(bridge),
             estop_rx: Some(estop_rx),
+            telemetry_backpressure: Arc::new(AtomicU8::new(0)),
         }
     }
 
@@ -244,6 +251,17 @@ impl CopperHandle {
     /// Get the shared state handle (for `CopperSpatialProvider`).
     pub const fn state(&self) -> &Arc<ArcSwap<ControllerState>> {
         &self.state
+    }
+
+    /// Accessor for the worker->copper telemetry-backpressure flag (FS-02, D-07).
+    ///
+    /// Returns the shared `Arc<AtomicU8>` so both the worker (writer) and the
+    /// controller tick-rate selector (reader) can use the same atom. The field
+    /// encodes three states: 0 = `BP_NORMAL` (100 Hz), 1 = `BP_DERATE_50HZ`
+    /// (50 Hz at 90 % buffer), 2 = `BP_DERATE_10HZ` (10 Hz at 95 % buffer).
+    #[must_use]
+    pub const fn telemetry_backpressure(&self) -> &Arc<AtomicU8> {
+        &self.telemetry_backpressure
     }
 
     /// Take the e-stop receiver (can only be called once).
