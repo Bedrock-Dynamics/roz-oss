@@ -210,6 +210,7 @@ async fn trust_rejection_happens_before_workflow_or_publish() {
             restate_ingress_url: &restate_url,
             nats_client: Some(&nats),
             trust_policy: &trust_policy,
+            signing_gate: None,
         },
         TaskDispatchRequest {
             tenant_id,
@@ -293,6 +294,7 @@ async fn dispatch_starts_workflow_before_publish_and_preserves_request_shape() {
             restate_ingress_url: &restate_url,
             nats_client: Some(&nats),
             trust_policy: &trust_policy,
+            signing_gate: None,
         },
         TaskDispatchRequest {
             tenant_id,

@@ -4,6 +4,10 @@
 //! The server publishes [`TaskInvocation`] to start work, and the worker responds with
 //! [`TaskResult`]. Tool approval flows use [`ApprovalRequest`] / [`ApprovalResponse`].
 
+use std::str::FromStr;
+
+use async_nats::{Client, HeaderMap, HeaderValue};
+use roz_core::signing::HEADER_NAME;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -180,6 +184,51 @@ pub struct ApprovalResponse {
     pub tool_use_id: String,
     pub approved: bool,
     pub modifier: Option<serde_json::Value>,
+}
+
+/// Errors surfaced by [`publish_signed`].
+#[derive(Debug, thiserror::Error)]
+pub enum PublishSignedError {
+    /// The signature-layer-provided header value contains characters
+    /// disallowed by `async_nats::HeaderValue`. In practice this cannot
+    /// happen because [`roz_core::signing::SignatureEnvelope::encode_header`]
+    /// emits pure URL-safe base64, but we guard it for defense in depth.
+    #[error("signature header contained invalid characters")]
+    InvalidHeader,
+    /// The underlying NATS client rejected the publish (broker closed,
+    /// connection dropped, etc.).
+    #[error("nats publish failed: {0}")]
+    Nats(String),
+}
+
+/// Publish a payload on NATS with a pre-built `roz-sig-v1` header attached.
+///
+/// The header value must be produced by the signing layer — callers in the
+/// server path use [`roz_server::signing_gate::SigningGate::sign_outbound`];
+/// callers in the worker path use the symmetric worker-side helper
+/// (added in Plan 23-07). This helper is transport-only — it does not
+/// touch the signing primitives itself so the `roz-nats` crate keeps its
+/// narrow dependency surface.
+///
+/// # Errors
+///
+/// - [`PublishSignedError::InvalidHeader`] if the header value contains
+///   bytes rejected by `async_nats::HeaderValue`. Structurally impossible
+///   with the current envelope encoder (URL-safe base64).
+/// - [`PublishSignedError::Nats`] on any transport failure.
+pub async fn publish_signed(
+    client: &Client,
+    subject: String,
+    payload: Vec<u8>,
+    header_value: &str,
+) -> Result<(), PublishSignedError> {
+    let mut headers = HeaderMap::new();
+    let hv = HeaderValue::from_str(header_value).map_err(|_| PublishSignedError::InvalidHeader)?;
+    headers.insert(HEADER_NAME, hv);
+    client
+        .publish_with_headers(subject, headers, payload.into())
+        .await
+        .map_err(|e| PublishSignedError::Nats(e.to_string()))
 }
 
 #[cfg(test)]

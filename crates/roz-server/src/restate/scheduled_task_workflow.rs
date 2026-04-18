@@ -363,6 +363,7 @@ async fn execute_iteration(
                 restate_ingress_url: &runtime.restate_ingress_url,
                 nats_client: runtime.nats_client.as_ref(),
                 trust_policy: runtime.trust_policy.as_ref(),
+                signing_gate: None,
             },
             TaskDispatchRequest {
                 tenant_id: input.tenant_id,

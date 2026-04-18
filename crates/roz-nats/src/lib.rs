@@ -6,5 +6,6 @@ pub mod provisioning;
 pub mod subjects;
 pub mod team;
 
+pub use dispatch::{PublishSignedError, publish_signed};
 pub use events::WasmTrustFailure;
 pub use subjects::Subjects;

@@ -20,13 +20,19 @@ pub struct TaskDispatchRequest {
     pub delegation_scope: Option<DelegationScope>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct TaskDispatchServices<'a> {
     pub pool: &'a sqlx::PgPool,
     pub http_client: &'a reqwest::Client,
     pub restate_ingress_url: &'a str,
     pub nats_client: Option<&'a async_nats::Client>,
     pub trust_policy: &'a TrustPolicy,
+    /// Phase 23 (FS-04 Plan 23-06) server-side sign gate. `None` for pre-
+    /// Phase 23 callers (none currently; kept `Option` to avoid churn in
+    /// tests that don't exercise the sign path yet). When present, every
+    /// outbound `invoke.{host}.{task}` publish gains a `roz-sig-v1`
+    /// header via [`roz_nats::publish_signed`].
+    pub signing_gate: Option<&'a crate::signing_gate::SigningGate>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -211,7 +217,43 @@ pub async fn dispatch_task(
         .map_err(|error| TaskDispatchError::BadRequest(format!("invalid NATS subject: {error}")))?;
     let payload = serde_json::to_vec(&invocation)
         .map_err(|error| TaskDispatchError::Internal(format!("failed to serialize task invocation: {error}")))?;
-    if let Err(error) = nats.publish(subject, payload.into()).await {
+
+    // Phase 23 (FS-04 Plan 23-06): every outbound server→worker invoke is
+    // signed with the `roz-sig-v1` header. The signing gate fetches the
+    // active `roz_server_signing_state` row, decrypts the seed, and
+    // atomically bumps the sequence counter before the publish. A sign
+    // failure in `Strict` mode aborts the dispatch and flips the task to
+    // `failed`, matching the existing publish-failure handling below.
+    if let Some(gate) = services.signing_gate {
+        match gate
+            .sign_outbound(request.tenant_id, host_uuid, task.id, &payload)
+            .await
+        {
+            Ok(header_value) => {
+                if let Err(error) = roz_nats::publish_signed(nats, subject, payload, &header_value).await {
+                    let _ = roz_db::tasks::update_status(&mut *conn, task.id, "failed").await;
+                    return Err(TaskDispatchError::Internal(format!(
+                        "failed to publish task invocation: {error}"
+                    )));
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    err = %error,
+                    tenant_id = %request.tenant_id,
+                    host_uuid = %host_uuid,
+                    task_id = %task.id,
+                    "sign_outbound failed"
+                );
+                let _ = roz_db::tasks::update_status(&mut *conn, task.id, "failed").await;
+                return Err(TaskDispatchError::Internal(format!(
+                    "failed to sign task invocation: {error}"
+                )));
+            }
+        }
+    } else if let Err(error) = nats.publish(subject, payload.into()).await {
+        // Legacy unsigned path — retained so non-Phase-23 callers (none
+        // currently) and tests that don't wire a signing gate still work.
         let _ = roz_db::tasks::update_status(&mut *conn, task.id, "failed").await;
         return Err(TaskDispatchError::Internal(format!(
             "failed to publish task invocation: {error}"

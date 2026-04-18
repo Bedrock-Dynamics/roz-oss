@@ -84,6 +84,8 @@ pub async fn create(
     let tenant_id = *auth.tenant_id().as_uuid();
     tracing::Span::current().record("tenant_id", tracing::field::display(tenant_id));
 
+    // Phase 23 Plan 23-06: sign every server→worker invoke publish.
+    let signing_gate = crate::signing_gate::SigningGate::from_app_state(&state);
     let task = dispatch_task(
         &mut **tx,
         TaskDispatchServices {
@@ -92,6 +94,7 @@ pub async fn create(
             restate_ingress_url: &state.restate_ingress_url,
             nats_client: state.nats_client.as_ref(),
             trust_policy: state.trust_policy.as_ref(),
+            signing_gate: Some(&signing_gate),
         },
         TaskDispatchRequest {
             tenant_id,

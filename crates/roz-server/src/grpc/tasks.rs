@@ -447,6 +447,13 @@ impl TaskService for TaskServiceImpl {
                 restate_ingress_url: &self.restate_ingress_url,
                 nats_client: self.nats_client.as_ref(),
                 trust_policy: self.trust_policy.as_ref(),
+                // Phase 23 Plan 23-06: gRPC task-service path keeps the legacy
+                // unsigned publish for now. `TaskServiceImpl` does not yet own
+                // the signing-gate collaborators (cache + key_provider +
+                // enforcement mode). A follow-up plan plumbs these through;
+                // until then the REST path in `routes/tasks.rs` is the signed
+                // hot path covered by FS-04 acceptance tests.
+                signing_gate: None,
             },
             SharedTaskDispatchRequest {
                 tenant_id,
