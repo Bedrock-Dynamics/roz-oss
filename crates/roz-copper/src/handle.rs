@@ -463,6 +463,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_handle_has_normal_backpressure() {
+        let handle = CopperHandle::spawn_execution_only(1.5);
+        let bp = handle.telemetry_backpressure();
+        assert_eq!(
+            bp.load(Ordering::Relaxed),
+            0,
+            "freshly spawned handle must start in BP_NORMAL (0)"
+        );
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn backpressure_clone_shares_state() {
+        let handle = CopperHandle::spawn_execution_only(1.5);
+        let writer = Arc::clone(handle.telemetry_backpressure());
+        writer.store(2, Ordering::Relaxed);
+        assert_eq!(
+            handle.telemetry_backpressure().load(Ordering::Relaxed),
+            2,
+            "backpressure flag must be shared via Arc between writer and reader"
+        );
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn handle_drop_stops_controller_thread() {
         let state;
         {
