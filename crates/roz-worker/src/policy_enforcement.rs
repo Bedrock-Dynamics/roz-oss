@@ -173,6 +173,136 @@ pub fn parse_policy_from_row(
     Ok(policy)
 }
 
+/// Evaluate a single velocity+force command against policy limits + interlocks.
+///
+/// Used by the copper 100 Hz tick filter via a thin wrapper in
+/// `crates/roz-copper/src/safety_filter.rs`. Hot path — avoids allocations on
+/// the pass path and performs at worst one `String::clone` per
+/// interlock/limit violation.
+///
+/// `interlock_states` is a slice of currently-asserted state names (e.g.,
+/// `["arm.extended", "gripper.closed"]`) — the caller assembles this from
+/// `TelemetryFrame.state` or copper's `ControllerState` before invoking.
+///
+/// **Geofence checks are not performed here.** Full geofence geometry lands when
+/// the MAVLink backend (Phase 25) surfaces `lat_lon_alt` in the command frame
+/// per 24-CONTEXT D-03.
+#[must_use]
+pub fn enforce_command(
+    policy: &PolicyV1,
+    velocity_linear_m_per_s: f64,
+    velocity_angular_rad_per_s: f64,
+    force_newtons: Option<f64>,
+    interlock_states: &[String],
+) -> EnforcementOutcome {
+    let max_linear = policy.limits.max_velocity.linear_m_per_s;
+    let max_angular = policy.limits.max_velocity.angular_rad_per_s;
+    let max_force = policy.limits.max_force.newtons;
+
+    // Linear velocity
+    if velocity_linear_m_per_s.abs() > max_linear {
+        let err = PolicyEnforcementError::LimitExceeded {
+            channel: "linear_velocity".to_string(),
+            value: velocity_linear_m_per_s,
+            max: max_linear,
+        };
+        return dispatch_mode(policy.enforcement_mode, err, || {
+            serde_json::json!({
+                "channel": "linear_velocity",
+                "clamped_to": max_linear.copysign(velocity_linear_m_per_s),
+            })
+        });
+    }
+
+    // Angular velocity
+    if velocity_angular_rad_per_s.abs() > max_angular {
+        let err = PolicyEnforcementError::LimitExceeded {
+            channel: "angular_velocity".to_string(),
+            value: velocity_angular_rad_per_s,
+            max: max_angular,
+        };
+        return dispatch_mode(policy.enforcement_mode, err, || {
+            serde_json::json!({
+                "channel": "angular_velocity",
+                "clamped_to": max_angular.copysign(velocity_angular_rad_per_s),
+            })
+        });
+    }
+
+    // Force (optional — not all commands carry force)
+    if let Some(f) = force_newtons
+        && f.abs() > max_force
+    {
+        let err = PolicyEnforcementError::LimitExceeded {
+            channel: "force".to_string(),
+            value: f,
+            max: max_force,
+        };
+        return dispatch_mode(policy.enforcement_mode, err, || {
+            serde_json::json!({
+                "channel": "force",
+                "clamped_to": max_force.copysign(f),
+            })
+        });
+    }
+
+    // Interlocks: every required state must be asserted; any missing → halt.
+    for interlock in &policy.interlocks {
+        for required in &interlock.required_states {
+            if !interlock_states.iter().any(|s| s == required) {
+                return EnforcementOutcome::Halt(PolicyEnforcementError::InterlockMissing {
+                    name: interlock.name.clone(),
+                });
+            }
+        }
+    }
+
+    EnforcementOutcome::Allow
+}
+
+/// Route a detected violation through the policy's configured enforcement
+/// mode. Under `clamp`, the caller-supplied closure produces the clamped
+/// details (lazy to avoid building the JSON object when `reject`/`halt` are
+/// in effect).
+fn dispatch_mode(
+    mode: EnforcementMode,
+    err: PolicyEnforcementError,
+    clamp_details_fn: impl FnOnce() -> serde_json::Value,
+) -> EnforcementOutcome {
+    match mode {
+        EnforcementMode::Reject => EnforcementOutcome::Reject(err),
+        EnforcementMode::Halt => EnforcementOutcome::Halt(err),
+        EnforcementMode::Clamp => EnforcementOutcome::Clamp {
+            clamped_details: clamp_details_fn(),
+        },
+    }
+}
+
+/// Pre-dispatch enforcement entrypoint — called by the worker dispatch layer
+/// before handing a `TaskInvocation` to the agent loop.
+///
+/// Checks the invocation's declared velocity parameters (if any) against
+/// policy limits. Interlocks and geofences are NOT evaluated here — they are
+/// live-state checks that only make sense in the 100 Hz copper tick via
+/// [`enforce_command`].
+///
+/// `None` declared parameters are treated as zero: the gate does not attempt
+/// to infer motion intent from an omitted field. When Plan 24-09 threads the
+/// actual `TaskInvocation.declared_*` fields through dispatch, the caller
+/// feeds them in directly.
+///
+/// Cheap: no allocations on the pass path.
+#[must_use]
+pub fn enforce_invocation(
+    policy: &PolicyV1,
+    declared_velocity_linear: Option<f64>,
+    declared_velocity_angular: Option<f64>,
+) -> EnforcementOutcome {
+    let vl = declared_velocity_linear.unwrap_or(0.0);
+    let va = declared_velocity_angular.unwrap_or(0.0);
+    enforce_command(policy, vl, va, None, &[])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,6 +592,10 @@ mod tests {
             let _ = enforce_invocation(&p, Some(1.0), Some(0.5));
         }
         let elapsed = start.elapsed();
+        eprintln!(
+            "bench: enforce_invocation x10_000 = {elapsed:?} (~{} ns/call)",
+            elapsed.as_nanos() / 10_000
+        );
         assert!(
             elapsed < std::time::Duration::from_millis(100),
             "enforce_invocation x10k should be << 100 ms, took {elapsed:?}"
