@@ -5,6 +5,19 @@ use std::time::Duration;
 
 use roz_core::wal::WalEntry;
 
+/// Running-total `SQLite` key (`worker_state` K/V) for telemetry buffer bytes.
+/// Stored as big-endian 8-byte `i64` payload. Read/written atomically inside the
+/// same transaction as every `append_telemetry_frame` / `ack_telemetry_up_to` /
+/// `enforce_fifo_quota` call — avoids an O(N) `SELECT SUM(size_bytes)` on the
+/// 100 Hz append hot path (24-RESEARCH.md §Pitfall 2).
+const TELEMETRY_BYTES_STATE_KEY: &str = "telemetry_bytes";
+
+/// FS-02 default byte quota (50 MB). Env override is out of scope for Plan 24-03.
+pub const DEFAULT_TELEMETRY_BYTE_QUOTA: i64 = 50 * 1024 * 1024;
+
+/// FS-02 default TTL (24 h). Frames older than this are evicted regardless of size.
+pub const DEFAULT_TELEMETRY_TTL_SECS: i64 = 24 * 60 * 60;
+
 /// `SQLite` WAL-mode database for crash recovery.
 ///
 /// Stores WAL entries, worker state K/V pairs, and an idempotency cache.
@@ -194,6 +207,53 @@ impl WalStore {
         // Saturating cast: rusqlite exposes `seq` as `i64`; negative values are
         // impossible because every write path only increments from 1.
         Ok(u64::try_from(row).unwrap_or(u64::MAX))
+    }
+
+    /// Append a telemetry frame to the store-and-forward buffer. RED-phase stub.
+    ///
+    /// # Errors
+    /// Propagates `rusqlite::Error` once implemented.
+    pub fn append_telemetry_frame(
+        &self,
+        _worker_id: &str,
+        _frame_type: &str,
+        _payload: &[u8],
+    ) -> Result<i64, rusqlite::Error> {
+        todo!("Plan 24-03 Task 1 GREEN — append_telemetry_frame not yet implemented")
+    }
+
+    /// Read the running-total byte counter. RED-phase stub.
+    ///
+    /// # Errors
+    /// Propagates `rusqlite::Error` once implemented.
+    pub fn telemetry_bytes_used(&self) -> Result<i64, rusqlite::Error> {
+        todo!("Plan 24-03 Task 1 GREEN — telemetry_bytes_used not yet implemented")
+    }
+
+    /// List unacked telemetry frames ordered by `seq` ascending. RED-phase stub.
+    ///
+    /// # Errors
+    /// Propagates `rusqlite::Error` once implemented.
+    pub fn list_unacked_telemetry(&self) -> Result<Vec<(i64, String, String, String, Vec<u8>)>, rusqlite::Error> {
+        todo!("Plan 24-03 Task 1 GREEN — list_unacked_telemetry not yet implemented")
+    }
+
+    /// Mark every frame with `seq <= up_to_seq` as acked and subtract their
+    /// combined `size_bytes` from the running total. RED-phase stub.
+    ///
+    /// # Errors
+    /// Propagates `rusqlite::Error` once implemented.
+    pub fn ack_telemetry_up_to(&self, _up_to_seq: i64) -> Result<usize, rusqlite::Error> {
+        todo!("Plan 24-03 Task 1 GREEN — ack_telemetry_up_to not yet implemented")
+    }
+
+    /// Enforce the FIFO quota: drop oldest frames until under size + TTL limits.
+    /// Returns the number of frames evicted. RED-phase stub.
+    ///
+    /// # Errors
+    /// Propagates `rusqlite::Error` once implemented.
+    pub fn enforce_fifo_quota(&self, _byte_quota: i64, _ttl_secs: i64) -> Result<usize, rusqlite::Error> {
+        todo!("Plan 24-03 Task 1 GREEN — enforce_fifo_quota not yet implemented")
     }
 }
 
@@ -438,5 +498,143 @@ mod tests {
 
         let cached = store.check_idempotency("expired-key").unwrap();
         assert!(cached.is_none(), "expired entry should return None");
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 24 Plan 03 Task 1: telemetry store-and-forward WAL methods.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn append_telemetry_frame_returns_sequence_number() {
+        let store = WalStore::open(":memory:").unwrap();
+        let seq1 = store.append_telemetry_frame("w1", "state", b"x").unwrap();
+        let seq2 = store.append_telemetry_frame("w1", "state", b"y").unwrap();
+        assert!(seq1 >= 1);
+        assert!(seq2 > seq1);
+    }
+
+    #[test]
+    fn append_telemetry_frame_persists_columns() {
+        let store = WalStore::open(":memory:").unwrap();
+        let seq = store.append_telemetry_frame("worker-42", "state", b"payload").unwrap();
+        let conn = store.conn.lock();
+        let row: (String, String, Vec<u8>, i64, i64) = conn
+            .query_row(
+                "SELECT worker_id, frame_type, payload, size_bytes, CAST(acked AS INTEGER)
+                 FROM telemetry_frames WHERE seq = ?1",
+                params![seq],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "worker-42");
+        assert_eq!(row.1, "state");
+        assert_eq!(row.2, b"payload".to_vec());
+        assert_eq!(row.3, 7);
+        assert_eq!(row.4, 0);
+    }
+
+    #[test]
+    fn telemetry_bytes_used_starts_at_zero() {
+        let store = WalStore::open(":memory:").unwrap();
+        assert_eq!(store.telemetry_bytes_used().unwrap(), 0);
+    }
+
+    #[test]
+    fn append_telemetry_frame_updates_running_total() {
+        let store = WalStore::open(":memory:").unwrap();
+        store.append_telemetry_frame("w", "state", &vec![0u8; 100]).unwrap();
+        store.append_telemetry_frame("w", "state", &vec![0u8; 200]).unwrap();
+        assert_eq!(store.telemetry_bytes_used().unwrap(), 300);
+    }
+
+    #[test]
+    fn telemetry_bytes_used_survives_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("wal.db");
+        let path_str = path.to_str().unwrap();
+        {
+            let store = WalStore::open(path_str).unwrap();
+            store.append_telemetry_frame("w", "state", &vec![0u8; 500]).unwrap();
+        }
+        let store = WalStore::open(path_str).unwrap();
+        assert_eq!(store.telemetry_bytes_used().unwrap(), 500);
+    }
+
+    #[test]
+    fn list_unacked_telemetry_ordered_by_seq_skips_acked() {
+        let store = WalStore::open(":memory:").unwrap();
+        let s1 = store.append_telemetry_frame("w", "state", b"a").unwrap();
+        let _s2 = store.append_telemetry_frame("w", "state", b"b").unwrap();
+        let s3 = store.append_telemetry_frame("w", "state", b"c").unwrap();
+        store.ack_telemetry_up_to(s1).unwrap();
+        let rows = store.list_unacked_telemetry().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].0 < s3);
+        assert_eq!(rows[0].4, b"b".to_vec());
+        assert_eq!(rows[1].0, s3);
+        assert_eq!(rows[1].4, b"c".to_vec());
+    }
+
+    #[test]
+    fn ack_telemetry_up_to_decrements_counter() {
+        let store = WalStore::open(":memory:").unwrap();
+        let s1 = store.append_telemetry_frame("w", "state", &vec![0u8; 100]).unwrap();
+        store.append_telemetry_frame("w", "state", &vec![0u8; 100]).unwrap();
+        assert_eq!(store.telemetry_bytes_used().unwrap(), 200);
+        store.ack_telemetry_up_to(s1).unwrap();
+        assert_eq!(store.telemetry_bytes_used().unwrap(), 100);
+    }
+
+    #[test]
+    fn enforce_fifo_quota_noop_under_limit() {
+        let store = WalStore::open(":memory:").unwrap();
+        store
+            .append_telemetry_frame("w", "state", &vec![0u8; 1_000_000])
+            .unwrap();
+        let dropped = store
+            .enforce_fifo_quota(DEFAULT_TELEMETRY_BYTE_QUOTA, DEFAULT_TELEMETRY_TTL_SECS)
+            .unwrap();
+        assert_eq!(dropped, 0);
+        assert_eq!(store.telemetry_bytes_used().unwrap(), 1_000_000);
+    }
+
+    #[test]
+    fn enforce_fifo_quota_evicts_over_byte_limit() {
+        let store = WalStore::open(":memory:").unwrap();
+        // 10 frames of 1 MB each = 10 MB total. Quota = 5 MB.
+        for _ in 0..10 {
+            store
+                .append_telemetry_frame("w", "state", &vec![0u8; 1_000_000])
+                .unwrap();
+        }
+        let dropped = store.enforce_fifo_quota(5_000_000, DEFAULT_TELEMETRY_TTL_SECS).unwrap();
+        assert!(dropped > 0);
+        assert!(
+            store.telemetry_bytes_used().unwrap() <= 5_000_000,
+            "post-eviction total {} must be <= 5 MB quota",
+            store.telemetry_bytes_used().unwrap()
+        );
+    }
+
+    #[test]
+    fn enforce_fifo_quota_evicts_ttl_expired() {
+        let store = WalStore::open(":memory:").unwrap();
+        let seq = store.append_telemetry_frame("w", "state", &vec![0u8; 100]).unwrap();
+        // Force the row's ts to 25 h ago
+        let stale_ts = (Utc::now() - chrono::Duration::hours(25)).to_rfc3339();
+        store
+            .conn
+            .lock()
+            .execute(
+                "UPDATE telemetry_frames SET ts = ?1 WHERE seq = ?2",
+                params![stale_ts, seq],
+            )
+            .unwrap();
+        let dropped = store
+            .enforce_fifo_quota(DEFAULT_TELEMETRY_BYTE_QUOTA, DEFAULT_TELEMETRY_TTL_SECS)
+            .unwrap();
+        assert_eq!(dropped, 1);
+        let remaining = store.list_unacked_telemetry().unwrap();
+        assert!(remaining.is_empty());
     }
 }
