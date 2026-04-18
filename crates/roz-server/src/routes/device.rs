@@ -481,6 +481,28 @@ mod tests {
         let err = serde_json::from_value::<RotateKeyRequest>(missing_version).expect_err("should reject");
         let _ = err;
     }
+
+    // Phase 24 Plan 24-06 Task 3 — clear-failsafe request/response shape.
+    // Impl lands in the GREEN commit.
+    #[test]
+    fn clear_failsafe_request_deserializes_worker_id_only() {
+        let json = serde_json::json!({ "worker_id": "host1" });
+        let req: ClearFailsafeRequest = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(req.worker_id, "host1");
+        assert!(req.reason.is_none());
+    }
+
+    #[test]
+    fn clear_failsafe_response_json_shape() {
+        let corr = uuid::Uuid::nil();
+        let resp = ClearFailsafeResponse {
+            cleared_at: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap(),
+            correlation_id: corr,
+        };
+        let v = serde_json::to_value(&resp).expect("serialize");
+        assert!(v.get("cleared_at").is_some(), "response must carry cleared_at");
+        assert_eq!(v.get("correlation_id").and_then(serde_json::Value::as_str), Some("00000000-0000-0000-0000-000000000000"));
+    }
 }
 
 // ===========================================================================
