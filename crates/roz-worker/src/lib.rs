@@ -37,6 +37,7 @@ pub mod signing_key;
 pub mod spatial_bridge;
 pub mod telemetry;
 pub mod telemetry_backpressure;
+pub mod telemetry_replay;
 pub mod transport_nats;
 pub mod trust;
 pub mod turn_flush;
