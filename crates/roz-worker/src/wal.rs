@@ -52,6 +52,24 @@ impl WalStore {
             CREATE TABLE IF NOT EXISTS signing_sequence_counter (
                 key_version INTEGER PRIMARY KEY,
                 seq         INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS telemetry_frames (
+                seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+                worker_id   TEXT NOT NULL,
+                ts          TEXT NOT NULL,
+                frame_type  TEXT NOT NULL,
+                payload     BLOB NOT NULL,
+                size_bytes  INTEGER NOT NULL,
+                acked       BOOLEAN DEFAULT FALSE
+            );
+
+            CREATE TABLE IF NOT EXISTS task_checkpoints (
+                checkpoint_id TEXT PRIMARY KEY,
+                task_id       TEXT NOT NULL,
+                step_counter  INTEGER NOT NULL,
+                snapshot_json BLOB NOT NULL,
+                created_at    TEXT NOT NULL
             );",
         )?;
 
