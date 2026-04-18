@@ -15,6 +15,7 @@ use roz_core::safety::SafetyLevel;
 use roz_core::tasks::{SpawnReply, SpawnRequest};
 use roz_nats::dispatch::{INTERNAL_TASK_STATUS_SUBJECT_PREFIX, TaskStatusEvent};
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use crate::signing_gate::SigningGate;
 
@@ -40,9 +41,9 @@ pub fn spawn_all(
         pool.clone(),
         restate_ingress_url,
         http_client,
-        signing_gate,
+        signing_gate.clone(),
     ));
-    tokio::spawn(spawn_task_status_handler(nats, pool));
+    tokio::spawn(spawn_task_status_handler(nats, pool, signing_gate));
 }
 
 /// Send an error string as the NATS reply so the caller does not time out.
@@ -332,7 +333,14 @@ async fn spawn_task_handler(
     tracing::info!(%subject, "internal NATS handler exiting");
 }
 
-async fn spawn_task_status_handler(nats: NatsClient, pool: PgPool) {
+/// Subscribe to `roz.internal.tasks.status.*` worker→server status events and
+/// apply each one to Postgres after a mandatory [`SigningGate::verify_inbound`]
+/// gate when signing is wired (Phase 23 Plan 23-11, FS-04).
+///
+/// When `signing_gate` is `None` (tests only), verification is skipped and
+/// events flow directly into [`apply_task_status_event`] — matches the
+/// legacy unsigned path. In production the gate is always `Some`.
+async fn spawn_task_status_handler(nats: NatsClient, pool: PgPool, signing_gate: Option<Arc<SigningGate>>) {
     let subject = format!("{INTERNAL_TASK_STATUS_SUBJECT_PREFIX}.*");
     let mut sub = match nats.subscribe(subject.clone()).await {
         Ok(sub) => sub,
@@ -345,11 +353,118 @@ async fn spawn_task_status_handler(nats: NatsClient, pool: PgPool) {
     tracing::info!(%subject, "task status handler ready");
 
     while let Some(msg) = sub.next().await {
-        match serde_json::from_slice::<TaskStatusEvent>(&msg.payload) {
-            Ok(event) => apply_task_status_event(&pool, &event).await,
-            Err(error) => tracing::warn!(%error, "failed to decode task status event"),
+        handle_task_status_message(&pool, signing_gate.as_deref(), &msg).await;
+    }
+}
+
+/// Process a single `roz.internal.tasks.status.{task_id}` NATS message.
+///
+/// FS-04 ordering invariant: the DB *lookup* for [`InboundContext`] is a
+/// read; [`SigningGate::verify_inbound`] is called before any DB *write*
+/// path inside [`apply_task_status_event`]. Verify failures in Strict
+/// drop the message before deserialization or commit.
+async fn handle_task_status_message(pool: &PgPool, signing_gate: Option<&SigningGate>, msg: &async_nats::Message) {
+    let Some(task_id) = parse_task_id_from_subject(msg.subject.as_str()) else {
+        return;
+    };
+
+    if verify_task_status_if_enabled(pool, signing_gate, msg, task_id)
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    match serde_json::from_slice::<TaskStatusEvent>(&msg.payload) {
+        Ok(event) => apply_task_status_event(pool, &event).await,
+        Err(error) => tracing::warn!(%error, "failed to decode task status event"),
+    }
+}
+
+/// Extract `{task_id}` from subject shape
+/// `roz.internal.tasks.status.{task_id}`. Returns `None` (with a `warn!`)
+/// when the subject prefix or UUID shape is unexpected — drops the message
+/// without side effects.
+fn parse_task_id_from_subject(subject: &str) -> Option<Uuid> {
+    let prefix = format!("{INTERNAL_TASK_STATUS_SUBJECT_PREFIX}.");
+    let Some(suffix) = subject.strip_prefix(&prefix) else {
+        tracing::warn!(%subject, "task status message has unexpected subject prefix");
+        return None;
+    };
+    match suffix.parse::<Uuid>() {
+        Ok(id) => Some(id),
+        Err(error) => {
+            tracing::warn!(%error, %subject, "task status subject has non-UUID task_id");
+            None
         }
     }
+}
+
+/// Run [`SigningGate::verify_inbound`] when signing is wired.
+///
+/// Derives [`InboundContext`] from a Postgres lookup of the task row —
+/// NOT from the payload's signed fields — so the cross-host-swap check
+/// added in Plan 23-06 remains non-tautological (a worker that forges
+/// `envelope.host_id` cannot smuggle through because the DB-trusted
+/// `host_id` is compared against the signed value inside
+/// `verify_inbound`).
+///
+/// Fail-closed policy: if the task row is missing, load errors out, or
+/// the task has no assigned `host_id`, the message is dropped.
+/// Constructing an `InboundContext` from envelope-claimed IDs would
+/// silently bypass the 23-06 cross-host mitigation, so we do not fall
+/// back to that path. Audit writes + failure-subject publishes in this
+/// branch are deferred: they require a trusted `host_id`, which is
+/// precisely what we could not establish.
+///
+/// Returns `Err(())` when the message must be dropped (verify failed,
+/// context could not be built). Returns `Ok(())` when either signing
+/// is disabled or verification succeeded.
+async fn verify_task_status_if_enabled(
+    pool: &PgPool,
+    signing_gate: Option<&SigningGate>,
+    msg: &async_nats::Message,
+    task_id: Uuid,
+) -> Result<(), ()> {
+    let Some(gate) = signing_gate else {
+        return Ok(());
+    };
+
+    let task_row = match roz_db::tasks::get_by_id(pool, task_id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            tracing::warn!(%task_id, "task status for unknown task_id; dropping");
+            return Err(());
+        }
+        Err(error) => {
+            tracing::error!(%error, %task_id, "failed to load task for verify context");
+            return Err(());
+        }
+    };
+    let Some(host_id) = task_row.host_id else {
+        tracing::warn!(
+            %task_id,
+            "task has no assigned host; cannot build InboundContext for verify, dropping"
+        );
+        return Err(());
+    };
+    let ctx = crate::signing_gate::InboundContext {
+        tenant_id: task_row.tenant_id,
+        host_id,
+    };
+
+    if let Err(error) = gate.verify_inbound(msg.headers.as_ref(), &msg.payload, ctx).await {
+        // In Strict, verify_inbound returns Err; in Off/Audit it returns Ok
+        // and we never reach this branch. The gate has already written the
+        // audit row and published the failure subjects internally.
+        tracing::error!(
+            %error,
+            %task_id,
+            "inbound task-status signature verification failed; dropping"
+        );
+        return Err(());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
