@@ -771,4 +771,78 @@ mod tests {
         };
         assert_eq!(canonical_event_type_name(&loaded), "skill_loaded");
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 24 — FS-01 / FS-03 — SafetyViolation / RecoveryPending
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn safety_violation_serde_roundtrip() {
+        let ev = SessionEvent::SafetyViolation {
+            policy_id: "11111111-1111-1111-1111-111111111111".to_string(),
+            violation_kind: "geofence_breach".to_string(),
+            enforcement_action: "halt".to_string(),
+            details: serde_json::json!({"lat": 40.7, "lon": -74.0}),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        let parsed: SessionEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SessionEvent::SafetyViolation {
+                policy_id,
+                violation_kind,
+                enforcement_action,
+                details,
+            } => {
+                assert_eq!(policy_id, "11111111-1111-1111-1111-111111111111");
+                assert_eq!(violation_kind, "geofence_breach");
+                assert_eq!(enforcement_action, "halt");
+                assert_eq!(details["lat"], serde_json::json!(40.7));
+            }
+            other => panic!("expected SafetyViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recovery_pending_serde_roundtrip() {
+        let ev = SessionEvent::RecoveryPending {
+            task_id: "task-42".to_string(),
+            checkpoint_id: "22222222-2222-2222-2222-222222222222".to_string(),
+            reason: "checkpoint_stale".to_string(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        let parsed: SessionEvent = serde_json::from_str(&json).unwrap();
+        match parsed {
+            SessionEvent::RecoveryPending {
+                task_id,
+                checkpoint_id,
+                reason,
+            } => {
+                assert_eq!(task_id, "task-42");
+                assert_eq!(checkpoint_id, "22222222-2222-2222-2222-222222222222");
+                assert_eq!(reason, "checkpoint_stale");
+            }
+            other => panic!("expected RecoveryPending, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn canonical_name_safety_violation() {
+        let ev = SessionEvent::SafetyViolation {
+            policy_id: "p".to_string(),
+            violation_kind: "limit_exceeded".to_string(),
+            enforcement_action: "clamp".to_string(),
+            details: serde_json::json!({}),
+        };
+        assert_eq!(canonical_event_type_name(&ev), "safety_violation");
+    }
+
+    #[test]
+    fn canonical_name_recovery_pending() {
+        let ev = SessionEvent::RecoveryPending {
+            task_id: "t".to_string(),
+            checkpoint_id: "c".to_string(),
+            reason: "r".to_string(),
+        };
+        assert_eq!(canonical_event_type_name(&ev), "recovery_pending");
+    }
 }
