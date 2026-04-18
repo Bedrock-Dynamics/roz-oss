@@ -1,5 +1,150 @@
-//! Policy cache (moka TTL) + hot-policy container (ArcSwap) for the worker
-//! (FS-01, D-04). TDD RED stub — implementations land in the GREEN commit.
+//! Policy cache (moka TTL) + hot-policy container (ArcSwap) for the worker (FS-01, D-04).
+//!
+//! Two separate structures serve two separate consumers:
+//! - [`PolicyCache`]: async-friendly LRU keyed by policy UUID, 30 s TTL per D-04. Serves
+//!   the pull-at-task-start path — worker looks up `invocation.policy_id` and either hits
+//!   the cache or fetches from the DB.
+//! - [`HotPolicy`]: single `Arc<ArcSwap<PolicyV1>>` read lock-free by the copper 100 Hz
+//!   safety filter (Plan 24-05). Every push on `roz.policy.{worker_id}` updates BOTH — the
+//!   cache by UUID and the hot pointer for the currently-active policy.
+//!
+//! Pattern source: 24-RESEARCH.md §Pattern 2 (moka) + §Pattern 1 (ArcSwap). Precedent:
+//! Phase 23 verifying-key cache in `crates/roz-server/src/signing_gate.rs:102-107`, and
+//! the lock-free `ControllerState` pointer in `crates/roz-copper/src/handle.rs:47`.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use arc_swap::ArcSwap;
+use moka::future::Cache;
+use uuid::Uuid;
+
+use crate::policy_enforcement::{
+    AccelerationLimits, DeadmanTimers, EnforcementMode, ForceLimits, OnBreachAction, PolicyLimits, PolicyV1,
+    VelocityLimits,
+};
+
+/// 30 s TTL for policy cache entries (D-04 max staleness before stale-audit path fires).
+pub const POLICY_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Generous upper bound per Assumption A8 — far exceeds any single-worker policy count.
+pub const POLICY_CACHE_CAPACITY: u64 = 256;
+
+/// Moka-backed TTL cache keyed by policy UUID. Clone to share across tokio tasks —
+/// moka's internal handle is `Arc`-shared so `Clone` is cheap.
+#[derive(Clone)]
+pub struct PolicyCache {
+    inner: Cache<Uuid, Arc<PolicyV1>>,
+}
+
+impl PolicyCache {
+    /// Construct an empty cache with the canonical 30 s TTL.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_ttl(POLICY_CACHE_TTL)
+    }
+
+    /// Construct a cache with an explicit TTL. Primarily a test seam — the
+    /// production path always uses [`PolicyCache::new`] (30 s TTL per D-04).
+    #[must_use]
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            inner: Cache::builder()
+                .time_to_live(ttl)
+                .max_capacity(POLICY_CACHE_CAPACITY)
+                .build(),
+        }
+    }
+
+    /// Fetch a policy by UUID. Returns `None` on miss or expiry.
+    pub async fn get(&self, policy_id: &Uuid) -> Option<Arc<PolicyV1>> {
+        self.inner.get(policy_id).await
+    }
+
+    /// Insert or replace a policy. Returns the inserted `Arc<PolicyV1>`.
+    pub async fn insert(&self, policy_id: Uuid, policy: PolicyV1) -> Arc<PolicyV1> {
+        let arc = Arc::new(policy);
+        self.inner.insert(policy_id, Arc::clone(&arc)).await;
+        arc
+    }
+
+    /// Test-helper / diagnostic: how many entries are currently resident.
+    #[must_use]
+    pub fn entry_count(&self) -> u64 {
+        self.inner.entry_count()
+    }
+}
+
+impl Default for PolicyCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Lock-free container for the currently-active worker policy. Read by the
+/// copper 100 Hz safety filter (Plan 24-05) via `load()` — sub-nanosecond on
+/// x86; no syscall, no allocation on the hot path.
+#[derive(Clone)]
+pub struct HotPolicy {
+    inner: Arc<ArcSwap<PolicyV1>>,
+}
+
+impl HotPolicy {
+    /// Wrap an existing policy.
+    #[must_use]
+    pub fn new(policy: PolicyV1) -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::from_pointee(policy)),
+        }
+    }
+
+    /// Conservative boot-time default: `enforcement_mode=halt`, tight limits,
+    /// empty geofences/interlocks, 5 s deadman-to-halt. Used before the first
+    /// push on `roz.policy.{worker_id}` arrives.
+    #[must_use]
+    pub fn permissive() -> Self {
+        Self::new(PolicyV1 {
+            policy_id: Uuid::nil(),
+            version: 1,
+            enforcement_mode: EnforcementMode::Halt,
+            limits: PolicyLimits {
+                max_velocity: VelocityLimits {
+                    linear_m_per_s: 1.0,
+                    angular_rad_per_s: 0.5,
+                },
+                max_acceleration: AccelerationLimits {
+                    linear_m_per_s2: 1.0,
+                    angular_rad_per_s2: 0.5,
+                },
+                max_force: ForceLimits { newtons: 25.0 },
+                joint_limits: Vec::new(),
+            },
+            geofences: Vec::new(),
+            interlocks: Vec::new(),
+            deadman_timers: DeadmanTimers {
+                command_timeout_ms: 5000,
+                on_expire: OnBreachAction::Halt,
+            },
+        })
+    }
+
+    /// Swap in a new policy. Sub-microsecond; reads are not blocked.
+    pub fn store(&self, policy: PolicyV1) {
+        self.inner.store(Arc::new(policy));
+    }
+
+    /// Lock-free read of the current policy. Returns a guard that derefs to
+    /// `Arc<PolicyV1>`; copper holds it for the duration of one tick.
+    pub fn load(&self) -> arc_swap::Guard<Arc<PolicyV1>> {
+        self.inner.load()
+    }
+}
+
+impl Default for HotPolicy {
+    fn default() -> Self {
+        Self::permissive()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -10,9 +155,7 @@ mod tests {
     use uuid::Uuid;
 
     fn sample_policy(id: Uuid) -> PolicyV1 {
-        use crate::policy_enforcement::{
-            AccelerationLimits, DeadmanTimers, ForceLimits, PolicyLimits, VelocityLimits,
-        };
+        use crate::policy_enforcement::{AccelerationLimits, DeadmanTimers, ForceLimits, PolicyLimits, VelocityLimits};
         PolicyV1 {
             policy_id: id,
             version: 1,
@@ -64,10 +207,7 @@ mod tests {
         cache.insert(id, sample_policy(id)).await;
         assert!(cache.get(&id).await.is_some(), "fresh entry should hit");
         tokio::time::sleep(Duration::from_millis(250)).await;
-        assert!(
-            cache.get(&id).await.is_none(),
-            "entry should be expired after 2.5x TTL"
-        );
+        assert!(cache.get(&id).await.is_none(), "entry should be expired after 2.5x TTL");
     }
 
     #[tokio::test]
