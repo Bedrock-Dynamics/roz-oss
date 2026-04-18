@@ -207,6 +207,72 @@ mod tests {
     }
 
     #[test]
+    fn open_creates_telemetry_frames_table() {
+        let store = WalStore::open(":memory:").unwrap();
+        let conn = store.conn.lock();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM telemetry_frames", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn open_creates_task_checkpoints_table() {
+        let store = WalStore::open(":memory:").unwrap();
+        let conn = store.conn.lock();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM task_checkpoints", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn telemetry_frames_schema_matches_spec() {
+        let store = WalStore::open(":memory:").unwrap();
+        let conn = store.conn.lock();
+        let mut stmt = conn.prepare("PRAGMA table_info('telemetry_frames')").unwrap();
+        let cols: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            cols,
+            vec![
+                ("seq".into(), "INTEGER".into()),
+                ("worker_id".into(), "TEXT".into()),
+                ("ts".into(), "TEXT".into()),
+                ("frame_type".into(), "TEXT".into()),
+                ("payload".into(), "BLOB".into()),
+                ("size_bytes".into(), "INTEGER".into()),
+                ("acked".into(), "BOOLEAN".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn task_checkpoints_schema_matches_spec() {
+        let store = WalStore::open(":memory:").unwrap();
+        let conn = store.conn.lock();
+        let mut stmt = conn.prepare("PRAGMA table_info('task_checkpoints')").unwrap();
+        let cols: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            cols,
+            vec![
+                ("checkpoint_id".into(), "TEXT".into()),
+                ("task_id".into(), "TEXT".into()),
+                ("step_counter".into(), "INTEGER".into()),
+                ("snapshot_json".into(), "BLOB".into()),
+                ("created_at".into(), "TEXT".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn append_and_unacked_roundtrip() {
         let store = WalStore::open(":memory:").unwrap();
         let entry = WalEntry::AdapterTransition {
