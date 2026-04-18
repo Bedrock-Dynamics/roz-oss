@@ -3,6 +3,8 @@ use axum::Json;
 use axum::extract::Path;
 use axum::http::StatusCode;
 use roz_core::auth::AuthIdentity;
+use roz_nats::Subjects;
+use roz_nats::dispatch::publish_signed;
 use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
@@ -10,6 +12,7 @@ use uuid::Uuid;
 use crate::error::AppError;
 use crate::extractors::pagination::ValidatedPagination;
 use crate::middleware::tx::Tx;
+use crate::signing_gate::SigningGate;
 
 #[derive(Deserialize)]
 pub struct CreatePolicyRequest {
@@ -129,9 +132,102 @@ pub async fn delete(
 }
 
 // ===========================================================================
-// Signed policy push (FS-01, D-04) — TDD RED stub for Plan 24-02 Task 3.
-// Implementation lands in the GREEN commit.
+// Signed policy push (FS-01, D-04)
 // ===========================================================================
+
+/// All failure modes surfaced by [`publish_policy_to_workers`].
+#[derive(Debug, thiserror::Error)]
+pub enum PublishPolicyError {
+    /// The policy row could not be serialized for transport.
+    #[error("serialize policy row: {0}")]
+    Serialize(#[from] serde_json::Error),
+    /// Caller supplied workers to fan out to but no NATS client is configured.
+    /// Operator reconciles by re-CRUD once the transport is reachable (D-04).
+    #[error("NATS client not configured; policy push unavailable")]
+    NatsClientMissing,
+    /// Caller supplied workers to fan out to but no SigningGate is available.
+    /// Every policy push MUST be signed (D-12) — no unsigned fallback.
+    #[error("SigningGate not configured; policy push cannot be signed")]
+    SigningGateMissing,
+}
+
+/// Publish a [`roz_db::safety_policies::SafetyPolicyRow`] to each bound worker
+/// via the Phase 23 signed envelope.
+///
+/// - Subject: `roz.policy.{worker_id}` (FS-01 D-04, subject builder
+///   `Subjects::policy` added in Plan 24-01).
+/// - Signing: [`SigningGate::sign_outbound`] with `direction=ServerToWorker`
+///   (D-12). There is no unsigned fallback.
+///
+/// The helper is idempotent per worker — duplicate pushes are suppressed at
+/// the worker cache layer (30 s TTL + version check, added in Plan 24-02's
+/// `PolicyCache`).
+///
+/// Per-worker failures are logged via `tracing::warn!` but do NOT abort the
+/// overall fan-out; the operator reconciles stragglers via re-CRUD or the
+/// pull-at-task-start path (D-04).
+///
+/// This helper is deliberately NOT yet wired into the `create` / `update`
+/// handlers — that lands in Plan 24-05 Task 4 (deferred).
+///
+/// # Errors
+///
+/// - [`PublishPolicyError::Serialize`] when the row cannot be serialized.
+/// - [`PublishPolicyError::NatsClientMissing`] / [`PublishPolicyError::SigningGateMissing`]
+///   when callers supply workers to fan out to but the transport / signer
+///   dependency is absent.
+#[tracing::instrument(
+    level = "info",
+    skip(nats, gate, policy),
+    fields(policy_id = %policy.id, tenant_id = %policy.tenant_id, worker_count = worker_ids.len())
+)]
+pub async fn publish_policy_to_workers(
+    nats: Option<&async_nats::Client>,
+    gate: Option<&SigningGate>,
+    policy: &roz_db::safety_policies::SafetyPolicyRow,
+    worker_ids: &[(Uuid, String)],
+) -> Result<(), PublishPolicyError> {
+    if worker_ids.is_empty() {
+        tracing::debug!("no workers bound to tenant; policy push skipped");
+        return Ok(());
+    }
+
+    let nats = nats.ok_or(PublishPolicyError::NatsClientMissing)?;
+    let gate = gate.ok_or(PublishPolicyError::SigningGateMissing)?;
+
+    let payload = serde_json::to_vec(policy)?;
+    let tenant_id = policy.tenant_id;
+
+    for (host_id, worker_id_str) in worker_ids {
+        let subject = match Subjects::policy(worker_id_str) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(worker_id = %worker_id_str, error = %e, "invalid worker_id; skipping policy push");
+                continue;
+            }
+        };
+        let header = match gate.sign_outbound(tenant_id, *host_id, policy.id, &payload).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(
+                    worker_id = %worker_id_str,
+                    error = %e,
+                    "failed to sign policy push; skipping worker"
+                );
+                continue;
+            }
+        };
+        if let Err(e) = publish_signed(nats, subject, payload.clone(), &header).await {
+            tracing::warn!(
+                worker_id = %worker_id_str,
+                error = %e,
+                "failed to publish policy to worker; operator must re-CRUD"
+            );
+        }
+    }
+
+    Ok(())
+}
 
 #[cfg(test)]
 mod publish_policy_tests {
