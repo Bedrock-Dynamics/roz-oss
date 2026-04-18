@@ -445,6 +445,16 @@ async fn grpc_untrusted_host_rejected() {
         "http://127.0.0.1:1".into(),
         None,
         Arc::new(base_policy()),
+        Arc::new(roz_server::signing_gate::SigningGate::new(
+            pool.clone(),
+            moka::future::Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(std::time::Duration::from_secs(60))
+                .build(),
+            Arc::new(roz_core::key_provider::StaticKeyProvider::from_key_bytes([7u8; 32])),
+            None,
+            roz_server::config::SignedDispatchEnforcement::Off,
+        )),
     );
 
     let mut req = Request::new(CreateTaskRequest {
@@ -499,6 +509,16 @@ async fn grpc_trusted_host_passes_gate() {
         "http://127.0.0.1:1".into(),
         None,
         Arc::new(permissive_policy_for_integration_tests()),
+        Arc::new(roz_server::signing_gate::SigningGate::new(
+            pool.clone(),
+            moka::future::Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(std::time::Duration::from_secs(60))
+                .build(),
+            Arc::new(roz_core::key_provider::StaticKeyProvider::from_key_bytes([7u8; 32])),
+            None,
+            roz_server::config::SignedDispatchEnforcement::Off,
+        )),
     );
 
     let mut req = Request::new(CreateTaskRequest {

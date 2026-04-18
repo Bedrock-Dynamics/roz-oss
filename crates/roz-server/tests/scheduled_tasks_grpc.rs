@@ -128,11 +128,21 @@ async fn start_grpc_server(
     restate_url: String,
 ) -> (TaskServiceClient<tonic::transport::Channel>, SocketAddr) {
     let task_svc = TaskServiceImpl::new(
-        pool,
+        pool.clone(),
         reqwest::Client::new(),
         restate_url,
         None,
         Arc::new(permissive_policy_for_integration_tests()),
+        Arc::new(roz_server::signing_gate::SigningGate::new(
+            pool,
+            moka::future::Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(Duration::from_secs(60))
+                .build(),
+            Arc::new(roz_core::key_provider::StaticKeyProvider::from_key_bytes([7u8; 32])),
+            None,
+            roz_server::config::SignedDispatchEnforcement::Off,
+        )),
     );
     let identity = AuthIdentity::User {
         user_id: format!("user:{tenant_id}"),

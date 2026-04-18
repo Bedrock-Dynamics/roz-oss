@@ -45,6 +45,13 @@ pub struct TaskServiceImpl {
     /// Device trust policy — enforced by `check_host_trust` in `create_task`
     /// BEFORE Restate / NATS dispatch (ENF-01).
     trust_policy: Arc<TrustPolicy>,
+    /// Phase 23 Plan 23-10 (FS-04): signing gate for outbound `invoke.*`
+    /// publishes. The gRPC task dispatch path signs every server→worker
+    /// envelope with `roz-sig-v1`, matching the REST hot path in
+    /// `routes::tasks::create`. An `Arc` is shared with `main.rs` so the
+    /// underlying collaborators (verifying-key cache, key provider,
+    /// enforcement mode) live exactly once per process.
+    signing_gate: Arc<crate::signing_gate::SigningGate>,
 }
 
 impl TaskServiceImpl {
@@ -54,6 +61,7 @@ impl TaskServiceImpl {
         restate_ingress_url: String,
         nats_client: Option<async_nats::Client>,
         trust_policy: Arc<TrustPolicy>,
+        signing_gate: Arc<crate::signing_gate::SigningGate>,
     ) -> Self {
         Self {
             pool,
@@ -61,6 +69,7 @@ impl TaskServiceImpl {
             restate_ingress_url,
             nats_client,
             trust_policy,
+            signing_gate,
         }
     }
 }
@@ -447,13 +456,11 @@ impl TaskService for TaskServiceImpl {
                 restate_ingress_url: &self.restate_ingress_url,
                 nats_client: self.nats_client.as_ref(),
                 trust_policy: self.trust_policy.as_ref(),
-                // Phase 23 Plan 23-06: gRPC task-service path keeps the legacy
-                // unsigned publish for now. `TaskServiceImpl` does not yet own
-                // the signing-gate collaborators (cache + key_provider +
-                // enforcement mode). A follow-up plan plumbs these through;
-                // until then the REST path in `routes/tasks.rs` is the signed
-                // hot path covered by FS-04 acceptance tests.
-                signing_gate: None,
+                // Phase 23 Plan 23-10 (FS-04): gRPC task-service path signs
+                // every outbound `invoke.{host}.{task}` publish with the
+                // shared `SigningGate`. Mirrors the REST hot path in
+                // `routes::tasks::create`.
+                signing_gate: Some(self.signing_gate.as_ref()),
             },
             SharedTaskDispatchRequest {
                 tenant_id,

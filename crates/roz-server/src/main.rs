@@ -88,12 +88,20 @@ fn app(state: AppState) -> Router {
 /// as the outer-most layer below). Each service reads `AuthIdentity` from
 /// request extensions via `crate::grpc::auth_ext::tenant_from_extensions`.
 fn grpc_router(state: &AppState) -> Router {
+    // Phase 23 Plan 23-10 (FS-04): share one signing gate across all three
+    // server-side dispatch paths (REST / gRPC / Restate scheduled /
+    // internal spawn). The gate holds only the collaborators from
+    // AppState (pool + cache + key provider + NATS + enforcement mode),
+    // so `Arc::new(SigningGate::from_app_state(&state))` is cheap and
+    // shares state with the other construction sites below.
+    let signing_gate = Arc::new(roz_server::signing_gate::SigningGate::from_app_state(state));
     let task_svc = roz_server::grpc::tasks::TaskServiceImpl::new(
         state.pool.clone(),
         state.http_client.clone(),
         state.restate_ingress_url.clone(),
         state.nats_client.clone(),
         state.trust_policy.clone(),
+        signing_gate,
     );
     // Build the primary Gemini media backend. If its dedicated HTTP client
     // fails to initialize (for example, transient TLS backend init errors —
@@ -491,12 +499,17 @@ async fn main() {
         use roz_server::restate::scheduled_task_workflow::{ScheduledTaskRuntime, ScheduledTaskWorkflow};
         use roz_server::restate::task_workflow::TaskWorkflow;
 
+        // Phase 23 Plan 23-10 (FS-04): scheduled-task workflow signs every
+        // outbound invoke publish — same shared SigningGate as the gRPC /
+        // REST / internal-spawn paths.
+        let scheduled_signing_gate = Arc::new(roz_server::signing_gate::SigningGate::from_app_state(&state));
         roz_server::restate::scheduled_task_workflow::install_scheduled_task_runtime(ScheduledTaskRuntime {
             pool: state.pool.clone(),
             http_client: state.http_client.clone(),
             restate_ingress_url: state.restate_ingress_url.clone(),
             nats_client: state.nats_client.clone(),
             trust_policy: state.trust_policy.clone(),
+            signing_gate: scheduled_signing_gate,
         });
 
         let endpoint = Endpoint::builder()

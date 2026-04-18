@@ -21,6 +21,11 @@ pub struct ScheduledTaskRuntime {
     pub restate_ingress_url: String,
     pub nats_client: Option<async_nats::Client>,
     pub trust_policy: Arc<TrustPolicy>,
+    /// Phase 23 Plan 23-10 (FS-04): signing gate for outbound `invoke.*`
+    /// publishes from the scheduled-task workflow. Shared `Arc` with the
+    /// gRPC / REST / internal-spawn dispatch paths so every server→worker
+    /// publish carries a `roz-sig-v1` header.
+    pub signing_gate: Arc<crate::signing_gate::SigningGate>,
 }
 
 static SCHEDULED_TASK_RUNTIME: LazyLock<RwLock<Option<Arc<ScheduledTaskRuntime>>>> =
@@ -363,7 +368,10 @@ async fn execute_iteration(
                 restate_ingress_url: &runtime.restate_ingress_url,
                 nats_client: runtime.nats_client.as_ref(),
                 trust_policy: runtime.trust_policy.as_ref(),
-                signing_gate: None,
+                // Phase 23 Plan 23-10 (FS-04): scheduled-task dispatch signs
+                // every outbound `invoke.{host}.{task}` publish with the
+                // shared `SigningGate`.
+                signing_gate: Some(runtime.signing_gate.as_ref()),
             },
             TaskDispatchRequest {
                 tenant_id: input.tenant_id,
