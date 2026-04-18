@@ -20,6 +20,14 @@ pub struct CrashState {
     pub mid_action: bool,
     pub task_id: Option<String>,
     pub last_wal_seq: Option<i64>,
+    /// Last `task_checkpoints.checkpoint_id` (UUID string) — feeds the D-11
+    /// `checkpoint_ok` predicate in Plan 24-09's resume gate.
+    #[serde(default)]
+    pub last_checkpoint_id: Option<String>,
+    /// Unix seconds when the last checkpoint row's `created_at` was written —
+    /// feeds the D-11 `age_ok` predicate (`checkpoint_age < 3600`).
+    #[serde(default)]
+    pub last_checkpoint_ts_unix: Option<i64>,
 }
 
 /// Decision made by the recovery coordinator.

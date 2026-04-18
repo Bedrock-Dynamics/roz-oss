@@ -48,6 +48,8 @@ mod tests {
             mid_action: false,
             task_id: None,
             last_wal_seq: None,
+            last_checkpoint_id: None,
+            last_checkpoint_ts_unix: None,
         };
         let decision = decide_recovery(&state);
         assert_eq!(decision.strategy, RecoveryStrategy::Abort);
@@ -61,6 +63,8 @@ mod tests {
             mid_action: true,
             task_id: Some("task-1".to_string()),
             last_wal_seq: Some(42),
+            last_checkpoint_id: None,
+            last_checkpoint_ts_unix: None,
         };
         let decision = decide_recovery(&state);
         assert_eq!(decision.strategy, RecoveryStrategy::ResumeFromCheckpoint);
@@ -74,6 +78,8 @@ mod tests {
             mid_action: true,
             task_id: Some("task-2".to_string()),
             last_wal_seq: Some(10),
+            last_checkpoint_id: None,
+            last_checkpoint_ts_unix: None,
         };
         let decision = decide_recovery(&state);
         assert_eq!(decision.strategy, RecoveryStrategy::SafeStateWait);
