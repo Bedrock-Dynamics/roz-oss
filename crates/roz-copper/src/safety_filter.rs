@@ -1155,3 +1155,149 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Plan 24-05 Task 3: policy-aware tick extension for SafetyFilterTask.
+// Tests live in their own module so they do not clash with the pre-existing
+// static-limit test module above. The filter's new `policy_clamp` method
+// reads an `Arc<ArcSwap<CopperPolicy>>` lock-free and applies either clamp
+// or halt-to-zero per the policy's enforcement mode.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    use crate::policy::{CopperEnforcementMode, CopperPolicy, new_hot_policy};
+    use arc_swap::ArcSwap;
+    use std::sync::Arc;
+
+    fn filter_with_policy(p: CopperPolicy) -> SafetyFilterTask {
+        let hot = Arc::new(ArcSwap::from_pointee(p));
+        SafetyFilterTask::new(2.0, 0.0, None).unwrap().with_policy(hot)
+    }
+
+    #[test]
+    fn policy_clamp_passthrough_within_limits() {
+        let p = CopperPolicy {
+            max_linear_m_per_s: 3.0,
+            max_angular_rad_per_s: 1.5,
+            max_force_newtons: 50.0,
+            enforcement_mode: CopperEnforcementMode::Clamp,
+        };
+        let f = filter_with_policy(p);
+        let (lin, ang, clamped) = f.policy_clamp(1.5, 0.5);
+        assert!(!clamped);
+        assert!((lin - 1.5).abs() < 1e-9);
+        assert!((ang - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn policy_clamp_projects_under_clamp_mode() {
+        let p = CopperPolicy {
+            max_linear_m_per_s: 3.0,
+            max_angular_rad_per_s: 1.5,
+            max_force_newtons: 50.0,
+            enforcement_mode: CopperEnforcementMode::Clamp,
+        };
+        let f = filter_with_policy(p);
+        let (lin, _, clamped) = f.policy_clamp(5.0, 0.0);
+        assert!(clamped);
+        assert!((lin - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn policy_clamp_zeros_under_halt_mode() {
+        let p = CopperPolicy {
+            max_linear_m_per_s: 3.0,
+            max_angular_rad_per_s: 1.5,
+            max_force_newtons: 50.0,
+            enforcement_mode: CopperEnforcementMode::Halt,
+        };
+        let f = filter_with_policy(p);
+        let (lin, ang, clamped) = f.policy_clamp(5.0, 2.0);
+        assert!(clamped);
+        assert!(lin.abs() < 1e-9);
+        assert!(ang.abs() < 1e-9);
+    }
+
+    #[test]
+    fn policy_clamp_zeros_under_reject_mode() {
+        // v3.0 scope: on the 100 Hz hot path there is no task to reject —
+        // treat reject-mode policy violations the same as halt.
+        let p = CopperPolicy {
+            max_linear_m_per_s: 3.0,
+            max_angular_rad_per_s: 1.5,
+            max_force_newtons: 50.0,
+            enforcement_mode: CopperEnforcementMode::Reject,
+        };
+        let f = filter_with_policy(p);
+        let (lin, ang, clamped) = f.policy_clamp(5.0, 2.0);
+        assert!(clamped);
+        assert!(lin.abs() < 1e-9);
+        assert!(ang.abs() < 1e-9);
+    }
+
+    #[test]
+    fn policy_clamp_without_policy_is_passthrough() {
+        // SafetyFilterTask with no policy attached should be a no-op for
+        // `policy_clamp` — the static-limit path is unaffected.
+        let f = SafetyFilterTask::new(2.0, 0.0, None).unwrap();
+        let (lin, ang, clamped) = f.policy_clamp(10.0, 10.0);
+        assert!(!clamped);
+        assert!((lin - 10.0).abs() < 1e-9);
+        assert!((ang - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn policy_swap_visible_to_reader_immediately() {
+        let hot = new_hot_policy();
+        let f = SafetyFilterTask::new(2.0, 0.0, None)
+            .unwrap()
+            .with_policy(hot.clone());
+        // Default conservative: max_linear 1.0 → clamp at 1.0.
+        let (lin, _, clamped) = f.policy_clamp(2.0, 0.0);
+        assert!(clamped);
+        assert!((lin - 1.0).abs() < 1e-9);
+        // Swap to permissive.
+        hot.store(Arc::new(CopperPolicy {
+            max_linear_m_per_s: 5.0,
+            max_angular_rad_per_s: 2.5,
+            max_force_newtons: 100.0,
+            enforcement_mode: CopperEnforcementMode::Clamp,
+        }));
+        let (lin, _, clamped) = f.policy_clamp(3.0, 0.0);
+        assert!(!clamped);
+        assert!((lin - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn policy_clamp_under_5ms_budget() {
+        // 10 000 iterations under 50 ms → per-call << 5 µs amortised, so the
+        // < 5 ms budget for a single 100 Hz tick has three orders of magnitude
+        // of headroom. Hot-path allocations are forbidden here.
+        let p = CopperPolicy {
+            max_linear_m_per_s: 3.0,
+            max_angular_rad_per_s: 1.5,
+            max_force_newtons: 50.0,
+            enforcement_mode: CopperEnforcementMode::Clamp,
+        };
+        let f = filter_with_policy(p);
+        // warmup
+        for _ in 0..100 {
+            let _ = f.policy_clamp(1.0, 0.5);
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..10_000 {
+            let _ = f.policy_clamp(1.0, 0.5);
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "bench: policy_clamp x10_000 = {elapsed:?} (~{} ns/call)",
+            elapsed.as_nanos() / 10_000
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "10k policy_clamp calls should be << 50 ms, took {elapsed:?}"
+        );
+    }
+}
