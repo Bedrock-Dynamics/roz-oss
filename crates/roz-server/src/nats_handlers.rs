@@ -467,6 +467,72 @@ async fn verify_task_status_if_enabled(
     Ok(())
 }
 
+// ===========================================================================
+// Plan 24-07 Task 3 RED stub: server-side telemetry sequence dedup (FS-02)
+// GREEN commit wires the body.
+// ===========================================================================
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+/// Per-worker monotonic telemetry high-water mark (RED stub).
+pub type TelemetryDedup = Arc<Mutex<HashMap<String, u64>>>;
+
+/// Construct a fresh dedup map (RED stub).
+#[must_use]
+pub fn new_telemetry_dedup() -> TelemetryDedup {
+    todo!("Plan 24-07 Task 3 GREEN: allocate dedup map")
+}
+
+/// Check + advance the dedup high-water mark (RED stub).
+#[must_use]
+pub fn check_telemetry_dedup(_map: &TelemetryDedup, _worker_id: &str, _seq: u64) -> bool {
+    todo!("Plan 24-07 Task 3 GREEN: advance high-water mark on novel seq")
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+
+    fn fresh_map() -> TelemetryDedup {
+        new_telemetry_dedup()
+    }
+
+    #[test]
+    fn dedup_allows_novel_seq() {
+        let m = fresh_map();
+        assert!(check_telemetry_dedup(&m, "w1", 10));
+        assert_eq!(*m.lock().unwrap().get("w1").unwrap(), 10);
+    }
+
+    #[test]
+    fn dedup_drops_replayed_seq() {
+        let m = fresh_map();
+        assert!(check_telemetry_dedup(&m, "w1", 10));
+        assert!(!check_telemetry_dedup(&m, "w1", 10));
+        assert!(!check_telemetry_dedup(&m, "w1", 5));
+        assert_eq!(*m.lock().unwrap().get("w1").unwrap(), 10);
+    }
+
+    #[test]
+    fn dedup_accepts_higher_seq_out_of_order() {
+        let m = fresh_map();
+        assert!(check_telemetry_dedup(&m, "w1", 12));
+        assert!(!check_telemetry_dedup(&m, "w1", 11));
+        assert_eq!(*m.lock().unwrap().get("w1").unwrap(), 12);
+    }
+
+    #[test]
+    fn dedup_state_per_worker_id() {
+        let m = fresh_map();
+        check_telemetry_dedup(&m, "w1", 10);
+        assert!(check_telemetry_dedup(&m, "w2", 5));
+        let guard = m.lock().unwrap();
+        assert_eq!(*guard.get("w1").unwrap(), 10);
+        assert_eq!(*guard.get("w2").unwrap(), 5);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
