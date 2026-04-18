@@ -49,12 +49,28 @@ pub enum DeviceCommand {
     /// immediately use the new key. Manual override of the 90-day auto-rotate
     /// policy (D-07).
     RotateKey,
+    /// Clear a worker's deadman failsafe latch (Phase 24 FS-01 D-02).
+    ///
+    /// After a deadman fire, motion stays latched on the worker per D-02 —
+    /// next valid command does NOT auto-clear. This subcommand issues the
+    /// operator-initiated re-arm: the server signs a `clear_failsafe`
+    /// envelope and publishes it on `cmd.{worker_id}.clear_failsafe`; the
+    /// worker verifies the signature and un-latches.
+    ClearFailsafe {
+        /// Target worker id (matches `ROZ_WORKER_ID` on the device, i.e.
+        /// the registered host name scoped to this tenant).
+        worker_id: String,
+        /// Optional free-text reason recorded in the server audit log.
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 /// Dispatch a `roz device <cmd>` invocation.
 pub async fn execute(cmd: &DeviceCommand) -> Result<()> {
     match cmd {
         DeviceCommand::RotateKey => rotate_key().await,
+        DeviceCommand::ClearFailsafe { worker_id, reason } => clear_failsafe(worker_id, reason.clone()).await,
     }
 }
 
@@ -84,6 +100,26 @@ impl WorkerEnv {
             api_key,
             worker_id,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_failsafe_variant_constructs() {
+        let cmd = DeviceCommand::ClearFailsafe {
+            worker_id: "host1".into(),
+            reason: Some("manual".into()),
+        };
+        match cmd {
+            DeviceCommand::ClearFailsafe { worker_id, reason } => {
+                assert_eq!(worker_id, "host1");
+                assert_eq!(reason.as_deref(), Some("manual"));
+            }
+            DeviceCommand::RotateKey => panic!("wrong variant"),
+        }
     }
 }
 
