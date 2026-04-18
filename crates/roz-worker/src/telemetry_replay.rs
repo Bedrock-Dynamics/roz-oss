@@ -1,11 +1,31 @@
 //! Telemetry replay loop for the FS-02 store-and-forward buffer (Plan 24-07).
 //!
-//! RED stub — Task 2 tests fail via `todo!()` until GREEN lands.
+//! On NATS reconnect, call [`TelemetryReplay::run_once`] to drain
+//! [`WalStore::list_unacked_telemetry`]:
+//!
+//! - Backlog ages < [`LIVE_REPLAY_CUTOFF_SECS`] → replay at ~original rate
+//!   (no aggressive acceleration).
+//! - Backlog ages ≥ [`LIVE_REPLAY_CUTOFF_SECS`] → replay at up to
+//!   [`REPLAY_SPEEDUP_FACTOR`]× the source rate, capped at 500 Hz
+//!   (the [`MIN_REPLAY_INTERVAL_MS`] floor; 24-CONTEXT D-06).
+//!
+//! Every replayed frame is re-signed with a FRESH correlation_id via
+//! [`WorkerSigningContext::sign_outbound_worker`], which also allocates a
+//! fresh monotonic signing sequence number through the WAL. That preserves
+//! the Phase 23 replay-protection linearity across partition boundaries —
+//! the server's dedup path (Plan 24-07 Task 3) compares against
+//! `SignedFields::sequence_number`, not against the original buffered
+//! `telemetry_frames.seq`.
+//!
+//! Jitter budget per 24-CONTEXT D-06: < 10 ms per frame.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use roz_nats::dispatch::publish_signed;
+use roz_nats::subjects::Subjects;
+use uuid::Uuid;
 
 use crate::signing_hooks::WorkerSigningContext;
 use crate::wal::WalStore;
@@ -31,29 +51,127 @@ pub struct TelemetryReplay {
 }
 
 impl TelemetryReplay {
+    /// Construct a replay driver. Both handles are `Arc`-cloned so the caller
+    /// retains ownership for other subsystems.
     #[must_use]
     pub const fn new(wal: Arc<WalStore>, signing_ctx: Arc<WorkerSigningContext>) -> Self {
         Self { wal, signing_ctx }
     }
 
-    #[allow(clippy::unused_async)]
-    pub async fn run_once(&self, _nats: &async_nats::Client, _worker_id: &str) -> anyhow::Result<usize> {
-        todo!("Plan 24-07 Task 2 GREEN: drain WAL buffer into NATS")
+    /// Drain the WAL buffer into NATS, returning the number of frames
+    /// successfully replayed. Stops at the first publish failure: frames
+    /// before the failure are acked; frames after remain unacked for the
+    /// next reconnect.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` on WAL read failures, timestamp-parse failures, or
+    /// signing failures. Pure NATS publish errors are absorbed: the caller
+    /// still observes `Ok(n)` where `n` is the number of frames drained
+    /// before the first failure.
+    pub async fn run_once(&self, nats: &async_nats::Client, worker_id: &str) -> anyhow::Result<usize> {
+        let frames = self
+            .wal
+            .list_unacked_telemetry()
+            .map_err(|e| anyhow::anyhow!("list_unacked_telemetry: {e}"))?;
+        if frames.is_empty() {
+            return Ok(0);
+        }
+        let now = Utc::now();
+        let mut last_ack = 0i64;
+        let mut replayed = 0usize;
+        let total = frames.len();
+
+        for (i, (seq, _w, ts_str, frame_type, payload)) in frames.iter().enumerate() {
+            let subject = match frame_type.as_str() {
+                "state" => Subjects::telemetry_state(worker_id),
+                "sensors" => Subjects::telemetry_sensors(worker_id),
+                other => Subjects::telemetry(worker_id, other),
+            }
+            .map_err(|e| anyhow::anyhow!("invalid subject: {e}"))?;
+
+            let delay = self.compute_delay(ts_str, now)?;
+            if delay.as_millis() > 0 {
+                tokio::time::sleep(delay).await;
+            }
+
+            // Fresh correlation_id per replay — the WAL-allocated signing seq
+            // inside the envelope keeps Phase 23 replay-protection linear
+            // across outages. The server's dedup map (Plan 24-07 Task 3)
+            // compares against `SignedFields::sequence_number`, not the
+            // original buffered `telemetry_frames.seq`.
+            let correlation = Uuid::new_v4();
+            let header = self
+                .signing_ctx
+                .sign_outbound_worker(correlation, payload)
+                .map_err(|e| anyhow::anyhow!("re-sign replay frame: {e}"))?;
+            if let Err(e) = publish_signed(nats, subject, payload.clone(), &header).await {
+                tracing::warn!(
+                    error = %e,
+                    replayed,
+                    remaining = total - i,
+                    "telemetry replay publish failed; stopping drain"
+                );
+                break;
+            }
+            last_ack = *seq;
+            replayed += 1;
+        }
+
+        if last_ack > 0
+            && let Err(e) = self.wal.ack_telemetry_up_to(last_ack)
+        {
+            tracing::error!(error = %e, last_ack, "failed to ack replayed frames");
+        }
+        Ok(replayed)
     }
 
-    pub(crate) fn compute_delay(&self, _ts_str: &str, _now: DateTime<Utc>) -> anyhow::Result<Duration> {
-        todo!("Plan 24-07 Task 2 GREEN: compute rate-limited delay per age band")
+    /// Per-frame pacing delay based on backlog age. Live (< 5 s) pacing uses
+    /// the nominal 10 ms base; stale (≥ 5 s) pacing accelerates 10× but never
+    /// below [`MIN_REPLAY_INTERVAL_MS`] (500 Hz ceiling, 24-CONTEXT D-06).
+    pub(crate) fn compute_delay(&self, ts_str: &str, now: DateTime<Utc>) -> anyhow::Result<Duration> {
+        let ts = DateTime::parse_from_rfc3339(ts_str)
+            .map_err(|e| anyhow::anyhow!("parse rfc3339: {e}"))?
+            .with_timezone(&Utc);
+        let age_secs = (now - ts).num_seconds().max(0);
+        if age_secs < LIVE_REPLAY_CUTOFF_SECS {
+            Ok(Duration::from_millis(BASE_INTERVAL_MS))
+        } else {
+            let sped = BASE_INTERVAL_MS / u64::from(REPLAY_SPEEDUP_FACTOR);
+            Ok(Duration::from_millis(sped.max(MIN_REPLAY_INTERVAL_MS)))
+        }
     }
 
-    // Expose wal for the empty-buffer test.
+    /// Test-only accessor for the underlying WAL store. Exposed for the
+    /// empty-buffer contract test in this module.
+    #[cfg(test)]
     pub(crate) fn wal(&self) -> &Arc<WalStore> {
         &self.wal
     }
+}
 
-    // Silence unused-field warning until GREEN wires the signing ctx.
-    #[allow(dead_code)]
-    fn signing_ctx(&self) -> &Arc<WorkerSigningContext> {
-        &self.signing_ctx
+/// Reconnect-driven replay loop. Drives [`TelemetryReplay::run_once`] each
+/// time `reconnect_notify` fires. Plan 24-09 wires the caller (worker main).
+///
+/// # Errors
+/// Propagates `Err` from `run_once`. Cancellation returns `Ok(())`.
+pub async fn run_telemetry_replay(
+    replay: Arc<TelemetryReplay>,
+    nats: async_nats::Client,
+    worker_id: String,
+    mut reconnect_notify: tokio::sync::mpsc::Receiver<()>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<()> {
+    loop {
+        tokio::select! {
+            Some(()) = reconnect_notify.recv() => {
+                match replay.run_once(&nats, &worker_id).await {
+                    Ok(n) => tracing::info!(replayed = n, "telemetry replay completed"),
+                    Err(e) => tracing::error!(error = %e, "telemetry replay failed"),
+                }
+            }
+            () = cancel.cancelled() => return Ok(()),
+        }
     }
 }
 
@@ -65,7 +183,6 @@ mod tests {
     use parking_lot::RwLock;
     use roz_core::key_provider::StaticKeyProvider;
     use tempfile::TempDir;
-    use uuid::Uuid;
 
     async fn fixture() -> (TempDir, Arc<TelemetryReplay>) {
         let tmp = TempDir::new().unwrap();
