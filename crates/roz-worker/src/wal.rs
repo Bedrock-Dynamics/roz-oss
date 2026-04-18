@@ -765,4 +765,100 @@ mod tests {
         let remaining = store.list_unacked_telemetry().unwrap();
         assert!(remaining.is_empty());
     }
+
+    // ---------------------------------------------------------------------
+    // Phase 24 Plan 04 Task 1: task_checkpoints WAL methods
+    // (append_checkpoint / latest_checkpoint / checkpoint_age_secs).
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn append_checkpoint_persists_row() {
+        let store = WalStore::open(":memory:").unwrap();
+        let ck = store.append_checkpoint("task-1", 5, b"snapshot").unwrap();
+        assert!(!ck.is_empty());
+        let latest = store.latest_checkpoint("task-1").unwrap().unwrap();
+        assert_eq!(latest.0, ck);
+        assert_eq!(latest.2, 5);
+        assert_eq!(latest.3, b"snapshot".to_vec());
+    }
+
+    #[test]
+    fn append_checkpoint_unique_id_per_call() {
+        let store = WalStore::open(":memory:").unwrap();
+        let ck1 = store.append_checkpoint("task-a", 1, b"x").unwrap();
+        let ck2 = store.append_checkpoint("task-b", 1, b"y").unwrap(); // different task
+        assert_ne!(ck1, ck2);
+    }
+
+    #[test]
+    fn append_checkpoint_idempotent_on_duplicate_key() {
+        let store = WalStore::open(":memory:").unwrap();
+        let ck1 = store.append_checkpoint("task-1", 5, b"first").unwrap();
+        let ck2 = store.append_checkpoint("task-1", 5, b"second").unwrap();
+        assert_eq!(
+            ck1, ck2,
+            "duplicate (task_id, step_counter) must return same checkpoint_id"
+        );
+        // First snapshot must be preserved
+        let latest = store.latest_checkpoint("task-1").unwrap().unwrap();
+        assert_eq!(latest.3, b"first".to_vec());
+    }
+
+    #[test]
+    fn append_checkpoint_caches_idempotency_key() {
+        let store = WalStore::open(":memory:").unwrap();
+        let ck = store.append_checkpoint("task-1", 5, b"snapshot").unwrap();
+        let cached = store.check_idempotency("task-1:5").unwrap().unwrap();
+        assert_eq!(String::from_utf8(cached).unwrap(), ck);
+    }
+
+    #[test]
+    fn latest_checkpoint_none_when_missing() {
+        let store = WalStore::open(":memory:").unwrap();
+        assert!(store.latest_checkpoint("unknown").unwrap().is_none());
+    }
+
+    #[test]
+    fn latest_checkpoint_returns_highest_step_counter() {
+        let store = WalStore::open(":memory:").unwrap();
+        store.append_checkpoint("task-x", 1, b"one").unwrap();
+        store.append_checkpoint("task-x", 5, b"five").unwrap();
+        store.append_checkpoint("task-x", 3, b"three").unwrap();
+        let latest = store.latest_checkpoint("task-x").unwrap().unwrap();
+        assert_eq!(latest.2, 5);
+        assert_eq!(latest.3, b"five".to_vec());
+    }
+
+    #[test]
+    fn checkpoint_age_secs_none_when_missing() {
+        let store = WalStore::open(":memory:").unwrap();
+        assert!(store.checkpoint_age_secs("unknown").unwrap().is_none());
+    }
+
+    #[test]
+    fn checkpoint_age_secs_small_for_fresh() {
+        let store = WalStore::open(":memory:").unwrap();
+        store.append_checkpoint("task-1", 1, b"x").unwrap();
+        let age = store.checkpoint_age_secs("task-1").unwrap().unwrap();
+        assert!(age < 3, "fresh checkpoint age should be < 3 s, got {age}");
+    }
+
+    #[test]
+    fn checkpoint_age_secs_reflects_old_rows() {
+        let store = WalStore::open(":memory:").unwrap();
+        let ck = store.append_checkpoint("task-old", 1, b"x").unwrap();
+        // Force created_at to 90 minutes ago
+        let old_ts = (Utc::now() - chrono::Duration::minutes(90)).to_rfc3339();
+        store
+            .conn
+            .lock()
+            .execute(
+                "UPDATE task_checkpoints SET created_at = ?1 WHERE checkpoint_id = ?2",
+                params![old_ts, ck],
+            )
+            .unwrap();
+        let age = store.checkpoint_age_secs("task-old").unwrap().unwrap();
+        assert!(age >= 5400, "90 min row should report ≥ 5400 s age, got {age}");
+        assert!(age < 7000, "should not overshoot 90 min significantly, got {age}");
+    }
 }
