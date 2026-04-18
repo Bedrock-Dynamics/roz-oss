@@ -34,6 +34,7 @@ pub use model_endpoint::{
 pub mod phases;
 pub mod primitives;
 pub mod provenance;
+pub mod reconnect;
 pub mod recording;
 pub mod recovery;
 pub mod safety;
