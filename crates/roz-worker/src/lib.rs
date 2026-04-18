@@ -14,6 +14,7 @@
 pub mod adapter;
 pub mod camera;
 pub mod checkpoint_writer;
+pub mod clear_failsafe;
 pub mod command_watchdog;
 pub mod config;
 pub mod copper_handle;
