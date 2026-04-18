@@ -103,26 +103,6 @@ impl WorkerEnv {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn clear_failsafe_variant_constructs() {
-        let cmd = DeviceCommand::ClearFailsafe {
-            worker_id: "host1".into(),
-            reason: Some("manual".into()),
-        };
-        match cmd {
-            DeviceCommand::ClearFailsafe { worker_id, reason } => {
-                assert_eq!(worker_id, "host1");
-                assert_eq!(reason.as_deref(), Some("manual"));
-            }
-            DeviceCommand::RotateKey => panic!("wrong variant"),
-        }
-    }
-}
-
 async fn rotate_key() -> Result<()> {
     let env = WorkerEnv::from_env()?;
 
@@ -179,4 +159,77 @@ async fn rotate_key() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// POST `/v1/device/clear-failsafe` for the given `worker_id` (Phase 24
+/// FS-01 D-02).
+///
+/// Sends the operator-initiated re-arm over bearer-auth REST; the server
+/// signs the server→worker envelope and publishes to
+/// `cmd.{worker_id}.clear_failsafe`. The worker's subscriber (Plan 24-06
+/// Task 2) verifies the signature and clears the motion latch.
+async fn clear_failsafe(worker_id: &str, reason: Option<String>) -> Result<()> {
+    // Skip the on-disk signing seed load — this request does not ride the
+    // device signing key; bearer auth is sufficient for an operator action.
+    let api_url = std::env::var("ROZ_API_URL")
+        .context("ROZ_API_URL is required (points at the roz-server this host is registered against)")?;
+    let api_key = std::env::var("ROZ_API_KEY")
+        .context("ROZ_API_KEY is required (tenant-scoped API key issued during worker enrollment)")?;
+
+    let http = reqwest::Client::builder()
+        .build()
+        .context("build HTTP client for clear-failsafe")?;
+
+    #[derive(serde::Serialize)]
+    struct Body<'a> {
+        worker_id: &'a str,
+        reason: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Response {
+        cleared_at: chrono::DateTime<chrono::Utc>,
+        correlation_id: uuid::Uuid,
+    }
+
+    let url = format!("{api_url}/v1/device/clear-failsafe");
+    let resp: Response = http
+        .post(&url)
+        .bearer_auth(&api_key)
+        .json(&Body { worker_id, reason })
+        .send()
+        .await
+        .context("POST /v1/device/clear-failsafe")?
+        .error_for_status()
+        .context("clear-failsafe returned non-2xx")?
+        .json()
+        .await
+        .context("parse clear-failsafe response")?;
+
+    eprintln!(
+        "Cleared failsafe on {} at {} (correlation_id={})",
+        worker_id,
+        resp.cleared_at.to_rfc3339(),
+        resp.correlation_id
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_failsafe_variant_constructs() {
+        let cmd = DeviceCommand::ClearFailsafe {
+            worker_id: "host1".into(),
+            reason: Some("manual".into()),
+        };
+        match cmd {
+            DeviceCommand::ClearFailsafe { worker_id, reason } => {
+                assert_eq!(worker_id, "host1");
+                assert_eq!(reason.as_deref(), Some("manual"));
+            }
+            DeviceCommand::RotateKey => panic!("wrong variant"),
+        }
+    }
 }
