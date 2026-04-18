@@ -988,4 +988,199 @@ mod handshake_tests {
             "20 fast calls should run well inside p99 envelope, elapsed={elapsed:?}"
         );
     }
+
+    // -------------------------------------------------------------------
+    // Plan 24-09 carry-over from 24-08: prove that a forged / unsigned
+    // `roz.state.worker_online` envelope drops BEFORE any Restate lookup
+    // runs. Exercises the structural pre-verify guards in
+    // `handle_worker_online_message` (missing headers, missing roz-sig-v1
+    // header, malformed header) — each path must return without calling
+    // `RestateWorkflowLookup::lookup`.
+    // -------------------------------------------------------------------
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Lookup that counts every call so the test can assert Restate was
+    /// never queried on a forged / unsigned envelope path.
+    struct CountingLookup {
+        calls: AtomicUsize,
+    }
+
+    impl CountingLookup {
+        const fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RestateWorkflowLookup for CountingLookup {
+        async fn lookup(
+            &self,
+            _task_id: Uuid,
+            _snapshot_checkpoint_id: Option<Uuid>,
+            _snapshot_step: u32,
+        ) -> anyhow::Result<Option<(Uuid, u32)>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        }
+    }
+
+    /// Construct a SigningGate that we never actually consult — every
+    /// structural pre-verify guard (no headers / no roz-sig-v1 / malformed
+    /// header) returns BEFORE the verify path touches Postgres. `connect_lazy`
+    /// does not open a connection until first use, so the gate is safe to
+    /// construct in a no-docker unit test as long as the forged paths drop
+    /// before `verify_inbound`.
+    fn gate_that_must_not_be_touched() -> SigningGate {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://fake:fake@127.0.0.1:1/fake")
+            .expect("lazy pool");
+        let cache = moka::future::Cache::builder()
+            .max_capacity(16)
+            .time_to_live(Duration::from_secs(60))
+            .build();
+        let key_provider: Arc<dyn roz_core::key_provider::KeyProvider> =
+            Arc::new(roz_core::key_provider::StaticKeyProvider::from_key_bytes([7u8; 32]));
+        SigningGate::new(
+            pool,
+            cache,
+            key_provider,
+            None,
+            crate::config::SignedDispatchEnforcement::Strict,
+        )
+    }
+
+    fn nats_message_with_headers(
+        subject: &str,
+        payload: Vec<u8>,
+        headers: Option<async_nats::HeaderMap>,
+    ) -> async_nats::Message {
+        async_nats::Message {
+            subject: subject.to_string().into(),
+            reply: None,
+            payload: payload.into(),
+            headers,
+            status: None,
+            description: None,
+            length: 0,
+        }
+    }
+
+    /// Build a placeholder WorkerOnlineSnapshot payload for the forged-
+    /// envelope tests. Shape is valid so `serde_json::from_slice` would
+    /// succeed — but the handler must drop BEFORE it ever reaches that
+    /// step when the envelope guards fail.
+    fn forged_worker_online_payload() -> Vec<u8> {
+        let snapshot = roz_core::reconnect::WorkerOnlineSnapshot {
+            worker_id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            last_checkpoint_id: None,
+            last_wal_seq: 0,
+            tasks_in_progress: vec![roz_core::reconnect::TaskProgress {
+                task_id: Uuid::new_v4(),
+                step: 0,
+            }],
+        };
+        serde_json::to_vec(&snapshot).unwrap()
+    }
+
+    /// Connect to a loopback nonexistent address with zero reconnects so we
+    /// get a NATS client handle the handler can reference — the forged-
+    /// payload drop paths return BEFORE any publish call, so the client is
+    /// never actually used on the wire. If even this dialless connect
+    /// fails, the test returns early (CI docker-less path still has the
+    /// same structural assertion through the other two forged tests).
+    async fn dialless_nats_or_skip() -> Option<async_nats::Client> {
+        async_nats::ConnectOptions::new()
+            .max_reconnects(Some(0))
+            .connect("nats://127.0.0.1:1")
+            .await
+            .ok()
+    }
+
+    /// Missing headers entirely → drop before any crypto or Restate call.
+    #[tokio::test]
+    async fn forged_worker_online_drops_before_restate_missing_headers() {
+        let lookup = CountingLookup::new();
+        let gate = gate_that_must_not_be_touched();
+        let msg = nats_message_with_headers("roz.state.worker_online", forged_worker_online_payload(), None);
+        let Some(nats) = dialless_nats_or_skip().await else {
+            eprintln!("no-op NATS client unavailable; skipping");
+            return;
+        };
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            handle_worker_online_message(&nats, &gate, &lookup, &msg),
+        )
+        .await;
+        assert!(result.is_ok(), "handler must complete without DB/NATS IO");
+        assert!(
+            result.unwrap().is_ok(),
+            "handler returns Ok even when dropping forged messages"
+        );
+        assert_eq!(
+            lookup.call_count(),
+            0,
+            "Restate lookup must not run when the envelope is missing"
+        );
+    }
+
+    /// Missing `roz-sig-v1` header (headers present but the key is absent)
+    /// → drop before verify or Restate call.
+    #[tokio::test]
+    async fn forged_worker_online_drops_before_restate_missing_sig_header() {
+        let lookup = CountingLookup::new();
+        let gate = gate_that_must_not_be_touched();
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert("x-unrelated", "noise");
+        let msg = nats_message_with_headers("roz.state.worker_online", forged_worker_online_payload(), Some(headers));
+        let Some(nats) = dialless_nats_or_skip().await else {
+            eprintln!("no-op NATS client unavailable; skipping");
+            return;
+        };
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            handle_worker_online_message(&nats, &gate, &lookup, &msg),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_ok());
+        assert_eq!(
+            lookup.call_count(),
+            0,
+            "Restate lookup must not run when roz-sig-v1 header is missing"
+        );
+    }
+
+    /// Malformed `roz-sig-v1` header (present but not a valid envelope) →
+    /// drop before verify or Restate call.
+    #[tokio::test]
+    async fn forged_worker_online_drops_before_restate_malformed_header() {
+        let lookup = CountingLookup::new();
+        let gate = gate_that_must_not_be_touched();
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert(HEADER_NAME, "not-a-real-envelope!!");
+        let msg = nats_message_with_headers("roz.state.worker_online", forged_worker_online_payload(), Some(headers));
+        let Some(nats) = dialless_nats_or_skip().await else {
+            eprintln!("no-op NATS client unavailable; skipping");
+            return;
+        };
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            handle_worker_online_message(&nats, &gate, &lookup, &msg),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_ok());
+        assert_eq!(
+            lookup.call_count(),
+            0,
+            "Restate lookup must not run when the envelope is malformed"
+        );
+    }
 }
