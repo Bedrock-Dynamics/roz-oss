@@ -1449,6 +1449,11 @@ async fn main() -> Result<()> {
     let relay_config = config.clone();
     let relay_estop_rx = estop_rx.clone();
     let relay_camera_mgr = camera_manager.clone();
+    // Phase 23 FS-04 (plan 23-12): thread the worker signing context into the
+    // session relay so authenticity-bearing runtime_checkpoint + event-envelope
+    // publishes carry a roz-sig-v1 header. `None` falls back to the D-12
+    // unsigned legacy path (pre-rollout workers).
+    let relay_signing_ctx = signing_ctx.clone();
     // C-01 narrowed (plan 15-04 + 15-05): `event_transport` is the single
     // abstracted publish seam. When `--features zenoh` AND the device signing
     // key resolves, we wrap NatsSessionTransport + ZenohSessionTransport in a
@@ -1477,6 +1482,7 @@ async fn main() -> Result<()> {
             relay_estop_rx,
             relay_camera_mgr,
             event_transport,
+            relay_signing_ctx,
         )
         .await
         {

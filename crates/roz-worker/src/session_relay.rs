@@ -53,6 +53,7 @@ use roz_nats::subjects::Subjects;
 
 use crate::camera::CameraManager;
 use crate::config::WorkerConfig;
+use crate::signing_hooks::WorkerSigningContext;
 
 pub(crate) const SESSION_EVENT_PREFIX: &str = "roz.v1";
 const EDGE_MAX_CYCLES: u32 = 20;
@@ -505,6 +506,11 @@ impl StreamingTurnExecutor for EdgeTurnExecutor {
                             _ = interval.tick() => {
                                 let message = serde_json::json!({"type": "keepalive"});
                                 if let Ok(payload) = serde_json::to_vec(&message) {
+                                    // Phase 23 FS-04 (plan 23-12): keepalive is a bare
+                                    // {"type":"keepalive"} heartbeat with no tenant-bearing
+                                    // content; classified as reporting-only per FS-04 and
+                                    // intentionally left unsigned (same rationale as the
+                                    // main.rs worker heartbeat deferred in plan 23-08).
                                     let _ = keepalive_nats.publish(keepalive_subject.clone(), payload.into()).await;
                                 }
                             }
@@ -599,6 +605,7 @@ pub async fn spawn_session_relay(
     estop_rx: tokio::sync::watch::Receiver<bool>,
     camera_manager: Option<Arc<CameraManager>>,
     event_transport: Option<Arc<dyn roz_core::transport::SessionTransport>>,
+    signing_ctx: Option<WorkerSigningContext>,
 ) -> anyhow::Result<()> {
     let subject = format!("session.{worker_id}.*.request");
     let mut sub = nats.subscribe(subject.clone()).await?;
@@ -633,6 +640,7 @@ pub async fn spawn_session_relay(
             let estop_rx_clone = estop_rx.clone();
             let cam_mgr_clone = camera_manager.clone();
             let transport_clone = event_transport.clone();
+            let signing_clone = signing_ctx.clone();
 
             let handle = tokio::spawn(async move {
                 if let Err(e) = handle_edge_session(
@@ -644,6 +652,7 @@ pub async fn spawn_session_relay(
                     estop_rx_clone,
                     cam_mgr_clone,
                     transport_clone,
+                    signing_clone,
                 )
                 .await
                 {
@@ -673,6 +682,7 @@ async fn handle_edge_session(
     estop_rx: tokio::sync::watch::Receiver<bool>,
     camera_manager: Option<Arc<CameraManager>>,
     event_transport: Option<Arc<dyn roz_core::transport::SessionTransport>>,
+    signing_ctx: Option<WorkerSigningContext>,
 ) -> anyhow::Result<()> {
     let response_subject = Subjects::session_response(worker_id, session_id)?;
     let bootstrap = parse_runtime_bootstrap(session_id, &start_msg)?;
@@ -739,6 +749,7 @@ async fn handle_edge_session(
     session_runtime.start_session().await?;
     drain_runtime_events(
         &nats,
+        signing_ctx.as_ref(),
         session_id,
         &response_subject,
         &mut event_rx,
@@ -746,7 +757,14 @@ async fn handle_edge_session(
     )
     .await?;
     let mut checkpoint_bootstrap = session_runtime.export_bootstrap();
-    publish_runtime_checkpoint(&nats, &response_subject, &checkpoint_bootstrap).await?;
+    publish_runtime_checkpoint(
+        &nats,
+        signing_ctx.as_ref(),
+        session_id,
+        &response_subject,
+        &checkpoint_bootstrap,
+    )
+    .await?;
 
     let mut executor = EdgeTurnExecutor {
         config: config.clone(),
@@ -777,6 +795,7 @@ async fn handle_edge_session(
             session_runtime.handle_failure(RuntimeFailureKind::SafetyBlocked);
             drain_runtime_events(
                 &nats,
+                signing_ctx.as_ref(),
                 session_id,
                 &response_subject,
                 &mut event_rx,
@@ -784,7 +803,14 @@ async fn handle_edge_session(
             )
             .await?;
             checkpoint_bootstrap = session_runtime.export_bootstrap();
-            publish_runtime_checkpoint(&nats, &response_subject, &checkpoint_bootstrap).await?;
+            publish_runtime_checkpoint(
+                &nats,
+                signing_ctx.as_ref(),
+                session_id,
+                &response_subject,
+                &checkpoint_bootstrap,
+            )
+            .await?;
             session_closed = true;
             break;
         }
@@ -811,7 +837,14 @@ async fn handle_edge_session(
                 );
                 prompt_staging.stage_system_context(system_context);
                 checkpoint_bootstrap = session_runtime.export_bootstrap();
-                publish_runtime_checkpoint(&nats, &response_subject, &checkpoint_bootstrap).await?;
+                publish_runtime_checkpoint(
+                    &nats,
+                    signing_ctx.as_ref(),
+                    session_id,
+                    &response_subject,
+                    &checkpoint_bootstrap,
+                )
+                .await?;
             }
             "user_message" => {
                 let user_text = envelope["text"].as_str().unwrap_or("").to_string();
@@ -887,10 +920,16 @@ async fn handle_edge_session(
                                 match recv {
                                     Ok(envelope) => {
                                         apply_runtime_event_to_checkpoint(&mut checkpoint_bootstrap, &envelope.event);
-                                        publish_event_envelope(&nats, session_id, &response_subject, &envelope, event_transport.as_ref()).await?;
+                                        publish_event_envelope(&nats, signing_ctx.as_ref(), session_id, &response_subject, &envelope, event_transport.as_ref()).await?;
                                         if approval_checkpoint_event(&envelope.event) {
-                                            publish_runtime_checkpoint(&nats, &response_subject, &checkpoint_bootstrap)
-                                                .await?;
+                                            publish_runtime_checkpoint(
+                                                &nats,
+                                                signing_ctx.as_ref(),
+                                                session_id,
+                                                &response_subject,
+                                                &checkpoint_bootstrap,
+                                            )
+                                            .await?;
                                         }
                                     }
                                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
@@ -947,6 +986,7 @@ async fn handle_edge_session(
                                     "user_message" => {
                                         publish_session_event(
                                             &nats,
+                                            signing_ctx.as_ref(),
                                             session_id,
                                             &response_subject,
                                             CorrelationId::new(),
@@ -983,6 +1023,7 @@ async fn handle_edge_session(
                         }
                         drain_runtime_events(
                             &nats,
+                            signing_ctx.as_ref(),
                             session_id,
                             &response_subject,
                             &mut event_rx,
@@ -990,12 +1031,20 @@ async fn handle_edge_session(
                         )
                         .await?;
                         checkpoint_bootstrap = session_runtime.export_bootstrap();
-                        publish_runtime_checkpoint(&nats, &response_subject, &checkpoint_bootstrap).await?;
+                        publish_runtime_checkpoint(
+                            &nats,
+                            signing_ctx.as_ref(),
+                            session_id,
+                            &response_subject,
+                            &checkpoint_bootstrap,
+                        )
+                        .await?;
                         if close_session_after_turn
                             && session_runtime.complete_session("cancelled by server").await.is_ok()
                         {
                             drain_runtime_events(
                                 &nats,
+                                signing_ctx.as_ref(),
                                 session_id,
                                 &response_subject,
                                 &mut event_rx,
@@ -1003,7 +1052,14 @@ async fn handle_edge_session(
                             )
                             .await?;
                             checkpoint_bootstrap = session_runtime.export_bootstrap();
-                            publish_runtime_checkpoint(&nats, &response_subject, &checkpoint_bootstrap).await?;
+                            publish_runtime_checkpoint(
+                                &nats,
+                                signing_ctx.as_ref(),
+                                session_id,
+                                &response_subject,
+                                &checkpoint_bootstrap,
+                            )
+                            .await?;
                             session_closed = true;
                         }
                     }
@@ -1021,6 +1077,7 @@ async fn handle_edge_session(
                         }
                         drain_runtime_events(
                             &nats,
+                            signing_ctx.as_ref(),
                             session_id,
                             &response_subject,
                             &mut event_rx,
@@ -1028,10 +1085,18 @@ async fn handle_edge_session(
                         )
                         .await?;
                         checkpoint_bootstrap = session_runtime.export_bootstrap();
-                        publish_runtime_checkpoint(&nats, &response_subject, &checkpoint_bootstrap).await?;
+                        publish_runtime_checkpoint(
+                            &nats,
+                            signing_ctx.as_ref(),
+                            session_id,
+                            &response_subject,
+                            &checkpoint_bootstrap,
+                        )
+                        .await?;
                         if let Some(event) = runtime_error_event(&error) {
                             publish_session_event(
                                 &nats,
+                                signing_ctx.as_ref(),
                                 session_id,
                                 &response_subject,
                                 CorrelationId::new(),
@@ -1054,6 +1119,7 @@ async fn handle_edge_session(
                 if session_runtime.complete_session("cancelled by server").await.is_ok() {
                     drain_runtime_events(
                         &nats,
+                        signing_ctx.as_ref(),
                         session_id,
                         &response_subject,
                         &mut event_rx,
@@ -1061,7 +1127,14 @@ async fn handle_edge_session(
                     )
                     .await?;
                     checkpoint_bootstrap = session_runtime.export_bootstrap();
-                    publish_runtime_checkpoint(&nats, &response_subject, &checkpoint_bootstrap).await?;
+                    publish_runtime_checkpoint(
+                        &nats,
+                        signing_ctx.as_ref(),
+                        session_id,
+                        &response_subject,
+                        &checkpoint_bootstrap,
+                    )
+                    .await?;
                 }
                 session_closed = true;
                 break;
@@ -1088,6 +1161,7 @@ async fn handle_edge_session(
         if session_runtime.complete_session("edge session ended").await.is_ok() {
             drain_runtime_events(
                 &nats,
+                signing_ctx.as_ref(),
                 session_id,
                 &response_subject,
                 &mut event_rx,
@@ -1095,7 +1169,14 @@ async fn handle_edge_session(
             )
             .await?;
             checkpoint_bootstrap = session_runtime.export_bootstrap();
-            publish_runtime_checkpoint(&nats, &response_subject, &checkpoint_bootstrap).await?;
+            publish_runtime_checkpoint(
+                &nats,
+                signing_ctx.as_ref(),
+                session_id,
+                &response_subject,
+                &checkpoint_bootstrap,
+            )
+            .await?;
         }
     }
 
@@ -1105,6 +1186,7 @@ async fn handle_edge_session(
 
 async fn drain_runtime_events(
     nats: &async_nats::Client,
+    signing_ctx: Option<&WorkerSigningContext>,
     session_id: &str,
     response_subject: &str,
     event_rx: &mut broadcast::Receiver<EventEnvelope>,
@@ -1113,7 +1195,15 @@ async fn drain_runtime_events(
     loop {
         match event_rx.try_recv() {
             Ok(envelope) => {
-                publish_event_envelope(nats, session_id, response_subject, &envelope, event_transport).await?;
+                publish_event_envelope(
+                    nats,
+                    signing_ctx,
+                    session_id,
+                    response_subject,
+                    &envelope,
+                    event_transport,
+                )
+                .await?;
             }
             Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => return Ok(()),
             Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
@@ -1125,6 +1215,8 @@ async fn drain_runtime_events(
 
 async fn publish_runtime_checkpoint(
     nats: &async_nats::Client,
+    signing_ctx: Option<&WorkerSigningContext>,
+    session_id: &str,
     response_subject: &str,
     bootstrap: &SessionRuntimeBootstrap,
 ) -> anyhow::Result<()> {
@@ -1132,7 +1224,23 @@ async fn publish_runtime_checkpoint(
         "type": "runtime_checkpoint",
         "bootstrap": bootstrap,
     }))?;
-    nats.publish(response_subject.to_string(), payload.into()).await?;
+    if let Some(ctx) = signing_ctx {
+        // Phase 23 FS-04: authenticity-bearing runtime_checkpoint carries a
+        // roz-sig-v1 header so the server verifier can bind it to this worker
+        // + session. Correlation id is the session UUID (D-03 session-scoped).
+        let correlation_id = uuid::Uuid::parse_str(session_id)
+            .map_err(|e| anyhow::anyhow!("session_id must be a UUID ({session_id}): {e}"))?;
+        let header = ctx
+            .sign_outbound_worker(correlation_id, &payload)
+            .map_err(|e| anyhow::anyhow!("sign runtime_checkpoint: {e}"))?;
+        roz_nats::dispatch::publish_signed(nats, response_subject.to_string(), payload, &header)
+            .await
+            .map_err(|e| anyhow::anyhow!("publish_signed runtime_checkpoint: {e}"))?;
+    } else {
+        // D-12 rollout-window fallback: signing context absent
+        // (ROZ_ENCRYPTION_KEY unset) — fall back to unsigned legacy path.
+        nats.publish(response_subject.to_string(), payload.into()).await?;
+    }
     Ok(())
 }
 
@@ -1145,6 +1253,10 @@ async fn publish_runtime_checkpoint(
 /// `SessionRuntimeBootstrap`. The serialized shape matches
 /// `publish_runtime_checkpoint` above byte-for-byte (same JSON keys in same
 /// order).
+///
+/// Phase 23 FS-04 (plan 23-12): intentionally unsigned — bypasses the
+/// signing path so the C-10 byte-stable payload-shape assertions stay
+/// sign-free. Not used in production paths.
 pub async fn publish_runtime_checkpoint_for_test(
     nats: &async_nats::Client,
     response_subject: &str,
@@ -1160,18 +1272,56 @@ pub async fn publish_runtime_checkpoint_for_test(
 
 async fn publish_event_envelope(
     nats: &async_nats::Client,
+    signing_ctx: Option<&WorkerSigningContext>,
     session_id: &str,
     response_subject: &str,
     envelope: &EventEnvelope,
     event_transport: Option<&Arc<dyn roz_core::transport::SessionTransport>>,
 ) -> anyhow::Result<()> {
+    // Leg 1: canonical event on the session response subject (gRPC-surfaced path).
     let canonical_payload = serde_json::to_vec(&CanonicalSessionEventEnvelope::from_event_envelope(envelope))?;
-    nats.publish(response_subject.to_string(), canonical_payload.into())
-        .await?;
+    if let Some(ctx) = signing_ctx {
+        // Phase 23 FS-04: session-scoped authenticity-bearing publish — bind
+        // correlation_id to the session UUID so server-side replay protection
+        // partitions on (direction, host_id, session_id, sequence).
+        let correlation_id = uuid::Uuid::parse_str(session_id)
+            .map_err(|e| anyhow::anyhow!("session_id must be a UUID ({session_id}): {e}"))?;
+        let header = ctx
+            .sign_outbound_worker(correlation_id, &canonical_payload)
+            .map_err(|e| anyhow::anyhow!("sign canonical session event: {e}"))?;
+        roz_nats::dispatch::publish_signed(nats, response_subject.to_string(), canonical_payload, &header)
+            .await
+            .map_err(|e| anyhow::anyhow!("publish_signed canonical session event: {e}"))?;
+    } else {
+        nats.publish(response_subject.to_string(), canonical_payload.into())
+            .await?;
+    }
 
+    // Leg 2: raw envelope on the per-event-type subject.
+    //
+    // IMPORTANT (D-18 wire-format pinning): the wire payload on this subject
+    // family is the full `EventEnvelope` JSON — matches `transport_nats.rs`
+    // and the legacy pre-23-12 path. Do NOT route through
+    // `event_nats::publish_session_event_signed` here: that helper serializes
+    // bare `&SessionEvent` (shape used by signed-outbound-only subscribers),
+    // which would break existing `EventEnvelope` subscribers on this subject.
+    //
+    // We therefore sign the EventEnvelope payload inline with the same
+    // correlation-id semantics (session UUID) used by the signed helper.
     let payload = serde_json::to_vec(envelope)?;
     let event_subject = crate::event_nats::event_subject(SESSION_EVENT_PREFIX, session_id, &envelope.event);
-    nats.publish(event_subject, payload.into()).await?;
+    if let Some(ctx) = signing_ctx {
+        let correlation_id = uuid::Uuid::parse_str(session_id)
+            .map_err(|e| anyhow::anyhow!("session_id must be a UUID ({session_id}): {e}"))?;
+        let header = ctx
+            .sign_outbound_worker(correlation_id, &payload)
+            .map_err(|e| anyhow::anyhow!("sign event envelope: {e}"))?;
+        roz_nats::dispatch::publish_signed(nats, event_subject, payload, &header)
+            .await
+            .map_err(|e| anyhow::anyhow!("publish_signed event envelope: {e}"))?;
+    } else {
+        nats.publish(event_subject, payload.into()).await?;
+    }
 
     // ZEN-02 dual-publish: invoke the injected SessionTransport AFTER both NATS
     // publishes succeed so the Phase 13 NATS wire path is never gated on
@@ -1194,6 +1344,7 @@ async fn publish_event_envelope(
 
 async fn publish_session_event(
     nats: &async_nats::Client,
+    signing_ctx: Option<&WorkerSigningContext>,
     session_id: &str,
     response_subject: &str,
     correlation_id: CorrelationId,
@@ -1207,7 +1358,15 @@ async fn publish_session_event(
         timestamp: chrono::Utc::now(),
         event,
     };
-    publish_event_envelope(nats, session_id, response_subject, &envelope, event_transport).await
+    publish_event_envelope(
+        nats,
+        signing_ctx,
+        session_id,
+        response_subject,
+        &envelope,
+        event_transport,
+    )
+    .await
 }
 
 /// Test-only wrapper exposing the byte-stable + transport-additive publish path.
@@ -1215,6 +1374,9 @@ async fn publish_session_event(
 /// Mirrors `publish_event_envelope` for the ZEN-02 integration test suite so
 /// tests can drive the production publish helper (both NATS legs + the
 /// optional `SessionTransport`) without re-implementing the subject derivation.
+///
+/// Passes `signing_ctx = None` unconditionally — the ZEN-02 regression suite
+/// asserts D-18 byte-stable wire format against the unsigned fixture path.
 pub async fn publish_event_envelope_for_test(
     nats: &async_nats::Client,
     session_id: &str,
@@ -1222,7 +1384,7 @@ pub async fn publish_event_envelope_for_test(
     envelope: &EventEnvelope,
     event_transport: Option<&Arc<dyn roz_core::transport::SessionTransport>>,
 ) -> anyhow::Result<()> {
-    publish_event_envelope(nats, session_id, response_subject, envelope, event_transport).await
+    publish_event_envelope(nats, None, session_id, response_subject, envelope, event_transport).await
 }
 
 fn apply_runtime_event_to_checkpoint(bootstrap: &mut SessionRuntimeBootstrap, event: &SessionEvent) {
