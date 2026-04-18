@@ -278,6 +278,28 @@ fn dispatch_mode(
     }
 }
 
+/// Project a worker-side [`PolicyV1`] into the minimal
+/// [`roz_copper::policy::CopperPolicy`] shape read by the 100 Hz copper
+/// safety filter (Plan 24-05).
+///
+/// Copper does NOT depend on `roz-worker`, so this projection is the only
+/// supported way to feed live policy data into the copper hot-swap pointer.
+/// Called from the worker's `roz.policy.{worker_id}` subscriber in `main.rs`
+/// after a policy push arrives and parses cleanly.
+#[must_use]
+pub fn project_to_copper_policy(p: &PolicyV1) -> roz_copper::policy::CopperPolicy {
+    roz_copper::policy::CopperPolicy {
+        max_linear_m_per_s: p.limits.max_velocity.linear_m_per_s,
+        max_angular_rad_per_s: p.limits.max_velocity.angular_rad_per_s,
+        max_force_newtons: p.limits.max_force.newtons,
+        enforcement_mode: match p.enforcement_mode {
+            EnforcementMode::Reject => roz_copper::policy::CopperEnforcementMode::Reject,
+            EnforcementMode::Clamp => roz_copper::policy::CopperEnforcementMode::Clamp,
+            EnforcementMode::Halt => roz_copper::policy::CopperEnforcementMode::Halt,
+        },
+    }
+}
+
 /// Pre-dispatch enforcement entrypoint — called by the worker dispatch layer
 /// before handing a `TaskInvocation` to the agent loop.
 ///
@@ -580,6 +602,25 @@ mod tests {
         let p: PolicyV1 = serde_json::from_value(minimal_policy_json()).unwrap();
         let out = enforce_invocation(&p, None, None);
         assert!(matches!(out, EnforcementOutcome::Allow), "got {out:?}");
+    }
+
+    #[test]
+    fn project_to_copper_policy_maps_every_field() {
+        let p: PolicyV1 = serde_json::from_value(minimal_policy_json()).unwrap();
+        let cp = project_to_copper_policy(&p);
+        assert!((cp.max_linear_m_per_s - 3.0).abs() < f64::EPSILON);
+        assert!((cp.max_angular_rad_per_s - 1.5).abs() < f64::EPSILON);
+        assert!((cp.max_force_newtons - 50.0).abs() < f64::EPSILON);
+        assert_eq!(cp.enforcement_mode, roz_copper::policy::CopperEnforcementMode::Reject);
+    }
+
+    #[test]
+    fn project_to_copper_policy_maps_halt_mode() {
+        let mut v = minimal_policy_json();
+        v["enforcement_mode"] = serde_json::json!("halt");
+        let p: PolicyV1 = serde_json::from_value(v).unwrap();
+        let cp = project_to_copper_policy(&p);
+        assert_eq!(cp.enforcement_mode, roz_copper::policy::CopperEnforcementMode::Halt);
     }
 
     #[test]
