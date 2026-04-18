@@ -6,6 +6,8 @@
 //! - `roz.internal.tasks.spawn` — `SpawnWorkerTool` calls this to create child tasks
 //!   without going through auth middleware.
 
+use std::sync::Arc;
+
 use async_nats::Client as NatsClient;
 use futures::StreamExt as _;
 use roz_core::phases::PhaseMode;
@@ -14,16 +16,31 @@ use roz_core::tasks::{SpawnReply, SpawnRequest};
 use roz_nats::dispatch::{INTERNAL_TASK_STATUS_SUBJECT_PREFIX, TaskStatusEvent};
 use sqlx::PgPool;
 
+use crate::signing_gate::SigningGate;
+
 /// Subscribe to all internal NATS subjects and spawn handler loops.
 ///
 /// This is called once at startup. Each subject gets its own `tokio::spawn` task that
 /// loops until the NATS connection is dropped.
-pub fn spawn_all(nats: NatsClient, pool: PgPool, restate_ingress_url: String, http_client: reqwest::Client) {
+///
+/// Phase 23 Plan 23-10 (FS-04): `signing_gate` is threaded through to the
+/// spawn-task handler so the outbound `invoke.{host}.{task}` publish is
+/// signed with a `roz-sig-v1` header. Tests that do not wire AppState pass
+/// `None` and fall through to the legacy unsigned publish. Plan 23-11 adds
+/// verify-inbound on `spawn_task_status_handler`.
+pub fn spawn_all(
+    nats: NatsClient,
+    pool: PgPool,
+    restate_ingress_url: String,
+    http_client: reqwest::Client,
+    signing_gate: Option<Arc<SigningGate>>,
+) {
     tokio::spawn(spawn_task_handler(
         nats.clone(),
         pool.clone(),
         restate_ingress_url,
         http_client,
+        signing_gate,
     ));
     tokio::spawn(spawn_task_status_handler(nats, pool));
 }
@@ -99,7 +116,13 @@ async fn apply_task_status_event(pool: &PgPool, event: &TaskStatusEvent) {
 /// Deserializes a [`SpawnRequest`], creates the task in the DB, submits it to Restate,
 /// and replies with a [`SpawnReply`] containing the new task ID.
 #[allow(clippy::too_many_lines)]
-async fn spawn_task_handler(nats: NatsClient, pool: PgPool, restate_ingress_url: String, http_client: reqwest::Client) {
+async fn spawn_task_handler(
+    nats: NatsClient,
+    pool: PgPool,
+    restate_ingress_url: String,
+    http_client: reqwest::Client,
+    signing_gate: Option<Arc<SigningGate>>,
+) {
     let subject = roz_nats::team::INTERNAL_SPAWN_SUBJECT;
     let mut sub = match nats.subscribe(subject).await {
         Ok(s) => s,
@@ -249,11 +272,47 @@ async fn spawn_task_handler(nats: NatsClient, pool: PgPool, restate_ingress_url:
             control_interface_manifest: req.control_interface_manifest.clone(),
             delegation_scope: req.delegation_scope.clone(),
         };
-        let invoke_subject = format!("invoke.{host_name}.{}", task.id);
-        if let Ok(payload) = serde_json::to_vec(&invocation)
-            && let Err(e) = nats.publish(invoke_subject, payload.into()).await
-        {
-            tracing::error!(?e, task_id = %task.id, "NATS invocation publish failed for internal spawn");
+        // Phase 23 Plan 23-10 (FS-04): sign the invoke publish when a
+        // signing gate is wired (production). The SpawnReply below uses a
+        // different subject — `reply_subject` is the ephemeral NATS inbox of
+        // the internal spawn_worker tool requester, NOT a server→worker
+        // `invoke.{host}.{task}` authenticity-bearing hop (D-01). Reply
+        // integrity to the internal requester is covered by NATS account
+        // boundaries, so that publish stays unsigned.
+        let invoke_subject = match roz_nats::Subjects::invoke(&host_name, &task.id.to_string()) {
+            Ok(s) => s,
+            Err(error) => {
+                tracing::error!(%error, task_id = %task.id, "invalid invoke subject for internal spawn");
+                send_error(&nats, &reply_subject, &format!("invalid invoke subject: {error}")).await;
+                continue;
+            }
+        };
+        let payload = match serde_json::to_vec(&invocation) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(error = %e, task_id = %task.id, "failed to serialize TaskInvocation for internal spawn");
+                send_error(
+                    &nats,
+                    &reply_subject,
+                    &format!("task invocation serialization failed: {e}"),
+                )
+                .await;
+                continue;
+            }
+        };
+        if let Some(gate) = signing_gate.as_ref() {
+            match gate.sign_outbound(req.tenant_id, host_uuid, task.id, &payload).await {
+                Ok(header_value) => {
+                    if let Err(e) = roz_nats::publish_signed(&nats, invoke_subject, payload, &header_value).await {
+                        tracing::error!(error = %e, task_id = %task.id, "NATS invocation publish failed for internal spawn");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, task_id = %task.id, "sign_outbound failed for internal spawn");
+                }
+            }
+        } else if let Err(e) = nats.publish(invoke_subject, payload.into()).await {
+            tracing::error!(error = %e, task_id = %task.id, "NATS invocation publish failed for internal spawn (unsigned fallback)");
         }
 
         // Reply to the caller with the new task ID.

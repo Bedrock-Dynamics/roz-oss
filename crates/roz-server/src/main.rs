@@ -480,11 +480,16 @@ async fn main() {
 
     // Spawn internal NATS request-reply handlers (e.g. spawn_worker tool bypass).
     if let Some(nats) = &state.nats_client {
+        // Phase 23 Plan 23-10 (FS-04): internal spawn handler signs the
+        // outbound `invoke.{host}.{task}` publish with the shared gate,
+        // matching the REST / gRPC / Restate dispatch paths.
+        let internal_signing_gate = Arc::new(roz_server::signing_gate::SigningGate::from_app_state(&state));
         nats_handlers::spawn_all(
             nats.clone(),
             state.pool.clone(),
             state.restate_ingress_url.clone(),
             state.http_client.clone(),
+            Some(internal_signing_gate),
         );
     }
 
