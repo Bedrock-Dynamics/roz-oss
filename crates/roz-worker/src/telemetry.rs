@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use parking_lot::Mutex;
@@ -9,6 +11,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::signing_hooks::WorkerSigningContext;
+use crate::telemetry_backpressure::TelemetryBackpressure;
+use crate::wal::{DEFAULT_TELEMETRY_BYTE_QUOTA, DEFAULT_TELEMETRY_TTL_SECS, WalStore};
 
 /// Rate-limited telemetry publisher.
 ///
@@ -115,6 +119,153 @@ pub async fn publish_state_signed(
         .await
         .map_err(|e| anyhow::anyhow!("publish_signed telemetry: {e}"))?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// FS-02 store-and-forward fallback (Plan 24-07 Task 1)
+// ---------------------------------------------------------------------------
+
+/// Rate-limit the drop-counter log (24-CONTEXT D-07): every 100th drop emits a
+/// `tracing::warn!`. One instance is shared worker-wide — the boot wiring
+/// instantiates it once and hands it to every caller of
+/// [`publish_state_signed_with_buffer`].
+pub struct DropCounter {
+    drops: AtomicU64,
+}
+
+impl DropCounter {
+    /// Construct a zeroed counter.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            drops: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one drop. Returns the new total plus a `should_log` hint: log at
+    /// `n == 1` and every `n % 100 == 0` thereafter. Per 24-07 must_have
+    /// (101 forced evictions → at most 2 log lines).
+    pub fn record_and_should_log(&self) -> (u64, bool) {
+        let n = self.drops.fetch_add(1, Ordering::Relaxed) + 1;
+        (n, n == 1 || n.is_multiple_of(100))
+    }
+}
+
+impl Default for DropCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Number of WAL appends between `enforce_fifo_quota` runs (24-RESEARCH
+/// §Pitfall 2 batch amortization).
+pub const ENFORCE_QUOTA_EVERY: u64 = 64;
+
+/// Compute the buffer-full percentage (0..=100) from `used` / `quota`.
+/// Non-positive quota saturates to 100 so an mis-configured worker derates
+/// rather than publishes unbounded.
+#[must_use]
+fn percent_full(used: i64, quota: i64) -> u8 {
+    if quota <= 0 {
+        return 100;
+    }
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    let pct = ((used as f64 / quota as f64) * 100.0).clamp(0.0, 100.0) as u8;
+    pct
+}
+
+/// Publish a signed telemetry state frame with WAL store-and-forward fallback
+/// (FS-02).
+///
+/// Behavior:
+/// 1. Serialize the payload once.
+/// 2. Attempt the signed NATS publish via [`publish_signed`]. On success, return.
+/// 3. On NATS publish error, append the raw payload to `telemetry_frames` via
+///    [`WalStore::append_telemetry_frame`]. The signed envelope header is NOT
+///    persisted — [`crate::telemetry_replay::TelemetryReplay`] re-signs each
+///    replayed frame with a fresh correlation_id and a fresh signing sequence
+///    number (preserving Phase 23 replay protection).
+/// 4. Refresh the backpressure flag via
+///    [`TelemetryBackpressure::update`] using the running-total percentage.
+/// 5. Every [`ENFORCE_QUOTA_EVERY`] appends, run
+///    [`WalStore::enforce_fifo_quota`] with the FS-02 defaults. Eviction log
+///    rate is capped by [`DropCounter`] (1/100 per 24-CONTEXT D-07).
+///
+/// # Errors
+///
+/// Returns `Err` only on signing or WAL-append failures — either one indicates
+/// a condition the caller cannot recover from by retrying NATS. Pure NATS
+/// publish errors are absorbed into the fallback path and return `Ok(())`.
+#[allow(clippy::too_many_arguments)]
+pub async fn publish_state_signed_with_buffer(
+    nats: &async_nats::Client,
+    signing_ctx: &WorkerSigningContext,
+    worker_id: &str,
+    correlation_id: Uuid,
+    data: &serde_json::Value,
+    wal: &Arc<WalStore>,
+    backpressure: &TelemetryBackpressure,
+    drop_counter: &DropCounter,
+    append_counter: &AtomicU64,
+) -> anyhow::Result<()> {
+    // Serialize once — same bytes go to NATS or WAL.
+    let payload = serde_json::to_vec(data)?;
+    let subject = Subjects::telemetry_state(worker_id).map_err(|e| anyhow::anyhow!("invalid worker_id: {e}"))?;
+    let header = signing_ctx
+        .sign_outbound_worker(correlation_id, &payload)
+        .map_err(|e| anyhow::anyhow!("sign telemetry publish: {e}"))?;
+
+    match publish_signed(nats, subject, payload.clone(), &header).await {
+        Ok(()) => Ok(()),
+        Err(nats_err) => {
+            // Fallback: buffer the frame. Replay (Plan 24-07 Task 2) re-signs
+            // each frame with a fresh correlation + sequence; we do NOT persist
+            // the header here.
+            let seq = wal
+                .append_telemetry_frame(worker_id, "state", &payload)
+                .map_err(|e| anyhow::anyhow!("wal append_telemetry_frame: {e}"))?;
+
+            let used = wal
+                .telemetry_bytes_used()
+                .map_err(|e| anyhow::anyhow!("telemetry_bytes_used: {e}"))?;
+            let usage_pct = percent_full(used, DEFAULT_TELEMETRY_BYTE_QUOTA);
+            backpressure.update(usage_pct);
+
+            let n = append_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_multiple_of(ENFORCE_QUOTA_EVERY) {
+                let dropped = wal
+                    .enforce_fifo_quota(DEFAULT_TELEMETRY_BYTE_QUOTA, DEFAULT_TELEMETRY_TTL_SECS)
+                    .map_err(|e| anyhow::anyhow!("enforce_fifo_quota: {e}"))?;
+                if dropped > 0 {
+                    for _ in 0..dropped {
+                        let (total, should_log) = drop_counter.record_and_should_log();
+                        if should_log {
+                            tracing::warn!(
+                                worker_id = %worker_id,
+                                total_dropped = total,
+                                "telemetry frame dropped under FIFO quota (log cap 1/100)"
+                            );
+                        }
+                    }
+                }
+            }
+
+            tracing::debug!(
+                worker_id = %worker_id,
+                seq,
+                size = payload.len(),
+                used_bytes = used,
+                usage_pct,
+                nats_error = %nats_err,
+                "telemetry buffered to WAL (NATS partitioned)"
+            );
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
