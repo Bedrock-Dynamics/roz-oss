@@ -9,6 +9,7 @@ pub mod response;
 pub mod restate;
 pub mod routes;
 pub mod scheduled_tasks;
+pub mod signing_gate;
 pub mod state;
 pub mod triggers;
 pub mod trust;
