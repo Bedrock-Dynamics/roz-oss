@@ -6,8 +6,172 @@
 //! is locked by `.planning/research/DEEP-FS.md §"Schema Definition (Industry
 //! Alignment)"` and D-03 / D-04 in this phase's CONTEXT.md.
 //!
-//! This file currently only declares tests (TDD RED phase for Plan 24-02 Task 1).
-//! The types themselves land in the GREEN commit.
+//! The serde struct uses `#[serde(deny_unknown_fields)]` at every level per
+//! 24-RESEARCH.md §Anti-Patterns — unknown shapes are a regression signal, not
+//! forward-compat room.
+//!
+//! This module ships TYPES ONLY — the `enforce_policy` function body lands in
+//! Plan 24-05.
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use uuid::Uuid;
+
+/// Locked policy JSON shape v1.0.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyV1 {
+    pub policy_id: Uuid,
+    pub version: u32,
+    pub enforcement_mode: EnforcementMode,
+    pub limits: PolicyLimits,
+    #[serde(default)]
+    pub geofences: Vec<Geofence>,
+    #[serde(default)]
+    pub interlocks: Vec<Interlock>,
+    pub deadman_timers: DeadmanTimers,
+}
+
+/// `enforcement_mode`: reject / clamp / halt (locked, D-03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnforcementMode {
+    Reject,
+    Clamp,
+    Halt,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyLimits {
+    pub max_velocity: VelocityLimits,
+    pub max_acceleration: AccelerationLimits,
+    pub max_force: ForceLimits,
+    #[serde(default)]
+    pub joint_limits: Vec<JointLimit>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct VelocityLimits {
+    pub linear_m_per_s: f64,
+    pub angular_rad_per_s: f64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AccelerationLimits {
+    pub linear_m_per_s2: f64,
+    pub angular_rad_per_s2: f64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ForceLimits {
+    pub newtons: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct JointLimit {
+    pub name: String,
+    pub min_rad: f64,
+    pub max_rad: f64,
+}
+
+/// Geofence shape per DEEP-FS v1.0. `kind` is the internally-tagged
+/// discriminant; polygons carry `vertices_lat_lon` + ceiling + breach action.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Geofence {
+    Polygon {
+        vertices_lat_lon: Vec<[f64; 2]>,
+        altitude_ceiling_m: f64,
+        action_on_breach: OnBreachAction,
+    },
+}
+
+/// Action values accepted by `action_on_breach` / `action_on_missing` / `on_expire`
+/// per D-03: `halt | hold_position | land | return_to_launch`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnBreachAction {
+    Halt,
+    HoldPosition,
+    Land,
+    ReturnToLaunch,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Interlock {
+    pub name: String,
+    pub required_states: Vec<String>,
+    pub action_on_missing: OnBreachAction,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DeadmanTimers {
+    pub command_timeout_ms: u64,
+    pub on_expire: OnBreachAction,
+}
+
+/// Outcome of running a command through the enforcement gate.
+///
+/// Shape mirrors the `TaskOutcome` tagged-enum idiom at
+/// `crates/roz-server/src/restate/task_workflow.rs:23-43`.
+#[derive(Debug)]
+pub enum EnforcementOutcome {
+    /// Command passes all policy checks unchanged.
+    Allow,
+    /// Command exceeds a soft limit; a clamped substitute is produced.
+    Clamp { clamped_details: serde_json::Value },
+    /// Command violates policy under `reject` mode.
+    Reject(PolicyEnforcementError),
+    /// Command violates policy under `halt` mode — motion must stop.
+    Halt(PolicyEnforcementError),
+}
+
+/// All failure modes surfaced by policy enforcement. `thiserror` at the crate
+/// boundary per CLAUDE.md §Error Handling.
+#[derive(Debug, Error)]
+pub enum PolicyEnforcementError {
+    #[error("limit exceeded: channel='{channel}' value={value} max={max}")]
+    LimitExceeded { channel: String, value: f64, max: f64 },
+
+    #[error("geofence breach at coordinates {coords}")]
+    GeofenceBreach { coords: String },
+
+    #[error("required interlock '{name}' missing")]
+    InterlockMissing { name: String },
+
+    #[error("policy JSON parse: {0}")]
+    PolicyParse(#[from] serde_json::Error),
+
+    #[error("policy cache stale: age {age_secs}s exceeds 30 s freshness window")]
+    PolicyStale { age_secs: u64 },
+}
+
+/// Convert a database row into a validated [`PolicyV1`].
+///
+/// The `policy_json` JSONB column is the source of truth; the other JSONB
+/// columns (`limits`, `geofences`, `interlocks`, `deadman_timers`) are
+/// denormalized accelerators that this function does NOT currently consult
+/// (A-10 in 24-RESEARCH).
+///
+/// # Errors
+///
+/// [`PolicyEnforcementError::PolicyParse`] on any shape mismatch or unknown
+/// field — the serde layer enforces `deny_unknown_fields` at every nested
+/// level, so malformed policy JSON surfaces here rather than corrupting the
+/// cache (T-24-12).
+pub fn parse_policy_from_row(
+    row: &roz_db::safety_policies::SafetyPolicyRow,
+) -> Result<PolicyV1, PolicyEnforcementError> {
+    let policy: PolicyV1 = serde_json::from_value(row.policy_json.clone())?;
+    Ok(policy)
+}
 
 #[cfg(test)]
 mod tests {
