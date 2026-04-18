@@ -209,6 +209,45 @@ impl Subjects {
         validate_token("worker_id", worker_id)?;
         Ok(format!("camera.{worker_id}.request"))
     }
+
+    // -----------------------------------------------------------------------
+    // Phase 24 — FS-01 / FS-02 / FS-03 subjects
+    // -----------------------------------------------------------------------
+
+    /// Build a safety-policy push subject: `roz.policy.{worker_id}`.
+    /// Server -> worker broadcast on `roz_safety_policies` row change (D-04).
+    pub fn policy(worker_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        Ok(format!("roz.policy.{worker_id}"))
+    }
+
+    /// Build a 1 Hz liveness-report subject: `roz.health.{worker_id}`.
+    /// Worker -> server reporting-only; explicitly NOT a control signal (FS-01).
+    pub fn health(worker_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        Ok(format!("roz.health.{worker_id}"))
+    }
+
+    /// Build a safety-violation audit subject: `safety.violation.{worker_id}`.
+    /// Worker -> server per-policy-violation stream (D-13).
+    pub fn safety_violation(worker_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        Ok(format!("safety.violation.{worker_id}"))
+    }
+
+    /// Return the worker-online reconnect-handshake subject: `roz.state.worker_online`.
+    /// Worker -> server publish on NATS reconnect (D-10). Not per-worker parameterized.
+    #[must_use]
+    pub const fn state_worker_online() -> &'static str {
+        "roz.state.worker_online"
+    }
+
+    /// Build a signed clear-failsafe command subject: `cmd.{worker_id}.clear_failsafe`.
+    /// Server -> worker explicit operator re-arm after deadman (D-02).
+    pub fn clear_failsafe(worker_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        Ok(format!("cmd.{worker_id}.clear_failsafe"))
+    }
 }
 
 #[cfg(test)]
@@ -466,10 +505,7 @@ mod tests {
 
     #[test]
     fn safety_violation_subject_builds() {
-        assert_eq!(
-            Subjects::safety_violation("host1").unwrap(),
-            "safety.violation.host1"
-        );
+        assert_eq!(Subjects::safety_violation("host1").unwrap(), "safety.violation.host1");
     }
 
     #[test]
@@ -484,10 +520,7 @@ mod tests {
 
     #[test]
     fn clear_failsafe_subject_builds() {
-        assert_eq!(
-            Subjects::clear_failsafe("host1").unwrap(),
-            "cmd.host1.clear_failsafe"
-        );
+        assert_eq!(Subjects::clear_failsafe("host1").unwrap(), "cmd.host1.clear_failsafe");
     }
 
     #[test]
