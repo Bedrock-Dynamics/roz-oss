@@ -117,7 +117,7 @@ Plans:
 Plans:
 - [x] 24-01-PLAN.md — Wave 1 foundation: WalStore schema (telemetry_frames + task_checkpoints tables), new NATS subjects (policy, health, safety_violation, state_worker_online, clear_failsafe), SessionEvent variants (SafetyViolation + RecoveryPending), CopperHandle backpressure field
 - [x] 24-02-PLAN.md — Policy cache + push subscriber scaffolding: PolicyV1 serde (deny_unknown_fields), PolicyCache (moka 30 s TTL), HotPolicy (ArcSwap), server publish_policy_to_workers helper
-- [ ] 24-03-PLAN.md — Telemetry buffer primitives: WalStore append_telemetry_frame + list_unacked + ack_up_to + enforce_fifo_quota with O(1) running-total counter + TelemetryBackpressure AtomicU8 with hysteresis
+- [x] 24-03-PLAN.md — Telemetry buffer primitives: WalStore append_telemetry_frame + list_unacked + ack_up_to + enforce_fifo_quota with O(1) running-total counter + TelemetryBackpressure AtomicU8 with hysteresis
 - [ ] 24-04-PLAN.md — Checkpoint writer: WalStore append_checkpoint (idempotent on task_id:step_counter) + latest_checkpoint + checkpoint_age_secs + CheckpointWriter tokio task with 4 trigger variants (no CopperMode regression) + CrashState extension
 - [ ] 24-05-PLAN.md — Enforcement gates: enforce_invocation + enforce_command (reject/clamp/halt modes), dispatch.rs pre-dispatch gate with audit-log + SessionEvent emission, copper safety_filter with CopperPolicy projection (<10 ms / <5 ms budgets)
 - [ ] 24-06-PLAN.md — Deadman extension + clear-failsafe: CommandWatchdog with on_expire callback + motion latch, clear_failsafe.rs signed subscriber, POST /v1/device/clear-failsafe server endpoint, roz device clear-failsafe CLI
