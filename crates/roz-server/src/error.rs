@@ -64,6 +64,21 @@ impl AppError {
             wire_override: Some((StatusCode::CONFLICT, "host_trust_posture_not_satisfied")),
         }
     }
+
+    /// Build a rate-limit rejection with a fixed `{"error":"rate_limited"}`
+    /// body and HTTP `429 Too Many Requests`.
+    ///
+    /// Used by Phase 23 Plan 23-05 device-provisioning to emit a 429 for the
+    /// "1 successful provision per host per hour" guard (D-06, mitigates
+    /// T-23-17). Kept next to [`Self::trust_rejected`] so any future
+    /// rate-limit callers share the same wire shape.
+    #[must_use]
+    pub fn rate_limited_wire_override() -> Self {
+        Self {
+            inner: roz_core::errors::RozError::ConditionViolated("rate_limited".into()),
+            wire_override: Some((StatusCode::TOO_MANY_REQUESTS, "rate_limited")),
+        }
+    }
 }
 
 impl IntoResponse for AppError {
