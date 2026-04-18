@@ -26,6 +26,7 @@ pub mod model_factory;
 pub mod policy_cache;
 pub mod policy_enforcement;
 pub mod provisioning;
+pub mod reconnect_handshake;
 pub mod recording;
 pub mod recording_reader;
 pub mod recovery;
