@@ -209,51 +209,179 @@ impl WalStore {
         Ok(u64::try_from(row).unwrap_or(u64::MAX))
     }
 
-    /// Append a telemetry frame to the store-and-forward buffer. RED-phase stub.
+    /// Append a telemetry frame and atomically advance the running-byte total.
+    ///
+    /// Returns the auto-increment `seq` assigned by `SQLite`. The running total
+    /// in `worker_state` (`telemetry_bytes`) is updated inside the same
+    /// transaction, giving O(1) quota tracking without an O(N) `SELECT
+    /// SUM(size_bytes)` (24-RESEARCH.md §Pitfall 2).
     ///
     /// # Errors
-    /// Propagates `rusqlite::Error` once implemented.
+    /// Propagates `rusqlite::Error` on any SQL failure.
     pub fn append_telemetry_frame(
         &self,
-        _worker_id: &str,
-        _frame_type: &str,
-        _payload: &[u8],
+        worker_id: &str,
+        frame_type: &str,
+        payload: &[u8],
     ) -> Result<i64, rusqlite::Error> {
-        todo!("Plan 24-03 Task 1 GREEN — append_telemetry_frame not yet implemented")
+        let size = i64::try_from(payload.len()).unwrap_or(i64::MAX);
+        let ts = Utc::now().to_rfc3339();
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO telemetry_frames (worker_id, ts, frame_type, payload, size_bytes, acked)
+             VALUES (?1, ?2, ?3, ?4, ?5, FALSE)",
+            params![worker_id, ts, frame_type, payload, size],
+        )?;
+        let seq = tx.last_insert_rowid();
+        let current = Self::read_telemetry_bytes_tx(&tx)?;
+        let next = current.saturating_add(size);
+        Self::write_telemetry_bytes_tx(&tx, next)?;
+        tx.commit()?;
+        Ok(seq)
     }
 
-    /// Read the running-total byte counter. RED-phase stub.
+    /// Read the running-total byte counter. Returns 0 when no append has happened.
     ///
     /// # Errors
-    /// Propagates `rusqlite::Error` once implemented.
+    /// Propagates `rusqlite::Error`.
     pub fn telemetry_bytes_used(&self) -> Result<i64, rusqlite::Error> {
-        todo!("Plan 24-03 Task 1 GREEN — telemetry_bytes_used not yet implemented")
+        let conn = self.conn.lock();
+        Self::read_telemetry_bytes_conn(&conn)
     }
 
-    /// List unacked telemetry frames ordered by `seq` ascending. RED-phase stub.
+    fn read_telemetry_bytes_conn(conn: &Connection) -> Result<i64, rusqlite::Error> {
+        let mut stmt = conn.prepare("SELECT value FROM worker_state WHERE key = ?1")?;
+        let mut rows = stmt.query(params![TELEMETRY_BYTES_STATE_KEY])?;
+        match rows.next()? {
+            Some(row) => {
+                let bytes: Vec<u8> = row.get(0)?;
+                let arr: [u8; 8] = bytes.as_slice().try_into().map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Blob,
+                        "telemetry_bytes value is not 8 bytes".into(),
+                    )
+                })?;
+                Ok(i64::from_be_bytes(arr))
+            }
+            None => Ok(0),
+        }
+    }
+
+    fn read_telemetry_bytes_tx(tx: &rusqlite::Transaction<'_>) -> Result<i64, rusqlite::Error> {
+        Self::read_telemetry_bytes_conn(tx)
+    }
+
+    fn write_telemetry_bytes_tx(tx: &rusqlite::Transaction<'_>, value: i64) -> Result<(), rusqlite::Error> {
+        tx.execute(
+            "INSERT INTO worker_state (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![TELEMETRY_BYTES_STATE_KEY, value.to_be_bytes().to_vec()],
+        )?;
+        Ok(())
+    }
+
+    /// List unacked telemetry frames ordered by `seq` ascending.
+    ///
+    /// Returns `(seq, worker_id, ts, frame_type, payload)` tuples.
     ///
     /// # Errors
-    /// Propagates `rusqlite::Error` once implemented.
+    /// Propagates `rusqlite::Error`.
     pub fn list_unacked_telemetry(&self) -> Result<Vec<(i64, String, String, String, Vec<u8>)>, rusqlite::Error> {
-        todo!("Plan 24-03 Task 1 GREEN — list_unacked_telemetry not yet implemented")
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT seq, worker_id, ts, frame_type, payload
+             FROM telemetry_frames WHERE acked = FALSE ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+            ))
+        })?;
+        rows.collect()
     }
 
     /// Mark every frame with `seq <= up_to_seq` as acked and subtract their
-    /// combined `size_bytes` from the running total. RED-phase stub.
+    /// combined `size_bytes` from the running total.
+    ///
+    /// Returns the number of rows that transitioned from unacked → acked.
     ///
     /// # Errors
-    /// Propagates `rusqlite::Error` once implemented.
-    pub fn ack_telemetry_up_to(&self, _up_to_seq: i64) -> Result<usize, rusqlite::Error> {
-        todo!("Plan 24-03 Task 1 GREEN — ack_telemetry_up_to not yet implemented")
+    /// Propagates `rusqlite::Error`.
+    pub fn ack_telemetry_up_to(&self, up_to_seq: i64) -> Result<usize, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+        let reclaimed: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM telemetry_frames
+             WHERE seq <= ?1 AND acked = FALSE",
+            params![up_to_seq],
+            |r| r.get(0),
+        )?;
+        let rows_changed = tx.execute(
+            "UPDATE telemetry_frames SET acked = TRUE WHERE seq <= ?1 AND acked = FALSE",
+            params![up_to_seq],
+        )?;
+        let current = Self::read_telemetry_bytes_tx(&tx)?;
+        let next = current.saturating_sub(reclaimed).max(0);
+        Self::write_telemetry_bytes_tx(&tx, next)?;
+        tx.commit()?;
+        Ok(rows_changed)
     }
 
-    /// Enforce the FIFO quota: drop oldest frames until under size + TTL limits.
-    /// Returns the number of frames evicted. RED-phase stub.
+    /// Enforce the FIFO quota: drop oldest frames until both (a) the
+    /// running-byte total ≤ `byte_quota` AND (b) no frame's `ts` is older than
+    /// `ttl_secs`.
+    ///
+    /// Returns the number of frames evicted. Callers log once per 100 drops
+    /// (Plan 24-07 wires the log rate limiter; D-07).
     ///
     /// # Errors
-    /// Propagates `rusqlite::Error` once implemented.
-    pub fn enforce_fifo_quota(&self, _byte_quota: i64, _ttl_secs: i64) -> Result<usize, rusqlite::Error> {
-        todo!("Plan 24-03 Task 1 GREEN — enforce_fifo_quota not yet implemented")
+    /// Propagates `rusqlite::Error`.
+    pub fn enforce_fifo_quota(&self, byte_quota: i64, ttl_secs: i64) -> Result<usize, rusqlite::Error> {
+        let conn = self.conn.lock();
+        let tx = conn.unchecked_transaction()?;
+
+        // (a) TTL eviction — remove frames older than (now - ttl_secs). RFC3339
+        // strings compare lexicographically for UTC-normalized timestamps.
+        let cutoff = (Utc::now() - chrono::Duration::seconds(ttl_secs)).to_rfc3339();
+        let ttl_evict_bytes: i64 = tx.query_row(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM telemetry_frames WHERE ts < ?1",
+            params![cutoff],
+            |r| r.get(0),
+        )?;
+        let ttl_count = tx.execute("DELETE FROM telemetry_frames WHERE ts < ?1", params![cutoff])?;
+
+        // (b) Byte-quota eviction — drop oldest (lowest seq) batches of 64
+        // until under quota. Batching amortizes DELETE cost per
+        // 24-RESEARCH.md §Pattern 3 / Pitfall 2.
+        let mut current = Self::read_telemetry_bytes_tx(&tx)?
+            .saturating_sub(ttl_evict_bytes)
+            .max(0);
+        let mut quota_count: usize = 0;
+        while current > byte_quota {
+            let batch: Vec<(i64, i64)> = {
+                let mut stmt = tx.prepare("SELECT seq, size_bytes FROM telemetry_frames ORDER BY seq ASC LIMIT 64")?;
+                stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+                    .collect::<Result<_, _>>()?
+            };
+            if batch.is_empty() {
+                break;
+            }
+            let last_seq = batch.last().map(|(s, _)| *s).unwrap_or(0);
+            let batch_bytes: i64 = batch.iter().map(|(_, b)| *b).sum();
+            tx.execute("DELETE FROM telemetry_frames WHERE seq <= ?1", params![last_seq])?;
+            current = current.saturating_sub(batch_bytes).max(0);
+            quota_count += batch.len();
+        }
+
+        Self::write_telemetry_bytes_tx(&tx, current)?;
+        tx.commit()?;
+        Ok(ttl_count + quota_count)
     }
 }
 
