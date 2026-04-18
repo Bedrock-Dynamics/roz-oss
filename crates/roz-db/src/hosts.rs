@@ -52,6 +52,27 @@ where
         .await
 }
 
+/// Fetch a single host by `name` scoped to the authenticated `tenant_id`.
+///
+/// Used by tenant-scoped RPC handlers that accept a worker identifier
+/// (e.g. `roz device clear-failsafe {worker_id}`) — the worker id maps
+/// directly onto [`HostRow::name`], mirroring the client-side lookup in
+/// `crates/roz-worker/src/registration.rs::lookup_host_identity`.
+pub async fn find_by_name_for_tenant<'e, E>(
+    executor: E,
+    tenant_id: Uuid,
+    name: &str,
+) -> Result<Option<HostRow>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query_as::<_, HostRow>("SELECT * FROM roz_hosts WHERE tenant_id = $1 AND name = $2")
+        .bind(tenant_id)
+        .bind(name)
+        .fetch_optional(executor)
+        .await
+}
+
 /// List hosts for a tenant with limit/offset pagination.
 /// Includes `tenant_id` filter for defense-in-depth (don't rely solely on RLS).
 pub async fn list<'e, E>(executor: E, tenant_id: Uuid, limit: i64, offset: i64) -> Result<Vec<HostRow>, sqlx::Error>
