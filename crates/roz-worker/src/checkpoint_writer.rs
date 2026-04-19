@@ -86,6 +86,52 @@ impl CheckpointTrigger {
     }
 }
 
+/// Worker-side `CheckpointSignal` implementation that routes trait calls
+/// into a `mpsc::Sender<CheckpointTrigger>`.
+///
+/// Used by `execute_task` to plug the AgentLoop into the per-task
+/// `CheckpointWriter`. Send failures (full bounded channel / closed
+/// receiver) are swallowed silently — matching the existing best-effort
+/// `try_send` pattern used by `emit_violation_event` and `pre_dispatch_check`.
+/// Checkpoint writes are operational durability, not correctness-critical.
+pub struct ChannelCheckpointSignal {
+    tx: mpsc::Sender<CheckpointTrigger>,
+}
+
+impl ChannelCheckpointSignal {
+    /// Construct a signal that forwards trait calls onto the given mpsc sender.
+    #[must_use]
+    pub const fn new(tx: mpsc::Sender<CheckpointTrigger>) -> Self {
+        Self { tx }
+    }
+}
+
+impl roz_core::checkpoint_signal::CheckpointSignal for ChannelCheckpointSignal {
+    fn tool_call_started(&self, task_id: &str, step_counter: i64, call_id: &str) {
+        let _ = self.tx.try_send(CheckpointTrigger::ToolCallStarted {
+            task_id: task_id.to_string(),
+            step_counter,
+            call_id: call_id.to_string(),
+        });
+    }
+
+    fn tool_call_completed(&self, task_id: &str, step_counter: i64, call_id: &str) {
+        let _ = self.tx.try_send(CheckpointTrigger::ToolCallCompleted {
+            task_id: task_id.to_string(),
+            step_counter,
+            call_id: call_id.to_string(),
+        });
+    }
+
+    fn approval_received(&self, task_id: &str, step_counter: i64, approval_id: &str) {
+        let _ = self.tx.try_send(CheckpointTrigger::ApprovalReceived {
+            task_id: task_id.to_string(),
+            step_counter,
+            approval_id: approval_id.to_string(),
+        });
+    }
+}
+
 /// Default periodic checkpoint interval (FS-03: 5 s baseline).
 pub const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -326,5 +372,86 @@ mod tests {
         // mpsc::Receiver does not expose a direct capacity getter; just assert
         // we can construct with the requested capacity and it doesn't panic.
         drop(rx);
+    }
+
+    // --- Plan 24-13 Task 1: ChannelCheckpointSignal tests ------------------
+
+    use roz_core::checkpoint_signal::CheckpointSignal;
+
+    #[tokio::test]
+    async fn channel_signal_sends_tool_call_started_over_mpsc() {
+        let (tx, mut rx) = checkpoint_writer_channel(8);
+        let signal = ChannelCheckpointSignal::new(tx);
+        signal.tool_call_started("task-a", 3, "call-x");
+        let received = rx.recv().await.expect("expected trigger on channel");
+        match received {
+            CheckpointTrigger::ToolCallStarted {
+                task_id,
+                step_counter,
+                call_id,
+            } => {
+                assert_eq!(task_id, "task-a");
+                assert_eq!(step_counter, 3);
+                assert_eq!(call_id, "call-x");
+            }
+            other => panic!("expected ToolCallStarted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_signal_sends_tool_call_completed_over_mpsc() {
+        let (tx, mut rx) = checkpoint_writer_channel(8);
+        let signal = ChannelCheckpointSignal::new(tx);
+        signal.tool_call_completed("task-b", 7, "call-y");
+        let received = rx.recv().await.expect("expected trigger on channel");
+        match received {
+            CheckpointTrigger::ToolCallCompleted {
+                task_id,
+                step_counter,
+                call_id,
+            } => {
+                assert_eq!(task_id, "task-b");
+                assert_eq!(step_counter, 7);
+                assert_eq!(call_id, "call-y");
+            }
+            other => panic!("expected ToolCallCompleted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_signal_sends_approval_received_over_mpsc() {
+        let (tx, mut rx) = checkpoint_writer_channel(8);
+        let signal = ChannelCheckpointSignal::new(tx);
+        signal.approval_received("task-c", 11, "approval-z");
+        let received = rx.recv().await.expect("expected trigger on channel");
+        match received {
+            CheckpointTrigger::ApprovalReceived {
+                task_id,
+                step_counter,
+                approval_id,
+            } => {
+                assert_eq!(task_id, "task-c");
+                assert_eq!(step_counter, 11);
+                assert_eq!(approval_id, "approval-z");
+            }
+            other => panic!("expected ApprovalReceived, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_signal_swallows_send_errors_on_closed_receiver() {
+        let (tx, rx) = checkpoint_writer_channel(1);
+        drop(rx);
+        let signal = ChannelCheckpointSignal::new(tx);
+        // No panic, no stall — best-effort semantics.
+        signal.tool_call_started("t", 0, "c");
+        signal.tool_call_completed("t", 0, "c");
+        signal.approval_received("t", 0, "a");
+    }
+
+    #[test]
+    fn channel_signal_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ChannelCheckpointSignal>();
     }
 }

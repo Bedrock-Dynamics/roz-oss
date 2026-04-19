@@ -5,6 +5,7 @@ pub mod bt;
 pub mod camera;
 pub mod capabilities;
 pub mod channels;
+pub mod checkpoint_signal;
 pub mod clock;
 pub mod command;
 pub mod controller;
