@@ -514,35 +514,19 @@ async fn execute_task(
     // cleanly.
     let _task_ckpt_sender_hold = task_ckpt_tx;
 
-    // Plan 24-13 Task 3: mpsc→broadcast forwarder for SessionEvent
-    // SafetyViolation emission from the pre-dispatch gate. The existing
-    // `emit_violation_event` helper (dispatch.rs:506) takes
-    // `mpsc::Sender<SessionEvent>` — bridging here preserves that signature
-    // (and its existing tests) while routing into the broadcast fan-out
-    // the resume subscriber (Plan 24-12 Task 4) also publishes on.
+    // Plan 24-13 Task 3 (refactored to testable helper in 24-14 Task 0):
+    // mpsc→broadcast forwarder for SessionEvent SafetyViolation emission
+    // from the pre-dispatch gate. The existing `emit_violation_event` helper
+    // (dispatch.rs:506) takes `mpsc::Sender<SessionEvent>` — bridging here
+    // preserves that signature (and its existing tests) while routing into
+    // the broadcast fan-out the resume subscriber (Plan 24-12 Task 4) also
+    // publishes on.
     //
     // EventEnvelope shape mirrors the existing 24-12 RecoveryPending emit
     // path (main.rs around line 1741) so both paths produce identical
     // envelope metadata and operators see a unified stream.
-    let (session_mpsc_tx, mut session_mpsc_rx) =
-        tokio::sync::mpsc::channel::<roz_core::session::event::SessionEvent>(64);
-    {
-        let forwarder_session_tx = session_event_tx.clone();
-        tokio::spawn(async move {
-            while let Some(event) = session_mpsc_rx.recv().await {
-                let envelope = roz_core::session::event::EventEnvelope {
-                    event_id: roz_core::session::event::EventId::new(),
-                    correlation_id: roz_core::session::event::CorrelationId::new(),
-                    parent_event_id: None,
-                    timestamp: chrono::Utc::now(),
-                    event,
-                };
-                // Best-effort; broadcast drops frames when no receivers
-                // exist, matching the RecoveryPending emit path.
-                let _ = forwarder_session_tx.send(envelope);
-            }
-        });
-    }
+    let (session_mpsc_tx, session_mpsc_rx) = tokio::sync::mpsc::channel::<roz_core::session::event::SessionEvent>(64);
+    roz_worker::session_event_forwarder::spawn_session_event_forwarder(session_mpsc_rx, session_event_tx.clone());
 
     let model = match roz_worker::model_factory::build_model(&task_config, None) {
         Ok(m) => m,
@@ -1683,35 +1667,24 @@ async fn main() -> Result<()> {
                                         continue;
                                     }
                                 };
-                            let policy = match roz_worker::policy_enforcement::parse_policy_from_row(&row) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "policy v1 validation failed");
-                                    continue;
-                                }
-                            };
-                            let policy_arc = subscribe_cache.insert(row.id, policy.clone()).await;
-                            subscribe_hot.store((*policy_arc).clone());
-                            let cp = roz_worker::policy_enforcement::project_to_copper_policy(&policy);
-                            subscribe_copper_hot.store(std::sync::Arc::new(cp));
-                            // Plan 24-12 Task 5 (FS-03 SC#2): emit a
-                            // DegradationChange checkpoint trigger on every
-                            // policy hot-swap. `task_id` is empty at boot
-                            // (no task active); an active task's own
-                            // CheckpointWriter runs in parallel and binds
-                            // the real task id for periodic anchors. Best-
-                            // effort `try_send` so a full channel does not
-                            // block the subscribe loop; a drop here is
-                            // acceptable because the policy itself has been
-                            // applied already.
-                            let trigger = roz_worker::checkpoint_writer::CheckpointTrigger::DegradationChange {
-                                task_id: String::new(),
-                                step_counter: 0,
-                                from: "unknown".into(),
-                                to: format!("policy_v{}", row.version),
-                            };
-                            if let Err(e) = subscribe_ckpt_tx.try_send(trigger) {
-                                tracing::debug!(error = %e, "degradation-change trigger dropped (channel full/closed)");
+                            // Plan 24-14 Task 2: apply fan-out extracted into
+                            // `apply_policy_push` so the e2e test in Task 3
+                            // can drive the same code path with a real NATS
+                            // container. The signing-verify + row-parse
+                            // branches remain inline above because they are
+                            // loop-scoped (`subscribe_ctx` + payload error
+                            // vocabulary).
+                            if let Err(e) = roz_worker::policy_enforcement::apply_policy_push(
+                                &row,
+                                &subscribe_cache,
+                                &subscribe_hot,
+                                &subscribe_copper_hot,
+                                Some(&subscribe_ckpt_tx),
+                            )
+                            .await
+                            {
+                                tracing::warn!(error = %e, "policy v1 validation failed");
+                                continue;
                             }
                             tracing::info!(
                                 policy_id = %row.id,
