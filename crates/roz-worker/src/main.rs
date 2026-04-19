@@ -1521,6 +1521,18 @@ async fn main() -> Result<()> {
     // the `HotPolicy` Arc clone. The subscribers below reuse them via
     // `.clone()` on the Arc wrappers.
 
+    // Plan 15-06 (D-11, D-23, D-24) / Plan 24-12 Task 4: worker-level
+    // SessionEvent bus so transport-health transitions AND the resume
+    // subscriber's `SessionEvent::RecoveryPending` emission (FS-03 SC#5)
+    // share one broadcast channel. Hoisted above the Phase 24 block so
+    // the resume subscriber in the `if let (Some(ctx_shared), ...)` body
+    // can clone the sender into its closure. Capacity 64 matches the
+    // EdgeHealthAggregator signal channel.
+    let (session_event_tx, _session_event_rx_keepalive): (
+        tokio::sync::broadcast::Sender<roz_core::session::event::EventEnvelope>,
+        tokio::sync::broadcast::Receiver<roz_core::session::event::EventEnvelope>,
+    ) = tokio::sync::broadcast::channel(64);
+
     if let (Some(ctx_shared), Some(wal_arc), Some(tenant_uuid)) =
         (signing_ctx_shared.as_ref(), worker_wal.as_ref(), worker_tenant)
     {
@@ -1652,6 +1664,100 @@ async fn main() -> Result<()> {
                 .await
                 {
                     tracing::error!(error = %e, "clear_failsafe subscriber failed");
+                }
+            });
+        }
+
+        // -----------------------------------------------------------------
+        // Resume-instruction subscriber on `roz.tasks.{worker_id}` (D-10,
+        // Plan 24-12 Task 4). The server publishes one `ResumeInstruction`
+        // per in-flight task on reconnect; the worker verifies the signed
+        // envelope, parses the instruction, and runs the D-11 recovery
+        // gate via `handle_resume_instruction`. On `SafeStateWait` we emit
+        // a `SessionEvent::RecoveryPending` on the session broadcast bus so
+        // operators see the state transition (FS-03 SC#5).
+        // -----------------------------------------------------------------
+        {
+            let rt_nats = nats.clone();
+            let rt_ctx = ctx_shared.clone();
+            let rt_wal = wal_arc.clone();
+            let rt_session_tx = session_event_tx.clone();
+            let rt_worker_id = config.worker_id.clone();
+            let rt_cancel = phase24_cancel.clone();
+            tokio::spawn(async move {
+                let subject = match roz_nats::Subjects::worker_tasks(&rt_worker_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "invalid worker_id for tasks subject; skipping resume subscriber");
+                        return;
+                    }
+                };
+                let mut sub = match rt_nats.subscribe(subject.clone()).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, %subject, "failed to subscribe to resume instructions");
+                        return;
+                    }
+                };
+                tracing::info!(%subject, "resume-instruction subscriber ready");
+                loop {
+                    tokio::select! {
+                        maybe_msg = futures::StreamExt::next(&mut sub) => {
+                            let Some(msg) = maybe_msg else {
+                                tracing::warn!("resume-instruction subscription ended");
+                                return;
+                            };
+                            let header = msg
+                                .headers
+                                .as_ref()
+                                .and_then(|h| h.get(roz_core::signing::HEADER_NAME).map(|v| v.to_string()));
+                            if let Err(e) = rt_ctx.verify_inbound_worker(header.as_deref(), &msg.payload) {
+                                tracing::warn!(error = %e, "resume instruction signature rejected");
+                                continue;
+                            }
+                            let instruction: roz_core::reconnect::ResumeInstruction =
+                                match serde_json::from_slice(&msg.payload) {
+                                    Ok(i) => i,
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "resume instruction parse failed");
+                                        continue;
+                                    }
+                                };
+                            let now = chrono::Utc::now().timestamp();
+                            match roz_worker::reconnect_handshake::handle_resume_instruction(
+                                &instruction,
+                                &rt_wal,
+                                now,
+                            ) {
+                                Ok(Some(event)) => {
+                                    // Wrap in EventEnvelope — shape copied
+                                    // from the 15-06 EdgeTransportDegraded
+                                    // emission path so the broadcast
+                                    // channel's payload shape matches.
+                                    let envelope = roz_core::session::event::EventEnvelope {
+                                        event_id: roz_core::session::event::EventId::new(),
+                                        correlation_id: roz_core::session::event::CorrelationId::new(),
+                                        parent_event_id: None,
+                                        timestamp: chrono::Utc::now(),
+                                        event,
+                                    };
+                                    if let Err(e) = rt_session_tx.send(envelope) {
+                                        tracing::debug!(
+                                            error = %e,
+                                            "RecoveryPending event dropped (no live receivers)"
+                                        );
+                                    }
+                                }
+                                Ok(None) => {
+                                    tracing::debug!(task_id = %instruction.task_id, "resume instruction handled without RecoveryPending");
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "handle_resume_instruction failed");
+                                }
+                            }
+                        }
+                        () = rt_cancel.cancelled() => return,
+                    }
                 }
             });
         }
@@ -1893,17 +1999,6 @@ async fn main() -> Result<()> {
             None
         }
     };
-
-    // Plan 15-06 (D-11, D-23, D-24): worker-level SessionEvent bus so transport-
-    // health state transitions emit SessionEvent::EdgeTransportDegraded on a
-    // real broadcast channel (see acceptance criterion `session_event_tx.send`).
-    // Capacity 64 matches the EdgeHealthAggregator signal channel. Consumers
-    // are plugged in by downstream plans; for now the channel guarantees the
-    // emission site exists and is reachable.
-    let (session_event_tx, _session_event_rx_keepalive): (
-        tokio::sync::broadcast::Sender<roz_core::session::event::EventEnvelope>,
-        tokio::sync::broadcast::Receiver<roz_core::session::event::EventEnvelope>,
-    ) = tokio::sync::broadcast::channel(64);
 
     // Plan 15-06 (D-11, D-23, D-24): wire the three-mechanism transport health
     // system — EdgeHealthAggregator, heartbeat publisher, liveliness monitor,
