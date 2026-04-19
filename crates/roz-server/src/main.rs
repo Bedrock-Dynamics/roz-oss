@@ -489,8 +489,37 @@ async fn main() {
             state.pool.clone(),
             state.restate_ingress_url.clone(),
             state.http_client.clone(),
-            Some(internal_signing_gate),
+            Some(internal_signing_gate.clone()),
         );
+
+        // Phase 24 gap closure (Plan 24-11): per VERIFICATION.md gaps 7 + 9.
+        //
+        // Gap 9 (FS-03 SC#4): subscribe to `roz.state.worker_online` in
+        // production. `spawn_worker_online_handler` shipped in 24-08 but was
+        // never wired at boot; without this subscribe loop the worker→server
+        // reconnect handshake is one-directional at runtime.
+        let lookup: Arc<dyn nats_handlers::RestateWorkflowLookup> = Arc::new(nats_handlers::RestateHttpLookup {
+            client: state.http_client.clone(),
+            ingress_url: state.restate_ingress_url.clone(),
+        });
+        tokio::spawn(nats_handlers::spawn_worker_online_handler(
+            nats.clone(),
+            internal_signing_gate.clone(),
+            lookup,
+        ));
+
+        // Gap 7 (FS-02 SC#3): subscribe to `telemetry.*.state` with per-worker
+        // dedup. `check_telemetry_dedup` shipped in 24-07 but had no
+        // production call site; this spawns the subscribe loop that gates
+        // every inbound frame on `envelope.fields.sequence_number` vs the
+        // high-water mark stored in `TelemetryDedup`. The map is owned here
+        // so its lifetime matches the NATS client.
+        let telemetry_dedup = nats_handlers::new_telemetry_dedup();
+        tokio::spawn(nats_handlers::spawn_telemetry_state_handler(
+            nats.clone(),
+            internal_signing_gate,
+            telemetry_dedup,
+        ));
     }
 
     // Serve Restate TaskWorkflow endpoint on a separate port for service discovery.
