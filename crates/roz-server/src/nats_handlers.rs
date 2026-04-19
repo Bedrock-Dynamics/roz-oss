@@ -529,6 +529,107 @@ pub fn check_telemetry_dedup(map: &TelemetryDedup, worker_id: &str, seq: u64) ->
     }
 }
 
+/// Extract the `{worker_id}` segment from a subject of the shape
+/// `telemetry.{worker_id}.state`. Returns `None` for any other shape —
+/// caller drops the message.
+fn parse_worker_id_from_telemetry_subject(subject: &str) -> Option<&str> {
+    let mut parts = subject.split('.');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some("telemetry"), Some(worker), Some("state"), None) if !worker.is_empty() => Some(worker),
+        _ => None,
+    }
+}
+
+/// Subscribe to `telemetry.*.state`, verify the signed envelope, and drop
+/// frames whose `sequence_number` is `≤` the per-worker high-water mark.
+///
+/// Plan 24-11 Task 2 closes VERIFICATION.md gap 7 (FS-02 SC#3 server-side
+/// dedup). The subscribe loop runs until the NATS connection is dropped.
+///
+/// Accepted (novel) frames are logged at `debug!` — downstream persistence /
+/// relay wiring beyond the dedup gate is explicitly out-of-scope for this
+/// plan (see the gap 7 "missing" bullet in VERIFICATION.md). What this
+/// handler guarantees is the dedup gate itself: no frame whose signed
+/// `sequence_number` is `≤` the stored high-water mark is ever forwarded.
+///
+/// Drop paths:
+/// - missing `async_nats::HeaderMap` → no `roz-sig-v1` header possible.
+/// - missing `HEADER_NAME` entry → unsigned frame; reject per D-12.
+/// - malformed envelope header → cannot derive `InboundContext`.
+/// - [`SigningGate::verify_inbound`] failure → reject per D-12 (gate itself
+///   writes the audit row and publishes failure subjects).
+/// - subject not shaped `telemetry.{worker_id}.state` → protocol violation.
+/// - [`check_telemetry_dedup`] returns `false` → replay duplicate.
+pub async fn spawn_telemetry_state_handler(nats: NatsClient, signing_gate: Arc<SigningGate>, dedup: TelemetryDedup) {
+    let subject = "telemetry.*.state".to_string();
+    let mut sub = match nats.subscribe(subject.clone()).await {
+        Ok(s) => s,
+        Err(error) => {
+            tracing::error!(%error, %subject, "failed to subscribe telemetry state");
+            return;
+        }
+    };
+    tracing::info!(%subject, "telemetry state handler ready");
+
+    while let Some(msg) = sub.next().await {
+        // 1. Structural pre-verify: headers present + roz-sig-v1 present.
+        //    Mirrors handle_worker_online_message lines 779-793.
+        let Some(headers) = msg.headers.as_ref() else {
+            tracing::warn!(subject = %msg.subject, "telemetry state: missing headers; dropping");
+            continue;
+        };
+        let Some(header_value) = headers.get(HEADER_NAME) else {
+            tracing::warn!(subject = %msg.subject, "telemetry state: missing roz-sig-v1 header; dropping");
+            continue;
+        };
+        let envelope = match SignatureEnvelope::decode_header(header_value.as_str()) {
+            Ok(env) => env,
+            Err(e) => {
+                tracing::warn!(error = %e, subject = %msg.subject, "telemetry state: decode_header failed; dropping");
+                continue;
+            }
+        };
+
+        // 2. Full gate: signature + cache + replay + DB advance. Context is
+        //    derived from the envelope's own tenant/host — verify_inbound
+        //    binds those to the DB-trusted device key, so the cross-host
+        //    check from 23-06 remains non-tautological.
+        let ctx = crate::signing_gate::InboundContext {
+            tenant_id: envelope.fields.tenant_id,
+            host_id: envelope.fields.host_id,
+        };
+        if let Err(e) = signing_gate
+            .verify_inbound(msg.headers.as_ref(), &msg.payload, ctx)
+            .await
+        {
+            tracing::warn!(error = %e, subject = %msg.subject, "telemetry state: verify_inbound failed; dropping");
+            continue;
+        }
+
+        // 3. Parse worker_id from subject. Use the subject (not the
+        //    envelope) because the dedup map is keyed by the worker's
+        //    string id as published, matching what the worker replay path
+        //    uses at publish time (Subjects::telemetry_state).
+        let Some(worker_id) = parse_worker_id_from_telemetry_subject(msg.subject.as_str()) else {
+            tracing::warn!(subject = %msg.subject, "telemetry state: malformed subject; dropping");
+            continue;
+        };
+
+        // 4. Dedup gate.
+        let seq = envelope.fields.sequence_number;
+        if check_telemetry_dedup(&dedup, worker_id, seq) {
+            tracing::debug!(worker_id = %worker_id, seq, "telemetry state frame accepted");
+            // Downstream persistence / relay is out-of-scope for Plan
+            // 24-11 (VERIFICATION.md gap 7 explicitly scopes the closure
+            // to the dedup gate itself).
+        } else {
+            tracing::trace!(worker_id = %worker_id, seq, "telemetry state frame dropped as replay duplicate");
+        }
+    }
+
+    tracing::info!(%subject, "telemetry state handler exiting");
+}
+
 #[cfg(test)]
 mod dedup_tests {
     use super::*;
@@ -571,6 +672,103 @@ mod dedup_tests {
         let guard = m.lock().unwrap();
         assert_eq!(*guard.get("w1").unwrap(), 10);
         assert_eq!(*guard.get("w2").unwrap(), 5);
+    }
+
+    // -----------------------------------------------------------------
+    // Plan 24-11 Task 2: `spawn_telemetry_state_handler` invariants.
+    //
+    // The subscribe loop itself needs a live NATS connection + a
+    // provisioned SigningGate, covered by the human-verification step
+    // in 24-11-PLAN.md. These tests exercise the dedup gate + subject
+    // parser that `spawn_telemetry_state_handler` composes — the same
+    // logic that decides accept-vs-drop for every inbound frame.
+    // -----------------------------------------------------------------
+
+    /// Given a pre-populated high-water mark of 10 for `worker-abc`,
+    /// a frame with seq=10 (same), seq=9 (lower), and seq=11 (novel)
+    /// results in exactly ONE accepted frame (seq=11).
+    #[test]
+    fn spawn_telemetry_state_handler_drops_duplicates() {
+        let m = fresh_map();
+        // Pre-populate the high-water mark as the subscribe loop would
+        // after processing a seq=10 frame.
+        m.lock().unwrap().insert("worker-abc".to_string(), 10);
+
+        // Three subsequent frames — only seq=11 must be accepted.
+        assert!(
+            !check_telemetry_dedup(&m, "worker-abc", 10),
+            "seq == high-water must be dropped as replay duplicate"
+        );
+        assert!(
+            !check_telemetry_dedup(&m, "worker-abc", 9),
+            "seq < high-water must be dropped as replay duplicate"
+        );
+        assert!(
+            check_telemetry_dedup(&m, "worker-abc", 11),
+            "seq > high-water must be accepted as novel"
+        );
+
+        // High-water advanced to the accepted seq.
+        assert_eq!(*m.lock().unwrap().get("worker-abc").unwrap(), 11);
+    }
+
+    /// Dedup map is shared across consecutive messages on the same
+    /// worker subject. Two novel seqs in order both accept and the
+    /// stored high-water is the greater.
+    #[test]
+    fn telemetry_dedup_state_shared_across_messages() {
+        let m = fresh_map();
+        assert!(check_telemetry_dedup(&m, "worker-abc", 5));
+        assert!(check_telemetry_dedup(&m, "worker-abc", 6));
+        assert_eq!(*m.lock().unwrap().get("worker-abc").unwrap(), 6);
+    }
+
+    /// `telemetry.{worker}.state` → `Some(worker)`. Any other shape —
+    /// including the historical `telemetry.{host}.sensors` subject —
+    /// returns `None` so the subscribe loop drops the frame instead
+    /// of using a malformed worker id as a dedup key.
+    #[test]
+    fn parse_worker_id_from_telemetry_subject_accepts_state_only() {
+        assert_eq!(
+            parse_worker_id_from_telemetry_subject("telemetry.worker-abc.state"),
+            Some("worker-abc"),
+        );
+        // The dedup subscriber only handles `.state`; `.sensors` is a
+        // different subject handled elsewhere (or not at all in this
+        // server build).
+        assert_eq!(
+            parse_worker_id_from_telemetry_subject("telemetry.worker-abc.sensors"),
+            None
+        );
+        // Too few segments.
+        assert_eq!(parse_worker_id_from_telemetry_subject("telemetry.worker-abc"), None);
+        // Too many segments.
+        assert_eq!(
+            parse_worker_id_from_telemetry_subject("telemetry.worker-abc.state.extra"),
+            None,
+        );
+        // Empty worker id must be rejected — otherwise a forged subject
+        // `telemetry..state` would map every publisher onto one key.
+        assert_eq!(parse_worker_id_from_telemetry_subject("telemetry..state"), None);
+        // Non-`telemetry` prefix.
+        assert_eq!(parse_worker_id_from_telemetry_subject("roz.policy.worker-abc"), None);
+    }
+
+    /// Structural sanity — the handler symbol exists and is public so
+    /// `main.rs` can tokio::spawn it. Pairs with the greppable
+    /// acceptance-criteria check from 24-11-PLAN.md Task 2.
+    #[test]
+    fn spawn_telemetry_state_handler_is_public() {
+        // If the symbol were removed or made non-pub, this line would
+        // fail to compile. Cheap smoke-test that guards the wire-up in
+        // Task 3 against future refactors.
+        #[allow(clippy::no_effect_underscore_binding)]
+        let _probe: fn(
+            NatsClient,
+            std::sync::Arc<SigningGate>,
+            TelemetryDedup,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+            |n, g, d| Box::pin(super::spawn_telemetry_state_handler(n, g, d));
     }
 }
 
