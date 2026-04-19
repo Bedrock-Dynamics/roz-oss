@@ -149,7 +149,6 @@ const OUTAGE_ENABLED: bool = true;
 async fn phase24_induced_30s_nats_outage_survives_buffering_and_replay() {
     use ed25519_dalek::SigningKey;
     use futures::StreamExt;
-    use noxious_client::{StreamDirection, Toxic, ToxicKind};
     use parking_lot::RwLock;
     use roz_core::key_provider::StaticKeyProvider;
     use roz_core::signing::{HEADER_NAME, SignatureEnvelope};
@@ -444,10 +443,4 @@ async fn phase24_induced_30s_nats_outage_survives_buffering_and_replay() {
         !check_dedup(&dedup, WORKER_ID, highest_seq),
         "re-feeding the high-water seq ({highest_seq}) must be rejected as a duplicate"
     );
-
-    // Compile-time reference so a future refactor that mutes Toxic/ToxicKind
-    // imports also fails the build rather than silently dropping coverage.
-    const _TOXIC: Option<Toxic> = None;
-    const _DIR: StreamDirection = StreamDirection::Downstream;
-    const _KIND: Option<ToxicKind> = None;
 }
