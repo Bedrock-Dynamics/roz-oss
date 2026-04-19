@@ -1469,7 +1469,11 @@ mod tests {
             .iter()
             .filter(|i| i.kind == InterventionKind::ChassisPolicyClamp)
             .collect();
-        assert_eq!(chassis_interventions.len(), 1, "expected exactly one chassis intervention");
+        assert_eq!(
+            chassis_interventions.len(),
+            1,
+            "expected exactly one chassis intervention"
+        );
         assert_eq!(chassis_interventions[0].raw_value, 5.0);
         assert!((chassis_interventions[0].clamped_value - 1.0).abs() < 1e-9);
         assert!(!result.estop, "Clamp mode must not set estop");

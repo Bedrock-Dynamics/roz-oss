@@ -205,12 +205,8 @@ async fn copper_tick_loop_clamps_over_limit_wasm_output_via_hot_copper_policy() 
     // At least one frame must be AT the clamp limit (not far below it) —
     // this proves the clamp is actually firing, not that the controller
     // never produced output.
-    let any_at_linear_limit = cmds
-        .iter()
-        .any(|frame| (frame.values[0] - 0.5).abs() < 0.01);
-    let any_at_angular_limit = cmds
-        .iter()
-        .any(|frame| (frame.values[1] - 0.5).abs() < 0.01);
+    let any_at_linear_limit = cmds.iter().any(|frame| (frame.values[0] - 0.5).abs() < 0.01);
+    let any_at_angular_limit = cmds.iter().any(|frame| (frame.values[1] - 0.5).abs() < 0.01);
     assert!(
         any_at_linear_limit,
         "no frame hit the linear clamp limit 0.5 — controller may not have produced output"
