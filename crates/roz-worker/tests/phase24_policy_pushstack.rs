@@ -57,17 +57,13 @@ use parking_lot::RwLock;
 use roz_copper::policy::{CopperEnforcementMode, new_hot_policy};
 use roz_copper::safety_filter::SafetyFilterTask;
 use roz_core::key_provider::StaticKeyProvider;
-use roz_core::signing::{
-    Direction, HEADER_NAME, SignatureEnvelope, SignedFields, payload_sha256_hex, sign_envelope,
-};
+use roz_core::signing::{Direction, HEADER_NAME, SignatureEnvelope, SignedFields, payload_sha256_hex, sign_envelope};
 use roz_db::safety_policies::SafetyPolicyRow;
 use roz_nats::dispatch::{ExecutionMode, TaskInvocation, publish_signed};
 use roz_nats::subjects::Subjects;
 use roz_worker::dispatch::{PreDispatchOutcome, pre_dispatch_check};
 use roz_worker::policy_cache::{HotPolicy, PolicyCache};
-use roz_worker::policy_enforcement::{
-    PolicyEnforcementError, apply_policy_push,
-};
+use roz_worker::policy_enforcement::{PolicyEnforcementError, apply_policy_push};
 use roz_worker::signing_hooks::WorkerSigningContext;
 use roz_worker::signing_key::{load, save};
 use roz_worker::wal::WalStore;
@@ -312,7 +308,11 @@ async fn policy_push_wire_to_cache_to_copper_filter_clamp() {
         inv_reject.safety_policy_id = Some(reject_id);
         let decision_reject = pre_dispatch_check(&cache, &hot, &inv_reject, Some(5.0), Some(0.0)).await;
         match decision_reject.outcome {
-            PreDispatchOutcome::Reject(PolicyEnforcementError::LimitExceeded { ref channel, value, max }) => {
+            PreDispatchOutcome::Reject(PolicyEnforcementError::LimitExceeded {
+                ref channel,
+                value,
+                max,
+            }) => {
                 assert_eq!(channel, "linear_velocity");
                 assert_eq!(value, 5.0);
                 assert_eq!(max, 1.0);

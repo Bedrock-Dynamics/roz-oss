@@ -78,7 +78,9 @@ async fn build_ctx_and_wal() -> (tempfile::TempDir, WorkerSigningContext, Arc<Wa
     let host = Uuid::new_v4();
     let server_signing = SigningKey::from_bytes(&SERVER_SEED);
     let svk = server_signing.verifying_key().to_bytes();
-    save(tmp.path(), &provider, tenant, 1, &WORKER_SEED, &svk).await.unwrap();
+    save(tmp.path(), &provider, tenant, 1, &WORKER_SEED, &svk)
+        .await
+        .unwrap();
     let material = load(tmp.path(), &provider, tenant, host).await.unwrap().unwrap();
     let wal = Arc::new(WalStore::open(":memory:").unwrap());
     let ctx = WorkerSigningContext::new(Arc::new(RwLock::new(material)), wal.clone());
@@ -129,23 +131,18 @@ async fn outage_to_wal_to_replay_to_dedup_drops_duplicate_sequence_numbers() {
     // short idle cutoff so we stop waiting once the last frame arrives.
     let drain_handle: tokio::task::JoinHandle<Vec<(u64, Vec<u8>)>> = tokio::spawn(async move {
         let mut collected: Vec<(u64, Vec<u8>)> = Vec::new();
-        loop {
-            match tokio::time::timeout(Duration::from_millis(1500), sub.next()).await {
-                Ok(Some(msg)) => {
-                    let hdr_str = msg
-                        .headers
-                        .as_ref()
-                        .and_then(|h| h.get(HEADER_NAME))
-                        .map(|v| v.to_string());
-                    let Some(hdr_str) = hdr_str else { continue };
-                    let env = match SignatureEnvelope::decode_header(&hdr_str) {
-                        Ok(e) => e,
-                        Err(_) => continue,
-                    };
-                    collected.push((env.fields.sequence_number, msg.payload.to_vec()));
-                }
-                _ => break,
-            }
+        while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(1500), sub.next()).await {
+            let hdr_str = msg
+                .headers
+                .as_ref()
+                .and_then(|h| h.get(HEADER_NAME))
+                .map(|v| v.to_string());
+            let Some(hdr_str) = hdr_str else { continue };
+            let env = match SignatureEnvelope::decode_header(&hdr_str) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            collected.push((env.fields.sequence_number, msg.payload.to_vec()));
         }
         collected
     });
@@ -207,10 +204,7 @@ async fn outage_to_wal_to_replay_to_dedup_drops_duplicate_sequence_numbers() {
     // ---------------------------- Phase 3: replay ------------------------
     let replay = TelemetryReplay::new(wal.clone(), Arc::new(signing_ctx.clone()));
     let replayed = replay.run_once(&nats, WORKER_ID).await.expect("replay run_once");
-    assert_eq!(
-        replayed, 3,
-        "replay must drain all 3 outage frames; got {replayed}"
-    );
+    assert_eq!(replayed, 3, "replay must drain all 3 outage frames; got {replayed}");
     nats.flush().await.expect("flush after replay");
 
     let unacked_post = wal.list_unacked_telemetry().expect("list unacked post");

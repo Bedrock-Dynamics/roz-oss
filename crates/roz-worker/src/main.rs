@@ -525,12 +525,8 @@ async fn execute_task(
     // EventEnvelope shape mirrors the existing 24-12 RecoveryPending emit
     // path (main.rs around line 1741) so both paths produce identical
     // envelope metadata and operators see a unified stream.
-    let (session_mpsc_tx, session_mpsc_rx) =
-        tokio::sync::mpsc::channel::<roz_core::session::event::SessionEvent>(64);
-    roz_worker::session_event_forwarder::spawn_session_event_forwarder(
-        session_mpsc_rx,
-        session_event_tx.clone(),
-    );
+    let (session_mpsc_tx, session_mpsc_rx) = tokio::sync::mpsc::channel::<roz_core::session::event::SessionEvent>(64);
+    roz_worker::session_event_forwarder::spawn_session_event_forwarder(session_mpsc_rx, session_event_tx.clone());
 
     let model = match roz_worker::model_factory::build_model(&task_config, None) {
         Ok(m) => m,
