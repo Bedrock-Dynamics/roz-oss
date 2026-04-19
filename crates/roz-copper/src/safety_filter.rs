@@ -414,6 +414,16 @@ pub struct HotPathSafetyFilter {
     workspace_bounds: Option<WorkspaceEnvelope>,
     previous_commands: Vec<f64>,
     tick_period_s: f64,
+    /// Phase 24 FS-01 policy-aware extension. `None` keeps joint-level
+    /// `JointSafetyLimits` clamping as the sole enforcement layer. `Some`
+    /// adds a lock-free read of the hot-swap policy pointer on every
+    /// `filter` call so chassis-level `CopperPolicy` limits (max_linear /
+    /// max_angular / max_force) can be enforced in the 100 Hz hot path.
+    ///
+    /// The worker updates the pointer on every `roz.policy.{worker_id}`
+    /// push via `HotCopperPolicy::store`. Swaps are visible to the next
+    /// reader immediately with no barrier coordination.
+    policy: Option<crate::policy::HotCopperPolicy>,
 }
 
 impl HotPathSafetyFilter {
@@ -429,7 +439,35 @@ impl HotPathSafetyFilter {
             workspace_bounds: None,
             previous_commands: Vec::new(),
             tick_period_s: validate_tick_period(tick_period_s)?,
+            policy: None,
         })
+    }
+
+    /// Attach a hot-swap policy pointer (Phase 24 FS-01 wiring). Once
+    /// attached, future `filter` calls have access to chassis-level
+    /// `CopperPolicy` limits via `ArcSwap::load` (lock-free).
+    ///
+    /// Worker-side code swaps the policy on every `roz.policy.{worker_id}`
+    /// push; readers pick up the new pointee on their next tick with no
+    /// barrier required.
+    ///
+    /// This is the per-joint-filter hook that matches `SafetyFilterTask::with_policy`
+    /// in shape. The production task graph uses `HotPathSafetyFilter` (see
+    /// `controller::tick_controller`), so attaching the hot policy here is
+    /// what closes VERIFICATION.md gap "FS-01 SC#1 — copper 100 Hz loop
+    /// check runs against policy".
+    #[must_use]
+    pub fn with_policy(mut self, policy: crate::policy::HotCopperPolicy) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// Accessor for the attached hot policy pointer (testing + diagnostics).
+    ///
+    /// Returns `None` when no policy has been attached.
+    #[must_use]
+    pub fn hot_policy(&self) -> Option<&crate::policy::HotCopperPolicy> {
+        self.policy.as_ref()
     }
 
     /// Set the workspace bounds for future workspace boundary checks.

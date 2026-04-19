@@ -25,7 +25,7 @@
 )]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -65,6 +65,33 @@ const LIVE_COMPILER_VERSION: &str = "wasmtime";
 const LIVE_HOST_ABI_VERSION: u32 = 2;
 const LIVE_CHANNEL_MANIFEST_VERSION: u32 = 1;
 const DEFAULT_CONTROL_RATE_HZ: u32 = 100;
+
+// Phase 24 FS-02 SC#2 — three-state telemetry-backpressure tick-rate selector.
+// Read once per iteration via `telemetry_backpressure.load(Ordering::Relaxed)`.
+// `0 = BP_NORMAL` (100 Hz, 10 ms period).
+// `1 = BP_DERATE_50HZ` (50 Hz, 20 ms period, triggered at 90 % buffer).
+// `2 = BP_DERATE_10HZ` (10 Hz, 100 ms period, triggered at 95 % buffer).
+// Any other value defends to 100 Hz.
+pub(crate) const TICK_MS_100HZ: u64 = 10;
+pub(crate) const TICK_MS_50HZ: u64 = 20;
+pub(crate) const TICK_MS_10HZ: u64 = 100;
+
+/// Phase 24 FS-02 SC#2 — map a three-state backpressure flag to a tick
+/// period. Defensive: unknown values default to the 100 Hz period.
+///
+/// Read each iteration in `run_controller_loop_with_policy`:
+/// ```ignore
+/// let period_ms = backpressure_period_ms(telemetry_backpressure.load(Ordering::Relaxed));
+/// ```
+#[must_use]
+pub(crate) const fn backpressure_period_ms(flag: u8) -> u64 {
+    match flag {
+        0 => TICK_MS_100HZ,
+        1 => TICK_MS_50HZ,
+        2 => TICK_MS_10HZ,
+        _ => TICK_MS_100HZ,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shared helpers (used by both plain and Gazebo controller loops)
@@ -447,6 +474,34 @@ fn current_tick_period(
     )
 }
 
+/// Phase 24 Plan 24-10 — derive the effective tick period for the next
+/// sleep, honouring the shared telemetry-backpressure flag when present.
+///
+/// When `telemetry_backpressure` is `Some`, the flag is read once per
+/// iteration via `load(Ordering::Relaxed)` and mapped to 10 / 20 / 100 ms
+/// via [`backpressure_period_ms`]. The chosen period is `max(
+/// controller_period, backpressure_period)` — derating NEVER ticks faster
+/// than the controller's configured rate.
+///
+/// When `telemetry_backpressure` is `None`, falls through to
+/// [`current_tick_period`] as before (no behavioural change for the legacy
+/// code path).
+fn effective_tick_period(
+    active_controller: &Option<LoadedController>,
+    candidate_controller: &Option<LoadedController>,
+    telemetry_backpressure: Option<&Arc<AtomicU8>>,
+) -> Duration {
+    let base = current_tick_period(active_controller, candidate_controller);
+    match telemetry_backpressure {
+        Some(bp) => {
+            let flag = bp.load(Ordering::Relaxed);
+            let bp_period = Duration::from_millis(backpressure_period_ms(flag));
+            base.max(bp_period)
+        }
+        None => base,
+    }
+}
+
 fn deployment_state_for_publish(
     active_controller: &Option<LoadedController>,
     candidate_state: Option<DeploymentState>,
@@ -516,7 +571,11 @@ pub(crate) fn prepare_controller(
     if !task.uses_component_model() {
         return Err("live-controller artifacts must load as WebAssembly components".into());
     }
-    let (tick_builder, hot_path_filter) = build_tick_infrastructure(&artifact, &control_profile);
+    // Plan 24-10: policy attachment happens on the controller thread when
+    // the `PreparedArtifact` message is drained (see `drain_commands`), not
+    // here, because `prepare_controller` runs off-thread in the tokio bridge
+    // and does not have access to the caller's `HotCopperPolicy` Arc.
+    let (tick_builder, hot_path_filter) = build_tick_infrastructure(&artifact, &control_profile, None);
     let evidence_collector = EvidenceCollector::new(&artifact.controller_id, &channel_names);
 
     Ok(PreparedController {
@@ -698,6 +757,11 @@ fn apply_lifecycle_annotation(
 ///
 /// When a `LoadArtifact` command is processed, also rebuilds the tick-contract
 /// infrastructure (`tick_builder` and `hot_path_filter`) from the new manifest.
+///
+/// When `hot_policy` is `Some`, the freshly loaded candidate's
+/// `hot_path_filter` receives the chassis-level policy via the fluent
+/// `with_policy(hot_policy.clone())` builder (Phase 24 Plan 24-10 — FS-01
+/// copper 100 Hz loop policy wiring).
 #[allow(clippy::too_many_arguments)]
 fn drain_commands(
     cmd_rx: &std::sync::mpsc::Receiver<crate::channels::CopperRuntimeCommand>,
@@ -716,6 +780,7 @@ fn drain_commands(
     last_candidate_evidence_bundle: &mut Option<ControllerEvidenceBundle>,
     lifecycle_annotation: &mut Option<serde_json::Map<String, serde_json::Value>>,
     deployment_manager: DeploymentManager,
+    hot_policy: Option<&crate::policy::HotCopperPolicy>,
 ) -> bool {
     let process = |cmd: crate::channels::CopperRuntimeCommand,
                    active_controller: &mut Option<LoadedController>,
@@ -732,7 +797,7 @@ fn drain_commands(
                    last_candidate_evidence_bundle: &mut Option<ControllerEvidenceBundle>,
                    lifecycle_annotation: &mut Option<serde_json::Map<String, serde_json::Value>>| {
         match cmd {
-            crate::channels::CopperRuntimeCommand::PreparedArtifact(load) => {
+            crate::channels::CopperRuntimeCommand::PreparedArtifact(mut load) => {
                 let controller_id = load.artifact.controller_id.clone();
                 finalize_controller_slot(
                     candidate_controller,
@@ -744,6 +809,18 @@ fn drain_commands(
                 );
                 if let Err(error) = lifecycle.load_artifact(load.artifact.clone()) {
                     tracing::warn!(controller_id = %controller_id, error = %error, "failed to register artifact in lifecycle");
+                }
+                // Phase 24 Plan 24-10 — attach the chassis-level hot policy
+                // to the freshly loaded candidate's `HotPathSafetyFilter` via
+                // the fluent `with_policy(hot_policy` builder. The worker's
+                // policy-push subscriber updates the pointee; the filter
+                // picks it up on its next tick via `ArcSwap::load`.
+                if let Some(hot_policy) = hot_policy {
+                    load.hot_path_filter = std::mem::replace(
+                        &mut load.hot_path_filter,
+                        HotPathSafetyFilter::new(Vec::new(), None, 1.0).expect("valid temporary placeholder"),
+                    )
+                    .with_policy(hot_policy.clone());
                 }
                 *candidate_controller = Some(LoadedController::from_prepared(load));
                 *candidate_state = lifecycle.current_state().or(Some(DeploymentState::VerifiedOnly));
@@ -1215,9 +1292,16 @@ fn materialize_snapshot_input(
 ///
 /// Returns the `(TickInputBuilder, HotPathSafetyFilter)` pair that will
 /// be used for structured safety filtering and evidence collection.
+///
+/// When `hot_policy` is `Some`, the filter is constructed with the
+/// chassis-level `HotCopperPolicy` attached via
+/// `HotPathSafetyFilter::with_policy` (Phase 24 Plan 24-10). The
+/// worker-side policy-push subscriber updates the pointee via
+/// `HotCopperPolicy::store`; readers see the new policy on the next tick.
 fn build_tick_infrastructure(
     artifact: &roz_core::controller::artifact::ControllerArtifact,
     profile: &PreparedControlProfile,
+    hot_policy: Option<&crate::policy::HotCopperPolicy>,
 ) -> (TickInputBuilder, HotPathSafetyFilter) {
     let digests = DigestSet {
         model: artifact.verification_key.model_digest.clone(),
@@ -1240,6 +1324,16 @@ fn build_tick_infrastructure(
         tick_period_s,
     )
     .expect("control profile tick period must be valid");
+
+    // Phase 24 FS-01 SC#1: attach the chassis-level hot policy so
+    // `HotPathSafetyFilter::filter` can project live `CopperPolicy` limits on
+    // top of the static `JointSafetyLimits`. The worker updates the pointee
+    // on every `roz.policy.{worker_id}` push; readers are lock-free.
+    let hot_path_filter = if let Some(hot_policy) = hot_policy {
+        hot_path_filter.with_policy(hot_policy.clone())
+    } else {
+        hot_path_filter
+    };
 
     (tick_builder, hot_path_filter)
 }
@@ -1792,6 +1886,8 @@ pub fn run_controller_loop_with_compatibility_fallback(
         emergency_rx,
         estop_tx,
         DeploymentManager::compatibility_default(),
+        None,
+        None,
     );
 }
 
@@ -1824,6 +1920,18 @@ pub fn run_controller_loop(
 }
 
 /// Same as [`run_controller_loop`] but with an explicit staged-promotion policy.
+///
+/// Phase 24 Plan 24-10 adds two optional wiring parameters:
+/// - `hot_policy`: when `Some`, the chassis-level `HotCopperPolicy` is
+///   attached to each newly loaded candidate's `HotPathSafetyFilter` via
+///   `with_policy`. The worker-side policy-push subscriber updates the
+///   pointee on every `roz.policy.{worker_id}` push; the filter picks up
+///   the new policy on its next tick (lock-free `ArcSwap::load`).
+/// - `telemetry_backpressure`: when `Some`, the 100 Hz loop reads this
+///   `Arc<AtomicU8>` each iteration and selects the tick period using
+///   `backpressure_period_ms` (10 ms / 20 ms / 100 ms for flag 0 / 1 / 2
+///   respectively). When `None`, the loop falls back to the default
+///   controller-derived period with no derating.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn run_controller_loop_with_policy(
     cmd_rx: &std::sync::mpsc::Receiver<crate::channels::CopperRuntimeCommand>,
@@ -1836,6 +1944,8 @@ pub fn run_controller_loop_with_policy(
     emergency_rx: Option<&std::sync::mpsc::Receiver<crate::channels::CopperRuntimeCommand>>,
     estop_tx: &tokio::sync::mpsc::Sender<String>,
     deployment_manager: DeploymentManager,
+    hot_policy: Option<crate::policy::HotCopperPolicy>,
+    telemetry_backpressure: Option<Arc<AtomicU8>>,
 ) {
     let mut active_controller: Option<LoadedController> = None;
     let mut candidate_controller: Option<LoadedController> = None;
@@ -1893,6 +2003,7 @@ pub fn run_controller_loop_with_policy(
             &mut last_candidate_evidence_bundle,
             &mut lifecycle_annotation,
             deployment_manager,
+            hot_policy.as_ref(),
         );
         if received {
             last_agent_contact = Instant::now();
@@ -1953,7 +2064,11 @@ pub fn run_controller_loop_with_policy(
             );
             tick += 1;
 
-            let tick_period = current_tick_period(&active_controller, &candidate_controller);
+            let tick_period = effective_tick_period(
+                &active_controller,
+                &candidate_controller,
+                telemetry_backpressure.as_ref(),
+            );
             let elapsed = tick_start.elapsed();
             if let Some(remaining) = tick_period.checked_sub(elapsed) {
                 std::thread::sleep(remaining);
@@ -2342,7 +2457,11 @@ pub fn run_controller_loop_with_policy(
         );
         tick += 1;
 
-        let tick_period = current_tick_period(&active_controller, &candidate_controller);
+        let tick_period = effective_tick_period(
+            &active_controller,
+            &candidate_controller,
+            telemetry_backpressure.as_ref(),
+        );
         let elapsed = tick_start.elapsed();
         if let Some(remaining) = tick_period.checked_sub(elapsed) {
             std::thread::sleep(remaining);
@@ -2367,6 +2486,7 @@ pub fn run_controller_loop_with_policy(
         &mut last_candidate_evidence_bundle,
         &mut lifecycle_annotation,
         deployment_manager,
+        hot_policy.as_ref(),
     );
     finalize_controller_slot(
         &mut active_controller,
@@ -2638,7 +2758,7 @@ mod tests {
         let channel_names = control_profile.channel_names.clone();
         let host_ctx = crate::wit_host::HostContext::with_control_manifest(&control_manifest);
         let task = CuWasmTask::from_source_with_host(wat, host_ctx).expect("load legacy test controller");
-        let (tick_builder, hot_path_filter) = build_tick_infrastructure(&artifact, &control_profile);
+        let (tick_builder, hot_path_filter) = build_tick_infrastructure(&artifact, &control_profile, None);
         let evidence_collector = EvidenceCollector::new(&artifact.controller_id, &channel_names);
 
         PreparedController {
@@ -2770,7 +2890,7 @@ mod tests {
         );
         let control_profile = build_control_profile_from_runtime(&control_manifest, &embodiment_runtime);
 
-        let (tick_builder, _) = build_tick_infrastructure(&artifact, &control_profile);
+        let (tick_builder, _) = build_tick_infrastructure(&artifact, &control_profile, None);
 
         assert_eq!(tick_builder.watched_frames(), &["runtime_frame".to_string()]);
     }
@@ -3222,6 +3342,8 @@ mod tests {
                 None,
                 &estop_tx,
                 deployment_manager,
+                None,
+                None,
             );
         });
 
@@ -3268,6 +3390,8 @@ mod tests {
                 None,
                 &estop_tx,
                 deployment_manager,
+                None,
+                None,
             );
         });
 
@@ -3349,6 +3473,8 @@ mod tests {
                 None,
                 &estop_tx,
                 deployment_manager,
+                None,
+                None,
             );
         });
 
@@ -3562,6 +3688,8 @@ mod tests {
                 None,
                 &estop_tx,
                 deployment_manager,
+                None,
+                None,
             );
         });
 
@@ -3628,6 +3756,8 @@ mod tests {
                 None,
                 &estop_tx,
                 deployment_manager,
+                None,
+                None,
             );
         });
 
@@ -3696,6 +3826,8 @@ mod tests {
                 None,
                 &estop_tx,
                 deployment_manager,
+                None,
+                None,
             );
         });
 
@@ -3775,6 +3907,8 @@ mod tests {
                 None,
                 &estop_tx,
                 deployment_manager,
+                None,
+                None,
             );
         });
 
@@ -3900,6 +4034,8 @@ mod tests {
                 None,
                 &estop_tx,
                 deployment_manager,
+                None,
+                None,
             );
         });
 
@@ -3998,6 +4134,8 @@ mod tests {
                 None,
                 &estop_tx,
                 deployment_manager,
+                None,
+                None,
             );
         });
 
@@ -4077,6 +4215,8 @@ mod tests {
                 None,
                 &estop_tx,
                 deployment_manager,
+                None,
+                None,
             );
         });
 

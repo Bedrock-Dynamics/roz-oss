@@ -192,6 +192,8 @@ async fn ardupilot_wasm_velocity_through_bridge() {
             Some(&emergency_rx),
             &estop_tx,
             deployment_manager,
+            None,
+            None,
         );
     });
 
