@@ -19,6 +19,10 @@ pub enum InterventionKind {
     ContactForceExceeded,
     SlipDetected,
     TactileOverload,
+    /// Phase 24 Plan 24-16 — chassis-level `CopperPolicy` clamp applied by
+    /// `HotPathSafetyFilter` (reason string distinguishes Clamp / Halt /
+    /// Reject enforcement modes).
+    ChassisPolicyClamp,
 }
 
 /// A structured record of a safety filter intervention.
@@ -65,8 +69,9 @@ mod tests {
             InterventionKind::ContactForceExceeded,
             InterventionKind::SlipDetected,
             InterventionKind::TactileOverload,
+            InterventionKind::ChassisPolicyClamp,
         ];
-        assert_eq!(kinds.len(), 13, "all 13 intervention kinds must be tested");
+        assert_eq!(kinds.len(), 14, "all 14 intervention kinds must be tested");
         for k in kinds {
             let json = serde_json::to_string(&k).unwrap();
             let back: InterventionKind = serde_json::from_str(&json).unwrap();

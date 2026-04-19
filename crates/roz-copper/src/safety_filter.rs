@@ -669,6 +669,67 @@ impl HotPathSafetyFilter {
             }
         }
 
+        // Phase 24 Plan 24-16 — chassis-level `CopperPolicy` enforcement
+        // (closes FS-01 SC#1 "copper 100 Hz loop check runs against policy").
+        //
+        // Applied as a separate pass after the per-channel joint-limit loop
+        // so chassis limits layer ON TOP of the static JointSafetyLimits:
+        // result_commands already reflect the per-channel velocity /
+        // acceleration / position clamps, and we now project onto whichever
+        // of (per-channel, chassis) is tighter. Both limits hold.
+        //
+        // Modes (from `CopperEnforcementMode`):
+        // - Clamp  → project onto ±limit, preserving sign.
+        // - Halt   → zero the command.
+        // - Reject → zero the command AND set `estop = true` so the caller
+        //            can propagate the e-stop through the tick loop.
+        if let Some(hot_policy) = self.policy.as_ref() {
+            let policy = hot_policy.load();
+            for i in 0..result_commands.len() {
+                let axis = self.chassis_axis.get(i).copied().unwrap_or(ChassisAxis::Other);
+                let limit = match axis {
+                    ChassisAxis::Linear => policy.max_linear_m_per_s,
+                    ChassisAxis::Angular => policy.max_angular_rad_per_s,
+                    ChassisAxis::Force => policy.max_force_newtons,
+                    ChassisAxis::Other => continue,
+                };
+                let cmd = result_commands[i];
+                if !cmd.is_finite() {
+                    continue; // NaN/Inf already handled earlier in the per-channel loop.
+                }
+                if cmd.abs() > limit {
+                    let (clamped, estop_from_reject) = match policy.enforcement_mode {
+                        crate::policy::CopperEnforcementMode::Clamp => {
+                            let sign = if cmd >= 0.0 { 1.0 } else { -1.0 };
+                            (sign * limit, false)
+                        }
+                        crate::policy::CopperEnforcementMode::Halt => (0.0, false),
+                        crate::policy::CopperEnforcementMode::Reject => (0.0, true),
+                    };
+                    let channel_name = self
+                        .joint_limits
+                        .get(i)
+                        .map(|l| l.joint_name.clone())
+                        .unwrap_or_else(|| format!("channel_{i}"));
+                    interventions.push(SafetyIntervention {
+                        channel: channel_name,
+                        raw_value: cmd,
+                        clamped_value: clamped,
+                        kind: InterventionKind::ChassisPolicyClamp,
+                        reason: format!(
+                            "chassis policy {axis:?} limit {limit:.3} exceeded by |cmd|={:.3} under {:?} mode",
+                            cmd.abs(),
+                            policy.enforcement_mode
+                        ),
+                    });
+                    result_commands[i] = clamped;
+                    if estop_from_reject {
+                        estop = true;
+                    }
+                }
+            }
+        }
+
         // 5. Force/torque limit check
         if let (Some(fl), Some(w)) = (&self.force_limits, wrench) {
             let force_mag = (w.2.mul_add(w.2, w.0.mul_add(w.0, w.1 * w.1))).sqrt();

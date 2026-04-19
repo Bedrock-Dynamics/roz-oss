@@ -195,7 +195,8 @@ impl EvidenceCollector {
                 | InterventionKind::WorkspaceBoundary
                 | InterventionKind::ContactForceExceeded
                 | InterventionKind::SlipDetected
-                | InterventionKind::TactileOverload => {
+                | InterventionKind::TactileOverload
+                | InterventionKind::ChassisPolicyClamp => {
                     self.limit_clamp_count += 1;
                 }
             }
