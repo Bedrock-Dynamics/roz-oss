@@ -25,8 +25,8 @@ use crate::error::AgentError;
 use crate::model::types::{ContentPart, Message, MessageRole, Model, StreamChunk};
 use crate::safety::SafetyStack;
 use crate::spatial_provider::WorldStateProvider;
-pub use roz_core::session::control::CognitionMode;
 use roz_core::checkpoint_signal::{CheckpointSignal, NoopCheckpointSignal};
+pub use roz_core::session::control::CognitionMode;
 use tokio::sync::mpsc;
 
 /// Compatibility alias retained while downstream crates converge on

@@ -728,6 +728,117 @@ mod tests {
         assert!(matches!(decision.outcome, PreDispatchOutcome::Allow));
     }
 
+    // --- Plan 24-13 Task 3: emit_violation_event post-decision tests -----
+
+    #[tokio::test]
+    async fn emit_violation_event_after_reject_decision_lands_on_session_stream() {
+        // Build a policy that rejects any linear velocity > 1.0; invocation
+        // declares 5.0 → pre_dispatch_check returns Reject(LimitExceeded).
+        let cache = PolicyCache::new();
+        let hot = HotPolicy::new(policy_with_linear_limit(1.0, EnforcementMode::Reject));
+        let inv = sample_invocation(ExecutionMode::React);
+        let decision = pre_dispatch_check(&cache, &hot, &inv, Some(5.0), Some(0.5)).await;
+
+        let err = match &decision.outcome {
+            PreDispatchOutcome::Reject(e) => e,
+            other => panic!("expected Reject, got {other:?}"),
+        };
+        let kind = enforcement_error_kind(err);
+        let details = serde_json::json!({"violation_kind": kind, "error": err.to_string()});
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SessionEvent>(4);
+        emit_violation_event(&tx, decision.policy_id, kind, "reject", details.clone());
+
+        let ev = rx.try_recv().expect("session event was emitted");
+        match ev {
+            SessionEvent::SafetyViolation {
+                policy_id,
+                violation_kind,
+                enforcement_action,
+                details: d,
+            } => {
+                assert_eq!(policy_id, decision.policy_id.to_string());
+                assert_eq!(violation_kind, "limit_exceeded");
+                assert_eq!(enforcement_action, "reject");
+                assert_eq!(d, details);
+                assert_eq!(severity_for_action(&enforcement_action), "warning");
+            }
+            other => panic!("expected SafetyViolation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_violation_event_after_halt_decision_lands_on_session_stream() {
+        // Halt mode rejects with the Halt variant — operator-visible error
+        // severity via severity_for_action.
+        let cache = PolicyCache::new();
+        let hot = HotPolicy::new(policy_with_linear_limit(1.0, EnforcementMode::Halt));
+        let inv = sample_invocation(ExecutionMode::React);
+        let decision = pre_dispatch_check(&cache, &hot, &inv, Some(5.0), Some(0.5)).await;
+
+        let err = match &decision.outcome {
+            PreDispatchOutcome::Halt(e) => e,
+            other => panic!("expected Halt, got {other:?}"),
+        };
+        let kind = enforcement_error_kind(err);
+        let details = serde_json::json!({"violation_kind": kind, "error": err.to_string()});
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SessionEvent>(4);
+        emit_violation_event(&tx, decision.policy_id, kind, "halt", details.clone());
+
+        let ev = rx.try_recv().expect("session event was emitted");
+        match ev {
+            SessionEvent::SafetyViolation {
+                policy_id,
+                enforcement_action,
+                ..
+            } => {
+                assert_eq!(policy_id, decision.policy_id.to_string());
+                assert_eq!(enforcement_action, "halt");
+                assert_eq!(severity_for_action(&enforcement_action), "error");
+            }
+            other => panic!("expected SafetyViolation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_violation_event_after_clamp_decision_lands_on_session_stream() {
+        // Clamp mode projects declared params onto policy limits and returns
+        // the clamped_details JSON.
+        let cache = PolicyCache::new();
+        let hot = HotPolicy::new(policy_with_linear_limit(1.0, EnforcementMode::Clamp));
+        let inv = sample_invocation(ExecutionMode::React);
+        let decision = pre_dispatch_check(&cache, &hot, &inv, Some(5.0), Some(0.5)).await;
+
+        let clamped_details = match decision.outcome {
+            PreDispatchOutcome::Clamp { clamped_details } => clamped_details,
+            other => panic!("expected Clamp, got {other:?}"),
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<SessionEvent>(4);
+        emit_violation_event(
+            &tx,
+            decision.policy_id,
+            "limit_exceeded",
+            "clamp",
+            clamped_details.clone(),
+        );
+
+        let ev = rx.try_recv().expect("session event was emitted");
+        match ev {
+            SessionEvent::SafetyViolation {
+                policy_id,
+                violation_kind,
+                enforcement_action,
+                details,
+            } => {
+                assert_eq!(policy_id, decision.policy_id.to_string());
+                assert_eq!(violation_kind, "limit_exceeded");
+                assert_eq!(enforcement_action, "clamp");
+                assert_eq!(details, clamped_details);
+                assert_eq!(severity_for_action(&enforcement_action), "warning");
+            }
+            other => panic!("expected SafetyViolation, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn emit_violation_sends_safety_violation_session_event() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<SessionEvent>(4);
