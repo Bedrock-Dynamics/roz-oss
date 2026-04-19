@@ -126,14 +126,24 @@ async fn estop_interrupts_agent_run_mid_execution() {
     );
 }
 
-/// Proves that `CommandWatchdog::run` actually cancels the token when the
-/// deadline expires without a `pet()` call.
+/// Proves that `CommandWatchdog::run` dispatches the on-expire callback and
+/// latches motion when the deadline expires without a `pet()` call.
+///
+/// Phase 24 changed the contract: the watchdog no longer cancels its
+/// `CancellationToken` on expiry — the token is an INPUT used to stop the
+/// loop. Expiry is signaled via the registered `on_expire` callback.
 #[tokio::test]
-async fn command_watchdog_fires_and_cancels_token() {
+async fn command_watchdog_fires_and_latches_on_expire() {
+    use std::sync::atomic::{AtomicBool, Ordering};
     // Deadline is 1ms — the watchdog loop ticks every 1s, so this will
     // expire on the first tick.
-    let watchdog = Arc::new(roz_worker::command_watchdog::CommandWatchdog::new(
+    let fired = Arc::new(AtomicBool::new(false));
+    let fired_cb = Arc::clone(&fired);
+    let watchdog = Arc::new(roz_worker::command_watchdog::CommandWatchdog::with_on_expire(
         Duration::from_millis(1),
+        Arc::new(move || {
+            fired_cb.store(true, Ordering::Relaxed);
+        }),
     ));
     let cancel = tokio_util::sync::CancellationToken::new();
 
@@ -141,21 +151,35 @@ async fn command_watchdog_fires_and_cancels_token() {
     let wd_cancel = cancel.clone();
     tokio::spawn(async move { wd.run(wd_cancel).await });
 
-    // The watchdog ticks every 1s, so it should notice the expired deadline
-    // on the first tick and cancel within ~2s.
-    let result = tokio::time::timeout(Duration::from_secs(5), cancel.cancelled()).await;
+    // The watchdog ticks every 1s; expect the callback within ~2s.
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if fired.load(Ordering::Relaxed) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
 
-    assert!(result.is_ok(), "watchdog should have cancelled within 5s");
+    assert!(result.is_ok(), "watchdog on_expire should have fired within 5s");
+    assert!(watchdog.is_latched(), "watchdog should latch motion after firing");
 }
 
 /// Proves that calling `pet()` keeps the watchdog alive, and that it
 /// only fires once petting stops.
 #[tokio::test]
 async fn command_watchdog_pet_prevents_firing() {
+    use std::sync::atomic::{AtomicBool, Ordering};
     // 3-second deadline. The watchdog ticks every 1s.
-    let watchdog = Arc::new(roz_worker::command_watchdog::CommandWatchdog::new(Duration::from_secs(
-        3,
-    )));
+    let fired = Arc::new(AtomicBool::new(false));
+    let fired_cb = Arc::clone(&fired);
+    let watchdog = Arc::new(roz_worker::command_watchdog::CommandWatchdog::with_on_expire(
+        Duration::from_secs(3),
+        Arc::new(move || {
+            fired_cb.store(true, Ordering::Relaxed);
+        }),
+    ));
     let cancel = tokio_util::sync::CancellationToken::new();
 
     let wd = Arc::clone(&watchdog);
@@ -170,14 +194,23 @@ async fn command_watchdog_pet_prevents_firing() {
     }
 
     assert!(
-        !cancel.is_cancelled(),
+        !fired.load(Ordering::Relaxed),
         "watchdog should NOT have fired — was being petted"
     );
 
     // Now stop petting. The 3s deadline will expire on the next tick.
-    let result = tokio::time::timeout(Duration::from_secs(10), cancel.cancelled()).await;
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if fired.load(Ordering::Relaxed) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
 
     assert!(result.is_ok(), "watchdog should fire after petting stops");
+    assert!(watchdog.is_latched(), "watchdog should latch motion after firing");
 }
 
 /// Full vertical integration: e-stop published to NATS reaches the watch
