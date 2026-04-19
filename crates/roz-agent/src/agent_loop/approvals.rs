@@ -198,9 +198,12 @@ impl AgentLoop {
     /// Suspends the current turn waiting for IDE approval of a `NeedsHuman` tool call.
     /// Notifies the IDE via `presence_tx`, registers a oneshot channel, then waits up to
     /// `timeout_secs`. Returns the dispatch result if approved, or a denied `ToolResult`.
+    ///
+    /// `step_counter` is threaded from `run_streaming_core`'s `cycles` counter
+    /// and stamps the Phase 24 FS-03 `ApprovalReceived` checkpoint trigger.
     #[expect(
         clippy::too_many_arguments,
-        reason = "cancellation_token is essential for session lifecycle"
+        reason = "cancellation_token is essential for session lifecycle; step_counter is Phase 24 FS-03 checkpoint stamp"
     )]
     pub(crate) async fn wait_for_human_approval(
         &self,
@@ -211,6 +214,7 @@ impl AgentLoop {
         presence_tx: &mpsc::Sender<PresenceSignal>,
         tool_ctx: &ToolContext,
         cancellation_token: Option<&tokio_util::sync::CancellationToken>,
+        step_counter: i64,
     ) -> roz_core::tools::ToolResult {
         match gate_tool_call_for_human_approval(
             call,
@@ -223,7 +227,16 @@ impl AgentLoop {
         )
         .await
         {
-            ApprovalGateResult::Approved(effective_call) => self.dispatcher.dispatch(&effective_call, tool_ctx).await,
+            ApprovalGateResult::Approved(effective_call) => {
+                // Phase 24 FS-03 D-08: emit ApprovalReceived ONLY on the
+                // approved path. The variant doc in checkpoint_writer.rs
+                // says "permission approval landed; physical-action gate
+                // cleared" — denials and timeouts do not clear the gate
+                // and are captured separately via the tool-call error path.
+                self.checkpoint_signal
+                    .approval_received(&tool_ctx.task_id, step_counter, &call.id);
+                self.dispatcher.dispatch(&effective_call, tool_ctx).await
+            }
             ApprovalGateResult::Rejected(result) => result,
         }
     }

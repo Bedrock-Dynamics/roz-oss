@@ -5714,3 +5714,282 @@ async fn on_tool_signal_trigger_does_not_advance_without_signal() {
     // stasis without advance_phase ever being called.
     assert_eq!(output.cycles, 3, "expected exactly 3 cycles, got {}", output.cycles);
 }
+
+// -----------------------------------------------------------------------
+// Plan 24-13 Task 2: CheckpointSignal triggers at D-08 locked transitions.
+// -----------------------------------------------------------------------
+
+mod checkpoint_signal_tests {
+    use super::*;
+    use roz_core::checkpoint_signal::CheckpointSignal;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// Test helper that counts each call and records the arguments of the
+    /// most recent call per method. Used to assert the AgentLoop emits the
+    /// three locked D-08 transitions exactly once per tool-call /
+    /// approval-resolve boundary.
+    #[derive(Default)]
+    pub struct CountingCheckpointSignal {
+        pub tool_call_started_count: AtomicUsize,
+        pub tool_call_completed_count: AtomicUsize,
+        pub approval_received_count: AtomicUsize,
+        /// (task_id, step_counter, call_id) of the latest call.
+        pub last_started: Mutex<Option<(String, i64, String)>>,
+        pub last_completed: Mutex<Option<(String, i64, String)>>,
+        pub last_approval: Mutex<Option<(String, i64, String)>>,
+    }
+
+    impl CheckpointSignal for CountingCheckpointSignal {
+        fn tool_call_started(&self, task_id: &str, step_counter: i64, call_id: &str) {
+            self.tool_call_started_count.fetch_add(1, Ordering::SeqCst);
+            *self.last_started.lock().unwrap() = Some((task_id.into(), step_counter, call_id.into()));
+        }
+        fn tool_call_completed(&self, task_id: &str, step_counter: i64, call_id: &str) {
+            self.tool_call_completed_count.fetch_add(1, Ordering::SeqCst);
+            *self.last_completed.lock().unwrap() = Some((task_id.into(), step_counter, call_id.into()));
+        }
+        fn approval_received(&self, task_id: &str, step_counter: i64, approval_id: &str) {
+            self.approval_received_count.fetch_add(1, Ordering::SeqCst);
+            *self.last_approval.lock().unwrap() = Some((task_id.into(), step_counter, approval_id.into()));
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_loop_emits_tool_call_started_on_dispatch() {
+        let signal = Arc::new(CountingCheckpointSignal::default());
+        let agent = setup_agent_loop().with_checkpoint_signal(signal.clone());
+
+        let input = AgentInput {
+            task_id: "test-task".into(),
+            tenant_id: "test-tenant".into(),
+            model_name: String::new(),
+            seed: AgentInputSeed::new(
+                vec!["You are a robot arm controller.".into()],
+                vec![],
+                "Move to position [1, 0, 0].",
+            ),
+            max_cycles: 5,
+            max_tokens: 4096,
+            max_context_tokens: 200_000,
+            mode: AgentLoopMode::React,
+            phases: vec![],
+            tool_choice: None,
+            response_schema: None,
+            streaming: false,
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
+        };
+
+        let mut agent = agent;
+        let _ = agent.run(input).await.unwrap();
+        assert_eq!(
+            signal.tool_call_started_count.load(Ordering::SeqCst),
+            1,
+            "expected exactly one ToolCallStarted emission for setup_agent_loop's single tool call"
+        );
+        let (task_id, step, call_id) = signal.last_started.lock().unwrap().clone().unwrap();
+        assert_eq!(task_id, "test-task");
+        assert_eq!(call_id, "toolu_1");
+        // cycles starts at 0 and is incremented AFTER the completion response
+        // but BEFORE dispatch — so step_counter = 1 on the first dispatch.
+        assert_eq!(step, 1);
+    }
+
+    #[tokio::test]
+    async fn agent_loop_emits_tool_call_completed_on_dispatch_return() {
+        let signal = Arc::new(CountingCheckpointSignal::default());
+        let agent = setup_agent_loop().with_checkpoint_signal(signal.clone());
+
+        let input = AgentInput {
+            task_id: "completed-test".into(),
+            tenant_id: "test-tenant".into(),
+            model_name: String::new(),
+            seed: AgentInputSeed::new(vec!["sys".into()], vec![], "go"),
+            max_cycles: 5,
+            max_tokens: 4096,
+            max_context_tokens: 200_000,
+            mode: AgentLoopMode::React,
+            phases: vec![],
+            tool_choice: None,
+            response_schema: None,
+            streaming: false,
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
+        };
+
+        let mut agent = agent;
+        let _ = agent.run(input).await.unwrap();
+        assert_eq!(
+            signal.tool_call_completed_count.load(Ordering::SeqCst),
+            1,
+            "expected exactly one ToolCallCompleted emission"
+        );
+        assert_eq!(
+            signal.tool_call_started_count.load(Ordering::SeqCst),
+            signal.tool_call_completed_count.load(Ordering::SeqCst),
+            "Started and Completed counts must match"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_loop_emits_approval_received_on_resolve() {
+        use approval_helpers::{RequireHumanApproval, approval_input};
+        use roz_agent::dispatch::remote::{PendingApprovals, resolve_approval};
+
+        let responses = vec![
+            CompletionResponse {
+                parts: vec![ContentPart::ToolUse {
+                    id: "toolu_sensitive_1".into(),
+                    name: "sensitive_op".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage {
+                    input_tokens: 20,
+                    output_tokens: 10,
+                    ..Default::default()
+                },
+            },
+            CompletionResponse {
+                parts: vec![ContentPart::Text {
+                    text: "Operation approved and completed.".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage {
+                    input_tokens: 40,
+                    output_tokens: 15,
+                    ..Default::default()
+                },
+            },
+        ];
+
+        let model = Box::new(MockModel::new(vec![ModelCapability::TextReasoning], responses));
+        let mut dispatcher = ToolDispatcher::new(Duration::from_secs(5));
+        dispatcher.register(Box::new(MockToolExecutor::new(
+            "sensitive_op",
+            ToolResult::success(json!({"result": "executed"})),
+        )));
+
+        let pending: PendingApprovals = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let signal = Arc::new(CountingCheckpointSignal::default());
+        let mut agent = AgentLoop::new(
+            model,
+            dispatcher,
+            SafetyStack::new(vec![Box::new(RequireHumanApproval)]),
+            Box::new(MockSpatialContextProvider::empty()),
+        )
+        .with_pending_approvals(pending.clone())
+        .with_checkpoint_signal(signal.clone());
+
+        let pa = pending.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            resolve_approval(&pa, "toolu_sensitive_1", true, None);
+        });
+
+        let output = agent.run(approval_input()).await.unwrap();
+        assert_eq!(output.cycles, 2);
+        assert_eq!(
+            signal.approval_received_count.load(Ordering::SeqCst),
+            1,
+            "expected exactly one ApprovalReceived emission on approved resolve"
+        );
+        let (task_id, _step, approval_id) = signal.last_approval.lock().unwrap().clone().unwrap();
+        assert_eq!(task_id, "approval-test");
+        assert_eq!(approval_id, "toolu_sensitive_1");
+        // And the tool call's start+complete boundaries still fire.
+        assert_eq!(signal.tool_call_started_count.load(Ordering::SeqCst), 1);
+        assert_eq!(signal.tool_call_completed_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn agent_loop_does_not_emit_approval_received_on_denial() {
+        use approval_helpers::{RequireHumanApproval, approval_input};
+        use roz_agent::dispatch::remote::{PendingApprovals, resolve_approval};
+
+        let responses = vec![
+            CompletionResponse {
+                parts: vec![ContentPart::ToolUse {
+                    id: "toolu_denied_1".into(),
+                    name: "sensitive_op".into(),
+                    input: json!({}),
+                }],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage {
+                    input_tokens: 20,
+                    output_tokens: 10,
+                    ..Default::default()
+                },
+            },
+            CompletionResponse {
+                parts: vec![ContentPart::Text {
+                    text: "Understood.".into(),
+                }],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage {
+                    input_tokens: 40,
+                    output_tokens: 15,
+                    ..Default::default()
+                },
+            },
+        ];
+
+        let model = Box::new(MockModel::new(vec![ModelCapability::TextReasoning], responses));
+        let mut dispatcher = ToolDispatcher::new(Duration::from_secs(5));
+        dispatcher.register(Box::new(MockToolExecutor::new(
+            "sensitive_op",
+            ToolResult::success(json!({"result": "should not run"})),
+        )));
+
+        let pending: PendingApprovals = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let signal = Arc::new(CountingCheckpointSignal::default());
+        let mut agent = AgentLoop::new(
+            model,
+            dispatcher,
+            SafetyStack::new(vec![Box::new(RequireHumanApproval)]),
+            Box::new(MockSpatialContextProvider::empty()),
+        )
+        .with_pending_approvals(pending.clone())
+        .with_checkpoint_signal(signal.clone());
+
+        let pa = pending.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            resolve_approval(&pa, "toolu_denied_1", false, None);
+        });
+
+        let _ = agent.run(approval_input()).await.unwrap();
+        assert_eq!(
+            signal.approval_received_count.load(Ordering::SeqCst),
+            0,
+            "ApprovalReceived must not fire on denial — the variant models a cleared physical-action gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_loop_with_noop_signal_is_backward_compatible() {
+        // Default NoopCheckpointSignal: existing tests must still pass.
+        // This test asserts the constructor path (without with_checkpoint_signal)
+        // completes cleanly with no panics.
+        let mut agent = setup_agent_loop();
+        let input = AgentInput {
+            task_id: "noop-test".into(),
+            tenant_id: "test-tenant".into(),
+            model_name: String::new(),
+            seed: AgentInputSeed::new(vec!["sys".into()], vec![], "go"),
+            max_cycles: 5,
+            max_tokens: 4096,
+            max_context_tokens: 200_000,
+            mode: AgentLoopMode::React,
+            phases: vec![],
+            tool_choice: None,
+            response_schema: None,
+            streaming: false,
+            cancellation_token: None,
+            control_mode: roz_core::safety::ControlMode::default(),
+        };
+        let output = agent.run(input).await.unwrap();
+        assert_eq!(output.cycles, 2, "existing agent-loop semantics must be unchanged");
+    }
+}

@@ -396,6 +396,13 @@ async fn execute_task(
     // task is active. `None` when signing bootstrap did not complete
     // (D-12 rollout / no `ROZ_ENCRYPTION_KEY`).
     worker_wal_shared: Option<std::sync::Arc<roz_worker::wal::WalStore>>,
+    // Plan 24-13 Task 3: broadcast sender for session-scoped events. The
+    // pre-dispatch gate emits `SessionEvent::SafetyViolation` on
+    // Reject/Halt/Clamp outcomes via an mpsc→broadcast forwarder so the
+    // existing mpsc-based `emit_violation_event` signature is preserved.
+    // The resume subscriber (Plan 24-12 Task 4) publishes directly on this
+    // same broadcast; both paths terminate on one fan-out stream.
+    session_event_tx: tokio::sync::broadcast::Sender<roz_core::session::event::EventEnvelope>,
 ) {
     tracing::info!("starting task execution");
 
@@ -495,11 +502,47 @@ async fn execute_task(
             }
         });
     }
+    // Plan 24-13 Task 3: clone the per-task sender into a
+    // `ChannelCheckpointSignal` and hand it to the AgentLoop below so the
+    // agent loop emits `CheckpointTrigger::ToolCallStarted` /
+    // `ToolCallCompleted` / `ApprovalReceived` at the three D-08 locked
+    // transitions. The original binding is held live for the task lifetime
+    // so the receiver never observes a disconnected channel.
+    let task_ckpt_tx_for_agent = task_ckpt_tx.clone();
     // Hold the per-task sender live for the duration of the task. Dropping
     // it + cancelling `task_ckpt_cancel` at task exit drains the receiver
-    // cleanly. Future plans wire this sender into the agent loop so
-    // `ToolCall*` / `ApprovalReceived` triggers fire.
+    // cleanly.
     let _task_ckpt_sender_hold = task_ckpt_tx;
+
+    // Plan 24-13 Task 3: mpsc→broadcast forwarder for SessionEvent
+    // SafetyViolation emission from the pre-dispatch gate. The existing
+    // `emit_violation_event` helper (dispatch.rs:506) takes
+    // `mpsc::Sender<SessionEvent>` — bridging here preserves that signature
+    // (and its existing tests) while routing into the broadcast fan-out
+    // the resume subscriber (Plan 24-12 Task 4) also publishes on.
+    //
+    // EventEnvelope shape mirrors the existing 24-12 RecoveryPending emit
+    // path (main.rs around line 1741) so both paths produce identical
+    // envelope metadata and operators see a unified stream.
+    let (session_mpsc_tx, mut session_mpsc_rx) =
+        tokio::sync::mpsc::channel::<roz_core::session::event::SessionEvent>(64);
+    {
+        let forwarder_session_tx = session_event_tx.clone();
+        tokio::spawn(async move {
+            while let Some(event) = session_mpsc_rx.recv().await {
+                let envelope = roz_core::session::event::EventEnvelope {
+                    event_id: roz_core::session::event::EventId::new(),
+                    correlation_id: roz_core::session::event::CorrelationId::new(),
+                    parent_event_id: None,
+                    timestamp: chrono::Utc::now(),
+                    event,
+                };
+                // Best-effort; broadcast drops frames when no receivers
+                // exist, matching the RecoveryPending emit path.
+                let _ = forwarder_session_tx.send(envelope);
+            }
+        });
+    }
 
     let model = match roz_worker::model_factory::build_model(&task_config, None) {
         Ok(m) => m,
@@ -762,10 +805,24 @@ async fn execute_task(
                         "safety_violation",
                         roz_worker::dispatch::severity_for_action("clamp"),
                         "worker-pre-dispatch",
-                        clamped_details,
+                        clamped_details.clone(),
                     )
                     .await;
                 }
+                // Plan 24-13 Task 3: emit SessionEvent::SafetyViolation on the
+                // Clamp branch AFTER the audit write. Operators see the
+                // violation on the session event stream; auditors see it in
+                // the roz_safety_audit_log row. Clamp retains the declared
+                // policy_id; violation_kind is "limit_exceeded" because the
+                // clamp projection triggers on a velocity/acceleration/etc.
+                // limit breach.
+                roz_worker::dispatch::emit_violation_event(
+                    &session_mpsc_tx,
+                    decision.policy_id,
+                    "limit_exceeded",
+                    "clamp",
+                    clamped_details,
+                );
             }
             roz_worker::dispatch::PreDispatchOutcome::Reject(ref err)
             | roz_worker::dispatch::PreDispatchOutcome::Halt(ref err) => {
@@ -794,6 +851,17 @@ async fn execute_task(
                     )
                     .await;
                 }
+                // Plan 24-13 Task 3: emit SessionEvent::SafetyViolation on the
+                // Reject / Halt branches AFTER the audit write and BEFORE the
+                // early return. Closes VERIFICATION.md gap 3 (FS-01 SC#1 —
+                // violations emit SafetyViolation session event).
+                roz_worker::dispatch::emit_violation_event(
+                    &session_mpsc_tx,
+                    decision.policy_id,
+                    violation_kind,
+                    enforcement_action,
+                    details.clone(),
+                );
                 tracing::warn!(
                     task_id = %task_id,
                     policy_id = %decision.policy_id,
@@ -1025,10 +1093,19 @@ async fn execute_task(
         }
     }
 
+    // Plan 24-13 Task 3: wire a `ChannelCheckpointSignal` (wrapping the per-
+    // task `task_ckpt_tx` cloned at the top of `execute_task`) into the
+    // AgentLoop via the additive `with_checkpoint_signal` builder (Plan
+    // 24-13 Task 2). Closes VERIFICATION.md gap 8-remaining (FS-03 SC#1 —
+    // checkpoint writer event-driven triggers have production emitters).
+    let checkpoint_signal: std::sync::Arc<dyn roz_core::checkpoint_signal::CheckpointSignal> = std::sync::Arc::new(
+        roz_worker::checkpoint_writer::ChannelCheckpointSignal::new(task_ckpt_tx_for_agent),
+    );
     let agent = AgentLoop::new(model, dispatcher, safety, spatial)
         .with_extensions(extensions)
         .with_approval_runtime(approval_runtime)
-        .with_turn_emitter_opt(turn_flush.emitter.clone());
+        .with_turn_emitter_opt(turn_flush.emitter.clone())
+        .with_checkpoint_signal(checkpoint_signal);
     let mut executor = WorkerTaskStreamingExecutor {
         agent: Some(agent),
         agent_input,
@@ -2109,13 +2186,14 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Silence unused-variable warnings when zenoh feature is off; the channel
-    // is kept in scope so the feature-off build preserves the same local
-    // bindings as the feature-on build.
-    #[cfg(not(feature = "zenoh"))]
-    {
-        drop(session_event_tx);
-    }
+    // Plan 24-13 Task 3: `session_event_tx` is now consumed per-task by
+    // the execute_task dispatch loop (cloned into `task_session_event_tx`
+    // in the subscribe loop below), so the previous feature-gated
+    // `drop(session_event_tx)` used for the zenoh-off build is no longer
+    // needed — the cloned sender keeps the broadcast alive for the worker
+    // lifetime. The `_session_event_rx_keepalive` binding at the channel
+    // construction site still keeps the receiver side from being dropped
+    // when no subscribers are attached yet.
 
     // Plan 15-10 (ZEN-05 gap closure): instantiate EdgeStateBusRunner and
     // ZenohCoordinator so the edge-horizontal subsystems have live worker
@@ -2361,11 +2439,16 @@ async fn main() -> Result<()> {
         // Plan 24-12 Tasks 1/3/5: clone the module-level shared state into
         // each spawned task so the pre-dispatch gate, the copper handle, and
         // the per-task checkpoint writer all see the live worker state.
+        // Plan 24-13 Task 3: clone the broadcast session_event_tx so the
+        // per-task mpsc→broadcast forwarder inside execute_task can publish
+        // SessionEvent::SafetyViolation on the same fan-out stream used by
+        // the resume subscriber.
         let task_policy_cache = policy_cache.clone();
         let task_hot_policy = hot_policy.clone();
         let task_copper_hot_policy = copper_hot_policy.clone();
         let task_telemetry_bp = telemetry_backpressure.clone();
         let task_worker_wal = worker_wal.clone();
+        let task_session_event_tx = session_event_tx.clone();
         let span = tracing::info_span!("worker.execute_task", task_id = %task_id);
         tokio::spawn(
             async move {
@@ -2386,6 +2469,7 @@ async fn main() -> Result<()> {
                     task_copper_hot_policy,
                     task_telemetry_bp,
                     task_worker_wal,
+                    task_session_event_tx,
                 )
                 .await;
             }
