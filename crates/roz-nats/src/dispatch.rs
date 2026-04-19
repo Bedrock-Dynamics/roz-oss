@@ -86,7 +86,14 @@ pub enum ExecutionMode {
 }
 
 /// Sent from server to worker via NATS to start a task.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+//
+// NOTE: Plan 24-12 added `declared_max_linear_m_per_s: Option<f64>` and
+// `declared_max_angular_rad_per_s: Option<f64>`, so `Eq` is no longer
+// derivable on this struct. `PartialEq` remains; consumers that previously
+// required `Eq` (e.g. hash-set membership) already did not use it in
+// practice because f64 equality is domain-specific.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TaskInvocation {
     pub task_id: Uuid,
     pub tenant_id: String,
@@ -111,6 +118,16 @@ pub struct TaskInvocation {
     /// Optional inherited worker delegation scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegation_scope: Option<roz_core::tasks::DelegationScope>,
+    /// Phase 24 FS-01: declared upper-bound linear velocity for the invocation.
+    /// The pre-dispatch policy gate uses this to evaluate against `PolicyV1`
+    /// limits BEFORE the agent loop starts. `None` on legacy (pre-24-12)
+    /// messages; `Some(_)` on v3.0+ invocations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_max_linear_m_per_s: Option<f64>,
+    /// Phase 24 FS-01: declared upper-bound angular velocity for the invocation.
+    /// See `declared_max_linear_m_per_s` — same semantics, angular axis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_max_angular_rad_per_s: Option<f64>,
 }
 
 /// Token counts for a completed task.
@@ -252,6 +269,8 @@ mod tests {
             phases: vec![],
             control_interface_manifest: None,
             delegation_scope: None,
+            declared_max_linear_m_per_s: None,
+            declared_max_angular_rad_per_s: None,
         };
 
         let bytes = serde_json::to_vec(&invocation).expect("serialize");
@@ -440,6 +459,8 @@ mod tests {
             ],
             control_interface_manifest: None,
             delegation_scope: None,
+            declared_max_linear_m_per_s: None,
+            declared_max_angular_rad_per_s: None,
         };
         let json = serde_json::to_string(&inv).unwrap();
         let back: TaskInvocation = serde_json::from_str(&json).unwrap();
@@ -471,6 +492,8 @@ mod tests {
             phases: vec![],
             control_interface_manifest: None,
             delegation_scope: None,
+            declared_max_linear_m_per_s: None,
+            declared_max_angular_rad_per_s: None,
         };
 
         // Verify optional fields serialize as null in the wire format.
@@ -506,5 +529,85 @@ mod tests {
             embodiment_changed_subject(host_id),
             format!("{INTERNAL_EMBODIMENT_CHANGED_PREFIX}.{host_id}")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Plan 24-12 Task 1: declared velocity fields on TaskInvocation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn task_invocation_legacy_without_declared_velocities_deserializes_to_none() {
+        // Serialize a pre-24-12 TaskInvocation shape — matches the bytes
+        // emitted by older servers/tests that existed before the two new
+        // declared_* fields were added.
+        let legacy = serde_json::json!({
+            "task_id": Uuid::nil(),
+            "tenant_id": "t",
+            "prompt": "p",
+            "environment_id": Uuid::nil(),
+            "safety_policy_id": null,
+            "host_id": Uuid::nil(),
+            "timeout_secs": 60,
+            "mode": "react",
+            "parent_task_id": null,
+            "restate_url": "http://localhost:8080",
+        });
+        let parsed: TaskInvocation = serde_json::from_value(legacy).expect("legacy invocation must parse");
+        assert!(parsed.declared_max_linear_m_per_s.is_none());
+        assert!(parsed.declared_max_angular_rad_per_s.is_none());
+    }
+
+    #[test]
+    fn task_invocation_serializes_declared_velocities_when_set() {
+        let invocation = TaskInvocation {
+            task_id: Uuid::new_v4(),
+            tenant_id: "t".into(),
+            prompt: "p".into(),
+            environment_id: Uuid::new_v4(),
+            safety_policy_id: None,
+            host_id: Uuid::new_v4(),
+            timeout_secs: 60,
+            mode: ExecutionMode::React,
+            parent_task_id: None,
+            restate_url: "http://localhost:8080".into(),
+            traceparent: None,
+            phases: vec![],
+            control_interface_manifest: None,
+            delegation_scope: None,
+            declared_max_linear_m_per_s: Some(1.5),
+            declared_max_angular_rad_per_s: Some(0.75),
+        };
+        let json = serde_json::to_value(&invocation).expect("serialize");
+        assert_eq!(json["declared_max_linear_m_per_s"], 1.5);
+        assert_eq!(json["declared_max_angular_rad_per_s"], 0.75);
+        let bytes = serde_json::to_vec(&invocation).expect("serialize bytes");
+        let back: TaskInvocation = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(back.declared_max_linear_m_per_s, Some(1.5));
+        assert_eq!(back.declared_max_angular_rad_per_s, Some(0.75));
+    }
+
+    #[test]
+    fn task_invocation_skips_declared_velocities_when_none() {
+        let invocation = TaskInvocation {
+            task_id: Uuid::new_v4(),
+            tenant_id: "t".into(),
+            prompt: "p".into(),
+            environment_id: Uuid::new_v4(),
+            safety_policy_id: None,
+            host_id: Uuid::new_v4(),
+            timeout_secs: 60,
+            mode: ExecutionMode::React,
+            parent_task_id: None,
+            restate_url: "http://localhost:8080".into(),
+            traceparent: None,
+            phases: vec![],
+            control_interface_manifest: None,
+            delegation_scope: None,
+            declared_max_linear_m_per_s: None,
+            declared_max_angular_rad_per_s: None,
+        };
+        let json = serde_json::to_string(&invocation).expect("serialize");
+        assert!(!json.contains("declared_max_linear_m_per_s"));
+        assert!(!json.contains("declared_max_angular_rad_per_s"));
     }
 }

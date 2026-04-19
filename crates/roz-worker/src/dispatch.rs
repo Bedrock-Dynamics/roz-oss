@@ -627,6 +627,8 @@ mod tests {
             phases: vec![],
             control_interface_manifest: None,
             delegation_scope: None,
+            declared_max_linear_m_per_s: None,
+            declared_max_angular_rad_per_s: None,
         }
     }
 
