@@ -247,6 +247,11 @@ struct PreparedControlProfile {
     joint_limits: Vec<JointSafetyLimits>,
     force_limits: Option<ForceSafetyLimits>,
     watched_frames: Vec<String>,
+    /// Phase 24 Plan 24-16 — per-channel chassis-axis classification used by
+    /// the `HotPathSafetyFilter` to route chassis-level `CopperPolicy` limits
+    /// onto the correct axis (Linear / Angular / Force / Other). Derived
+    /// once from the `ControlInterfaceManifest` when the profile is built.
+    chassis_axis_map: Vec<crate::safety_filter::ChassisAxis>,
 }
 
 #[derive(Default)]
@@ -1274,6 +1279,7 @@ fn build_control_profile_from_runtime(
             .as_ref()
             .and_then(|overlay| overlay.force_limits.clone()),
         watched_frames: embodiment_runtime.watched_frames.clone(),
+        chassis_axis_map: crate::safety_filter::chassis_axis_map_from_manifest(control_manifest),
     }
 }
 
@@ -1329,6 +1335,14 @@ fn build_tick_infrastructure(
         tick_period_s,
     )
     .expect("control profile tick period must be valid");
+
+    // Phase 24 Plan 24-16: attach the per-channel chassis-axis map so the
+    // filter can route chassis-level `CopperPolicy` limits onto the correct
+    // axis (Linear / Angular / Force). The map length is guaranteed to equal
+    // `joint_limits.len()` because both are derived from the same manifest.
+    let hot_path_filter = hot_path_filter
+        .with_chassis_axis_map(profile.chassis_axis_map.clone())
+        .expect("chassis_axis_map length must match joint_limits length by construction");
 
     // Phase 24 FS-01 SC#1: attach the chassis-level hot policy so
     // `HotPathSafetyFilter::filter` can project live `CopperPolicy` limits on

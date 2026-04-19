@@ -2,9 +2,82 @@
 
 use roz_core::command::{CommandFrame, MotorCommand};
 use roz_core::controller::intervention::{InterventionKind, SafetyIntervention};
-use roz_core::embodiment::binding::{CommandInterfaceType, ControlInterfaceManifest};
+use roz_core::embodiment::binding::{
+    ChannelBinding, CommandInterfaceType, ControlChannelDef, ControlInterfaceManifest,
+};
 use roz_core::embodiment::limits::{ForceSafetyLimits, JointSafetyLimits};
+use roz_core::embodiment::model::SemanticRole;
 use roz_core::embodiment::workspace::WorkspaceEnvelope;
+
+/// Chassis-level axis classification for a single control channel.
+///
+/// Used by [`HotPathSafetyFilter`] to route per-channel commands onto the
+/// correct `CopperPolicy` limit (max_linear_m_per_s vs max_angular_rad_per_s
+/// vs max_force_newtons). Inferred from the channel's [`SemanticRole`] when
+/// available, with a units-based fallback.
+///
+/// [`ChassisAxis::Other`] means the channel has no chassis-policy mapping
+/// (e.g. a joint velocity on a manipulator, or an IMU sensor) — the
+/// per-channel [`JointSafetyLimits`] still apply, but chassis-level
+/// `CopperPolicy` limits are skipped for that channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChassisAxis {
+    Linear,
+    Angular,
+    Force,
+    Other,
+}
+
+/// Infer the [`ChassisAxis`] for a control channel.
+///
+/// Priority:
+/// 1. If the supplied `binding` carries a [`SemanticRole`], map that to the
+///    chassis axis (BaseTranslation → Linear, BaseRotation → Angular,
+///    ForceTorqueSensor → Force).
+/// 2. Otherwise, fall back to the channel's `units` string.
+/// 3. Anything else → [`ChassisAxis::Other`].
+///
+/// The inference is deterministic and conservative — unknown channels map
+/// to `Other` so the chassis-policy enforcement step is skipped rather than
+/// silently clamping the wrong axis.
+#[must_use]
+pub fn infer_chassis_axis(channel: &ControlChannelDef, binding: Option<&ChannelBinding>) -> ChassisAxis {
+    if let Some(role) = binding.and_then(|b| b.semantic_role.as_ref()) {
+        match role {
+            SemanticRole::BaseTranslation => return ChassisAxis::Linear,
+            SemanticRole::BaseRotation => return ChassisAxis::Angular,
+            SemanticRole::ForceTorqueSensor => return ChassisAxis::Force,
+            _ => {}
+        }
+    }
+    match channel.units.as_str() {
+        "m/s" => ChassisAxis::Linear,
+        "rad/s" => ChassisAxis::Angular,
+        "N" | "Nm" => ChassisAxis::Force,
+        _ => ChassisAxis::Other,
+    }
+}
+
+/// Build a parallel [`ChassisAxis`] map from a [`ControlInterfaceManifest`].
+///
+/// The returned vector has one entry per `control_manifest.channels[i]`,
+/// with the binding (if any) at `channel_index == i` supplying the
+/// semantic-role hint.
+#[must_use]
+pub fn chassis_axis_map_from_manifest(manifest: &ControlInterfaceManifest) -> Vec<ChassisAxis> {
+    manifest
+        .channels
+        .iter()
+        .enumerate()
+        .map(|(index, channel)| {
+            let binding = manifest
+                .bindings
+                .iter()
+                .find(|binding| usize::try_from(binding.channel_index).ok() == Some(index));
+            infer_chassis_axis(channel, binding)
+        })
+        .collect()
+}
 
 /// Copper task that clamps motor commands to safety limits.
 ///
@@ -424,6 +497,13 @@ pub struct HotPathSafetyFilter {
     /// push via `HotCopperPolicy::store`. Swaps are visible to the next
     /// reader immediately with no barrier coordination.
     policy: Option<crate::policy::HotCopperPolicy>,
+    /// Phase 24 Plan 24-16 — per-channel chassis-axis classification used to
+    /// route the correct `CopperPolicy` limit onto each channel (Linear /
+    /// Angular / Force / Other). One entry per channel, parallel to
+    /// `joint_limits`. Defaults to all-`Other` (no chassis clamp) when a
+    /// control manifest has not been supplied via
+    /// [`HotPathSafetyFilter::with_chassis_axis_map`].
+    chassis_axis: Vec<ChassisAxis>,
 }
 
 impl HotPathSafetyFilter {
@@ -433,6 +513,7 @@ impl HotPathSafetyFilter {
         force_limits: Option<ForceSafetyLimits>,
         tick_period_s: f64,
     ) -> Result<Self, String> {
+        let axis_len = joint_limits.len();
         Ok(Self {
             joint_limits,
             force_limits,
@@ -440,7 +521,32 @@ impl HotPathSafetyFilter {
             previous_commands: Vec::new(),
             tick_period_s: validate_tick_period(tick_period_s)?,
             policy: None,
+            chassis_axis: vec![ChassisAxis::Other; axis_len],
         })
+    }
+
+    /// Attach a per-channel [`ChassisAxis`] classification map (Phase 24
+    /// Plan 24-16).
+    ///
+    /// `axis_map.len()` must equal `self.joint_limits.len()`; if the control
+    /// manifest has fewer channels than joints (or vice versa), callers
+    /// should build a manifest-derived map via
+    /// [`chassis_axis_map_from_manifest`] and pad/truncate appropriately
+    /// before calling this builder.
+    ///
+    /// Returns an error when the map length does not match the configured
+    /// joint-limit count — silently truncating would cause incorrect chassis
+    /// enforcement on unmapped channels.
+    pub fn with_chassis_axis_map(mut self, axis_map: Vec<ChassisAxis>) -> Result<Self, String> {
+        if axis_map.len() != self.joint_limits.len() {
+            return Err(format!(
+                "chassis_axis_map length {} does not match joint_limits length {}",
+                axis_map.len(),
+                self.joint_limits.len()
+            ));
+        }
+        self.chassis_axis = axis_map;
+        Ok(self)
     }
 
     /// Attach a hot-swap policy pointer (Phase 24 FS-01 wiring). Once
