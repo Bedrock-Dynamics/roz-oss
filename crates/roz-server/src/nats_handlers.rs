@@ -272,6 +272,11 @@ async fn spawn_task_handler(
             phases: req.phases.clone(),
             control_interface_manifest: req.control_interface_manifest.clone(),
             delegation_scope: req.delegation_scope.clone(),
+            // Plan 24-12: child-task declared velocity bounds — server does
+            // not (yet) project from parent policy, worker falls back to
+            // `HotPolicy` trivial-allow on None.
+            declared_max_linear_m_per_s: None,
+            declared_max_angular_rad_per_s: None,
         };
         // Phase 23 Plan 23-10 (FS-04): sign the invoke publish when a
         // signing gate is wired (production). The SpawnReply below uses a

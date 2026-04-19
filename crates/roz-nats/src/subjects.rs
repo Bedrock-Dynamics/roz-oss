@@ -248,6 +248,16 @@ impl Subjects {
         validate_token("worker_id", worker_id)?;
         Ok(format!("cmd.{worker_id}.clear_failsafe"))
     }
+
+    /// Build a worker-scoped resume-instruction subject: `roz.tasks.{worker_id}`.
+    /// Server -> worker dispatch on reconnect (D-10). The worker subscribes
+    /// and parses `ResumeInstruction` payloads published after the
+    /// `roz.state.worker_online` handshake resolves. See Plan 24-12 Task 4
+    /// for the worker-side subscriber.
+    pub fn worker_tasks(worker_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        Ok(format!("roz.tasks.{worker_id}"))
+    }
 }
 
 #[cfg(test)]
@@ -527,5 +537,18 @@ mod tests {
     fn clear_failsafe_subject_rejects_invalid() {
         assert!(Subjects::clear_failsafe("").is_err());
         assert!(Subjects::clear_failsafe("a.b").is_err());
+    }
+
+    #[test]
+    fn worker_tasks_subject_builds() {
+        assert_eq!(Subjects::worker_tasks("host1").unwrap(), "roz.tasks.host1");
+    }
+
+    #[test]
+    fn worker_tasks_subject_rejects_invalid() {
+        assert!(Subjects::worker_tasks("").is_err());
+        assert!(Subjects::worker_tasks("a.b").is_err());
+        assert!(Subjects::worker_tasks("a*").is_err());
+        assert!(Subjects::worker_tasks("a>").is_err());
     }
 }

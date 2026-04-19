@@ -212,6 +212,11 @@ pub async fn dispatch_task(
         phases: request.phases,
         control_interface_manifest: request.control_interface_manifest,
         delegation_scope: request.delegation_scope,
+        // Plan 24-12: declared velocity bounds are not yet surfaced on the
+        // REST create-task payload — worker pre-dispatch gate falls through
+        // to trivial-allow on None. Follow-up plan threads them in.
+        declared_max_linear_m_per_s: None,
+        declared_max_angular_rad_per_s: None,
     };
     let subject = roz_nats::subjects::Subjects::invoke(&host.name, &task.id.to_string())
         .map_err(|error| TaskDispatchError::BadRequest(format!("invalid NATS subject: {error}")))?;

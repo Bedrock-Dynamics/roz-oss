@@ -379,6 +379,23 @@ async fn execute_task(
     estop_rx: tokio::sync::watch::Receiver<bool>,
     camera_manager: Option<Arc<roz_worker::camera::CameraManager>>,
     signing_ctx: Option<WorkerSigningContext>,
+    // Plan 24-12 Task 1: module-level policy state threaded in so the
+    // pre-dispatch gate evaluates against the live `PolicyCache`/`HotPolicy`
+    // updated by the policy push subscriber — not a fresh permissive
+    // default. Arc clones are cheap (atomic bump).
+    policy_cache: std::sync::Arc<roz_worker::policy_cache::PolicyCache>,
+    hot_policy: std::sync::Arc<roz_worker::policy_cache::HotPolicy>,
+    // Plan 24-12 Task 3: the copper chassis-level hot policy + shared
+    // backpressure atom that `CopperHandle::spawn_with_policy` plugs into
+    // the running task graph (Plan 24-10 API). Reads are lock-free on the
+    // 100 Hz tick.
+    copper_hot_policy: roz_copper::policy::HotCopperPolicy,
+    telemetry_backpressure: std::sync::Arc<roz_worker::telemetry_backpressure::TelemetryBackpressure>,
+    // Plan 24-12 Task 5: shared `WalStore` so `execute_task` can spawn a
+    // per-task `CheckpointWriter` with a real `periodic_task_id` while a
+    // task is active. `None` when signing bootstrap did not complete
+    // (D-12 rollout / no `ROZ_ENCRYPTION_KEY`).
+    worker_wal_shared: Option<std::sync::Arc<roz_worker::wal::WalStore>>,
 ) {
     tracing::info!("starting task execution");
 
@@ -437,6 +454,53 @@ async fn execute_task(
     }
 
     let task_agent_cancel = CancellationToken::new();
+
+    // Plan 24-12 Task 5: spawn a short-lived per-task `CheckpointWriter`
+    // with a real `periodic_task_id = task_id.to_string()` so the 5 s
+    // periodic WAL checkpoints run for the duration of the task. The
+    // boot-time writer at main.rs has `periodic_task_id=""` which disables
+    // periodic writes; we bind a real task id here. The sender
+    // (`task_ckpt_tx`) is held live for the task lifetime; dropping it +
+    // cancelling `task_ckpt_cancel` at task exit drains the receiver
+    // cleanly. Future plans wire the sender into the agent loop so
+    // `ToolCallStarted` / `ToolCallCompleted` / `ApprovalReceived`
+    // triggers fire.
+    let task_ckpt_cancel = CancellationToken::new();
+    let (task_ckpt_tx, task_ckpt_rx) = roz_worker::checkpoint_writer::checkpoint_writer_channel(
+        roz_worker::checkpoint_writer::DEFAULT_CHANNEL_CAPACITY,
+    );
+    if let Some(wal) = worker_wal_shared.as_ref() {
+        let wal_clone = wal.clone();
+        let cancel_clone = task_ckpt_cancel.clone();
+        let task_id_str = task_id.to_string();
+        tokio::spawn(async move {
+            let writer = roz_worker::checkpoint_writer::CheckpointWriter::new(
+                wal_clone,
+                task_id_str,
+                0,
+                roz_worker::checkpoint_writer::DEFAULT_CHECKPOINT_INTERVAL,
+                cancel_clone,
+            );
+            writer.run(task_ckpt_rx).await;
+        });
+    } else {
+        // Drain the receiver so the channel does not back up when no WAL
+        // is available. Without this the `task_ckpt_tx` would fill the
+        // bounded channel and subsequent `try_send` from future agent-loop
+        // wiring would drop triggers silently.
+        tokio::spawn(async move {
+            let mut rx = task_ckpt_rx;
+            while rx.recv().await.is_some() {
+                // Drop; no WAL available to checkpoint against.
+            }
+        });
+    }
+    // Hold the per-task sender live for the duration of the task. Dropping
+    // it + cancelling `task_ckpt_cancel` at task exit drains the receiver
+    // cleanly. Future plans wire this sender into the agent loop so
+    // `ToolCall*` / `ApprovalReceived` triggers fire.
+    let _task_ckpt_sender_hold = task_ckpt_tx;
+
     let model = match roz_worker::model_factory::build_model(&task_config, None) {
         Ok(m) => m,
         Err(e) => {
@@ -478,11 +542,20 @@ async fn execute_task(
     // Worker task invocations currently carry the canonical control contract
     // but not a compiled EmbodimentRuntime or runtime-owned rollout policy, so
     // the worker must stay on the execution boundary only.
+    //
+    // Plan 24-12 Task 3: `spawn_with_policy` replaces `spawn_execution_only`
+    // so the chassis-level `HotCopperPolicy` (updated by the policy push
+    // subscriber) and the shared `TelemetryBackpressure` atom (written by
+    // the WAL-aware telemetry publisher) reach the running task graph.
     let mut copper_handle = match invocation.mode {
         roz_nats::dispatch::ExecutionMode::OodaReAct => {
             let max_velocity = task_config.max_velocity.unwrap_or(1.5);
-            let handle = roz_worker::copper_handle::CopperHandle::spawn_execution_only(max_velocity);
-            tracing::info!("copper controller spawned for OodaReAct task in execution-only mode");
+            let handle = roz_worker::copper_handle::CopperHandle::spawn_with_policy(
+                max_velocity,
+                copper_hot_policy.clone(),
+                telemetry_backpressure.shared(),
+            );
+            tracing::info!("copper controller spawned for OodaReAct task with hot policy + shared backpressure");
             Some(handle)
         }
         roz_nats::dispatch::ExecutionMode::React => None,
@@ -615,18 +688,21 @@ async fn execute_task(
     // and return early. On stale-cache (D-01) write a `policy_stale` warning
     // audit row and continue.
     //
-    // Plan 24-05 scope: the gate function is wired, runtime instances are
-    // locally constructed from the `permissive()` default. Plan 24-09 threads
-    // the live `PolicyCache` + `HotPolicy` from the worker main loop once the
-    // `roz.policy.{worker_id}` subscribe loop exists. Declared velocity fields
-    // also land on `TaskInvocation` in 24-09 — until then the gate evaluates
-    // against effective velocity=0 and trivially Allows.
+    // Plan 24-12 Task 1: the gate now uses the module-level `PolicyCache` +
+    // `HotPolicy` threaded in from `main()` (updated by the policy push
+    // subscriber) — NOT a fresh permissive default. Declared velocity
+    // fields come from the invocation payload per Plan 24-12 Task 1
+    // (`TaskInvocation.declared_max_{linear,angular}_{m,rad}_per_s`).
     {
-        let policy_cache = roz_worker::policy_cache::PolicyCache::new();
-        let hot_policy = roz_worker::policy_cache::HotPolicy::permissive();
         let gate_start = std::time::Instant::now();
-        let decision =
-            roz_worker::dispatch::pre_dispatch_check(&policy_cache, &hot_policy, &invocation, None, None).await;
+        let decision = roz_worker::dispatch::pre_dispatch_check(
+            policy_cache.as_ref(),
+            hot_policy.as_ref(),
+            &invocation,
+            invocation.declared_max_linear_m_per_s,
+            invocation.declared_max_angular_rad_per_s,
+        )
+        .await;
         let gate_elapsed = gate_start.elapsed();
         if gate_elapsed > Duration::from_millis(10) {
             tracing::warn!(
@@ -1157,15 +1233,41 @@ async fn main() -> Result<()> {
     let estop_rx = roz_worker::estop::spawn_estop_listener(estop_sub);
     tracing::info!(worker_id = %config.worker_id, "e-stop listener active");
 
+    // =================================================================
+    // Phase 24 shared state — hoisted above the watchdog construction so
+    // the policy-sourced `on_expire` callback (Plan 24-12 Task 2) can
+    // capture the module-level `HotPolicy` Arc before the watchdog spawns.
+    // The Arc wrappers also allow Plan 24-12 Task 1 to thread these into
+    // `execute_task` for the pre-dispatch gate instead of constructing a
+    // fresh permissive default per invocation.
+    // =================================================================
+    let phase24_cancel = CancellationToken::new();
+    let policy_cache = std::sync::Arc::new(roz_worker::policy_cache::PolicyCache::new());
+    let hot_policy = std::sync::Arc::new(roz_worker::policy_cache::HotPolicy::permissive());
+    let copper_hot_policy = roz_copper::policy::new_hot_policy();
+    // Telemetry backpressure is wrapped in an `Arc` so the worker's
+    // telemetry publisher (writes via `TelemetryBackpressure::update`) and
+    // `CopperHandle::spawn_with_policy` (reads the same atom via
+    // `shared()`) see one pointee. Plan 24-12 Task 3 threads this into
+    // `execute_task`.
+    let telemetry_backpressure = std::sync::Arc::new(roz_worker::telemetry_backpressure::TelemetryBackpressure::new());
+    let telemetry_drop_counter = std::sync::Arc::new(roz_worker::telemetry::DropCounter::new());
+    let telemetry_append_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     // Spawn idle watchdog — fires if no NATS message arrives within 30s.
-    let watchdog = Arc::new(roz_worker::command_watchdog::CommandWatchdog::new(Duration::from_secs(
-        30,
-    )));
+    // Plan 24-12 Task 2: the `on_expire` callback reads the live
+    // `HotPolicy.deadman_timers.on_expire` action and logs it. Phase 25
+    // replaces the log body with an actual MAVLink command dispatch.
+    let deadman_callback = roz_worker::command_watchdog::build_deadman_callback(hot_policy.clone());
+    let watchdog = Arc::new(roz_worker::command_watchdog::CommandWatchdog::with_on_expire(
+        Duration::from_secs(30),
+        deadman_callback,
+    ));
     let watchdog_cancel = CancellationToken::new();
     let wd = watchdog.clone();
     let wd_cancel = watchdog_cancel.clone();
     tokio::spawn(async move { wd.run(wd_cancel).await });
-    tracing::info!("idle watchdog active (30s deadline)");
+    tracing::info!("idle watchdog active (30s deadline, policy-sourced on_expire)");
 
     // Load embodiment runtime from robot.toml if configured (D-01, D-02)
     let embodiment_runtime: Option<roz_core::embodiment::embodiment_runtime::EmbodimentRuntime> =
@@ -1341,10 +1443,12 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Phase 23 FS-04: spawn telemetry publisher (10 Hz) now that signing
-    // bootstrap has run. When signing is enabled, route through
-    // `publish_state_signed` so every telemetry frame carries a roz-sig-v1
-    // header. Otherwise fall back to the unsigned path (D-12 rollout).
+    // Phase 23 FS-04 / Plan 24-12 Task 3: spawn telemetry publisher (10 Hz).
+    // When signing AND a WAL are both configured, route through
+    // `publish_state_signed_with_buffer` so NATS-outage frames are buffered
+    // to the WAL and replayed on reconnect (FS-02). When only signing is
+    // configured, fall back to the plain signed publish. When signing is
+    // disabled (D-12 rollout) use the unsigned path.
     // `correlation_id` for telemetry is a stable worker-lifetime UUID so
     // the server's verifier can scope replay protection consistently across
     // the continuous telemetry stream.
@@ -1352,6 +1456,10 @@ async fn main() -> Result<()> {
     let telem_worker_id = config.worker_id.clone();
     let telem_signing_ctx = signing_ctx.clone();
     let telem_correlation_id = Uuid::new_v4();
+    let telem_wal = worker_wal.clone();
+    let telem_bp = telemetry_backpressure.clone();
+    let telem_drop = telemetry_drop_counter.clone();
+    let telem_append = telemetry_append_counter.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(100));
         loop {
@@ -1361,17 +1469,33 @@ async fn main() -> Result<()> {
                 "joints": [],
                 "sensors": {}
             });
-            let publish_result = if let Some(ref ctx) = telem_signing_ctx {
-                roz_worker::telemetry::publish_state_signed(
-                    &telem_nats,
-                    ctx,
-                    &telem_worker_id,
-                    telem_correlation_id,
-                    &state,
-                )
-                .await
-            } else {
-                roz_worker::telemetry::publish_state(&telem_nats, &telem_worker_id, &state).await
+            let publish_result = match (telem_signing_ctx.as_ref(), telem_wal.as_ref()) {
+                (Some(ctx), Some(wal)) => {
+                    roz_worker::telemetry::publish_state_signed_with_buffer(
+                        &telem_nats,
+                        ctx,
+                        &telem_worker_id,
+                        telem_correlation_id,
+                        &state,
+                        wal,
+                        &telem_bp,
+                        &telem_drop,
+                        &telem_append,
+                    )
+                    .await
+                }
+                (Some(ctx), None) => {
+                    // Signing enabled but no WAL — fall back to plain signed publish (no buffering).
+                    roz_worker::telemetry::publish_state_signed(
+                        &telem_nats,
+                        ctx,
+                        &telem_worker_id,
+                        telem_correlation_id,
+                        &state,
+                    )
+                    .await
+                }
+                (None, _) => roz_worker::telemetry::publish_state(&telem_nats, &telem_worker_id, &state).await,
             };
             if let Err(e) = publish_result {
                 tracing::trace!(error = %e, "telemetry publish failed");
@@ -1393,14 +1517,42 @@ async fn main() -> Result<()> {
     // - Policy caches (30 s TTL moka + ArcSwap hot pointer) — consumers log
     //   a permissive default until the first `roz.policy.{worker_id}` push.
     // - Copper hot policy pointer — ready for a subscribe-driven store().
-    let phase24_cancel = CancellationToken::new();
-    let policy_cache = roz_worker::policy_cache::PolicyCache::new();
-    let hot_policy = roz_worker::policy_cache::HotPolicy::permissive();
-    let copper_hot_policy = roz_copper::policy::new_hot_policy();
+    //
+    // NOTE: `phase24_cancel`, `policy_cache`, `hot_policy`, `copper_hot_policy`,
+    // `telemetry_backpressure`, `telemetry_drop_counter`, and
+    // `telemetry_append_counter` are constructed **above** the watchdog
+    // block (Plan 24-12 Task 2 hoist) so the deadman callback can capture
+    // the `HotPolicy` Arc clone. The subscribers below reuse them via
+    // `.clone()` on the Arc wrappers.
+
+    // Plan 15-06 (D-11, D-23, D-24) / Plan 24-12 Task 4: worker-level
+    // SessionEvent bus so transport-health transitions AND the resume
+    // subscriber's `SessionEvent::RecoveryPending` emission (FS-03 SC#5)
+    // share one broadcast channel. Hoisted above the Phase 24 block so
+    // the resume subscriber in the `if let (Some(ctx_shared), ...)` body
+    // can clone the sender into its closure. Capacity 64 matches the
+    // EdgeHealthAggregator signal channel.
+    let (session_event_tx, _session_event_rx_keepalive): (
+        tokio::sync::broadcast::Sender<roz_core::session::event::EventEnvelope>,
+        tokio::sync::broadcast::Receiver<roz_core::session::event::EventEnvelope>,
+    ) = tokio::sync::broadcast::channel(64);
 
     if let (Some(ctx_shared), Some(wal_arc), Some(tenant_uuid)) =
         (signing_ctx_shared.as_ref(), worker_wal.as_ref(), worker_tenant)
     {
+        // -----------------------------------------------------------------
+        // Checkpoint-trigger channel hoisted above the policy subscriber so
+        // the push subscriber can emit `CheckpointTrigger::DegradationChange`
+        // on every policy swap (Plan 24-12 Task 5). The boot-time
+        // `CheckpointWriter` below drains `ckpt_rx`; the policy subscriber
+        // clones `ckpt_tx` into its closure. The outer `ckpt_tx` binding is
+        // held live for the worker's lifetime so the receiver never sees a
+        // disconnected channel when no active producer is sending.
+        // -----------------------------------------------------------------
+        let (ckpt_tx, ckpt_rx) = roz_worker::checkpoint_writer::checkpoint_writer_channel(
+            roz_worker::checkpoint_writer::DEFAULT_CHANNEL_CAPACITY,
+        );
+
         // -----------------------------------------------------------------
         // Policy push subscriber on `roz.policy.{worker_id}` (D-04).
         // -----------------------------------------------------------------
@@ -1412,6 +1564,7 @@ async fn main() -> Result<()> {
             let subscribe_copper_hot = copper_hot_policy.clone();
             let subscribe_worker_id = config.worker_id.clone();
             let subscribe_cancel = phase24_cancel.clone();
+            let subscribe_ckpt_tx = ckpt_tx.clone();
             tokio::spawn(async move {
                 let subject = match roz_nats::Subjects::policy(&subscribe_worker_id) {
                     Ok(s) => s,
@@ -1464,10 +1617,29 @@ async fn main() -> Result<()> {
                             subscribe_hot.store((*policy_arc).clone());
                             let cp = roz_worker::policy_enforcement::project_to_copper_policy(&policy);
                             subscribe_copper_hot.store(std::sync::Arc::new(cp));
+                            // Plan 24-12 Task 5 (FS-03 SC#2): emit a
+                            // DegradationChange checkpoint trigger on every
+                            // policy hot-swap. `task_id` is empty at boot
+                            // (no task active); an active task's own
+                            // CheckpointWriter runs in parallel and binds
+                            // the real task id for periodic anchors. Best-
+                            // effort `try_send` so a full channel does not
+                            // block the subscribe loop; a drop here is
+                            // acceptable because the policy itself has been
+                            // applied already.
+                            let trigger = roz_worker::checkpoint_writer::CheckpointTrigger::DegradationChange {
+                                task_id: String::new(),
+                                step_counter: 0,
+                                from: "unknown".into(),
+                                to: format!("policy_v{}", row.version),
+                            };
+                            if let Err(e) = subscribe_ckpt_tx.try_send(trigger) {
+                                tracing::debug!(error = %e, "degradation-change trigger dropped (channel full/closed)");
+                            }
                             tracing::info!(
                                 policy_id = %row.id,
                                 version = row.version,
-                                "policy push applied (cache + hot + copper hot)"
+                                "policy push applied (cache + hot + copper hot + degradation trigger)"
                             );
                         }
                         () = subscribe_cancel.cancelled() => return,
@@ -1501,16 +1673,114 @@ async fn main() -> Result<()> {
         }
 
         // -----------------------------------------------------------------
-        // Checkpoint writer (D-08). The per-task anchoring id is injected
-        // when a task begins executing — this boot-time spawn uses an empty
-        // `periodic_task_id`, so only explicit `CheckpointTrigger` events
-        // (future wiring into the agent loop) land in the WAL. Plan 24-09
-        // scope is the spawn itself; per-task binding threading is deferred
-        // to a follow-up plan (see deviations in 24-09 SUMMARY).
+        // Resume-instruction subscriber on `roz.tasks.{worker_id}` (D-10,
+        // Plan 24-12 Task 4). The server publishes one `ResumeInstruction`
+        // per in-flight task on reconnect; the worker verifies the signed
+        // envelope, parses the instruction, and runs the D-11 recovery
+        // gate via `handle_resume_instruction`. On `SafeStateWait` we emit
+        // a `SessionEvent::RecoveryPending` on the session broadcast bus so
+        // operators see the state transition (FS-03 SC#5).
         // -----------------------------------------------------------------
-        let (ckpt_tx, ckpt_rx) = roz_worker::checkpoint_writer::checkpoint_writer_channel(
-            roz_worker::checkpoint_writer::DEFAULT_CHANNEL_CAPACITY,
-        );
+        {
+            let rt_nats = nats.clone();
+            let rt_ctx = ctx_shared.clone();
+            let rt_wal = wal_arc.clone();
+            let rt_session_tx = session_event_tx.clone();
+            let rt_worker_id = config.worker_id.clone();
+            let rt_cancel = phase24_cancel.clone();
+            tokio::spawn(async move {
+                let subject = match roz_nats::Subjects::worker_tasks(&rt_worker_id) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "invalid worker_id for tasks subject; skipping resume subscriber");
+                        return;
+                    }
+                };
+                let mut sub = match rt_nats.subscribe(subject.clone()).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(error = %e, %subject, "failed to subscribe to resume instructions");
+                        return;
+                    }
+                };
+                tracing::info!(%subject, "resume-instruction subscriber ready");
+                loop {
+                    tokio::select! {
+                        maybe_msg = futures::StreamExt::next(&mut sub) => {
+                            let Some(msg) = maybe_msg else {
+                                tracing::warn!("resume-instruction subscription ended");
+                                return;
+                            };
+                            let header = msg
+                                .headers
+                                .as_ref()
+                                .and_then(|h| h.get(roz_core::signing::HEADER_NAME).map(|v| v.to_string()));
+                            if let Err(e) = rt_ctx.verify_inbound_worker(header.as_deref(), &msg.payload) {
+                                tracing::warn!(error = %e, "resume instruction signature rejected");
+                                continue;
+                            }
+                            let instruction: roz_core::reconnect::ResumeInstruction =
+                                match serde_json::from_slice(&msg.payload) {
+                                    Ok(i) => i,
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "resume instruction parse failed");
+                                        continue;
+                                    }
+                                };
+                            let now = chrono::Utc::now().timestamp();
+                            match roz_worker::reconnect_handshake::handle_resume_instruction(
+                                &instruction,
+                                &rt_wal,
+                                now,
+                            ) {
+                                Ok(Some(event)) => {
+                                    // Wrap in EventEnvelope — shape copied
+                                    // from the 15-06 EdgeTransportDegraded
+                                    // emission path so the broadcast
+                                    // channel's payload shape matches.
+                                    let envelope = roz_core::session::event::EventEnvelope {
+                                        event_id: roz_core::session::event::EventId::new(),
+                                        correlation_id: roz_core::session::event::CorrelationId::new(),
+                                        parent_event_id: None,
+                                        timestamp: chrono::Utc::now(),
+                                        event,
+                                    };
+                                    if let Err(e) = rt_session_tx.send(envelope) {
+                                        tracing::debug!(
+                                            error = %e,
+                                            "RecoveryPending event dropped (no live receivers)"
+                                        );
+                                    }
+                                }
+                                Ok(None) => {
+                                    tracing::debug!(task_id = %instruction.task_id, "resume instruction handled without RecoveryPending");
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "handle_resume_instruction failed");
+                                }
+                            }
+                        }
+                        () = rt_cancel.cancelled() => return,
+                    }
+                }
+            });
+        }
+
+        // -----------------------------------------------------------------
+        // Boot-time checkpoint writer (D-08). The per-task periodic writer
+        // lives inside `execute_task` (Plan 24-12 Task 5) with a real
+        // `periodic_task_id = task_id.to_string()`. This boot-time writer
+        // has `periodic_task_id=""` — it only drains event-driven triggers
+        // (such as `CheckpointTrigger::DegradationChange` emitted by the
+        // policy push subscriber above) so system-wide degradation events
+        // are captured even while no task is active.
+        //
+        // The `ckpt_tx` / `ckpt_rx` channel pair is declared above so the
+        // push subscriber can clone `ckpt_tx` into its closure. The outer
+        // `ckpt_tx` binding is dropped immediately after the writer spawn
+        // below — the subscriber's cloned sender keeps the channel live
+        // for the duration of the spawned subscriber loop.
+        // -----------------------------------------------------------------
         {
             let cw_wal = wal_arc.clone();
             let cw_cancel = phase24_cancel.clone();
@@ -1525,9 +1795,13 @@ async fn main() -> Result<()> {
                 writer.run(ckpt_rx).await;
             });
         }
-        // Keep the sender alive for the worker's lifetime. Future wiring
-        // into the agent loop will swap this binding for a cloned sender.
-        let _ckpt_tx_keepalive = ckpt_tx;
+        // The `ckpt_tx` itself is now live-held by the policy push
+        // subscriber's `.clone()` inside its tokio::spawn closure — which
+        // runs until `phase24_cancel` fires. The boot-time receiver never
+        // observes a disconnected channel as long as the policy subscriber
+        // is active. Drop the outer binding here so the Plan 24-09
+        // keepalive placeholder is gone.
+        drop(ckpt_tx);
 
         // -----------------------------------------------------------------
         // Telemetry replay loop (FS-02). Fires each time `reconnect_tx`
@@ -1729,17 +2003,6 @@ async fn main() -> Result<()> {
             None
         }
     };
-
-    // Plan 15-06 (D-11, D-23, D-24): worker-level SessionEvent bus so transport-
-    // health state transitions emit SessionEvent::EdgeTransportDegraded on a
-    // real broadcast channel (see acceptance criterion `session_event_tx.send`).
-    // Capacity 64 matches the EdgeHealthAggregator signal channel. Consumers
-    // are plugged in by downstream plans; for now the channel guarantees the
-    // emission site exists and is reachable.
-    let (session_event_tx, _session_event_rx_keepalive): (
-        tokio::sync::broadcast::Sender<roz_core::session::event::EventEnvelope>,
-        tokio::sync::broadcast::Receiver<roz_core::session::event::EventEnvelope>,
-    ) = tokio::sync::broadcast::channel(64);
 
     // Plan 15-06 (D-11, D-23, D-24): wire the three-mechanism transport health
     // system — EdgeHealthAggregator, heartbeat publisher, liveliness monitor,
@@ -2095,6 +2358,14 @@ async fn main() -> Result<()> {
             }
             continue;
         };
+        // Plan 24-12 Tasks 1/3/5: clone the module-level shared state into
+        // each spawned task so the pre-dispatch gate, the copper handle, and
+        // the per-task checkpoint writer all see the live worker state.
+        let task_policy_cache = policy_cache.clone();
+        let task_hot_policy = hot_policy.clone();
+        let task_copper_hot_policy = copper_hot_policy.clone();
+        let task_telemetry_bp = telemetry_backpressure.clone();
+        let task_worker_wal = worker_wal.clone();
         let span = tracing::info_span!("worker.execute_task", task_id = %task_id);
         tokio::spawn(
             async move {
@@ -2110,6 +2381,11 @@ async fn main() -> Result<()> {
                     task_estop_rx,
                     task_camera_mgr,
                     task_signing_ctx,
+                    task_policy_cache,
+                    task_hot_policy,
+                    task_copper_hot_policy,
+                    task_telemetry_bp,
+                    task_worker_wal,
                 )
                 .await;
             }
@@ -2142,6 +2418,8 @@ mod tests {
             phases: vec![],
             control_interface_manifest: None,
             delegation_scope: None,
+            declared_max_linear_m_per_s: None,
+            declared_max_angular_rad_per_s: None,
         }
     }
 
