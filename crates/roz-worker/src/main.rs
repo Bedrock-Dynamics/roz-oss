@@ -1671,35 +1671,24 @@ async fn main() -> Result<()> {
                                         continue;
                                     }
                                 };
-                            let policy = match roz_worker::policy_enforcement::parse_policy_from_row(&row) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    tracing::warn!(error = %e, "policy v1 validation failed");
-                                    continue;
-                                }
-                            };
-                            let policy_arc = subscribe_cache.insert(row.id, policy.clone()).await;
-                            subscribe_hot.store((*policy_arc).clone());
-                            let cp = roz_worker::policy_enforcement::project_to_copper_policy(&policy);
-                            subscribe_copper_hot.store(std::sync::Arc::new(cp));
-                            // Plan 24-12 Task 5 (FS-03 SC#2): emit a
-                            // DegradationChange checkpoint trigger on every
-                            // policy hot-swap. `task_id` is empty at boot
-                            // (no task active); an active task's own
-                            // CheckpointWriter runs in parallel and binds
-                            // the real task id for periodic anchors. Best-
-                            // effort `try_send` so a full channel does not
-                            // block the subscribe loop; a drop here is
-                            // acceptable because the policy itself has been
-                            // applied already.
-                            let trigger = roz_worker::checkpoint_writer::CheckpointTrigger::DegradationChange {
-                                task_id: String::new(),
-                                step_counter: 0,
-                                from: "unknown".into(),
-                                to: format!("policy_v{}", row.version),
-                            };
-                            if let Err(e) = subscribe_ckpt_tx.try_send(trigger) {
-                                tracing::debug!(error = %e, "degradation-change trigger dropped (channel full/closed)");
+                            // Plan 24-14 Task 2: apply fan-out extracted into
+                            // `apply_policy_push` so the e2e test in Task 3
+                            // can drive the same code path with a real NATS
+                            // container. The signing-verify + row-parse
+                            // branches remain inline above because they are
+                            // loop-scoped (`subscribe_ctx` + payload error
+                            // vocabulary).
+                            if let Err(e) = roz_worker::policy_enforcement::apply_policy_push(
+                                &row,
+                                &subscribe_cache,
+                                &subscribe_hot,
+                                &subscribe_copper_hot,
+                                Some(&subscribe_ckpt_tx),
+                            )
+                            .await
+                            {
+                                tracing::warn!(error = %e, "policy v1 validation failed");
+                                continue;
                             }
                             tracing::info!(
                                 policy_id = %row.id,

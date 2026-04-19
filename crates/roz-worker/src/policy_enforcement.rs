@@ -325,6 +325,54 @@ pub fn enforce_invocation(
     enforce_command(policy, vl, va, None, &[])
 }
 
+/// Apply a verified [`SafetyPolicyRow`] to the worker's in-memory policy
+/// surfaces: [`PolicyCache`], [`HotPolicy`], and the copper [`HotCopperPolicy`]
+/// `ArcSwap`. Best-effort emits a [`CheckpointTrigger::DegradationChange`]
+/// trigger on the provided sender (drop on full channel matches production
+/// semantics — mirrors main.rs:1713 pre-refactor).
+///
+/// This is the "apply" half of the policy-push subscriber in main.rs: the
+/// signature-verify + row-parse half stays inline in the subscribe loop
+/// because the signing context and `serde_json::from_slice` error branches
+/// are loop-specific. Plan 24-14 Task 2 extracts the apply half so the
+/// Task 3 end-to-end test can drive the cache/hot/copper_hot fan-out
+/// without replicating the production wiring.
+///
+/// [`SafetyPolicyRow`]: roz_db::safety_policies::SafetyPolicyRow
+/// [`PolicyCache`]: crate::policy_cache::PolicyCache
+/// [`HotPolicy`]: crate::policy_cache::HotPolicy
+/// [`HotCopperPolicy`]: roz_copper::policy::HotCopperPolicy
+/// [`CheckpointTrigger::DegradationChange`]: crate::checkpoint_writer::CheckpointTrigger::DegradationChange
+///
+/// # Errors
+///
+/// Propagates [`PolicyEnforcementError::PolicyParse`] when the row's
+/// `policy_json` column cannot be parsed as a `PolicyV1` (unknown field,
+/// wrong enum, etc. — the `deny_unknown_fields` fence at every level).
+pub async fn apply_policy_push(
+    row: &roz_db::safety_policies::SafetyPolicyRow,
+    cache: &crate::policy_cache::PolicyCache,
+    hot: &crate::policy_cache::HotPolicy,
+    copper_hot: &roz_copper::policy::HotCopperPolicy,
+    ckpt_tx: Option<&tokio::sync::mpsc::Sender<crate::checkpoint_writer::CheckpointTrigger>>,
+) -> Result<(), PolicyEnforcementError> {
+    let policy = parse_policy_from_row(row)?;
+    let policy_arc = cache.insert(row.id, policy.clone()).await;
+    hot.store((*policy_arc).clone());
+    let cp = project_to_copper_policy(&policy);
+    copper_hot.store(std::sync::Arc::new(cp));
+    if let Some(tx) = ckpt_tx {
+        let trigger = crate::checkpoint_writer::CheckpointTrigger::DegradationChange {
+            task_id: String::new(),
+            step_counter: 0,
+            from: "unknown".into(),
+            to: format!("policy_v{}", row.version),
+        };
+        let _ = tx.try_send(trigger);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
