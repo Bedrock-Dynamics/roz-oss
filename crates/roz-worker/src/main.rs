@@ -495,7 +495,11 @@ async fn execute_task(
             }
         });
     }
-    let _task_ckpt_tx_keepalive = task_ckpt_tx;
+    // Hold the per-task sender live for the duration of the task. Dropping
+    // it + cancelling `task_ckpt_cancel` at task exit drains the receiver
+    // cleanly. Future plans wire this sender into the agent loop so
+    // `ToolCall*` / `ApprovalReceived` triggers fire.
+    let _task_ckpt_sender_hold = task_ckpt_tx;
 
     let model = match roz_worker::model_factory::build_model(&task_config, None) {
         Ok(m) => m,
@@ -1772,10 +1776,10 @@ async fn main() -> Result<()> {
         // are captured even while no task is active.
         //
         // The `ckpt_tx` / `ckpt_rx` channel pair is declared above so the
-        // push subscriber can clone `ckpt_tx` into its closure; the outer
-        // `ckpt_tx` binding is held live via `_ckpt_tx_keepalive` below so
-        // the receiver never observes a disconnected channel during idle
-        // windows.
+        // push subscriber can clone `ckpt_tx` into its closure. The outer
+        // `ckpt_tx` binding is dropped immediately after the writer spawn
+        // below — the subscriber's cloned sender keeps the channel live
+        // for the duration of the spawned subscriber loop.
         // -----------------------------------------------------------------
         {
             let cw_wal = wal_arc.clone();
@@ -1795,8 +1799,8 @@ async fn main() -> Result<()> {
         // subscriber's `.clone()` inside its tokio::spawn closure — which
         // runs until `phase24_cancel` fires. The boot-time receiver never
         // observes a disconnected channel as long as the policy subscriber
-        // is active. Drop the outer binding here so the grep-verifiable
-        // `_ckpt_tx_keepalive` binding from Plan 24-09 is gone.
+        // is active. Drop the outer binding here so the Plan 24-09
+        // keepalive placeholder is gone.
         drop(ckpt_tx);
 
         // -----------------------------------------------------------------
