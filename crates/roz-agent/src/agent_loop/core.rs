@@ -470,6 +470,7 @@ impl AgentLoop {
                 &mut messages,
                 &presence_tx,
                 input.cancellation_token.as_ref(),
+                i64::from(cycles),
             )
             .await;
 

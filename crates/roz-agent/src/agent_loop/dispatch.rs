@@ -29,6 +29,14 @@ impl AgentLoop {
     ///   `[capture_frame (pure), move_robot (physical), capture_frame (pure)]`.
     ///
     /// Results are collected in original call order for context compaction.
+    ///
+    /// `step_counter` is the current turn counter (`cycles`) threaded from
+    /// `run_streaming_core`; it is used to stamp Phase 24 FS-03 checkpoint
+    /// triggers with the agent-loop step at which the dispatch occurred.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "step_counter is threaded for Phase 24 FS-03 checkpoint-trigger stamping; adding a context struct would be churn for one downstream caller"
+    )]
     pub(crate) async fn dispatch_tool_calls(
         &self,
         tool_calls: &[roz_core::tools::ToolCall],
@@ -37,6 +45,7 @@ impl AgentLoop {
         messages: &mut Vec<Message>,
         presence_tx: &mpsc::Sender<PresenceSignal>,
         cancellation_token: Option<&tokio_util::sync::CancellationToken>,
+        step_counter: i64,
     ) {
         use roz_core::tools::ToolCategory;
 
@@ -66,12 +75,19 @@ impl AgentLoop {
                             segment_end = j,
                             "dispatching pure tool in contiguous segment"
                         );
-                        async move { (idx, self.dispatcher.dispatch(c, tool_ctx).await) }
+                        // Phase 24 FS-03 D-08: emit ToolCallStarted at dispatch
+                        // boundary for every tool call (pure and physical).
+                        self.checkpoint_signal
+                            .tool_call_started(&tool_ctx.task_id, step_counter, &c.id);
+                        async move { (idx, c.id.clone(), self.dispatcher.dispatch(c, tool_ctx).await) }
                     })
                     .collect();
 
                 let pure_results = futures::future::join_all(pure_futures).await;
-                for (idx, res) in pure_results {
+                for (idx, call_id, res) in pure_results {
+                    // Emit ToolCallCompleted on both success and error paths.
+                    self.checkpoint_signal
+                        .tool_call_completed(&tool_ctx.task_id, step_counter, &call_id);
                     indexed_results[idx] = Some(res);
                 }
 
@@ -84,6 +100,13 @@ impl AgentLoop {
                     index = i,
                     "dispatching physical tool sequentially"
                 );
+
+                // Phase 24 FS-03 D-08: emit ToolCallStarted at the dispatch
+                // boundary. For physical tools this fires BEFORE safety
+                // evaluation so the checkpoint captures the intent even if
+                // the safety stack blocks the call.
+                self.checkpoint_signal
+                    .tool_call_started(&tool_ctx.task_id, step_counter, &call.id);
 
                 let safety_result = self.safety.evaluate(call, spatial_ctx).await;
 
@@ -103,6 +126,7 @@ impl AgentLoop {
                                 presence_tx,
                                 tool_ctx,
                                 cancellation_token,
+                                step_counter,
                             )
                             .await
                         } else {
@@ -113,6 +137,11 @@ impl AgentLoop {
                         }
                     }
                 };
+
+                // Emit ToolCallCompleted on every physical return path
+                // (success, blocked, approval-denied, approval-timeout).
+                self.checkpoint_signal
+                    .tool_call_completed(&tool_ctx.task_id, step_counter, &call.id);
 
                 indexed_results[i] = Some(tool_result);
                 i += 1;

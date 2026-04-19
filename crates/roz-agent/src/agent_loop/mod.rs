@@ -26,6 +26,7 @@ use crate::model::types::{ContentPart, Message, MessageRole, Model, StreamChunk}
 use crate::safety::SafetyStack;
 use crate::spatial_provider::WorldStateProvider;
 pub use roz_core::session::control::CognitionMode;
+use roz_core::checkpoint_signal::{CheckpointSignal, NoopCheckpointSignal};
 use tokio::sync::mpsc;
 
 /// Compatibility alias retained while downstream crates converge on
@@ -67,6 +68,12 @@ pub struct AgentLoop {
     /// per role-tagged message (user/assistant/tool); otherwise emission
     /// is a no-op and no DB is touched.
     turn_emitter: Option<turn_emitter::TurnEmitter>,
+    /// Phase 24 FS-03 D-08: checkpoint-trigger signal routed into the
+    /// worker's per-task `CheckpointWriter`. Defaults to
+    /// [`NoopCheckpointSignal`] so non-Phase-24 environments and existing
+    /// tests see zero behavior change. Swapped in at construction time via
+    /// [`Self::with_checkpoint_signal`].
+    pub(super) checkpoint_signal: std::sync::Arc<dyn CheckpointSignal>,
 }
 
 impl AgentLoop {
@@ -92,7 +99,22 @@ impl AgentLoop {
             extensions: crate::dispatch::Extensions::default(),
             meter: std::sync::Arc::new(crate::meter::NoOpMeter),
             turn_emitter: None,
+            checkpoint_signal: std::sync::Arc::new(NoopCheckpointSignal),
         }
+    }
+
+    /// Attach a checkpoint-trigger signal that fires on the three locked
+    /// D-08 transitions (`ToolCallStarted`, `ToolCallCompleted`,
+    /// `ApprovalReceived`).
+    ///
+    /// Default is [`NoopCheckpointSignal`] — callers not opting in see no
+    /// behavior change. The worker's `execute_task` passes a
+    /// `ChannelCheckpointSignal` wrapping the per-task `task_ckpt_tx`
+    /// created in Plan 24-12 Task 5.
+    #[must_use]
+    pub fn with_checkpoint_signal(mut self, signal: std::sync::Arc<dyn CheckpointSignal>) -> Self {
+        self.checkpoint_signal = signal;
+        self
     }
 
     /// Set the usage meter for budget checks and usage recording.
