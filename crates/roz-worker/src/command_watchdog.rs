@@ -25,9 +25,27 @@ pub type OnExpireCallback = Arc<dyn Fn() + Send + Sync>;
 /// halt / land / RTL) is Phase 25 scope per 24-CONTEXT D-03.
 #[must_use]
 pub fn build_deadman_callback(hot_policy: Arc<HotPolicy>) -> OnExpireCallback {
+    build_deadman_callback_with_observer(hot_policy, Arc::new(|_| {}))
+}
+
+/// Test-seam variant of [`build_deadman_callback`] that additionally invokes an
+/// observer closure with the resolved [`OnBreachAction`] each time the
+/// callback fires (Plan 24-17 Task 1).
+///
+/// The observer runs AFTER the `tracing::error!` log and receives the same
+/// `OnBreachAction` value the log line encodes, so integration tests can
+/// assert the full policy→callback→action chain without scraping tracing
+/// output. The production [`build_deadman_callback`] delegates here with a
+/// no-op observer, so runtime behaviour on the worker is unchanged.
+#[must_use]
+pub fn build_deadman_callback_with_observer(
+    hot_policy: Arc<HotPolicy>,
+    observer: Arc<dyn Fn(OnBreachAction) + Send + Sync>,
+) -> OnExpireCallback {
     Arc::new(move || {
         let policy = hot_policy.load();
-        let action = match policy.deadman_timers.on_expire {
+        let on_expire = policy.deadman_timers.on_expire;
+        let action = match on_expire {
             OnBreachAction::Halt => "halt",
             OnBreachAction::HoldPosition => "hold_position",
             OnBreachAction::Land => "land",
@@ -38,6 +56,7 @@ pub fn build_deadman_callback(hot_policy: Arc<HotPolicy>) -> OnExpireCallback {
             %action,
             "deadman watchdog expired — dispatching policy-sourced action"
         );
+        observer(on_expire);
     })
 }
 
