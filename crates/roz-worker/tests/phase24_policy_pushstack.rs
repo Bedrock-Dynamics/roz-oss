@@ -55,7 +55,9 @@ use ed25519_dalek::SigningKey;
 use futures::StreamExt;
 use parking_lot::RwLock;
 use roz_copper::policy::{CopperEnforcementMode, new_hot_policy};
-use roz_copper::safety_filter::SafetyFilterTask;
+use roz_copper::safety_filter::{ChassisAxis, HotPathSafetyFilter, SafetyFilterTask};
+use roz_core::controller::intervention::InterventionKind;
+use roz_core::embodiment::limits::JointSafetyLimits;
 use roz_core::key_provider::StaticKeyProvider;
 use roz_core::signing::{Direction, HEADER_NAME, SignatureEnvelope, SignedFields, payload_sha256_hex, sign_envelope};
 use roz_db::safety_policies::SafetyPolicyRow;
@@ -362,4 +364,69 @@ async fn policy_push_wire_to_cache_to_copper_filter_clamp() {
     assert_eq!(guard.enforcement_mode, CopperEnforcementMode::Clamp);
     assert!((guard.max_linear_m_per_s - 1.0).abs() < 1e-9);
     assert!((guard.max_angular_rad_per_s - 0.5).abs() < 1e-9);
+
+    // ---- Assertion 4 — HotPathSafetyFilter (THE production tick-path
+    // filter) clamps through the SAME HotCopperPolicy pointer.
+    //
+    // Plan 24-16 closed the "dead-field" gap where HotPathSafetyFilter
+    // stored self.policy but never read it. The assertion above uses
+    // SafetyFilterTask::policy_clamp (a separate, legacy filter API).
+    // This assertion targets the ACTUAL filter used by
+    // controller::build_tick_infrastructure: HotPathSafetyFilter.
+    //
+    // If 24-16 regresses (the filter() method stops reading self.policy),
+    // this assertion fails even though assertion 3 still passes, because
+    // SafetyFilterTask::policy_clamp uses its own policy read path.
+    let joint_limits = vec![
+        // Loose per-channel limits so chassis policy is the only clamp layer.
+        JointSafetyLimits {
+            joint_name: "linear_x".into(),
+            max_velocity: 100.0,
+            max_acceleration: f64::INFINITY,
+            max_jerk: f64::INFINITY,
+            position_min: -1000.0,
+            position_max: 1000.0,
+            max_torque: None,
+        },
+        JointSafetyLimits {
+            joint_name: "angular_z".into(),
+            max_velocity: 100.0,
+            max_acceleration: f64::INFINITY,
+            max_jerk: f64::INFINITY,
+            position_min: -1000.0,
+            position_max: 1000.0,
+            max_torque: None,
+        },
+    ];
+    let mut hot_filter = HotPathSafetyFilter::new(joint_limits, None, 0.01)
+        .expect("valid tick period")
+        .with_chassis_axis_map(vec![ChassisAxis::Linear, ChassisAxis::Angular])
+        .expect("axis map length matches joint limits")
+        .with_policy(copper_hot.clone());
+
+    // Feed the same over-limit command used in assertion 3.
+    let result = hot_filter.filter(&[5.0, 2.0], None, None);
+    assert!(
+        (result.commands[0] - 1.0).abs() < 1e-9,
+        "HotPathSafetyFilter must clamp linear to pushed policy limit 1.0; got {}",
+        result.commands[0]
+    );
+    assert!(
+        (result.commands[1] - 0.5).abs() < 1e-9,
+        "HotPathSafetyFilter must clamp angular to pushed policy limit 0.5; got {}",
+        result.commands[1]
+    );
+    let chassis_count = result
+        .interventions
+        .iter()
+        .filter(|i| i.kind == InterventionKind::ChassisPolicyClamp)
+        .count();
+    assert_eq!(
+        chassis_count, 2,
+        "HotPathSafetyFilter should record exactly one ChassisPolicyClamp intervention per clamped axis (2 total); got {chassis_count}"
+    );
+    assert!(
+        !result.estop,
+        "Clamp mode must never set estop on HotPathSafetyFilter; got estop=true"
+    );
 }
