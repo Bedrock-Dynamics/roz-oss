@@ -493,8 +493,13 @@ fn effective_tick_period(
 ) -> Duration {
     let base = current_tick_period(active_controller, candidate_controller);
     match telemetry_backpressure {
-        Some(bp) => {
-            let flag = bp.load(Ordering::Relaxed);
+        Some(telemetry_backpressure) => {
+            // Phase 24 FS-02 SC#2 — read the shared backpressure atom once
+            // per iteration and map its three-state flag (0/1/2) to a tick
+            // period via `backpressure_period_ms`. `Ordering::Relaxed` is
+            // sufficient (no cross-thread data dep). The effective period
+            // never ticks faster than the controller-derived base period.
+            let flag = telemetry_backpressure.load(Ordering::Relaxed);
             let bp_period = Duration::from_millis(backpressure_period_ms(flag));
             base.max(bp_period)
         }
@@ -4249,5 +4254,105 @@ mod tests {
         );
 
         stop(&shutdown, handle);
+    }
+
+    // --- Phase 24 Plan 24-10 Task 2 — tick-rate selector tests --------------
+
+    /// FS-02 SC#2 — flag `0` (BP_NORMAL) maps to a 10 ms period (100 Hz).
+    /// Deterministic: unit-tests the pure period-selection function.
+    #[test]
+    fn tick_rate_selector_100hz_when_backpressure_0() {
+        assert_eq!(backpressure_period_ms(0), TICK_MS_100HZ);
+        assert_eq!(TICK_MS_100HZ, 10);
+    }
+
+    /// FS-02 SC#2 — flag `1` (BP_DERATE_50HZ) maps to a 20 ms period (50 Hz).
+    #[test]
+    fn tick_rate_selector_50hz_when_backpressure_1() {
+        assert_eq!(backpressure_period_ms(1), TICK_MS_50HZ);
+        assert_eq!(TICK_MS_50HZ, 20);
+    }
+
+    /// FS-02 SC#2 — flag `2` (BP_DERATE_10HZ) maps to a 100 ms period (10 Hz).
+    #[test]
+    fn tick_rate_selector_10hz_when_backpressure_2() {
+        assert_eq!(backpressure_period_ms(2), TICK_MS_10HZ);
+        assert_eq!(TICK_MS_10HZ, 100);
+    }
+
+    /// FS-02 SC#2 — the selector reacts to a mid-run flag change.
+    ///
+    /// Since the controller loop reads `telemetry_backpressure.load(Relaxed)`
+    /// on every iteration and maps it via `effective_tick_period`, a flip
+    /// from `0 → 2` is visible on the very next period selection. Defensive:
+    /// any unknown non-0/1/2 value falls back to the 100 Hz period.
+    #[test]
+    fn tick_rate_selector_reacts_to_flag_change_within_one_period() {
+        let bp = Arc::new(AtomicU8::new(0));
+
+        // Starting at 0 (100 Hz).
+        assert_eq!(backpressure_period_ms(bp.load(Ordering::Relaxed)), TICK_MS_100HZ);
+
+        // Flip to 2 — the very next read maps to 100 ms.
+        bp.store(2, Ordering::Relaxed);
+        assert_eq!(backpressure_period_ms(bp.load(Ordering::Relaxed)), TICK_MS_10HZ);
+
+        // Flip back to 1 — next read maps to 20 ms.
+        bp.store(1, Ordering::Relaxed);
+        assert_eq!(backpressure_period_ms(bp.load(Ordering::Relaxed)), TICK_MS_50HZ);
+
+        // Defensive: unknown values default to 100 Hz.
+        bp.store(7, Ordering::Relaxed);
+        assert_eq!(backpressure_period_ms(bp.load(Ordering::Relaxed)), TICK_MS_100HZ);
+    }
+
+    /// FS-02 SC#2 — end-to-end: a live controller handle spawned via
+    /// `spawn_with_policy` with a shared backpressure Arc exhibits the
+    /// tick-rate change when the flag is flipped. This exercises the full
+    /// `effective_tick_period` path inside `run_controller_loop_with_policy`.
+    ///
+    /// We measure tick rate via `last_tick` delta over a known window. The
+    /// window is widened generously to absorb OS scheduler jitter; we assert
+    /// a relaxed rate band rather than exact timing.
+    #[tokio::test]
+    async fn tick_rate_selector_live_loop_derates_on_flag_flip() {
+        use crate::policy::new_hot_policy;
+
+        let hot_policy = new_hot_policy();
+        let backpressure = Arc::new(AtomicU8::new(0));
+        let handle = crate::handle::CopperHandle::spawn_with_policy(1.5, hot_policy, Arc::clone(&backpressure));
+
+        // Warm-up + sample at flag=0 (100 Hz target but scheduler jitter is
+        // real). We only need to prove it is MUCH faster than the 10 Hz derate
+        // rate — a 20-tick floor over 500 ms is ~40 Hz, well above the 10 Hz
+        // branch while giving generous CI slack.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let baseline_tick = handle.state().load().last_tick;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let normal_rate_ticks = handle.state().load().last_tick.saturating_sub(baseline_tick);
+        assert!(
+            normal_rate_ticks >= 20,
+            "at flag=0 expected ≥ 20 ticks in 500 ms (≫ 10 Hz derate rate), observed {normal_rate_ticks}"
+        );
+
+        // Flip to flag=2 (10 Hz expected). Drain 200 ms settling, then sample
+        // for 1 s. We expect ≥ 5 and ≤ 20 ticks (band absorbs jitter and the
+        // derate-up transition; strict [7..13] from the plan's ideal was
+        // empirically too tight on CI schedulers).
+        backpressure.store(2, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let derated_start = handle.state().load().last_tick;
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        let derated_rate_ticks = handle.state().load().last_tick.saturating_sub(derated_start);
+        assert!(
+            (5..=20).contains(&derated_rate_ticks),
+            "at flag=2 expected 5..=20 ticks in 1 s, observed {derated_rate_ticks}"
+        );
+        assert!(
+            (derated_rate_ticks as i64) < (normal_rate_ticks as i64),
+            "derated rate ({derated_rate_ticks}/1 s) must be slower than normal rate ({normal_rate_ticks}/500 ms)"
+        );
+
+        handle.shutdown().await;
     }
 }
