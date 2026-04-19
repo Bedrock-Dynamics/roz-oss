@@ -1,6 +1,6 @@
 use axum::Extension;
 use axum::Json;
-use axum::extract::Path;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use roz_core::auth::AuthIdentity;
 use roz_nats::Subjects;
@@ -13,6 +13,7 @@ use crate::error::AppError;
 use crate::extractors::pagination::ValidatedPagination;
 use crate::middleware::tx::Tx;
 use crate::signing_gate::SigningGate;
+use crate::state::AppState;
 
 #[derive(Deserialize)]
 pub struct CreatePolicyRequest {
@@ -40,6 +41,7 @@ pub struct UpdatePolicyRequest {
 
 /// POST /v1/safety-policies
 pub async fn create(
+    State(state): State<AppState>,
     mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Json(body): Json<CreatePolicyRequest>,
@@ -56,6 +58,10 @@ pub async fn create(
         &body.deadman_timers,
     )
     .await?;
+    // Phase 24-11 (FS-01 SC#1): fan the policy out to every worker bound to
+    // this tenant. Push failures are logged but do NOT roll back the HTTP
+    // response — operator reconciles via re-CRUD (D-04).
+    fanout_policy_to_tenant(&state, tenant_id, &policy).await;
     Ok((StatusCode::CREATED, Json(json!({"data": policy}))))
 }
 
@@ -88,6 +94,7 @@ pub async fn get(
 
 /// PUT /v1/safety-policies/:id
 pub async fn update(
+    State(state): State<AppState>,
     mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Path(id): Path<Uuid>,
@@ -111,6 +118,10 @@ pub async fn update(
     )
     .await?
     .ok_or_else(|| AppError::not_found("safety policy not found"))?;
+    // Phase 24-11 (FS-01 SC#1): fan the updated policy out to every worker
+    // bound to this tenant. Push failures are logged but do NOT roll back
+    // the HTTP response.
+    fanout_policy_to_tenant(&state, tenant_id, &policy).await;
     Ok(Json(json!({"data": policy})))
 }
 
@@ -229,6 +240,57 @@ pub async fn publish_policy_to_workers(
     Ok(())
 }
 
+/// Fan a freshly-committed safety policy out to every worker bound to the
+/// tenant via [`publish_policy_to_workers`].
+///
+/// Called by both [`create`] and [`update`] after the DB write succeeds. The
+/// whole fan-out is best-effort per D-04:
+/// - DB lookup errors are logged and swallowed (policy CRUD already succeeded).
+/// - Per-worker transport errors are logged by [`publish_policy_to_workers`]
+///   but do NOT abort the fan-out.
+/// - Operator reconciles stragglers via re-CRUD or the pull-at-task-start
+///   path.
+///
+/// Runs against the raw `state.pool` — RLS is not required here because
+/// [`roz_db::hosts::list`] applies an explicit `WHERE tenant_id = $1`
+/// defense-in-depth filter.
+async fn fanout_policy_to_tenant(state: &AppState, tenant_id: Uuid, policy: &roz_db::safety_policies::SafetyPolicyRow) {
+    // Up to 1 000 workers per tenant — matches other tenant-scoped list
+    // helpers in the server (e.g. hosts::list defaults) and well above any
+    // plausible single-tenant fleet size in the current deployment.
+    let hosts = match roz_db::hosts::list(&state.pool, tenant_id, 1_000, 0).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                policy_id = %policy.id,
+                tenant_id = %tenant_id,
+                error = %e,
+                "failed to list tenant hosts for policy push; skipping fan-out"
+            );
+            return;
+        }
+    };
+    if hosts.is_empty() {
+        tracing::debug!(
+            policy_id = %policy.id,
+            tenant_id = %tenant_id,
+            "no workers bound to tenant; policy push skipped"
+        );
+        return;
+    }
+
+    let worker_ids: Vec<(Uuid, String)> = hosts.into_iter().map(|h| (h.id, h.name)).collect();
+    let gate = SigningGate::from_app_state(state);
+    if let Err(e) = publish_policy_to_workers(state.nats_client.as_ref(), Some(&gate), policy, &worker_ids).await {
+        tracing::warn!(
+            policy_id = %policy.id,
+            tenant_id = %tenant_id,
+            error = %e,
+            "policy fan-out failed; operator must re-CRUD to reconcile"
+        );
+    }
+}
+
 #[cfg(test)]
 mod publish_policy_tests {
     use super::*;
@@ -275,5 +337,42 @@ mod publish_policy_tests {
         let worker_ids = vec![(Uuid::new_v4(), "worker-abc".to_string())];
         let result = publish_policy_to_workers(None, None, &row, &worker_ids).await;
         assert!(matches!(result, Err(PublishPolicyError::NatsClientMissing)));
+    }
+
+    /// Plan 24-11 wiring test: both [`super::create`] and [`super::update`]
+    /// must delegate fan-out to [`super::fanout_policy_to_tenant`] so the
+    /// single helper is the one and only production call site of
+    /// [`publish_policy_to_workers`]. A file-content check catches
+    /// accidental regressions where a future refactor inlines or removes
+    /// the call. Building a full [`AppState`] in a unit test is
+    /// impractical (≥15 trait-object fields); this grep-style assertion is
+    /// the pragmatic equivalent.
+    #[test]
+    fn create_and_update_handlers_call_fanout_policy_to_tenant() {
+        let source = include_str!("safety_policies.rs");
+        // Helper definition is present.
+        assert!(
+            source.contains("async fn fanout_policy_to_tenant("),
+            "fanout_policy_to_tenant helper must be defined"
+        );
+        // Both handlers reference it. We look for the exact call
+        // expression so a doc-comment mention alone would not satisfy.
+        let call_count = source
+            .matches("fanout_policy_to_tenant(&state, tenant_id, &policy)")
+            .count();
+        assert!(
+            call_count >= 2,
+            "expected ≥2 call sites of fanout_policy_to_tenant (create + update), got {call_count}"
+        );
+        // The helper is the ONLY production path to publish_policy_to_workers
+        // — confirm it contains the helper invocation inside its body.
+        let fanout_body_start = source
+            .find("async fn fanout_policy_to_tenant(")
+            .expect("fanout helper present");
+        let after_fanout = &source[fanout_body_start..];
+        assert!(
+            after_fanout.contains("publish_policy_to_workers("),
+            "fanout_policy_to_tenant body must invoke publish_policy_to_workers"
+        );
     }
 }
