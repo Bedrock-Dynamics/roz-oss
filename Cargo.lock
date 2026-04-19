@@ -7008,6 +7008,7 @@ dependencies = [
  "mcap",
  "moka",
  "nix 0.29.0",
+ "noxious-client",
  "object_store",
  "openh264",
  "parking_lot",
