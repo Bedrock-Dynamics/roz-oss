@@ -1411,6 +1411,303 @@ mod tests {
                 .any(|intervention| intervention.kind == InterventionKind::UnconfiguredJoint)
         );
     }
+
+    // -- Phase 24 Plan 24-16: chassis-level CopperPolicy enforcement --------
+
+    fn loose_sample_limits(name: &str) -> JointSafetyLimits {
+        // Per-channel joint limits deliberately set wide enough that they do
+        // NOT interfere with the chassis-policy tests below — we want the
+        // chassis pass to be the only clamping layer so the assertions are
+        // unambiguous.
+        JointSafetyLimits {
+            joint_name: name.into(),
+            max_velocity: 100.0,
+            max_acceleration: f64::INFINITY,
+            max_jerk: f64::INFINITY,
+            position_min: -1000.0,
+            position_max: 1000.0,
+            max_torque: Some(1000.0),
+        }
+    }
+
+    fn hot_policy_with(
+        max_linear: f64,
+        max_angular: f64,
+        max_force: f64,
+        mode: crate::policy::CopperEnforcementMode,
+    ) -> crate::policy::HotCopperPolicy {
+        use crate::policy::CopperPolicy;
+        use arc_swap::ArcSwap;
+        std::sync::Arc::new(ArcSwap::from_pointee(CopperPolicy {
+            max_linear_m_per_s: max_linear,
+            max_angular_rad_per_s: max_angular,
+            max_force_newtons: max_force,
+            enforcement_mode: mode,
+        }))
+    }
+
+    #[test]
+    fn hot_path_filter_chassis_clamp_under_clamp_mode() {
+        // Linear channel, cmd=5.0, policy max_linear=1.0 Clamp -> 1.0
+        let limits = vec![loose_sample_limits("linear_x")];
+        let axis_map = vec![ChassisAxis::Linear];
+        let hot = hot_policy_with(1.0, 0.5, 25.0, crate::policy::CopperEnforcementMode::Clamp);
+        let mut filter = HotPathSafetyFilter::new(limits, None, 0.01)
+            .unwrap()
+            .with_chassis_axis_map(axis_map)
+            .unwrap()
+            .with_policy(hot);
+
+        let result = filter.filter(&[5.0], None, None);
+        assert!(
+            (result.commands[0] - 1.0).abs() < 1e-9,
+            "clamp should project to +1.0, got {}",
+            result.commands[0]
+        );
+        let chassis_interventions: Vec<_> = result
+            .interventions
+            .iter()
+            .filter(|i| i.kind == InterventionKind::ChassisPolicyClamp)
+            .collect();
+        assert_eq!(chassis_interventions.len(), 1, "expected exactly one chassis intervention");
+        assert_eq!(chassis_interventions[0].raw_value, 5.0);
+        assert!((chassis_interventions[0].clamped_value - 1.0).abs() < 1e-9);
+        assert!(!result.estop, "Clamp mode must not set estop");
+    }
+
+    #[test]
+    fn hot_path_filter_chassis_clamp_preserves_sign() {
+        // Linear channel, cmd=-5.0, policy max_linear=1.0 Clamp -> -1.0
+        let limits = vec![loose_sample_limits("linear_x")];
+        let axis_map = vec![ChassisAxis::Linear];
+        let hot = hot_policy_with(1.0, 0.5, 25.0, crate::policy::CopperEnforcementMode::Clamp);
+        let mut filter = HotPathSafetyFilter::new(limits, None, 0.01)
+            .unwrap()
+            .with_chassis_axis_map(axis_map)
+            .unwrap()
+            .with_policy(hot);
+
+        let result = filter.filter(&[-5.0], None, None);
+        assert!(
+            (result.commands[0] - (-1.0)).abs() < 1e-9,
+            "clamp should project to -1.0, got {}",
+            result.commands[0]
+        );
+    }
+
+    #[test]
+    fn hot_path_filter_chassis_halt_zeros_command() {
+        // Linear channel, cmd=5.0, policy max_linear=1.0 Halt -> 0.0
+        let limits = vec![loose_sample_limits("linear_x")];
+        let axis_map = vec![ChassisAxis::Linear];
+        let hot = hot_policy_with(1.0, 0.5, 25.0, crate::policy::CopperEnforcementMode::Halt);
+        let mut filter = HotPathSafetyFilter::new(limits, None, 0.01)
+            .unwrap()
+            .with_chassis_axis_map(axis_map)
+            .unwrap()
+            .with_policy(hot);
+
+        let result = filter.filter(&[5.0], None, None);
+        assert_eq!(result.commands[0], 0.0, "Halt mode must zero the command");
+        assert!(!result.estop, "Halt mode must not set estop");
+        assert!(
+            result
+                .interventions
+                .iter()
+                .any(|i| i.kind == InterventionKind::ChassisPolicyClamp)
+        );
+    }
+
+    #[test]
+    fn hot_path_filter_chassis_reject_sets_estop() {
+        // Linear channel, cmd=5.0, policy max_linear=1.0 Reject -> 0.0 + estop
+        let limits = vec![loose_sample_limits("linear_x")];
+        let axis_map = vec![ChassisAxis::Linear];
+        let hot = hot_policy_with(1.0, 0.5, 25.0, crate::policy::CopperEnforcementMode::Reject);
+        let mut filter = HotPathSafetyFilter::new(limits, None, 0.01)
+            .unwrap()
+            .with_chassis_axis_map(axis_map)
+            .unwrap()
+            .with_policy(hot);
+
+        let result = filter.filter(&[5.0], None, None);
+        assert_eq!(result.commands[0], 0.0, "Reject mode must zero the command");
+        assert!(result.estop, "Reject mode must set estop=true");
+        assert!(
+            result
+                .interventions
+                .iter()
+                .any(|i| i.kind == InterventionKind::ChassisPolicyClamp)
+        );
+    }
+
+    #[test]
+    fn hot_path_filter_chassis_policy_passthrough_when_under_limit() {
+        // Linear channel, cmd=0.5 under max_linear=1.0 -> passthrough
+        let limits = vec![loose_sample_limits("linear_x")];
+        let axis_map = vec![ChassisAxis::Linear];
+        let hot = hot_policy_with(1.0, 0.5, 25.0, crate::policy::CopperEnforcementMode::Clamp);
+        let mut filter = HotPathSafetyFilter::new(limits, None, 0.01)
+            .unwrap()
+            .with_chassis_axis_map(axis_map)
+            .unwrap()
+            .with_policy(hot);
+
+        let result = filter.filter(&[0.5], None, None);
+        assert!((result.commands[0] - 0.5).abs() < 1e-9);
+        assert!(
+            result
+                .interventions
+                .iter()
+                .all(|i| i.kind != InterventionKind::ChassisPolicyClamp),
+            "under-limit command must not produce chassis interventions"
+        );
+        assert!(!result.estop);
+    }
+
+    #[test]
+    fn hot_path_filter_chassis_ignores_other_axis() {
+        // Channel mapped to Other — chassis limit 1.0 must be skipped even
+        // when cmd=5.0 exceeds it, because the axis is unknown.
+        let limits = vec![loose_sample_limits("mystery_channel")];
+        let axis_map = vec![ChassisAxis::Other];
+        let hot = hot_policy_with(1.0, 0.5, 25.0, crate::policy::CopperEnforcementMode::Clamp);
+        let mut filter = HotPathSafetyFilter::new(limits, None, 0.01)
+            .unwrap()
+            .with_chassis_axis_map(axis_map)
+            .unwrap()
+            .with_policy(hot);
+
+        let result = filter.filter(&[5.0], None, None);
+        // Per-channel limits are deliberately loose (max_velocity=100), so
+        // the only layer that could clamp is chassis — and Other disables it.
+        assert!(
+            (result.commands[0] - 5.0).abs() < 1e-9,
+            "Other-axis channel must pass through: got {}",
+            result.commands[0]
+        );
+        assert!(
+            result
+                .interventions
+                .iter()
+                .all(|i| i.kind != InterventionKind::ChassisPolicyClamp),
+            "Other axis must never produce chassis interventions"
+        );
+    }
+
+    #[test]
+    fn hot_path_filter_chassis_respects_per_channel_joint_limit_also() {
+        // Per-channel max_velocity=0.3 (tighter), chassis max_linear=1.0
+        // (looser). cmd=5.0 -> per-channel VelocityClamp projects to 0.3
+        // FIRST, then chassis limit 1.0 is NOT exceeded by 0.3 so no
+        // chassis intervention fires. Per-channel VelocityClamp IS recorded.
+        //
+        // This proves "whichever is tighter wins" — the per-channel joint
+        // limit dominates when it is the tighter of the two.
+        let tight_limits = vec![JointSafetyLimits {
+            joint_name: "linear_x".into(),
+            max_velocity: 0.3,
+            max_acceleration: f64::INFINITY,
+            max_jerk: f64::INFINITY,
+            position_min: -1000.0,
+            position_max: 1000.0,
+            max_torque: None,
+        }];
+        let axis_map = vec![ChassisAxis::Linear];
+        let hot = hot_policy_with(1.0, 0.5, 25.0, crate::policy::CopperEnforcementMode::Clamp);
+        let mut filter = HotPathSafetyFilter::new(tight_limits, None, 0.01)
+            .unwrap()
+            .with_chassis_axis_map(axis_map)
+            .unwrap()
+            .with_policy(hot);
+
+        let result = filter.filter(&[5.0], None, None);
+        assert!(
+            (result.commands[0] - 0.3).abs() < 1e-9,
+            "tighter per-channel limit should win: expected 0.3, got {}",
+            result.commands[0]
+        );
+        let kinds: Vec<_> = result.interventions.iter().map(|i| &i.kind).collect();
+        assert!(
+            kinds.contains(&&InterventionKind::VelocityClamp),
+            "per-channel VelocityClamp must fire; kinds: {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&&InterventionKind::ChassisPolicyClamp),
+            "chassis clamp should NOT fire when per-channel result (0.3) is under chassis limit (1.0); kinds: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn hot_path_filter_chassis_respects_chassis_when_tighter_than_joint() {
+        // Inverse of the above: per-channel max_velocity=5.0 (loose),
+        // chassis max_linear=1.0 (tight). cmd=5.0 -> per-channel passes,
+        // chassis clamps to 1.0. BOTH layers were evaluated; only the
+        // chassis intervention fires.
+        let limits = vec![JointSafetyLimits {
+            joint_name: "linear_x".into(),
+            max_velocity: 5.0,
+            max_acceleration: f64::INFINITY,
+            max_jerk: f64::INFINITY,
+            position_min: -1000.0,
+            position_max: 1000.0,
+            max_torque: None,
+        }];
+        let axis_map = vec![ChassisAxis::Linear];
+        let hot = hot_policy_with(1.0, 0.5, 25.0, crate::policy::CopperEnforcementMode::Clamp);
+        let mut filter = HotPathSafetyFilter::new(limits, None, 0.01)
+            .unwrap()
+            .with_chassis_axis_map(axis_map)
+            .unwrap()
+            .with_policy(hot);
+
+        let result = filter.filter(&[5.0], None, None);
+        assert!(
+            (result.commands[0] - 1.0).abs() < 1e-9,
+            "chassis should clamp to 1.0 when it is the tighter layer, got {}",
+            result.commands[0]
+        );
+        let kinds: Vec<_> = result.interventions.iter().map(|i| &i.kind).collect();
+        assert!(
+            kinds.contains(&&InterventionKind::ChassisPolicyClamp),
+            "chassis clamp must fire when it is the tighter layer; kinds: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn hot_path_filter_policy_enforcement_under_5ms_budget() {
+        // 10 000 iterations of filter(&[3.0, 2.0], ...) with hot_policy
+        // attached; assert elapsed < 50 ms (matches the existing
+        // policy_clamp_under_5ms_budget pattern: per-call << 5 us means
+        // the <5ms per 100 Hz tick budget has three orders of magnitude
+        // of headroom).
+        let limits = vec![loose_sample_limits("linear_x"), loose_sample_limits("angular_z")];
+        let axis_map = vec![ChassisAxis::Linear, ChassisAxis::Angular];
+        let hot = hot_policy_with(1.0, 0.5, 25.0, crate::policy::CopperEnforcementMode::Clamp);
+        let mut filter = HotPathSafetyFilter::new(limits, None, 0.01)
+            .unwrap()
+            .with_chassis_axis_map(axis_map)
+            .unwrap()
+            .with_policy(hot);
+
+        // warmup
+        for _ in 0..100 {
+            let _ = filter.filter(&[3.0, 2.0], None, None);
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..10_000 {
+            let _ = filter.filter(&[3.0, 2.0], None, None);
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "bench: HotPathSafetyFilter::filter x10_000 = {elapsed:?} (~{} ns/call)",
+            elapsed.as_nanos() / 10_000
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "10k filter calls with chassis policy should be << 50 ms, took {elapsed:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
