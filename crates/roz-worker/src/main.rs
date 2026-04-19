@@ -514,35 +514,23 @@ async fn execute_task(
     // cleanly.
     let _task_ckpt_sender_hold = task_ckpt_tx;
 
-    // Plan 24-13 Task 3: mpsc→broadcast forwarder for SessionEvent
-    // SafetyViolation emission from the pre-dispatch gate. The existing
-    // `emit_violation_event` helper (dispatch.rs:506) takes
-    // `mpsc::Sender<SessionEvent>` — bridging here preserves that signature
-    // (and its existing tests) while routing into the broadcast fan-out
-    // the resume subscriber (Plan 24-12 Task 4) also publishes on.
+    // Plan 24-13 Task 3 (refactored to testable helper in 24-14 Task 0):
+    // mpsc→broadcast forwarder for SessionEvent SafetyViolation emission
+    // from the pre-dispatch gate. The existing `emit_violation_event` helper
+    // (dispatch.rs:506) takes `mpsc::Sender<SessionEvent>` — bridging here
+    // preserves that signature (and its existing tests) while routing into
+    // the broadcast fan-out the resume subscriber (Plan 24-12 Task 4) also
+    // publishes on.
     //
     // EventEnvelope shape mirrors the existing 24-12 RecoveryPending emit
     // path (main.rs around line 1741) so both paths produce identical
     // envelope metadata and operators see a unified stream.
-    let (session_mpsc_tx, mut session_mpsc_rx) =
+    let (session_mpsc_tx, session_mpsc_rx) =
         tokio::sync::mpsc::channel::<roz_core::session::event::SessionEvent>(64);
-    {
-        let forwarder_session_tx = session_event_tx.clone();
-        tokio::spawn(async move {
-            while let Some(event) = session_mpsc_rx.recv().await {
-                let envelope = roz_core::session::event::EventEnvelope {
-                    event_id: roz_core::session::event::EventId::new(),
-                    correlation_id: roz_core::session::event::CorrelationId::new(),
-                    parent_event_id: None,
-                    timestamp: chrono::Utc::now(),
-                    event,
-                };
-                // Best-effort; broadcast drops frames when no receivers
-                // exist, matching the RecoveryPending emit path.
-                let _ = forwarder_session_tx.send(envelope);
-            }
-        });
-    }
+    roz_worker::session_event_forwarder::spawn_session_event_forwarder(
+        session_mpsc_rx,
+        session_event_tx.clone(),
+    );
 
     let model = match roz_worker::model_factory::build_model(&task_config, None) {
         Ok(m) => m,
