@@ -14,6 +14,20 @@ pub struct HostRow {
     pub clock_offset_ms: Option<f64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+
+    /// Ciphertext of the 32-byte MAVLink v2 signing seed (base64-wrapped then
+    /// AES-256-GCM encrypted via `roz_server::signing_gate::encrypt_signing_seed`).
+    /// `None` for pre-migration hosts (pre-2026-04-19). When `None`,
+    /// MAVLink signing is force-disabled at worker boot per Phase 25 D-12.
+    #[serde(skip)]
+    pub mavlink_signing_key_ciphertext: Option<Vec<u8>>,
+
+    /// 12-byte AES-GCM nonce paired with the ciphertext.
+    #[serde(skip)]
+    pub mavlink_signing_key_nonce: Option<Vec<u8>>,
+
+    /// 1-based version counter; bumped on rotation.
+    pub mavlink_signing_key_version: Option<i16>,
 }
 
 /// Insert a new host and return the created row.
@@ -175,6 +189,74 @@ where
     .bind(tenant_id)
     .fetch_all(executor)
     .await
+}
+
+/// Set the MAVLink v2 signing key columns on an existing host row.
+///
+/// Caller is responsible for generating the 32-byte seed and encrypting it
+/// via `roz_server::signing_gate::encrypt_signing_seed`. This function is a
+/// pure DB UPDATE — no crypto happens here (roz-db must stay free of
+/// roz-server's key-provider layer per workspace layering).
+///
+/// # Errors
+/// Returns `sqlx::Error` if the UPDATE fails (e.g. host not found, CHECK
+/// constraint violation).
+pub async fn set_mavlink_signing_key<'e, E>(
+    executor: E,
+    host_id: Uuid,
+    ciphertext: &[u8],
+    nonce: &[u8],
+    version: i16,
+) -> Result<HostRow, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query_as::<_, HostRow>(
+        "UPDATE roz_hosts \
+         SET mavlink_signing_key_ciphertext = $1, \
+             mavlink_signing_key_nonce      = $2, \
+             mavlink_signing_key_version    = $3 \
+         WHERE id = $4 \
+         RETURNING *",
+    )
+    .bind(ciphertext)
+    .bind(nonce)
+    .bind(version)
+    .bind(host_id)
+    .fetch_one(executor)
+    .await
+}
+
+/// Fetch the MAVLink v2 signing key triple for a host.
+///
+/// Returns `Ok(None)` if any of the three columns is NULL (pre-migration
+/// host or partial-state bug — the migration's CHECK constraint makes
+/// partial-state impossible, so NULL always means pre-migration).
+///
+/// # Errors
+/// Returns `sqlx::Error` if the SELECT fails.
+pub async fn get_mavlink_signing_key<'e, E>(
+    executor: E,
+    host_id: Uuid,
+) -> Result<Option<(Vec<u8>, Vec<u8>, i16)>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let row: Option<(Option<Vec<u8>>, Option<Vec<u8>>, Option<i16>)> = sqlx::query_as(
+        "SELECT mavlink_signing_key_ciphertext, \
+                mavlink_signing_key_nonce, \
+                mavlink_signing_key_version \
+         FROM roz_hosts \
+         WHERE id = $1",
+    )
+    .bind(host_id)
+    .fetch_optional(executor)
+    .await?;
+
+    Ok(row.and_then(|(c, n, v)| match (c, n, v) {
+        (Some(c), Some(n), Some(v)) => Some((c, n, v)),
+        _ => None,
+    }))
 }
 
 #[cfg(test)]
