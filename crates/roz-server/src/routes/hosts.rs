@@ -38,12 +38,24 @@ pub struct UpdateStatusRequest {
 }
 
 /// POST /v1/hosts
+///
+/// Phase 25 D-11 / D-23 (post-review): on successful host creation, this
+/// handler auto-generates a 32-byte MAVLink v2 signing seed, encrypts it
+/// via `signing_gate::encrypt_signing_seed` (Phase 23 helper — reuses
+/// AES-256-GCM + per-tenant KEK), and persists ciphertext/nonce/version
+/// in the SAME transaction as the host row insert. Per D-12, pre-migration
+/// hosts existing before the migration landed keep NULL values for these
+/// columns; they are re-provisioned by a future rotation RPC (not in
+/// Phase 25 scope).
 pub async fn create(
+    State(state): State<AppState>,
     mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Json(body): Json<CreateHostRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
     let tenant_id = *auth.tenant_id().as_uuid();
+
+    // Existing insert — unchanged.
     let host = roz_db::hosts::create(
         &mut **tx,
         tenant_id,
@@ -53,6 +65,34 @@ pub async fn create(
         &body.labels,
     )
     .await?;
+
+    // Phase 25 D-11 / D-23: auto-generate + encrypt + persist MAVLink signing key.
+    // Single-transaction invariant: if either the encrypt or the update fails,
+    // the whole host creation rolls back. No half-provisioned hosts.
+    use rand::RngCore;
+    let mut seed = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut seed);
+
+    let (ciphertext, nonce) = crate::signing_gate::encrypt_signing_seed(state.key_provider.as_ref(), tenant_id, &seed)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, host_id = %host.id, "failed to encrypt MAVLink signing key");
+            AppError::internal("failed to encrypt MAVLink signing key")
+        })?;
+
+    // Zeroize the plaintext seed as soon as we no longer need it.
+    // (Defense-in-depth; it was already sealed into the encrypted blob.)
+    seed.fill(0);
+
+    roz_db::hosts::set_mavlink_signing_key(&mut **tx, host.id, &ciphertext, &nonce, /* key_version */ 1)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, host_id = %host.id, "failed to persist MAVLink signing key");
+            AppError::internal("failed to persist MAVLink signing key")
+        })?;
+
+    tracing::info!(host_id = %host.id, "MAVLink signing key auto-provisioned (D-11)");
+
     Ok((StatusCode::CREATED, Json(json!({"data": host}))))
 }
 

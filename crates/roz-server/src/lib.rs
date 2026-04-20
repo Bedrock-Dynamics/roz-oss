@@ -11,6 +11,7 @@ pub mod routes;
 pub mod scheduled_tasks;
 pub mod signing_gate;
 pub mod state;
+pub mod test_support;
 pub mod triggers;
 pub mod trust;
 pub mod ws;
