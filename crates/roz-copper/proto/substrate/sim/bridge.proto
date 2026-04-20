@@ -409,6 +409,25 @@ message ReadinessState {
   // Computed readiness levels
   bool ready_to_arm = 9;          // heartbeat + GPS + EKF all valid
   bool fully_operational = 10;    // ready + system STANDBY/ACTIVE
+
+  // Phase 25 D-05' additive: autopilot vendor tag.
+  // Consumers use this to disambiguate PX4 vs ArduPilot mode-string
+  // translation tables without heuristics. Populated by
+  // ReadinessBuilder from the MAVLink HEARTBEAT autopilot field.
+  // Wire-compat: field 11 is new; old v1 clients ignore unknown fields.
+  MavAutopilot autopilot = 11;
+}
+
+// MAV_AUTOPILOT subset - Phase 25 consumers use this to disambiguate
+// PX4 vs ArduPilot mode-string translation tables without heuristics.
+// Source: https://mavlink.io/en/messages/common.html#MAV_AUTOPILOT
+// Added per 25-CONTEXT.md D-05' / D-09 post-review reconciliation.
+enum MavAutopilot {
+  MAV_AUTOPILOT_UNSPECIFIED = 0;
+  MAV_AUTOPILOT_GENERIC = 1;            // wire 0
+  MAV_AUTOPILOT_PX4 = 2;                // wire 12 - PX4 Autopilot
+  MAV_AUTOPILOT_ARDUPILOTMEGA = 3;      // wire 3  - ArduPilot
+  MAV_AUTOPILOT_INVALID = 4;            // wire 8  - no valid autopilot
 }
 
 enum DataAuthority {
