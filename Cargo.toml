@@ -17,6 +17,7 @@ members = [
     "crates/roz-zenoh",
     "crates/roz-local",
     "crates/roz-openai",
+    "crates/roz-mavlink",
 ]
 
 [workspace.package]
