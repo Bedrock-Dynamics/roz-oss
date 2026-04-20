@@ -38,8 +38,9 @@ roz-core   = { path = "../roz-core" }
 roz-copper = { path = "../roz-copper" }
 
 # Async + sync primitives
-tokio      = { workspace = true, features = ["rt", "sync", "io-util", "time", "macros"] }
+tokio       = { workspace = true, features = ["rt", "sync", "io-util", "time", "macros"] }
 parking_lot = { workspace = true }
+async-trait = { workspace = true }
 
 # Error handling — thiserror at crate boundary, anyhow at trait edge (CLAUDE.md convention).
 anyhow    = { workspace = true }
