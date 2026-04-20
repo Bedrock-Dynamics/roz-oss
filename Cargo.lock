@@ -6907,6 +6907,7 @@ name = "roz-mavlink"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "mavlink",
  "parking_lot",
  "rand 0.8.5",
