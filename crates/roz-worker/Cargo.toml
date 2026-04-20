@@ -51,6 +51,7 @@ directories.workspace = true
 secrecy.workspace = true
 roz-copper = { path = "../roz-copper", default-features = false }
 roz-local = { path = "../roz-local" }
+roz-mavlink = { path = "../roz-mavlink" }
 roz-zenoh = { path = "../roz-zenoh", optional = true }
 zenoh = { workspace = true, optional = true }
 tokio-util.workspace = true

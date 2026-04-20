@@ -64,6 +64,11 @@ pub struct WorkerConfig {
     /// Camera subsystem configuration.
     #[serde(default)]
     pub camera: CameraConfig,
+    /// MAVLink backend configuration (Phase 25 D-03).
+    /// Absent `[mavlink]` section → worker runs without a MAVLink backend
+    /// (existing Gazebo-SITL / joint-arm embodiments unaffected).
+    #[serde(default)]
+    pub mavlink: MavlinkConfig,
     /// Trusted signing keys for `.cwasm` modules. Set via `ROZ_WASM_PUBKEYS`.
     ///
     /// Format: `"<key_id>:<base64 Ed25519 pubkey>,..."`. Empty/unset yields
@@ -202,6 +207,61 @@ const fn default_max_concurrent_tasks() -> usize {
 
 fn default_anthropic_provider() -> String {
     "anthropic".to_string()
+}
+
+/// MAVLink backend configuration (Phase 25 D-03). Absent fields inherit sensible defaults.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MavlinkConfig {
+    /// Transport URL. Examples: `"serial:/dev/ttyUSB0:921600"` for Pixhawk over
+    /// TELEM2, `"udpin:0.0.0.0:14540"` for PX4 SITL offboard. `None` disables
+    /// the MAVLink backend entirely.
+    #[serde(default)]
+    pub transport: Option<String>,
+
+    /// Signing posture + overrides. Defaults to `SigningPosture::Auto` (off on
+    /// serial, on on UDP per D-03).
+    #[serde(default)]
+    pub signing: MavlinkSigningSection,
+
+    /// Autopilot hint used for SET_MODE vendor dispatch. `None` = auto-detect
+    /// from HEARTBEAT.autopilot at runtime. Valid strings: `"px4"`,
+    /// `"arducopter"`, `"arduplane"`.
+    #[serde(default)]
+    pub autopilot_hint: Option<String>,
+}
+
+/// `[mavlink.signing]` subsection.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MavlinkSigningSection {
+    /// `"off"` | `"on"` | `"auto"` (D-03 default).
+    #[serde(default = "default_signing_posture_string")]
+    pub posture: String,
+
+    /// Accept unsigned inbound frames when signing is on. Default: false.
+    #[serde(default)]
+    pub allow_unsigned: bool,
+
+    /// Link-ID for copper's outbound frames. Default: 1 (D-04).
+    #[serde(default = "default_link_id")]
+    pub local_link_id: u8,
+}
+
+impl Default for MavlinkSigningSection {
+    fn default() -> Self {
+        Self {
+            posture: default_signing_posture_string(),
+            allow_unsigned: false,
+            local_link_id: default_link_id(),
+        }
+    }
+}
+
+fn default_signing_posture_string() -> String {
+    "auto".to_string()
+}
+
+const fn default_link_id() -> u8 {
+    1
 }
 
 impl WorkerConfig {
