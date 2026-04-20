@@ -101,7 +101,7 @@ Plans:
   5. Every signature failure emits an audit row to `roz_safety_audit_log` and publishes `safety.signature_failure.{worker_id}` (worker-side) or `safety.signature_failure.server.{tenant_id}` (server-side) — verified by an end-to-end tampered-payload integration test.
 **Plans**: TBD
 
-### Phase 24: Edge-enforced safety policies, store-and-forward telemetry, and in-flight task WAL recovery (ALL PLANS COMPLETE 2026-04-18 — READY FOR /gsd-verify-phase 24)
+### Phase 24: Edge-enforced safety policies, store-and-forward telemetry, and in-flight task WAL recovery (GAP CLOSURE IN PROGRESS 2026-04-18 — 9 complete + 4 new gap-closure plans 24-10..24-13)
 
 **Goal**: Make the worker field-survivable — policy enforcement runs at the edge and survives NATS partitions, telemetry buffers and replays across disconnects, and in-flight tasks resume safely on reconnect.
 **Depends on**: Phase 23 (signed dispatch primitive used in safety-audit and policy-push paths)
@@ -112,7 +112,7 @@ Plans:
   3. New `telemetry_frames` table in the existing `WalStore` buffers up to 50 MB / 24 h FIFO on NATS disconnect; on reconnect, frames replay at original rate for <5 s partitions and 10× rate for longer partitions, with server-side sequence-number dedup and 90% / 95% backpressure signaling to copper tick (100 Hz → 50 Hz → 10 Hz).
   4. In-flight task state checkpoints to WAL every 5 s + on every state transition with idempotency key `"{task_id}:{step_counter}"`; on reconnect, worker publishes `roz.state.worker_online` with last-checkpoint digest and server responds with resume or abort within 500 ms.
   5. Resume gate honored: worker only resumes iff `(brakes_engaged OR joint_positions_known) AND checkpoint_age < 1 h`; otherwise enters `SafeStateWait` with a session event requesting operator intervention — verified by a test matrix covering all three recovery-decision branches.
-**Plans:** 9/9 plans complete
+**Plans:** 9/13 plans complete (gap closure: 4 new plans 24-10..24-13 following /gsd-verify-phase 24 findings)
 
 Plans:
 - [x] 24-01-PLAN.md — Wave 1 foundation: WalStore schema (telemetry_frames + task_checkpoints tables), new NATS subjects (policy, health, safety_violation, state_worker_online, clear_failsafe), SessionEvent variants (SafetyViolation + RecoveryPending), CopperHandle backpressure field
@@ -124,19 +124,42 @@ Plans:
 - [x] 24-07-PLAN.md — Store-and-forward wiring: publish_state_signed_with_buffer (WAL-on-failure), TelemetryReplay with original/10x rate (500 Hz cap), server-side last_acked_seq dedup
 - [x] 24-08-PLAN.md — Reconnect handshake: worker-side publish_worker_online, server-side handle_worker_online with 500 ms Restate lookup budget and fail-closed abort (checkpoint: verify Restate SDK 0.9 API)
 - [x] 24-09-PLAN.md — Main.rs wiring + resume gate + 4-branch test matrix + phase24 e2e integration test (includes checkpoint: human-verify for final phase sign-off)
+- [ ] 24-10-PLAN.md — Gap closure (wave 1): copper API — new `CopperHandle::spawn_with_policy` constructor threads `HotCopperPolicy` into `SafetyFilterTask::with_policy` and shared `Arc<AtomicU8>` into the 100 Hz controller tick-rate selector (100 / 50 / 10 Hz)
+- [ ] 24-11-PLAN.md — Gap closure (wave 1): server boot wiring — REST safety_policies create/update call `publish_policy_to_workers`; new `spawn_telemetry_state_handler` with `check_telemetry_dedup`; `spawn_worker_online_handler` invoked at boot with `RestateHttpLookup`
+- [ ] 24-12-PLAN.md — Gap closure (wave 2): worker main.rs integration — TaskInvocation gains declared velocity fields; execute_task uses module-level PolicyCache + HotPolicy; `CommandWatchdog::with_on_expire` sources action from `HotPolicy.deadman_timers`; `publish_state_signed_with_buffer` wired; `CopperHandle::spawn_with_policy` replaces `spawn_execution_only`; worker subscribes to `roz.tasks.{worker_id}` + emits RecoveryPending; `CheckpointTrigger::DegradationChange` emitted on policy hot-swap; per-task CheckpointWriter bound to real `periodic_task_id`
+- [ ] 24-13-PLAN.md — Gap closure (wave 3): AgentLoop threading — `CheckpointSignal` trait in roz-core + `ChannelCheckpointSignal` worker adapter; AgentLoop emits `ToolCallStarted` / `ToolCallCompleted` / `ApprovalReceived` at the three locked D-08 transitions; execute_task calls `emit_violation_event` on Reject/Halt/Clamp pre-dispatch outcomes after `write_safety_audit`
 
-### Phase 25: Native MAVLink backend in `crates/roz-mavlink` plus bridge.proto semantics clean-up
+### Phase 25: Native MAVLink backend in `crates/roz-mavlink` plus bridge.proto semantics clean-up — COMPLETE 2026-04-20 (14/16 plans; 25-14 + 25-15 deferred to Phase 27 SC5/SC6/SC7 — live-FCU compliance + readiness fixtures)
 
-**Goal**: Make Pixhawk a single-binary deployment target — copper speaks MAVLink directly to PX4 / ArduPilot with no companion bridge, proto semantics stay MAVLink-accurate for the SITL path, and `ReadinessState` is trustworthy against real MAVLink streams.
+**Goal**: Make Pixhawk a single-binary deployment target — copper speaks MAVLink directly to PX4 / ArduPilot with no companion bridge, proto semantics stay MAVLink-accurate for the SITL path, and the MAVLink backend is trustworthy against committed `.tlog` fixtures. Live-FCU + task-layer end-to-end integration is scoped to Phase 27 (SITL CI), which picks up the backend shipped here.
 **Depends on**: Phase 22 (policy doc is the decision authority for native backend choice)
 **Requirements**: MAV-01, MAV-02, MAV-03
+**Scope note (post-review hybrid narrowing):** Phase 25 ships the MAVLink backend contract + byte-exact fixture compliance; it does NOT ship the worker task-layer FlightCommand dispatch wiring or live-FCU coexistence. Those move to Phase 27 (now has new SC6 + SC7 covering them).
 **Success Criteria** (what must be TRUE):
-  1. New `crates/roz-mavlink` crate is registered in the workspace `Cargo.toml` and implements copper's `SensorSource` + `ActuatorSink` traits against MAVLink v2 using the async-reader → `tokio::sync::mpsc` → sync `try_recv` / `send` pattern; supports `/dev/ttyUSB0` at 921600 baud and UDP 14540 (offboard) / 14550 (GCS); MAVLink v2 signing is off on direct USB and on for RF links with `SETUP_SIGNING` key distribution.
-  2. Compliance test fixture under `crates/roz-mavlink/tests/compliance/` uses pymavlink-recorded `.tlog` samples covering ARM / DISARM / TAKEOFF / LAND / RTL / SET_MODE / GOTO for both PX4 and ArduPilot; crate-emitted MAVLink bytes round-trip against the fixtures, and PX4 vs ArduPilot mode-string translation is documented + tested.
-  3. `bridge.proto` `FlightCommandResponse.result` is replaced with a proto enum mirroring `MAV_RESULT` (ACCEPTED / TEMPORARILY_REJECTED / DENIED / UNSUPPORTED / FAILED / IN_PROGRESS / CANCELLED); position-bearing commands (GOTO / SET_POSITION) carry an optional `MAV_FRAME` enum (no silent ENU assumptions); every `FlightCommand` variant has a doc-comment with its canonical `MAV_CMD_*` ID and param1..7 layout — all changes remain wire-compatible with `substrate.sim.v1`.
-  4. `ReadinessState` round-trip fixtures under `crates/roz-mavlink/tests/readiness_fixtures/` cover HEARTBEAT (msg 0), GPS_RAW_INT (msg 24), ESTIMATOR_STATUS (msg 230) across ready / not-ready / degraded cases for both autopilots; replay harness asserts `heartbeat_alive`, `heartbeat_age_ms`, `gps_fix_type`, `has_gps_fix`, `ekf_converged`, `ready_to_arm`, `fully_operational` exactly.
-  5. Full boot integration test: copper boot → `roz-mavlink` backend emits `TelemetryFrame.readiness` → copper deployment state machine reflects posture correctly, with a concurrent QGC-like peer on `MAV_COMP_ID_MISSIONPLANNER (190)` active alongside copper's `MAV_COMP_ID_ONBOARD_COMPUTER (195)` — no command or heartbeat conflicts.
-**Plans**: TBD
+  1. New `crates/roz-mavlink` crate is registered in the workspace `Cargo.toml` and implements copper's `SensorSource` + `ActuatorSink` + `DiscreteCommandSink<FlightCommand>` traits against MAVLink v2 using the async-reader → `tokio::sync::mpsc` → sync `try_recv` / `send` pattern. `SensorSource::try_recv` returns a `SensorFrame` derived from the latest HEARTBEAT + GPS_RAW_INT + ESTIMATOR_STATUS observations (not a synthetic default). `ActuatorSink::send` maps `CommandFrame.twist` to `SET_POSITION_TARGET_LOCAL_NED` (not a zero-velocity placeholder). Supports `/dev/ttyUSB0` at 921600 baud and UDP 14540 (PX4) / 14550 (ArduPilot); MAVLink v2 signing is off on direct USB and on for RF links with `SETUP_SIGNING` key distribution.
+  2. Compliance test fixture under `crates/roz-mavlink/tests/compliance/` uses `.tlog` samples covering ARM / DISARM / TAKEOFF / LAND / RTL / SET_MODE / GOTO for both PX4 and ArduPilot; the harness asserts BYTE-EXACT (or field-level equivalent) equality between `FlightCommandDispatcher::build_message(FlightCommand::X(params))` output and the outbound `COMMAND_LONG` / `COMMAND_INT` frames in the fixture, with `COMMAND_ACK` presence as a secondary check. PX4 vs ArduPilot mode-string translation is documented + tested.
+  3. `bridge.proto` semantics are corrected: v2 `bridge.proto` declares a proto3-safe `MavResult` enum (mirrors `MAV_RESULT` ACCEPTED..CANCELLED with a `_UNSPECIFIED=0` sentinel); position-bearing commands (GOTO / SET_POSITION / JointCommand positions) carry an optional `MAV_FRAME` enum (no silent ENU assumptions); every `FlightCommand` variant has a doc-comment with its canonical `MAV_CMD_*` ID and param1..7 layout. v1 `bridge.proto` gains the wire-compatible additive field `MavAutopilot autopilot = 11` on `ReadinessState` (D-05'); v1 existing field shapes stay frozen so `substrate.sim.v1` consumers keep working.
+  4. `ReadinessState` round-trip fixtures under `crates/roz-mavlink/tests/readiness_fixtures/` cover HEARTBEAT (msg 0), GPS_RAW_INT (msg 24), ESTIMATOR_STATUS (msg 230) across ready / not-ready / degraded cases for both autopilots; replay harness asserts `heartbeat_alive`, `heartbeat_age_ms`, `gps_fix_type`, `has_gps_fix`, `ekf_converged`, `ready_to_arm`, `fully_operational` exactly. The `latest_readiness_state()` side-channel on `MavlinkBackend` is populated from `ReadinessBuilder` output; `SensorSource::try_recv` exposes the latest readiness inside `SensorFrame.frame_snapshot_input` for consumers that want readiness without going through `TelemetryFrame`.
+  5. MAVLink-library-level coexistence test: two `MavlinkBackend` instances on loopback (copper on `MAV_COMP_ID_ONBOARD_COMPUTER (195)` link_id 1 + QGC-shim on `MAV_COMP_ID_MISSIONPLANNER (190)` link_id 3) exchange heartbeats + one of each command type without signing-state contention, verified against MAVLink's link-id + seq-number rules. `docs/mavlink-coexistence.md` documents the companion-ID + link-ID allocation table and known limitations (no timestamp persistence on restart; signed RF-link degrade-on-no-heartbeat instead of SETUP_SIGNING COMMAND_ACK per D-14'). FULL-BOOT live-FCU integration + task-layer `DiscreteCommandSink<FlightCommand>` dispatch is scoped to Phase 27.
+**Plans:** 16 plans
+
+Plans:
+- [x] 25-01-PLAN.md — Wave 0 foundation: workspace registration + `crates/roz-mavlink` crate skeleton with every source-file stub + `mavlink 0.17.1` dep locked with scoped dialect features (no `dialect-all`)
+- [x] 25-02-PLAN.md — Wave 0: add `DiscreteCommandSink<Cmd>` generic trait + supporting Rust types (`FlightCommand`, `FlightCommandParams`, `FlightCommandResponse`, `MavResult`, `MavFrame`, `MavAutopilot`) to `crates/roz-copper/src/io.rs` per D-19 (B1 fix)
+- [x] 25-03-PLAN.md — Wave 0: create `crates/roz-copper/proto/substrate/sim/v2/bridge.proto` with proto3-safe `MavResult` shift (D-08'), `MavFrame` on position-bearing messages (D-09), `MavAutopilot` on `ReadinessState`, per-variant `MAV_CMD_*` doc-comments, hybrid cross-package imports (Transform3D/Vector3/Quaternion imported from v1; SetEntityPose/JointCommand re-declared)
+- [x] 25-04-PLAN.md — Wave 1: extend `crates/roz-copper/build.rs` for v2 codegen alongside v1 + add `pub mod proto_v2` barrel in `crates/roz-copper/src/lib.rs`
+- [x] 25-05-PLAN.md — Wave 2: thin signing wrapper over upstream `mavlink[mav2-message-signing]` per D-01' + `mav_result.rs` wire-boundary shift helpers per D-08' + SETUP_SIGNING message builder per D-14
+- [x] 25-06-PLAN.md — Wave 1: transport adapters (serial + UDP) — `TransportHandle` owning upstream MavConnection + reader/writer tasks + companion-ID constants per DEEP-MAV §3
+- [x] 25-07-PLAN.md — Wave 2: `ReadinessBuilder` — HEARTBEAT + GPS_RAW_INT + ESTIMATOR_STATUS → `proto_v2::ReadinessState` per DEEP-MAV §4 translation rules
+- [x] 25-08-PLAN.md — Wave 1: PX4 + ArduPilot mode integer↔string translation tables verbatim from upstream headers (`px4_custom_mode.h`, `ArduCopter/mode.h`, `ArduPlane/mode.h`)
+- [x] 25-09-PLAN.md — Wave 3: `FlightCommandDispatcher` — maps all 7 `FlightCommand` variants to `MAV_CMD_*` `COMMAND_LONG`/`COMMAND_INT` per RESEARCH §Code Examples param layout table; non-zero `vehicle_index` returns `Unsupported` per D-16
+- [x] 25-10-PLAN.md — Wave 0: `migrations/20260419036_mavlink_signing_key.sql` — three additive columns on `roz_hosts` + CHECK constraints (nonce length 12, version ≥ 1, all-or-none) per D-10
+- [x] 25-11-PLAN.md — Wave 1: `HostRow` extended + `hosts::set_mavlink_signing_key` / `get_mavlink_signing_key` helpers + host-creation route auto-generates + encrypts + persists the 32-byte seed via Phase 23 `encrypt_signing_seed` (D-11)
+- [x] 25-12-PLAN.md — Wave 4: `MavlinkBackend` assembly — implements `SensorSource + ActuatorSink + DiscreteCommandSink<FlightCommand>` + inbound router + broadcast-based `BackendAckWatcher` + SETUP_SIGNING bring-up with ACK-timeout → `SigningState::DegradedNoAck` per D-14
+- [x] 25-13-PLAN.md — Wave 5: worker wiring — `[mavlink]` + `[mavlink.signing]` config sections; decrypt host signing seed + construct `MavlinkBackend::new_serial` / `new_udp_in`; D-12 NULL-column warning; first production call-site for `CopperHandle::spawn_with_io_*`
+- [ ] 25-14-PLAN.md (DEFERRED to Phase 27 SC5/SC6/SC7) — Wave 6: MAV-01 compliance fixtures — 14 `.tlog` files (7 commands × 2 autopilots) + replay harness + operator-run recording script; `cargo test -p roz-mavlink --test compliance` exits 0
+- [ ] 25-15-PLAN.md (DEFERRED to Phase 27 SC5/SC6/SC7) — Wave 6: MAV-03 readiness fixtures — 6 `.tlog` files (ready/not_ready/degraded × PX4/ArduPilot) + `ReadinessBuilder` replay harness with exact-field-value assertions
+- [x] 25-16-PLAN.md — Wave 6: MAV-01 SC5 QGC coexistence integration test (signed + unsigned variants on shared UDP port) + `docs/mavlink-coexistence.md` runbook (companion-ID table, link-ID allocation, port footgun, signing posture, known limitations)
 
 ### Phase 26: Unified MCAP observability with Foxglove-native schema projection
 
@@ -151,16 +174,19 @@ Plans:
   5. `roz session export <session_id> --format mcap` CLI + matching gRPC endpoint stream a valid MCAP to disk or stdout with incremental time-range seek; scripted 30 s fixture session (1500 telemetry frames + 20 tool calls + 5 approvals) round-trips through export, re-reads cleanly via the `mcap` crate, and loads in Foxglove Studio.
 **Plans**: TBD
 
-### Phase 27: Nightly PX4 SITL integration CI with induced NATS outage
+### Phase 27: Nightly PX4 SITL integration CI with induced NATS outage + live-FCU task-layer wiring
 
-**Goal**: A nightly CI job proves the full field-survivability stack (edge safety, WAL telemetry + task recovery, native MAVLink) works end-to-end against PX4 SITL — so every merge to main has automated regression coverage before any hardware exists.
-**Depends on**: Phase 24 (FS-01/02/03 wiring), Phase 25 (native MAVLink backend), Phase 26 (MCAP artifact export on CI)
-**Requirements**: RD-01
+**Goal**: A nightly CI job proves the full field-survivability stack (edge safety, WAL telemetry + task recovery, native MAVLink) works end-to-end against PX4 SITL — so every merge to main has automated regression coverage before any hardware exists. Phase 27 also ships the worker task-layer `DiscreteCommandSink<FlightCommand>` dispatch wiring (scoped out of Phase 25 per post-review hybrid narrowing) and the live-FCU `TelemetryFrame.readiness` propagation path.
+**Depends on**: Phase 24 (FS-01/02/03 wiring), Phase 25 (native MAVLink backend contract + fixture compliance), Phase 26 (MCAP artifact export on CI)
+**Requirements**: RD-01, MAV-01 (SC5 full-boot tail), MAV-03 (live readiness tail)
 **Success Criteria** (what must be TRUE):
   1. New `integration-px4-sitl` GitHub Actions nightly job brings up `bedrockdynamics/substrate-sim:px4-gazebo-humble` (PX4 SITL v1.16.1 + Gazebo Harmonic + MAVLink 14540/14550) + standalone roz-copper + NATS + Postgres via the existing substrate-ide `docker-compose.yml` pattern; copper connects via its native `roz-mavlink` backend on UDP 14540.
   2. Scripted scenario runs ARM → TAKEOFF 5 m → HOVER 10 s → RTL → LAND with MAVLink command/response validated at each transition, and the final LAND returns `MAV_RESULT::ACCEPTED`.
   3. Mid-hover, the job runs `docker network disconnect` on the NATS container for 30 s; WAL buffers telemetry (FS-02) and in-flight task state survives (FS-03); on reconnect, replay is idempotent (no duplicate frames) and the task completes cleanly.
   4. Job completes in < 600 s on a free GitHub Actions runner and uploads a JUnit test report plus the exported session MCAP as workflow artifacts for post-run inspection.
+  5. Worker `execute_task` path dispatches `DiscreteCommandSink<FlightCommand>::send_command` end-to-end for drone embodiments: a flight-command task (or tool-call) produced by the agent is routed to `Box<dyn DiscreteCommandSink<FlightCommand>>` extracted from `roz_agent::dispatch::Extensions`, the call returns `FlightCommandResponse`, and the response propagates back to the agent loop for reasoning. Integration test exercises this via a scripted task that issues ARM + TAKEOFF via the DiscreteCommandSink path (not direct gRPC shim).
+  6. Live `TelemetryFrame.readiness` propagation: `roz-mavlink` `SensorSource::try_recv` feeds `SensorFrame.frame_snapshot_input` that carries `ReadinessState` derived from SITL HEARTBEAT + GPS_RAW_INT + ESTIMATOR_STATUS; copper telemetry publisher attaches that readiness to the outbound `TelemetryFrame.readiness` field (populated with autopilot=PX4); a subscriber asserts the readiness round-trip against the scripted scenario's expected state at TAKEOFF and LAND checkpoints.
+  7. Full-boot QGC coexistence: a QGC-shim peer on `MAV_COMP_ID_MISSIONPLANNER (190)` link_id 3 connects to the same SITL instance while copper is flying the scripted scenario; both peers send + receive without command or heartbeat conflicts; QGC-shim can observe TELEMETRY_RADIO and READY-level heartbeats from copper without interleaving-induced drops. This closes the SC5 live-FCU gap scoped out of Phase 25.
 **Plans**: TBD
 
 ### Phase 28: HITL documentation, companion setup, and Pixhawk single-binary deployment quickstart
@@ -172,7 +198,7 @@ Plans:
   1. `docs/deployments/hitl.md` ships with bench-rig BOM, Pixhawk 6C + RPi 5 wiring, pre-flight checklist, two-layer e-stop (software `MAV_CMD_DO_SET_MODE → LAND` + hardware battery-cutoff relay), and tether spec; `docs/deployments/companion-setup.md` ships the Ubuntu 22.04 flash, serial driver, and roz-worker systemd unit template; `docs/mavlink-coexistence.md` documents the companion-ID contract and the PX4 UDP-14540 vs TCP-14540 vs GCS-UDP-14550 port footgun referenced in `drone_wasm_velocity.rs`.
   2. No separate `substrate-hardware-bridge` process is referenced as a deployment prerequisite in any of the three docs; copper's `roz-mavlink` backend handles real hardware directly.
   3. `docs/deployments/pixhawk.md` stays under 2000 words and walks the operator from `git clone roz-oss` to tethered-bench-flight readiness, covering: hardware BOM + wiring → Ubuntu 22.04 flash → roz-worker install + systemd enable → MAVLink device config in `roz.toml` (serial port, baud, signing posture) → device enrollment (exercises FS-04) → safety policy bind (exercises FS-01) → first tethered flight with pre-flight checklist → MCAP export + Foxglove replay (exercises OBS-03).
-  4. The quickstart has been validated end-to-end on at least one real RPi 5 + Pixhawk 6C system; a screenshot or short video of Foxglove MCAP playback of that flight is attached to the v3.0 milestone acceptance record.
+  4. The quickstart has been validated end-to-end on at least one RPi 5 + Pixhawk 6C system; a screenshot or short video of Foxglove MCAP playback of that flight is attached to the v3.0 milestone acceptance record.
 **Plans**: TBD
 
 ## Current Status
@@ -190,8 +216,8 @@ v3.0 Production Robotics milestone is in the planning stage. Phase 22 is planned
 | 21.1. Runtime Event Contracts and Completeness | v2.2 | 3/3 | Complete | 2026-04-16 |
 | 22. Integration policy | v3.0 | 3/3 | Complete    | 2026-04-17 |
 | 23. Signed dispatch | v3.0 | 0/0 | Not started | — |
-| 24. Edge safety + WAL resilience | v3.0 | 1/9 | In progress | — |
-| 25. Native MAVLink backend | v3.0 | 0/0 | Not started | — |
+| 24. Edge safety + WAL resilience | v3.0 | 9/13 | Gap closure (4 new plans 24-10..24-13) | — |
+| 25. Native MAVLink backend | v3.0 | 0/16 | Plans drafted 2026-04-19 | — |
 | 26. Unified MCAP observability | v3.0 | 0/0 | Not started | — |
 | 27. Nightly PX4 SITL CI | v3.0 | 0/0 | Not started | — |
 | 28. HITL docs + Pixhawk quickstart | v3.0 | 0/0 | Not started | — |
