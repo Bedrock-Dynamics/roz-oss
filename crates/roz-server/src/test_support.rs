@@ -32,7 +32,8 @@ use crate::config::SignedDispatchEnforcement;
 use crate::middleware::rate_limit::{RateLimitConfig, create_rate_limiter};
 use crate::state::{AppState, ModelConfig};
 
-/// Build a happy-path [`AppState`] backed by a `StaticKeyProvider` so
+/// Build a happy-path [`AppState`] backed by a `StaticKeyProvider`.
+///
 /// `encrypt_signing_seed` succeeds. The caller supplies a live Postgres
 /// pool; everything else (NATS, Restate, gateway URLs) is stubbed out
 /// with values that do not hit the network during the hosts-route test.
@@ -43,10 +44,11 @@ pub fn build_test_app_state(pool: PgPool) -> AppState {
     build_test_app_state_with_key_provider(pool, key_provider)
 }
 
-/// Negative-path [`AppState`] variant whose [`roz_core::key_provider::KeyProvider`]
-/// always errors with `KeyNotConfigured` on `encrypt`. Used to prove the
-/// Phase 25 D-23 single-transaction invariant: when the signing-key write
-/// step fails AFTER the `hosts::create` insert on the SAME transaction,
+/// Negative-path [`AppState`] with a key provider that always fails on `encrypt`.
+///
+/// The provider returns `KeyNotConfigured` on every `encrypt` call. Used to
+/// prove the Phase 25 D-23 single-transaction invariant: when the signing-key
+/// write step fails AFTER the `hosts::create` insert on the SAME transaction,
 /// the whole transaction must roll back and no host row may persist.
 #[must_use]
 pub fn build_test_app_state_with_failing_key_provider(pool: PgPool) -> AppState {
