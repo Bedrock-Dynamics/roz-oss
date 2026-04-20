@@ -21,3 +21,8 @@ pub mod modes;
 pub mod readiness;
 pub mod signing;
 pub mod transport;
+
+// Public API re-exports per Phase 25 barrel convention.
+pub use backend::{MavlinkBackend, SigningState};
+pub use flight_command::{AutopilotHint, CommandAckWatcher, DEFAULT_ACK_TIMEOUT, FlightCommandDispatcher};
+pub use signing::{MavlinkSigningConfig, SigningPosture, TransportKind};
