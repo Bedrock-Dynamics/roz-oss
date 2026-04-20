@@ -24,7 +24,7 @@ async fn null_signing_key_forces_signing_off() {
     };
     let bind = format!("127.0.0.1:{port}");
     let signing_config = MavlinkSigningConfig {
-        seed: None, // D-12: pre-migration host — seed columns NULL.
+        seed: None,                  // D-12: pre-migration host — seed columns NULL.
         posture: SigningPosture::On, // Even when the operator asks for ON, seed=None force-disables.
         allow_unsigned: false,
         local_link_id: 1,

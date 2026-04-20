@@ -7143,6 +7143,7 @@ dependencies = [
  "roz-core",
  "roz-db",
  "roz-local",
+ "roz-mavlink",
  "roz-nats",
  "roz-test",
  "roz-zenoh",

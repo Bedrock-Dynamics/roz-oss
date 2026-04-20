@@ -13,7 +13,10 @@
 //! integration tests are a separate compilation unit and link against the
 //! library surface, so `#[cfg(test)]` would not reach them.
 
-#![allow(dead_code, reason = "Helpers are used from integration tests only; rustc can't see the cross-crate link.")]
+#![allow(
+    dead_code,
+    reason = "Helpers are used from integration tests only; rustc can't see the cross-crate link."
+)]
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
