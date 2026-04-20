@@ -1,0 +1,59 @@
+[package]
+name = "roz-mavlink"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Native MAVLink v2 backend implementing roz-copper's SensorSource + ActuatorSink + DiscreteCommandSink<FlightCommand> for PX4 / ArduPilot."
+
+[dependencies]
+# Upstream MAVLink crate — provides wire protocol + v2 signing + transports.
+# Feature set locked per Phase 25 25-RESEARCH.md §Standard Stack.
+#
+# Deviation (Rule 1): The plan's feature list used names from an older/renamed
+# mavlink version (`mav2-message-signing`, `dialect-common`,
+# `dialect-ardupilotmega`, `dialect-standard`, `dialect-all`). Upstream 0.17.1
+# publishes these as `signing`, `common`, `ardupilotmega`, `standard`, and
+# `all-dialects` respectively. Substituted with upstream-correct names to make
+# `cargo build -p roz-mavlink` succeed. Intent of T-25-01-01 (avoid the
+# all-dialects bloat feature) is preserved — `all-dialects` remains absent.
+#
+# `default` dropped because with `default-features = false` it would silently
+# re-pull `tcp` and `format-generated-code` which are outside Phase 25 scope.
+mavlink = { version = "0.17.1", default-features = false, features = [
+    "std",
+    "serde",
+    "direct-serial",
+    "udp",
+    "tokio-1",
+    "signing",
+    "common",
+    "ardupilotmega",
+    "standard",
+] }
+
+# Workspace crates — implement SensorSource/ActuatorSink/DiscreteCommandSink<FlightCommand> from roz-copper.
+roz-core   = { path = "../roz-core" }
+roz-copper = { path = "../roz-copper" }
+
+# Async + sync primitives
+tokio      = { workspace = true, features = ["rt", "sync", "io-util", "time", "macros"] }
+parking_lot = { workspace = true }
+
+# Error handling — thiserror at crate boundary, anyhow at trait edge (CLAUDE.md convention).
+anyhow    = { workspace = true }
+thiserror = { workspace = true }
+
+# Logging (workspace convention).
+tracing = { workspace = true }
+
+# Config + randomness (signing-key material handling in tests / harness).
+serde = { workspace = true, features = ["derive"] }
+rand  = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+
+[lints]
+workspace = true
