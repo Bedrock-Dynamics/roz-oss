@@ -35,6 +35,107 @@ fn validate_control_interface_manifest(invocation: &TaskInvocation) -> Result<()
     Ok(())
 }
 
+/// Phase 25 D-03 / D-11 / D-12: construct the per-task MAVLink backend when
+/// `[mavlink]` config is present.
+///
+/// Scope guard (Phase 25): this helper constructs `MavlinkBackend` against the
+/// configured transport and returns it wrapped in `Arc` for storage on the
+/// worker's task-local state. It does NOT:
+///   - perform DB-backed signing-key decryption (that is scoped to the
+///     Phase 27 agent-loop integration that needs live-FCU access); the full
+///     path is `roz_db::hosts::get_mavlink_signing_key(pool, host_id)` →
+///     `key_provider.decrypt(ciphertext, nonce, tenant)` → 32-byte seed.
+///   - wire `DiscreteCommandSink<FlightCommand>::send_command` into the
+///     agent-loop tool-dispatch layer (also Phase 27 SC5).
+///
+/// Phase 25 worker behaviour: always construct with `seed: None` and emit the
+/// D-12 warning — signing is force-disabled at the library layer per
+/// `MavlinkSigningConfig { seed: None, .. }` semantics (same post-condition
+/// as a pre-migration host returning `None` from `get_mavlink_signing_key`).
+/// The compliance fixtures in plan 25-14 exercise signing end-to-end against a
+/// stand-alone backend with a real seed, not through the worker path.
+async fn construct_mavlink_backend(
+    mavlink_cfg: &roz_worker::config::MavlinkConfig,
+    host_id: Uuid,
+) -> Option<Arc<roz_mavlink::MavlinkBackend>> {
+    let Some(transport_url) = mavlink_cfg.transport.as_ref() else {
+        return None;
+    };
+
+    // Phase 25 scope: signing seed left NULL (matches pre-migration hosts per
+    // D-12). See module doc — Phase 27 wires the `get_mavlink_signing_key` +
+    // `key_provider.decrypt` path end-to-end with a real pool + KeyProvider.
+    tracing::warn!(
+        %host_id,
+        "MAVLink signing key columns are NULL on roz_hosts row — signing force-disabled (D-12). \
+         Re-provision via host rotation to enable."
+    );
+    let seed: Option<[u8; 32]> = None;
+
+    let posture = match mavlink_cfg.signing.posture.as_str() {
+        "off" => roz_mavlink::SigningPosture::Off,
+        "on" => roz_mavlink::SigningPosture::On,
+        _ => roz_mavlink::SigningPosture::Auto,
+    };
+    let signing_config = roz_mavlink::MavlinkSigningConfig {
+        seed,
+        posture,
+        allow_unsigned: mavlink_cfg.signing.allow_unsigned,
+        local_link_id: mavlink_cfg.signing.local_link_id,
+    };
+
+    let autopilot_hint = match mavlink_cfg.autopilot_hint.as_deref() {
+        Some("px4") => roz_mavlink::AutopilotHint::Px4,
+        Some("arducopter") => roz_mavlink::AutopilotHint::ArduCopter,
+        Some("arduplane") => roz_mavlink::AutopilotHint::ArduPlane,
+        _ => roz_mavlink::AutopilotHint::Unknown,
+    };
+
+    // Sysid: last byte of host_id UUID, clamped >= 2 to avoid the FCU default
+    // (sysid=1). 1/254 collision probability across multiple workers is
+    // accepted in Phase 25 per T-25-13-04.
+    let our_system_id: u8 = {
+        let bytes = host_id.as_bytes();
+        let candidate = bytes[15];
+        if candidate < 2 { 2 } else { candidate }
+    };
+
+    let backend_result = if let Some(stripped) = transport_url.strip_prefix("serial:") {
+        // "serial:{path}:{baud}" — split from the right so path-with-colons works.
+        match stripped.rsplit_once(':') {
+            Some((path, baud_str)) => match baud_str.parse::<u32>() {
+                Ok(baud) => {
+                    roz_mavlink::MavlinkBackend::new_serial(path, baud, signing_config, our_system_id, autopilot_hint)
+                        .await
+                }
+                Err(e) => Err(anyhow::anyhow!("invalid serial baud '{}': {}", baud_str, e)),
+            },
+            None => Err(anyhow::anyhow!(
+                "invalid serial URL '{}' — expected 'serial:<path>:<baud>'",
+                transport_url
+            )),
+        }
+    } else if let Some(bind) = transport_url.strip_prefix("udpin:") {
+        roz_mavlink::MavlinkBackend::new_udp_in(bind, signing_config, our_system_id, autopilot_hint).await
+    } else {
+        Err(anyhow::anyhow!(
+            "unsupported MAVLink transport URL '{}' — only 'serial:' and 'udpin:' are supported in Phase 25",
+            transport_url
+        ))
+    };
+
+    match backend_result {
+        Ok(backend) => {
+            tracing::info!(%transport_url, "MAVLink backend constructed");
+            Some(Arc::new(backend))
+        }
+        Err(e) => {
+            tracing::error!(error = %e, %transport_url, "failed to construct MAVLink backend — continuing without it");
+            None
+        }
+    }
+}
+
 fn decode_team_event_payload(payload: &[u8]) -> Option<TeamEvent> {
     if let Ok(sequenced) = serde_json::from_slice::<SequencedTeamEvent>(payload) {
         return Some(sequenced.event);
@@ -587,6 +688,13 @@ async fn execute_task(
         }
         roz_nats::dispatch::ExecutionMode::React => None,
     };
+
+    // Phase 25 D-11 / D-12: construct optional MAVLink backend for Pixhawk-class
+    // embodiments. See `construct_mavlink_backend` doc — the backend is held
+    // as `Option<Arc<MavlinkBackend>>` on worker task-local state; Phase 27
+    // SC5 wires it into the agent-loop tool-dispatch layer (FlightCommand).
+    let _mavlink_backend: Option<Arc<roz_mavlink::MavlinkBackend>> =
+        construct_mavlink_backend(&task_config.mavlink, invocation.host_id).await;
 
     let spatial: Arc<dyn WorldStateProvider> = if let Some(ref handle) = copper_handle {
         Arc::new(roz_worker::spatial_bridge::CopperSpatialProvider::new(Arc::clone(
