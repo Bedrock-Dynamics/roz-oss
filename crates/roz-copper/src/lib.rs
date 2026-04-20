@@ -41,6 +41,39 @@ pub mod io_ws;
 pub mod manifest;
 pub mod mcap_export;
 pub mod policy;
+
+/// Generated Rust bindings for the `substrate.sim.v2` proto package
+/// (Phase 25 MAV-02). Compiled in parallel with v1 via
+/// `crates/roz-copper/build.rs`.
+///
+/// Key types exported:
+/// * `MavResult` (proto3-safe shift per 25-CONTEXT.md D-08'; see
+///   crates/roz-mavlink/src/mav_result.rs for wire-boundary helpers)
+/// * `MavFrame`, `MavAutopilot`, `FlightCommand` enums
+/// * `FlightCommandRequest`, `FlightCommandResponse`
+/// * `SetEntityPoseRequest`, `JointCommandRequest` (re-declared with frame tags)
+///
+/// Stable primitive types (`Transform3D`, `Vector3`, `Quaternion`,
+/// `JointCommandMode`) are IMPORTED from v1 per 25-03 Open Question #6
+/// resolution — reference them via `crate::io_grpc::proto::Transform3D` etc.
+#[allow(
+    dead_code,
+    clippy::doc_markdown,
+    clippy::derive_partial_eq_without_eq,
+    clippy::default_trait_access,
+    clippy::large_enum_variant,
+    clippy::struct_excessive_bools,
+    clippy::missing_const_for_fn,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::pedantic,
+    clippy::nursery,
+    clippy::or_fun_call,
+    clippy::type_complexity
+)]
+pub mod proto_v2 {
+    tonic::include_proto!("substrate.sim.v2");
+}
+
 pub mod replay;
 pub mod safety_filter;
 pub mod state_injector;
