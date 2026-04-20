@@ -146,6 +146,40 @@ pub fn build_signing_data(config: &MavlinkSigningConfig, transport: TransportKin
     Some(SigningData::from_config(upstream))
 }
 
+/// Build an upstream `mavlink::SigningConfig` (NOT `SigningData`) from our
+/// config + transport kind.
+///
+/// Mirror of [`build_signing_data`] but returns the pre-`SigningData` value
+/// that `MavConnection::setup_signing` expects per upstream 0.17.1. The
+/// transport layer (plan 25-06 `open_transport`) takes `Option<SigningConfig>`
+/// because that is the signature upstream exposes; the backend (plan 25-12)
+/// owns the conversion to `SigningData` when it needs to verify inbound
+/// frames locally.
+///
+/// Returns `None` for the same two cases as [`build_signing_data`] —
+/// pre-migration host (no seed) or posture-off.
+#[must_use]
+pub fn build_signing_config(config: &MavlinkSigningConfig, transport: TransportKind) -> Option<SigningConfig> {
+    let Some(seed) = config.seed else {
+        tracing::warn!(
+            transport = ?transport,
+            "mavlink signing force-disabled: no seed in config (pre-migration host? \
+             see 25-CONTEXT.md D-12)"
+        );
+        return None;
+    };
+    if !config.posture.resolve(transport) {
+        tracing::debug!(transport = ?transport, posture = ?config.posture, "mavlink signing off by config");
+        return None;
+    }
+    Some(SigningConfig::new(
+        seed,
+        config.local_link_id,
+        /* sign_outgoing */ true,
+        config.allow_unsigned,
+    ))
+}
+
 /// MAVLink epoch constant — 2015-01-01 00:00:00 UTC in Unix seconds.
 /// [CITED: mavlink.io/en/guide/message_signing.html — timestamp format]
 const MAVLINK_EPOCH_UNIX_SECS: u64 = 1_420_070_400;
