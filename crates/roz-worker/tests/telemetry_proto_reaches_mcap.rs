@@ -80,7 +80,7 @@ async fn setup(worker_name: &str) -> Fixture {
         .expect("create tenant");
     let tenant_id = tenant.id;
     roz_db::set_tenant_context(&pool, &tenant_id).await.expect("set tenant ctx");
-    let _host = roz_db::hosts::create(&pool, tenant_id, worker_name, "edge", &[], &serde_json::json!({}))
+    let host = roz_db::hosts::create(&pool, tenant_id, worker_name, "edge", &[], &serde_json::json!({}))
         .await
         .expect("create host");
 
@@ -91,7 +91,7 @@ async fn setup(worker_name: &str) -> Fixture {
     let device_pk = device_signing.verifying_key().to_bytes();
     // Insert the verifying key on the server side. The signing gate looks
     // this up keyed by (tenant_id, host_id, key_version=1).
-    let _device_row = roz_db::device_keys::insert_device_key(&pool, tenant_id, _host.id, &device_pk, 1)
+    let _device_row = roz_db::device_keys::insert_device_key(&pool, tenant_id, host.id, &device_pk, 1)
         .await
         .expect("insert device key");
 
@@ -105,7 +105,7 @@ async fn setup(worker_name: &str) -> Fixture {
     save_key(key_dir.path(), &provider, tenant_id, 1, &device_seed, &svk_bytes)
         .await
         .expect("save device key");
-    let material = load_key(key_dir.path(), &provider, tenant_id, _host.id)
+    let material = load_key(key_dir.path(), &provider, tenant_id, host.id)
         .await
         .expect("load material")
         .expect("material present");
