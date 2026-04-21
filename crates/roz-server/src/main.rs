@@ -457,6 +457,30 @@ async fn main() {
         "signed dispatch enforcement initialized"
     );
 
+    // Phase 26 OBS-01/02/D-01: resolve MCAP archive root (ROZ_MCAP_DIR or
+    // /var/lib/roz/mcap), create if missing, canonicalize for the path-
+    // traversal defence-in-depth guard in WriterActor::open.
+    let mcap_dir = {
+        let raw = std::env::var(roz_server::observability::ENV_MCAP_DIR)
+            .unwrap_or_else(|_| roz_server::observability::DEFAULT_MCAP_DIR.to_string());
+        let path = std::path::PathBuf::from(&raw);
+        if let Err(e) = std::fs::create_dir_all(&path) {
+            tracing::warn!(error = %e, mcap_dir = %path.display(), "failed to create MCAP directory (may already exist)");
+        }
+        path.canonicalize().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, mcap_dir = %path.display(), "failed to canonicalize MCAP directory; using raw path");
+            path
+        })
+    };
+
+    // Phase 26 OBS-02: decode Foxglove + roz.v1 descriptor subsets once.
+    let schema_descriptors = roz_server::observability::schema_registry::SchemaDescriptors::load()
+        .expect("schema descriptors must load at server boot");
+
+    // Phase 26 OBS-01: per-session WriterActor registry + task-lifecycle broadcast sink.
+    let active_writers = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let task_lifecycle_sink = roz_server::observability::task_lifecycle::new_task_lifecycle_sink();
+
     let state = AppState {
         pool,
         rate_limiter,
@@ -476,6 +500,10 @@ async fn main() {
         session_bus: Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
         verifying_key_cache,
         signed_dispatch_enforcement,
+        active_writers,
+        task_lifecycle_sink,
+        schema_descriptors,
+        mcap_dir,
     };
 
     // Spawn internal NATS request-reply handlers (e.g. spawn_worker tool bypass).
@@ -614,6 +642,8 @@ mod tests {
     }
 
     fn test_state_with_operator(pool: sqlx::PgPool, operator_seed: Option<String>) -> AppState {
+        let mcap_dir = std::env::temp_dir().join(format!("roz-mcap-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&mcap_dir).expect("create test mcap dir");
         AppState {
             pool,
             rate_limiter: middleware::rate_limit::create_rate_limiter(&middleware::rate_limit::RateLimitConfig {
@@ -648,6 +678,11 @@ mod tests {
                 .time_to_live(std::time::Duration::from_secs(60))
                 .build(),
             signed_dispatch_enforcement: roz_server::config::SignedDispatchEnforcement::Strict,
+            active_writers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            task_lifecycle_sink: roz_server::observability::task_lifecycle::new_task_lifecycle_sink(),
+            schema_descriptors: roz_server::observability::schema_registry::SchemaDescriptors::load()
+                .expect("schema descriptors must load in tests"),
+            mcap_dir,
         }
     }
 
@@ -2312,6 +2347,8 @@ mod tests {
     // -- E-stop endpoint tests ------------------------------------------------
 
     fn test_state_with_nats(pool: sqlx::PgPool, nats_client: async_nats::Client) -> AppState {
+        let mcap_dir = std::env::temp_dir().join(format!("roz-mcap-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&mcap_dir).expect("create test mcap dir");
         AppState {
             pool,
             rate_limiter: middleware::rate_limit::create_rate_limiter(&middleware::rate_limit::RateLimitConfig {
@@ -2346,6 +2383,11 @@ mod tests {
                 .time_to_live(std::time::Duration::from_secs(60))
                 .build(),
             signed_dispatch_enforcement: roz_server::config::SignedDispatchEnforcement::Strict,
+            active_writers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            task_lifecycle_sink: roz_server::observability::task_lifecycle::new_task_lifecycle_sink(),
+            schema_descriptors: roz_server::observability::schema_registry::SchemaDescriptors::load()
+                .expect("schema descriptors must load in tests"),
+            mcap_dir,
         }
     }
 

@@ -66,6 +66,9 @@ fn build_test_app_state_with_key_provider(
         burst_size: NonZeroU32::new(2000).expect("burst"),
     });
 
+    let mcap_dir = std::env::temp_dir().join(format!("roz-mcap-test-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&mcap_dir).expect("create test mcap dir");
+
     AppState {
         pool,
         rate_limiter,
@@ -97,6 +100,11 @@ fn build_test_app_state_with_key_provider(
             .time_to_live(Duration::from_secs(60))
             .build(),
         signed_dispatch_enforcement: SignedDispatchEnforcement::Audit,
+        active_writers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        task_lifecycle_sink: crate::observability::task_lifecycle::new_task_lifecycle_sink(),
+        schema_descriptors: crate::observability::schema_registry::SchemaDescriptors::load()
+            .expect("schema descriptors must load in tests"),
+        mcap_dir,
     }
 }
 

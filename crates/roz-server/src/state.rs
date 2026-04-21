@@ -111,6 +111,43 @@ pub struct AppState {
     /// [`SignedDispatchEnforcement::Strict`] everywhere else per the
     /// Phase 23 Planner Discretion Q6.
     pub signed_dispatch_enforcement: SignedDispatchEnforcement,
+    /// Phase 26 OBS-01: registry of per-session `WriterActor` command senders.
+    ///
+    /// Keyed by `session_id`; the value is an
+    /// [`tokio::sync::mpsc::Sender<WriteCommand>`] owned by the per-session
+    /// MCAP writer. The SIGTERM drain (Plan 26-07) iterates this map and
+    /// sends `Finalize { Shutdown }` so every open archive transitions to
+    /// `finalized` + is flushed/closed cleanly on shutdown. Shape mirrors
+    /// the existing `TelemetryDedup` (`Arc<Mutex<HashMap>>`) rather than
+    /// introducing a new `DashMap` workspace dep; contention on 10–100
+    /// active-session entries is negligible and never on the hot write path.
+    pub active_writers: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<Uuid, tokio::sync::mpsc::Sender<crate::observability::mcap_archive::WriteCommand>>,
+        >,
+    >,
+    /// Phase 26 OBS-01: broadcast sink for `TaskLifecycleEvent`.
+    ///
+    /// Populated by the 3 UPDATE sites in `crates/roz-db/src/tasks.rs`
+    /// (Plan 26-08); each per-session `WriterActor` subscribes once at
+    /// session start and emits `WriteCommand::Event { channel:
+    /// TaskLifecycle }` for every transition. Bounded (1024) — catastrophic
+    /// backlog implies the archive is already compromised.
+    pub task_lifecycle_sink: crate::observability::task_lifecycle::TaskLifecycleSink,
+    /// Phase 26 OBS-02: pre-loaded Foxglove + `roz.v1` schema descriptor bytes.
+    ///
+    /// Decoded once at server boot from the `FileDescriptorSet` output of
+    /// `build.rs` (roz-server's Foxglove + roz.v1 descriptor bins); cloned
+    /// by-value into each per-session `WriterActor::open` so
+    /// `mcap::Writer::add_schema` has the subset FDS bytes for all six
+    /// registered channels.
+    pub schema_descriptors: crate::observability::schema_registry::SchemaDescriptors,
+    /// Phase 26 D-01: base directory for MCAP archives (`ROZ_MCAP_DIR`).
+    ///
+    /// Absolute, canonicalized path enforced as the root for the
+    /// path-traversal defence-in-depth check in `WriterActor::open`
+    /// (T-26-40). Created at boot if missing.
+    pub mcap_dir: std::path::PathBuf,
 }
 
 impl FromRef<AppState> for PgPool {

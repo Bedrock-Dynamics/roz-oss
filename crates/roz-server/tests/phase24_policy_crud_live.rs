@@ -130,6 +130,15 @@ fn build_test_app_state(
         // push. Off/Audit would let missing or bad signatures slide and
         // downgrade this to a cache-only test.
         signed_dispatch_enforcement: roz_server::config::SignedDispatchEnforcement::Strict,
+        active_writers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        task_lifecycle_sink: roz_server::observability::task_lifecycle::new_task_lifecycle_sink(),
+        schema_descriptors: roz_server::observability::schema_registry::SchemaDescriptors::load()
+            .expect("schema descriptors must load in tests"),
+        mcap_dir: {
+            let d = std::env::temp_dir().join(format!("roz-mcap-test-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&d).expect("create test mcap dir");
+            d
+        },
     }
 }
 

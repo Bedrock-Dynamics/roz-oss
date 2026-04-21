@@ -694,6 +694,9 @@ mod integration_tests {
                 burst_size: NonZeroU32::new(200).unwrap(),
             });
 
+        let mcap_dir = std::env::temp_dir().join(format!("roz-mcap-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&mcap_dir).expect("create test mcap dir");
+
         let state = AppState {
             pool: pool.clone(),
             rate_limiter,
@@ -728,6 +731,11 @@ mod integration_tests {
                 .time_to_live(std::time::Duration::from_secs(60))
                 .build(),
             signed_dispatch_enforcement: crate::config::SignedDispatchEnforcement::Strict,
+            active_writers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            task_lifecycle_sink: crate::observability::task_lifecycle::new_task_lifecycle_sink(),
+            schema_descriptors: crate::observability::schema_registry::SchemaDescriptors::load()
+                .expect("schema descriptors must load in tests"),
+            mcap_dir,
         };
 
         let app = crate::build_router(state.clone());

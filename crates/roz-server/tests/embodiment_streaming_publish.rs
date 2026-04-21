@@ -51,6 +51,9 @@ async fn start_server_with_nats() -> (String, String, uuid::Uuid, uuid::Uuid, ro
             burst_size: NonZeroU32::new(100).unwrap(),
         });
 
+    let mcap_dir = std::env::temp_dir().join(format!("roz-mcap-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&mcap_dir).expect("create test mcap dir");
+
     let state = roz_server::state::AppState {
         pool: pool.clone(),
         rate_limiter,
@@ -82,6 +85,11 @@ async fn start_server_with_nats() -> (String, String, uuid::Uuid, uuid::Uuid, ro
             .time_to_live(std::time::Duration::from_secs(60))
             .build(),
         signed_dispatch_enforcement: roz_server::config::SignedDispatchEnforcement::Strict,
+        active_writers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        task_lifecycle_sink: roz_server::observability::task_lifecycle::new_task_lifecycle_sink(),
+        schema_descriptors: roz_server::observability::schema_registry::SchemaDescriptors::load()
+            .expect("schema descriptors must load in tests"),
+        mcap_dir,
     };
 
     let app = roz_server::build_router(state);
