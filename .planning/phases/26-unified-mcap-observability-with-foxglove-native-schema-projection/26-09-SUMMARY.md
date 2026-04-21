@@ -89,6 +89,7 @@ completed: 2026-04-21
 1. **Task 1: Extend observability.proto** — `84bca72` (feat) — TimeRangeNs, ExportSessionRequest, ExportSessionChunk, ObservabilityService.ExportSession.
 2. **Task 2: export.rs + grpc/observability.rs + main.rs wiring** — `6deae7f` (feat) — 6 unit tests + 4 gRPC integration tests (`#[ignore]`, Postgres-backed).
 3. **Task 3: roz session export CLI** — `f969b87` (feat) — 6 parse unit tests + `--help` surface verified.
+4. **Post-advisor fix: archive_status per-file emission** — `601e62b` (fix) — handler now emits `archive_status` on the first chunk of EACH file via `Option::take()`; integration test pads fixture past `EXPORT_CHUNK_BYTES` so later-chunks assertion is non-vacuous.
 
 **Plan metadata:** (this commit — docs only)
 
@@ -160,10 +161,17 @@ Multiple Rule 1/3 fixes applied inline. Plan sketches were conceptual and did no
 - **Fix:** Collapsed to `if let Some(s) = x && p { continue }`; split doc comment into a short first paragraph; rewrote bool assertions as `assert!(...)` / `assert!(!...)`.
 - **Commit:** `6deae7f` (amended pre-commit).
 
+**7. [Rule 2 — Missing critical] `archive_status` emission per-file vs per-process**
+- **Found during:** Post-advisor review after task 3.
+- **Issue:** Plan's example sets `archive_status = if idx == 0 { Some(row.status) } else { None }` and clones that onto every chunk. That both (a) stamps EVERY chunk of file 0 with the status (not just the first), and (b) never stamps file 1+. Proto doc explicitly says "populated on the first chunk of each rollover file" (per D-06 X-Roz-Mcap-Status semantics). Also made the original integration test's "later chunks lack status" assertion vacuous because the tiny empty-MCAP fixture only ever produced one chunk per file.
+- **Fix:** Rewrote the per-file loop to use `let mut archive_status: Option<String> = Some(row.status.clone())` + `archive_status.take()` inside each send call. Status is now emitted exactly once per file, on the first chunk, for every rollover (0, 1, 2, ...). Added a trailing-empty-chunk fallback for zero-byte files so the invariant still holds when a rollover has no bytes to stream. Padded the integration-test fixtures past `EXPORT_CHUNK_BYTES` (256 KiB) with distinct byte patterns so the test actually exercises the multi-chunk path; strengthened assertions to cover BOTH rollover files.
+- **Files modified:** `crates/roz-server/src/grpc/observability.rs`, `crates/roz-server/tests/observability_export_grpc.rs`.
+- **Commit:** `601e62b`.
+
 ---
 
-**Total deviations:** 6 auto-fixed (4 Rule 1 bugs, 2 Rule 3 blocking). No Rule 4 (architectural) decisions.
-**Impact on plan:** All fixes compile-level or correctness-preserving; no scope creep. Handler behavior matches plan intent (cross-tenant rejected, tenant-scoped + path-safe, rollover-ordered streaming, time-range re-encoding) even where the example code required adjustment.
+**Total deviations:** 7 auto-fixed (4 Rule 1 bugs, 2 Rule 3 blocking, 1 Rule 2 missing-critical). No Rule 4 (architectural) decisions.
+**Impact on plan:** All fixes compile-level or correctness-preserving; no scope creep. Handler behavior matches plan intent (cross-tenant rejected, tenant-scoped + path-safe, rollover-ordered streaming, time-range re-encoding, one-status-per-file) even where the example code required adjustment.
 
 ## Issues Encountered
 
@@ -203,3 +211,4 @@ All 12 non-ignored tests pass: `cargo test -p roz-server --lib observability::ex
 - FOUND commit `84bca72` (Task 1: proto)
 - FOUND commit `6deae7f` (Task 2: export.rs + handler + main.rs wiring + tests)
 - FOUND commit `f969b87` (Task 3: CLI)
+- FOUND commit `601e62b` (post-advisor fix: archive_status per-file)
