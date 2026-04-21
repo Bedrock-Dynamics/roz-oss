@@ -504,6 +504,13 @@ async fn execute_task(
     // The resume subscriber (Plan 24-12 Task 4) publishes directly on this
     // same broadcast; both paths terminate on one fan-out stream.
     session_event_tx: tokio::sync::broadcast::Sender<roz_core::session::event::EventEnvelope>,
+    // Phase 26-12 OBS-01: shared pointer to the currently-active copper
+    // `ControllerState`. Set by this function when it spawns a
+    // `CopperHandle`; cleared on task shutdown. The worker-wide 10 Hz
+    // telemetry loop reads this to populate `TelemetryUpdate.end_effector_pose`.
+    shared_copper_state: std::sync::Arc<
+        arc_swap::ArcSwapOption<arc_swap::ArcSwap<roz_copper::channels::ControllerState>>,
+    >,
 ) {
     tracing::info!("starting task execution");
 
@@ -684,6 +691,13 @@ async fn execute_task(
                 telemetry_backpressure.shared(),
             );
             tracing::info!("copper controller spawned for OodaReAct task with hot policy + shared backpressure");
+            // Phase 26-12 OBS-01: install a clone of the controller state
+            // pointer so the worker-wide 10 Hz telemetry loop (main()) can
+            // observe `ControllerState.entities` and publish
+            // `TelemetryUpdate.end_effector_pose`. The pointer is cleared
+            // at task shutdown (e-stop drop + final shutdown) so telemetry
+            // does not continue to read stale state from a prior task.
+            shared_copper_state.store(Some(std::sync::Arc::clone(handle.state())));
             Some(handle)
         }
         roz_nats::dispatch::ExecutionMode::React => None,
@@ -1236,6 +1250,10 @@ async fn execute_task(
             if *estop_rx.borrow() {
                 tracing::error!(task_id = %task_id, "E-STOP during task execution");
                 drop(copper_handle.take());
+                // Phase 26-12 OBS-01: clear the shared pose pointer so the
+                // worker-wide telemetry loop stops reading the (now-dead)
+                // controller state.
+                shared_copper_state.store(None);
             }
             Err(session_runtime_error_to_agent_error(&error, *estop_rx.borrow()))
         }
@@ -1289,6 +1307,10 @@ async fn execute_task(
     // Shut down Copper if it was spawned.
     if let Some(handle) = copper_handle {
         handle.shutdown().await;
+        // Phase 26-12 OBS-01: clear the shared pose pointer so the
+        // worker-wide telemetry loop stops reading the (now-dead)
+        // controller state once this task ends.
+        shared_copper_state.store(None);
     }
 
     // DEBT-03: drain the write-behind flush task before returning so any
@@ -1422,6 +1444,18 @@ async fn main() -> Result<()> {
     let telemetry_backpressure = std::sync::Arc::new(roz_worker::telemetry_backpressure::TelemetryBackpressure::new());
     let telemetry_drop_counter = std::sync::Arc::new(roz_worker::telemetry::DropCounter::new());
     let telemetry_append_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // Phase 26-12 OBS-01: shared pointer to the currently-active copper
+    // `ControllerState`. `None` when no OodaReAct task is running (or when
+    // the running task did not spawn a CopperHandle). `execute_task` stores
+    // a clone of `handle.state()` here when it spawns a CopperHandle, and
+    // clears it on task completion. The worker-wide 10 Hz telemetry loop at
+    // the bottom of `main()` reads from this pointer to populate
+    // `TelemetryUpdate.end_effector_pose` from the first entity with both a
+    // position and an orientation.
+    let shared_copper_state: std::sync::Arc<
+        arc_swap::ArcSwapOption<arc_swap::ArcSwap<roz_copper::channels::ControllerState>>,
+    > = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
 
     // Spawn idle watchdog — fires if no NATS message arrives within 30s.
     // Plan 24-12 Task 2: the `on_expire` callback reads the live
@@ -1612,15 +1646,38 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Phase 23 FS-04 / Plan 24-12 Task 3: spawn telemetry publisher (10 Hz).
+    // Phase 23 FS-04 / Plan 24-12 Task 3 / Phase 26-12 OBS-01: spawn
+    // telemetry publisher (10 Hz).
+    //
+    // **Wire format (Phase 26-12 OBS-01):** payload is a prost-encoded
+    // `roz.v1.TelemetryUpdate` (not serde_json). Same NATS subject
+    // (`telemetry.{worker_id}.state`); the server's MCAP ingest
+    // (ingest_cloud.rs Plan 26-05) and gRPC relay (agent.rs Plan 26-12 Task 2)
+    // both decode via `prost::Message::decode`. Legacy JSON frames from
+    // pre-migration builds are silently dropped on the server side
+    // (debug-log-and-continue, no panic).
+    //
     // When signing AND a WAL are both configured, route through
-    // `publish_state_signed_with_buffer` so NATS-outage frames are buffered
-    // to the WAL and replayed on reconnect (FS-02). When only signing is
-    // configured, fall back to the plain signed publish. When signing is
-    // disabled (D-12 rollout) use the unsigned path.
+    // `publish_state_proto_signed_with_buffer` so NATS-outage frames are
+    // buffered to the WAL and replayed on reconnect (FS-02). The WAL treats
+    // payloads as opaque bytes, so `telemetry_replay.rs` needs no change —
+    // it re-signs and re-publishes stored protobuf payloads verbatim. When
+    // only signing is configured, fall back to the plain signed publish.
+    // When signing is disabled (D-12 rollout) use the unsigned path.
+    //
     // `correlation_id` for telemetry is a stable worker-lifetime UUID so
     // the server's verifier can scope replay protection consistently across
     // the continuous telemetry stream.
+    //
+    // `end_effector_pose` is populated from the shared copper state pointer
+    // (`shared_copper_state`). When an OodaReAct task is executing with a
+    // `CopperHandle`, that task installs a clone of its `handle.state()`
+    // Arc into this pointer so the worker-wide telemetry loop can observe
+    // the live `ControllerState.entities[0]`. Between tasks (or for non-
+    // OodaReAct invocations) the pointer is `None` and the pose is
+    // published as absent — matching the pre-26-12 behavior where joints/
+    // sensors/pose were always empty because `main()` had no copper
+    // visibility.
     let telem_nats = nats.clone();
     let telem_worker_id = config.worker_id.clone();
     let telem_signing_ctx = signing_ctx.clone();
@@ -1629,23 +1686,59 @@ async fn main() -> Result<()> {
     let telem_bp = telemetry_backpressure.clone();
     let telem_drop = telemetry_drop_counter.clone();
     let telem_append = telemetry_append_counter.clone();
+    let telem_copper_state = shared_copper_state.clone();
     tokio::spawn(async move {
+        use prost::Message as _;
         let mut interval = tokio::time::interval(Duration::from_millis(100));
         loop {
             interval.tick().await;
-            let state = serde_json::json!({
-                "timestamp": chrono::Utc::now().timestamp_millis(),
-                "joints": [],
-                "sensors": {}
+
+            // Build `roz.v1.TelemetryUpdate` from the live copper state.
+            // `ControllerState.entities[0]` is the pose source per the
+            // existing spatial-bridge pattern. When no task is running, or
+            // the running task has no copper, the pointer is `None` and
+            // `end_effector_pose` is `None` — matching the pre-26-12
+            // emission (empty pose) for those conditions.
+            let end_effector_pose = telem_copper_state.load_full().and_then(|arc| {
+                let state = arc.load();
+                let entity = state.entities.first()?;
+                let pos = entity.position?;
+                let quat_wxyz = entity.orientation?;
+                Some(roz_worker::roz_v1::Pose {
+                    x: pos[0],
+                    y: pos[1],
+                    z: pos[2],
+                    // `roz_core::spatial::EntityState.orientation` is
+                    // `[w, x, y, z]`; `roz.v1.Pose` fields are
+                    // `(qx, qy, qz, qw)`. Reorder explicitly at the
+                    // assignment site.
+                    qx: quat_wxyz[1],
+                    qy: quat_wxyz[2],
+                    qz: quat_wxyz[3],
+                    qw: quat_wxyz[0],
+                })
             });
+
+            #[allow(clippy::cast_precision_loss)]
+            let ts_secs = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+
+            let update = roz_worker::roz_v1::TelemetryUpdate {
+                host_id: telem_worker_id.clone(),
+                timestamp: ts_secs,
+                joint_states: Vec::new(),
+                end_effector_pose,
+                sensor_readings: std::collections::BTreeMap::new(),
+            };
+            let payload = update.encode_to_vec();
+
             let publish_result = match (telem_signing_ctx.as_ref(), telem_wal.as_ref()) {
                 (Some(ctx), Some(wal)) => {
-                    roz_worker::telemetry::publish_state_signed_with_buffer(
+                    roz_worker::telemetry::publish_state_proto_signed_with_buffer(
                         &telem_nats,
                         ctx,
                         &telem_worker_id,
                         telem_correlation_id,
-                        &state,
+                        &payload,
                         wal,
                         &telem_bp,
                         &telem_drop,
@@ -1655,16 +1748,18 @@ async fn main() -> Result<()> {
                 }
                 (Some(ctx), None) => {
                     // Signing enabled but no WAL — fall back to plain signed publish (no buffering).
-                    roz_worker::telemetry::publish_state_signed(
+                    roz_worker::telemetry::publish_state_proto_signed(
                         &telem_nats,
                         ctx,
                         &telem_worker_id,
                         telem_correlation_id,
-                        &state,
+                        &payload,
                     )
                     .await
                 }
-                (None, _) => roz_worker::telemetry::publish_state(&telem_nats, &telem_worker_id, &state).await,
+                (None, _) => {
+                    roz_worker::telemetry::publish_state_proto(&telem_nats, &telem_worker_id, &payload).await
+                }
             };
             if let Err(e) = publish_result {
                 tracing::trace!(error = %e, "telemetry publish failed");
@@ -2530,6 +2625,11 @@ async fn main() -> Result<()> {
         let task_telemetry_bp = telemetry_backpressure.clone();
         let task_worker_wal = worker_wal.clone();
         let task_session_event_tx = session_event_tx.clone();
+        // Phase 26-12 OBS-01: clone the worker-wide copper state pointer
+        // into each spawned task; when the task spawns a `CopperHandle`,
+        // it installs a pose snapshot here so the worker-wide 10 Hz
+        // telemetry loop can publish `end_effector_pose`.
+        let task_shared_copper_state = shared_copper_state.clone();
         let span = tracing::info_span!("worker.execute_task", task_id = %task_id);
         tokio::spawn(
             async move {
@@ -2551,6 +2651,7 @@ async fn main() -> Result<()> {
                     task_telemetry_bp,
                     task_worker_wal,
                     task_session_event_tx,
+                    task_shared_copper_state,
                 )
                 .await;
             }

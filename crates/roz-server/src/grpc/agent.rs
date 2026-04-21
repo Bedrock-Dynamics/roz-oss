@@ -2169,42 +2169,35 @@ async fn spawn_telemetry_relay(
                     None => break,
                 },
             };
-            if let Ok(data) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
-                // Parse joint states from the worker telemetry JSON.
-                let joint_states: Vec<roz_v1::JointState> = data["joints"]
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|j| {
-                                Some(roz_v1::JointState {
-                                    name: j["name"].as_str()?.to_string(),
-                                    position: j["position"].as_f64().unwrap_or(0.0),
-                                    velocity: j["velocity"].as_f64().unwrap_or(0.0),
-                                    effort: j["effort"].as_f64().unwrap_or(0.0),
-                                })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                // Parse sensor readings from the worker telemetry JSON.
-                let sensor_readings: std::collections::BTreeMap<String, f64> = data["sensors"]
-                    .as_object()
-                    .map(|obj| obj.iter().filter_map(|(k, v)| Some((k.clone(), v.as_f64()?))).collect())
-                    .unwrap_or_default();
-
-                let update = roz_v1::TelemetryUpdate {
-                    host_id: host_id_owned.clone(),
-                    timestamp: data["timestamp"].as_f64().unwrap_or(0.0),
-                    joint_states,
-                    end_effector_pose: None,
-                    sensor_readings,
-                };
-                let resp = SessionResponse {
-                    response: Some(session_response::Response::Telemetry(update)),
-                };
-                if telem_tx.send(Ok(resp)).await.is_err() {
-                    break; // client disconnected
+            // Phase 26-12 OBS-01 wire-format migration: the worker
+            // publishes prost-encoded `roz.v1.TelemetryUpdate` (not
+            // serde_json). Decode via prost; legacy JSON publishers
+            // (pre-migration builds, tests) log at debug and continue —
+            // the `SessionResponse::Telemetry` stream degrades to silence
+            // rather than panicking, matching the MCAP ingest path's
+            // backward-compat stance
+            // (crates/roz-server/src/observability/ingest_cloud.rs:320-328).
+            match <roz_v1::TelemetryUpdate as prost::Message>::decode(msg.payload.as_ref()) {
+                Ok(mut update) => {
+                    // `host_id_owned` was resolved upstream from the session's
+                    // host UUID; overwrite the worker-reported value so the
+                    // gRPC consumer sees the canonical tenant-scoped ID
+                    // (matches pre-migration behavior where the relay
+                    // overrode it in the rebuild step).
+                    update.host_id = host_id_owned.clone();
+                    let resp = SessionResponse {
+                        response: Some(session_response::Response::Telemetry(update)),
+                    };
+                    if telem_tx.send(Ok(resp)).await.is_err() {
+                        break; // client disconnected
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        subject = %msg.subject,
+                        "telemetry relay decode as proto failed (likely legacy JSON publisher); dropping"
+                    );
                 }
             }
         }

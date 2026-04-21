@@ -2553,13 +2553,22 @@ async fn session_with_host_receives_telemetry() {
     );
 
     // 8. Publish telemetry to NATS on the host's subject.
+    // Phase 26-12 OBS-01 (Task 2): payload is prost-encoded
+    // `roz.v1.TelemetryUpdate`, not serde_json. The gRPC relay migrated
+    // from `serde_json::from_slice` to `TelemetryUpdate::decode` at
+    // `agent.rs:2179`; a JSON payload here would be silently dropped by
+    // the debug-log-and-continue branch, and the subsequent
+    // `.expect("expected TelemetryUpdate response")` would panic.
     let telem_subject = roz_nats::subjects::Subjects::telemetry_state("telem-test-host").expect("valid subject");
-    let telem_data = serde_json::json!({
-        "timestamp": 1_234_567_890.0,
-        "joints": [],
-        "sensors": {}
-    });
-    nats.publish(telem_subject, serde_json::to_vec(&telem_data).unwrap().into())
+    let telem_update = roz_v1::TelemetryUpdate {
+        host_id: "telem-test-host".to_string(),
+        timestamp: 1_234_567_890.0,
+        joint_states: vec![],
+        end_effector_pose: None,
+        sensor_readings: Default::default(),
+    };
+    let telem_payload = <roz_v1::TelemetryUpdate as prost::Message>::encode_to_vec(&telem_update);
+    nats.publish(telem_subject, telem_payload.into())
         .await
         .expect("publish telemetry to NATS");
     nats.flush().await.expect("flush NATS");
