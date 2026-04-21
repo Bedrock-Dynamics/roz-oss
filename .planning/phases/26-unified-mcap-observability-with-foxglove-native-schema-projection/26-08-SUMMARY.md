@@ -24,7 +24,7 @@ tech-stack:
   patterns:
     - "Erased closure (`Arc<dyn Fn(TaskLifecycleData) + Send + Sync>`) as the roz-db → roz-server boundary — avoids cyclic dependency while keeping a single dispatch point for proto translation"
     - "sink_to_emit adapter in observability/task_lifecycle.rs centralises TaskLifecycleSink → TaskLifecycleEmit construction; every call site invokes it once per handler, not once per UPDATE"
-    - "Lifecycle companions pre-read task-level `prev_status` on the same pool, then run legacy UPDATE SQL verbatim, then emit when `prev != new` — identity-transition guard drops duplicate events (`complete_run` often keeps task status unchanged)"
+    - "Lifecycle companions take `&mut PgConnection` (NOT `&PgPool`) so the prev-read + UPDATE share the same session — critical under READ COMMITTED when the caller holds an open tx containing uncommitted inserts; identity-transition guard drops duplicate events"
     - "complete_run_with_lifecycle_emit gains additive task_id param so prev-read can resolve owning task (legacy signature only carries run_id)"
     - "error_message surfaced as lifecycle `reason` for run-level companions; `actor: None` (legacy carries neither)"
 
@@ -47,7 +47,7 @@ key-files:
 key-decisions:
   - "Plan's example SQL for complete_run + complete_active_run_for_task included an extra `UPDATE roz_tasks SET status = $2` adjacent to the run UPDATE. Legacy bodies do NOT touch roz_tasks. Per objective (execute legacy UPDATE SQL verbatim) and the nats_handlers flow (apply_task_status_event already calls update_status after complete_active_run_for_task), we did NOT add the second UPDATE — doing so would double-write the status column and change behaviour."
   - "Plan's example signatures for complete_run/complete_active_run used reason + actor + failure_reason; legacy signatures use status + error_message with `completed_at` column. Preserved legacy signatures verbatim; surfaced error_message as TaskLifecycleData.reason; actor = None at these boundaries."
-  - "All `*_with_lifecycle_emit` helpers take `pool: &PgPool` rather than a generic `E: Executor + Copy`. Rationale: `&PgPool: Copy` but `&mut PgConnection` / `&mut *tx` do not, so the generic-Copy bound would force all call sites to migrate to `&pool` anyway. Taking `&PgPool` directly is simpler and all call sites already have a pool handle."
+  - "All `*_with_lifecycle_emit` helpers take `conn: &mut sqlx::PgConnection` (NOT `&PgPool` or the plan's `E: Executor + Copy`). An initial `&PgPool` implementation was shipped and then fixed: under READ COMMITTED isolation, callers holding an open tx (REST `Tx` extractor, scheduled `pool.begin()`) cannot see their own uncommitted INSERTs when the helper acquires a separate pool connection for the prev-read + UPDATE — the final `queued` transition in `dispatch_task` would affect zero rows and fail with `task disappeared after dispatch`. Fix: take `&mut PgConnection` + `&mut *conn` reborrow in each sub-query, matching the existing `ensure_active_run` pattern. A regression test (`update_status_with_lifecycle_emit_sees_uncommitted_insert_on_same_tx`) pins the invariant."
   - "Identity-transition emit guard (`if prev != new`). Without this, complete_run_with_lifecycle_emit would emit duplicate events when the task-level status is already `failed` / `succeeded` from an earlier `update_status` hop in the same worker→server flow."
   - "spawn_task_handler accepts `_task_lifecycle_sink: TaskLifecycleSink` by convention (threaded through from spawn_all) but does not use it — the handler runs `tasks::create` + Restate start + invoke publish, with no status transitions of its own. Status transitions for internally-spawned tasks flow back through the worker→server `roz.internal.tasks.status.*` subject handled by spawn_task_status_handler, which does emit."
 
@@ -68,12 +68,12 @@ completed: 2026-04-21
 
 ## Performance
 
-- **Duration:** ~28 min
-- **Tasks:** 2 (both committed atomically)
+- **Duration:** ~40 min (2 tasks + advisor-driven fix)
+- **Tasks:** 2 main + 1 correctness fix, all committed atomically
 - **Files created:** 0
 - **Files modified:** 12 (3 roz-db + roz-server helper modules, 4 test integration files)
-- **Unit tests added:** 5 (4 in roz-db::tasks, 1 in observability::task_lifecycle)
-- **Total roz-db tasks tests:** 17/17 passing (13 pre-existing + 4 new)
+- **Unit tests added:** 6 (5 in roz-db::tasks including a tx-visibility regression, 1 in observability::task_lifecycle)
+- **Total roz-db tasks tests:** 18/18 passing (13 pre-existing + 5 new)
 - **Total roz-server observability lib tests:** 28/28 passing (27 from earlier Wave 6 plans + 1 new)
 - **Total roz-server lib tests:** 411/411 passing (no regressions)
 - **Clippy:** clean with `-D warnings` on lib + tests
@@ -134,6 +134,7 @@ Each task committed atomically via `git commit --no-verify`:
 
 1. **Task 1: roz-db lifecycle emit helpers + read_task_prev_status** — `fc2a66d` (feat)
 2. **Task 2: Route all roz-server task-status callers through emitting variants + sink_to_emit adapter** — `156a7d1` (feat)
+3. **Correctness fix (advisor): helpers must take `&mut PgConnection` for tx visibility** — `e9cbe94` (fix)
 
 ## Files Created/Modified
 
@@ -225,6 +226,15 @@ Each task committed atomically via `git commit --no-verify`:
 - **Files modified:** `crates/roz-server/tests/*.rs`
 - **Commit:** `156a7d1`
 
+**8. [Rule 1 — Bug] Initial `&PgPool` signature caused tx-visibility failure on REST/scheduled dispatch happy path**
+
+- **Found during:** advisor review after Task 2 commit.
+- **Issue:** The `*_with_lifecycle_emit` helpers initially took `pool: &PgPool` and acquired fresh pool connections inside the body for `read_task_prev_status` + the UPDATE. In `dispatch_task`, callers (REST via `Tx` extractor, scheduled via `pool.begin()`) hold an open transaction containing an uncommitted `INSERT INTO roz_tasks`. Under Postgres READ COMMITTED isolation, a separate pool connection cannot observe that uncommitted row — so the final `update_status_with_lifecycle_emit("queued")` in `dispatch_task` would `UPDATE` zero rows, return `Ok(None)`, and `.ok_or_else(|| TaskDispatchError::Internal("task disappeared after dispatch"))` would fire on every happy-path task creation. The roz-db unit tests passed because they called the helpers outside of any surrounding tx. The integration tests that exercise REST task creation are `#[ignore]`'d behind testcontainers, so the failure was invisible without runtime exercise.
+- **Fix:** Changed all 3 helpers to take `conn: &mut sqlx::PgConnection`. Inside each body, the prev-read and the UPDATE both use `&mut *conn` reborrow, guaranteeing a shared session. Call-site migrations: `routes/task_dispatch.rs` uses the fn's existing `&mut *conn` (7 sites); `routes/tasks.rs::delete` uses `&mut **tx` via the `Tx` extractor (also restores transactional atomicity with the preceding `get_by_id` tenant check); `grpc/tasks.rs::cancel_task` acquires a dedicated connection via `self.pool.acquire()`; `nats_handlers::apply_task_status_event` acquires per emit with a graceful `tracing::warn` fallback on acquire failure; `main.rs` metrics test acquires one shared connection for both emit calls. Added a regression test `update_status_with_lifecycle_emit_sees_uncommitted_insert_on_same_tx` that opens `pool.begin()`, inserts via `tasks::create(&mut *tx, ...)`, calls the emit helper on the SAME tx, and asserts the row is visible + the transition + emit fired. This test would have caught the bug at Task 1 time if the signature had been wrong from the start.
+- **Files modified:** `crates/roz-db/src/tasks.rs`, `crates/roz-server/src/routes/task_dispatch.rs`, `crates/roz-server/src/routes/tasks.rs`, `crates/roz-server/src/grpc/tasks.rs`, `crates/roz-server/src/nats_handlers.rs`, `crates/roz-server/src/main.rs`
+- **Commit:** `e9cbe94`
+- **Threat implications:** none new — the fix aligns the helpers with the existing `ensure_active_run` `&mut PgConnection` pattern in the same module.
+
 ### Plan signature / example code drift (noted for verifier)
 
 - Plan Task 1's example signatures for `complete_run_with_lifecycle_emit` / `complete_active_run_for_task_with_lifecycle_emit` use `new_status, reason, actor` parameters and `failure_reason` / `actor` columns in the SQL. Actual legacy functions use `status, error_message` + `completed_at` / `error_message` columns. We followed the objective's "legacy SQL verbatim" directive and the acceptance criteria (which only require "concrete bodies — NO `todo!()` placeholders"). The committed companions match the legacy API shape exactly, with a plan-faithful `reason`/`actor` pair added on top for `update_status_with_lifecycle_emit` where the signature is cleaner.
@@ -243,7 +253,7 @@ No architectural deviations. No decision checkpoints reached. No auth gates.
 - `cargo clippy -p roz-server --no-deps --tests -- -D warnings` — clean.
 - `cargo fmt -p roz-db --check` — clean.
 - `cargo fmt -p roz-server --check` — clean.
-- `cargo test -p roz-db --lib tasks::` — **17/17 passing** (13 pre-existing + 4 new lifecycle-emit tests).
+- `cargo test -p roz-db --lib tasks::` — **18/18 passing** (13 pre-existing + 4 lifecycle-emit tests + 1 tx-visibility regression).
 - `cargo test -p roz-server --lib observability` — **28/28 passing** (27 pre-existing + 1 new `sink_to_emit_translates_data_to_proto_and_broadcasts`).
 - `cargo test -p roz-server --lib` — **411/411 passing** (0 regressions).
 - `cargo check -p roz-server --tests` — clean.
@@ -293,6 +303,7 @@ Commits verified via `git log --oneline`:
 
 - `fc2a66d` — **FOUND** (feat(26-08): task-lifecycle emit helpers in roz-db)
 - `156a7d1` — **FOUND** (feat(26-08): route roz-server task-status updates through lifecycle emit)
+- `e9cbe94` — **FOUND** (fix(26-08): lifecycle emit helpers must take &mut PgConnection, not &PgPool)
 
 Invariants:
 
@@ -310,7 +321,7 @@ Build + lint + tests:
 - `cargo clippy -p roz-server --no-deps --tests -- -D warnings` — **PASS**.
 - `cargo fmt -p roz-db --check` — **PASS**.
 - `cargo fmt -p roz-server --check` — **PASS**.
-- `cargo test -p roz-db --lib tasks::` — **17/17 PASS**.
+- `cargo test -p roz-db --lib tasks::` — **18/18 PASS**.
 - `cargo test -p roz-server --lib observability` — **28/28 PASS**.
 - `cargo test -p roz-server --lib` — **411/411 PASS**.
 - `cargo check -p roz-server --tests` — **PASS**.
