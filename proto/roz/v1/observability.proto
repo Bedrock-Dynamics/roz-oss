@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package roz.v1;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+
+// D-09: Task status values mirror the roz_tasks.status enum declared in
+// migrations/021_task_timeout_status.sql:
+//   'pending', 'queued', 'provisioning', 'running', 'succeeded',
+//   'failed', 'timed_out', 'cancelled', 'safety_stop', 'retrying'.
+// Proto3 requires an _UNSPECIFIED zero sentinel.
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED  = 0;
+  TASK_STATUS_PENDING      = 1;
+  TASK_STATUS_QUEUED       = 2;
+  TASK_STATUS_PROVISIONING = 3;
+  TASK_STATUS_RUNNING      = 4;
+  TASK_STATUS_SUCCEEDED    = 5;
+  TASK_STATUS_FAILED       = 6;
+  TASK_STATUS_TIMED_OUT    = 7;
+  TASK_STATUS_CANCELLED    = 8;
+  TASK_STATUS_SAFETY_STOP  = 9;
+  TASK_STATUS_RETRYING     = 10;
+}
+
+// D-09: One emission per roz_tasks.status transition. Wrapped at the
+// 3 UPDATE sites in crates/roz-db/src/tasks.rs.
+message TaskLifecycleEvent {
+  string task_id = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  TaskStatus prev_status = 3;
+  TaskStatus new_status = 4;
+  optional string reason = 5;
+  optional string actor  = 6;
+}
+
+// D-08: Field sets reuse agent.proto's ToolCall*Payload shapes verbatim
+// but are re-declared here (not imported) to keep observability concerns
+// isolated per D-07.
+message ToolCallStarted {
+  string tool_name = 1;
+  string category  = 2;
+}
+message ToolCallRequested {
+  string tool_name = 1;
+  google.protobuf.Struct parameters = 2;
+  uint32 timeout_ms = 3;
+}
+message ToolCallFinished {
+  string tool_name = 1;
+  string result_summary = 2;
+}
+
+// D-08: Single envelope, single channel /roz/tool/calls. Mirrors
+// SessionEventEnvelope's oneof pattern at agent.proto lines 352-401.
+message ToolCallEvent {
+  string call_id = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  oneof payload {
+    ToolCallStarted   started   = 3;
+    ToolCallRequested requested = 4;
+    ToolCallFinished  finished  = 5;
+  }
+}
