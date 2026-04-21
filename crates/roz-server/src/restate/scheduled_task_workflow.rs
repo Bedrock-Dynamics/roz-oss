@@ -26,6 +26,10 @@ pub struct ScheduledTaskRuntime {
     /// gRPC / REST / internal-spawn dispatch paths so every server→worker
     /// publish carries a `roz-sig-v1` header.
     pub signing_gate: Arc<crate::signing_gate::SigningGate>,
+    /// Phase 26 OBS-01: broadcast sink for task-status lifecycle events.
+    /// Threaded through `TaskDispatchServices` so every scheduled dispatch
+    /// transition (queued / failed) emits on `/roz/task/lifecycle`.
+    pub task_lifecycle_sink: crate::observability::task_lifecycle::TaskLifecycleSink,
 }
 
 static SCHEDULED_TASK_RUNTIME: LazyLock<RwLock<Option<Arc<ScheduledTaskRuntime>>>> =
@@ -372,6 +376,10 @@ async fn execute_iteration(
                 // every outbound `invoke.{host}.{task}` publish with the
                 // shared `SigningGate`.
                 signing_gate: Some(runtime.signing_gate.as_ref()),
+                // Phase 26 OBS-01: scheduled dispatches emit lifecycle events
+                // on the shared broadcast sink so `/roz/task/lifecycle` sees
+                // every "queued" / "failed" edge.
+                task_lifecycle_sink: &runtime.task_lifecycle_sink,
             },
             TaskDispatchRequest {
                 tenant_id: input.tenant_id,

@@ -143,6 +143,7 @@ async fn start_grpc_server(
             None,
             roz_server::config::SignedDispatchEnforcement::Off,
         )),
+        roz_server::observability::task_lifecycle::new_task_lifecycle_sink(),
     );
     let identity = AuthIdentity::User {
         user_id: format!("user:{tenant_id}"),

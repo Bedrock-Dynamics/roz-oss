@@ -10,6 +10,8 @@
 //! Bounded ring. If the writer falls behind, drops are acceptable —
 //! catastrophic backlog means the archive is already compromised.
 
+use std::sync::Arc;
+
 use tokio::sync::broadcast;
 
 use crate::grpc::roz_v1::TaskLifecycleEvent;
@@ -55,10 +57,44 @@ pub fn map_status(status: &str) -> i32 {
     }
 }
 
+/// Phase 26 OBS-01 helper: wrap a [`TaskLifecycleSink`] in the erased
+/// `TaskLifecycleEmit` closure that `roz-db` call sites accept.
+///
+/// The DB layer cannot name `TaskLifecycleEvent` / `TaskLifecycleSink`
+/// (cyclic dependency). Every roz-server call site that transitions a
+/// `roz_tasks.status` row goes through a `*_with_lifecycle_emit` helper
+/// that takes `&TaskLifecycleEmit`; this constructor is the single
+/// adapter from `broadcast::Sender<TaskLifecycleEvent>` to the erased
+/// closure. It:
+///   1. Maps the DB's free-form `prev_status` / `new_status` strings to
+///      the proto `TaskStatus` enum via [`map_status`] (authoritative
+///      mapping from `migrations/021_task_timeout_status.sql`).
+///   2. Wraps `data.timestamp` into `prost_types::Timestamp`.
+///   3. Calls `sink.send(...)`, ignoring `SendError` (broadcast drops
+///      under backlog are accepted per Plan 26-04 / T-26-80).
+#[must_use]
+pub fn sink_to_emit(sink: TaskLifecycleSink) -> roz_db::tasks::TaskLifecycleEmit {
+    Arc::new(move |data: roz_db::tasks::TaskLifecycleData| {
+        let event = TaskLifecycleEvent {
+            task_id: data.task_id.to_string(),
+            timestamp: Some(prost_types::Timestamp {
+                seconds: data.timestamp.timestamp(),
+                nanos: data.timestamp.timestamp_subsec_nanos().cast_signed(),
+            }),
+            prev_status: map_status(&data.prev_status),
+            new_status: map_status(&data.new_status),
+            reason: data.reason,
+            actor: data.actor,
+        };
+        let _ = sink.send(event);
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{map_status, new_task_lifecycle_sink};
+    use super::{map_status, new_task_lifecycle_sink, sink_to_emit};
     use crate::grpc::roz_v1::{TaskLifecycleEvent, TaskStatus};
+    use std::sync::Arc;
 
     #[test]
     fn map_status_roundtrips_each_value() {
@@ -87,5 +123,35 @@ mod tests {
         // Sending with at least one subscriber should succeed.
         let event = TaskLifecycleEvent::default();
         assert!(sink.send(event).is_ok());
+    }
+
+    #[test]
+    fn sink_to_emit_translates_data_to_proto_and_broadcasts() {
+        let sink = new_task_lifecycle_sink();
+        let mut rx = sink.subscribe();
+        let emit = sink_to_emit(sink);
+        let task_id = uuid::Uuid::nil();
+        let ts = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 123_456_789).expect("fixed ts");
+        let data = roz_db::tasks::TaskLifecycleData {
+            task_id,
+            timestamp: ts,
+            prev_status: "pending".into(),
+            new_status: "running".into(),
+            reason: Some("starting".into()),
+            actor: Some("system:dispatch".into()),
+        };
+        (emit)(data);
+        let event = rx.try_recv().expect("broadcast receive");
+        assert_eq!(event.task_id, task_id.to_string());
+        assert_eq!(event.prev_status, TaskStatus::Pending as i32);
+        assert_eq!(event.new_status, TaskStatus::Running as i32);
+        assert_eq!(event.reason.as_deref(), Some("starting"));
+        assert_eq!(event.actor.as_deref(), Some("system:dispatch"));
+        let ts_out = event.timestamp.expect("timestamp set");
+        assert_eq!(ts_out.seconds, 1_700_000_000);
+        assert_eq!(ts_out.nanos, 123_456_789);
+        // Silence the unused `Arc` import warning in case future edits remove
+        // other Arc usage from the test module.
+        let _ = Arc::new(());
     }
 }

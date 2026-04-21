@@ -95,6 +95,9 @@ pub async fn create(
             nats_client: state.nats_client.as_ref(),
             trust_policy: state.trust_policy.as_ref(),
             signing_gate: Some(&signing_gate),
+            // Phase 26 OBS-01: thread the broadcast sink so each status
+            // transition inside dispatch_task emits a TaskLifecycleEvent.
+            task_lifecycle_sink: &state.task_lifecycle_sink,
         },
         TaskDispatchRequest {
             tenant_id,
@@ -214,8 +217,9 @@ pub async fn get(
 }
 
 /// DELETE /v1/tasks/:id  (cancel)
-#[tracing::instrument(name = "tasks.delete", skip(tx, auth), fields(tenant_id))]
+#[tracing::instrument(name = "tasks.delete", skip(state, tx, auth), fields(tenant_id))]
 pub async fn delete(
+    State(state): State<AppState>,
     mut tx: Tx,
     Extension(auth): Extension<AuthIdentity>,
     Path(id): Path<Uuid>,
@@ -228,7 +232,26 @@ pub async fn delete(
     if task.tenant_id != tenant_id {
         return Err(AppError::not_found("task not found"));
     }
-    let updated = roz_db::tasks::update_status(&mut **tx, id, "cancelled").await?;
+    // Phase 26 OBS-01: REST cancel transitions to "cancelled" via the
+    // lifecycle-emitting helper so `/roz/task/lifecycle` captures the edge.
+    // The UPDATE runs on the pool rather than the Tx extractor — lifecycle
+    // reporting is best-effort (T-26-80) and cancellations are terminal
+    // writes with no subsequent rollback path in this handler.
+    let emit = crate::observability::task_lifecycle::sink_to_emit(state.task_lifecycle_sink.clone());
+    let actor = match &auth {
+        AuthIdentity::User { user_id, .. } => format!("user:{user_id}"),
+        AuthIdentity::ApiKey { key_id, .. } => format!("api_key:{key_id}"),
+        AuthIdentity::Worker { worker_id, .. } => format!("worker:{worker_id}"),
+    };
+    let updated = roz_db::tasks::update_status_with_lifecycle_emit(
+        &state.pool,
+        id,
+        "cancelled",
+        Some("rest cancel"),
+        Some(&actor),
+        &emit,
+    )
+    .await?;
     if updated.is_none() {
         return Err(AppError::not_found("task not found"));
     }

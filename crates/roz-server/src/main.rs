@@ -102,6 +102,9 @@ fn grpc_router(state: &AppState) -> Router {
         state.nats_client.clone(),
         state.trust_policy.clone(),
         signing_gate,
+        // Phase 26 OBS-01: gRPC cancel + dispatch-path transitions emit
+        // lifecycle events via the shared broadcast sink.
+        state.task_lifecycle_sink.clone(),
     );
     // Build the primary Gemini media backend. If its dedicated HTTP client
     // fails to initialize (for example, transient TLS backend init errors —
@@ -529,6 +532,9 @@ async fn main() {
             state.restate_ingress_url.clone(),
             state.http_client.clone(),
             Some(internal_signing_gate.clone()),
+            // Phase 26 OBS-01: thread the broadcast sink so the
+            // `roz.internal.tasks.status.*` handler emits lifecycle events.
+            state.task_lifecycle_sink.clone(),
         );
 
         // Phase 24 gap closure (Plan 24-11): per VERIFICATION.md gaps 7 + 9.
@@ -583,6 +589,9 @@ async fn main() {
             nats_client: state.nats_client.clone(),
             trust_policy: state.trust_policy.clone(),
             signing_gate: scheduled_signing_gate,
+            // Phase 26 OBS-01: scheduled-task dispatch emits lifecycle events
+            // via the shared broadcast sink.
+            task_lifecycle_sink: state.task_lifecycle_sink.clone(),
         });
 
         let endpoint = Endpoint::builder()
@@ -2281,11 +2290,20 @@ mod tests {
         )
         .await
         .expect("create running task");
-        roz_db::tasks::update_status(&pool, t2.id, "running").await.unwrap();
+        // Phase 26 OBS-01: test-only direct status updates route through the
+        // lifecycle-emitting helper. A no-op emit closure satisfies the
+        // signature — the metrics endpoint under test reads the row, not
+        // the broadcast, so emit drops are inconsequential here.
+        let metrics_test_emit: roz_db::tasks::TaskLifecycleEmit = std::sync::Arc::new(|_| {});
+        roz_db::tasks::update_status_with_lifecycle_emit(&pool, t2.id, "running", None, None, &metrics_test_emit)
+            .await
+            .unwrap();
         let t3 = roz_db::tasks::create(&pool, tenant_id, "done-task", env.id, None, serde_json::json!([]), None)
             .await
             .expect("create done task");
-        roz_db::tasks::update_status(&pool, t3.id, "succeeded").await.unwrap();
+        roz_db::tasks::update_status_with_lifecycle_emit(&pool, t3.id, "succeeded", None, None, &metrics_test_emit)
+            .await
+            .unwrap();
 
         // GET /v1/metrics/tasks
         let req = Request::builder()

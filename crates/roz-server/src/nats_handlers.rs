@@ -17,6 +17,7 @@ use roz_nats::dispatch::{INTERNAL_TASK_STATUS_SUBJECT_PREFIX, TaskStatusEvent};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::observability::task_lifecycle::TaskLifecycleSink;
 use crate::signing_gate::SigningGate;
 
 /// Subscribe to all internal NATS subjects and spawn handler loops.
@@ -35,6 +36,7 @@ pub fn spawn_all(
     restate_ingress_url: String,
     http_client: reqwest::Client,
     signing_gate: Option<Arc<SigningGate>>,
+    task_lifecycle_sink: TaskLifecycleSink,
 ) {
     tokio::spawn(spawn_task_handler(
         nats.clone(),
@@ -42,8 +44,9 @@ pub fn spawn_all(
         restate_ingress_url,
         http_client,
         signing_gate.clone(),
+        task_lifecycle_sink.clone(),
     ));
-    tokio::spawn(spawn_task_status_handler(nats, pool, signing_gate));
+    tokio::spawn(spawn_task_status_handler(nats, pool, signing_gate, task_lifecycle_sink));
 }
 
 /// Send an error string as the NATS reply so the caller does not time out.
@@ -75,7 +78,7 @@ fn is_terminal_task_status(status: &str) -> bool {
     )
 }
 
-async fn apply_task_status_event(pool: &PgPool, event: &TaskStatusEvent) {
+async fn apply_task_status_event(pool: &PgPool, event: &TaskStatusEvent, task_lifecycle_sink: &TaskLifecycleSink) {
     if let Some(host_id) = event.host_id
         && let Err(error) = roz_db::tasks::assign_host(pool, event.task_id, host_id).await
     {
@@ -99,15 +102,38 @@ async fn apply_task_status_event(pool: &PgPool, event: &TaskStatusEvent) {
         {
             let _ = roz_db::tasks::ensure_active_run(&mut conn, event.task_id, event.host_id).await;
         }
-        if let Err(error) =
-            roz_db::tasks::complete_active_run_for_task(pool, event.task_id, &event.status, event.detail.as_deref())
-                .await
+        // Phase 26 OBS-01: route the run-completion through the lifecycle-
+        // emitting helper. The worker supplies the authoritative status +
+        // detail; actor is always "worker" at this boundary.
+        let emit = crate::observability::task_lifecycle::sink_to_emit(task_lifecycle_sink.clone());
+        if let Err(error) = roz_db::tasks::complete_active_run_for_task_with_lifecycle_emit(
+            pool,
+            event.task_id,
+            &event.status,
+            event.detail.as_deref(),
+            &emit,
+        )
+        .await
         {
             tracing::warn!(%error, task_id = %event.task_id, "failed to complete active task run");
         }
     }
 
-    if let Err(error) = roz_db::tasks::update_status(pool, event.task_id, &event.status).await {
+    // Phase 26 OBS-01: the authoritative task-status transition routes
+    // through the lifecycle-emitting helper. Actor is "worker" because
+    // this handler processes worker→server status events on the
+    // `roz.internal.tasks.status.*` subject.
+    let emit = crate::observability::task_lifecycle::sink_to_emit(task_lifecycle_sink.clone());
+    if let Err(error) = roz_db::tasks::update_status_with_lifecycle_emit(
+        pool,
+        event.task_id,
+        &event.status,
+        event.detail.as_deref(),
+        Some("worker"),
+        &emit,
+    )
+    .await
+    {
         tracing::warn!(%error, task_id = %event.task_id, status = %event.status, "failed to update task status");
     }
 }
@@ -123,6 +149,12 @@ async fn spawn_task_handler(
     restate_ingress_url: String,
     http_client: reqwest::Client,
     signing_gate: Option<Arc<SigningGate>>,
+    // Phase 26 OBS-01: threaded through from `spawn_all` for future use
+    // (e.g. a "failed" transition when an internal spawn can't publish).
+    // Today the handler only runs `tasks::create` + Restate start + invoke
+    // publish; any status transitions it triggers flow back through the
+    // worker→server status subject handled by `spawn_task_status_handler`.
+    _task_lifecycle_sink: TaskLifecycleSink,
 ) {
     let subject = roz_nats::team::INTERNAL_SPAWN_SUBJECT;
     let mut sub = match nats.subscribe(subject).await {
@@ -345,7 +377,12 @@ async fn spawn_task_handler(
 /// When `signing_gate` is `None` (tests only), verification is skipped and
 /// events flow directly into [`apply_task_status_event`] — matches the
 /// legacy unsigned path. In production the gate is always `Some`.
-async fn spawn_task_status_handler(nats: NatsClient, pool: PgPool, signing_gate: Option<Arc<SigningGate>>) {
+async fn spawn_task_status_handler(
+    nats: NatsClient,
+    pool: PgPool,
+    signing_gate: Option<Arc<SigningGate>>,
+    task_lifecycle_sink: TaskLifecycleSink,
+) {
     let subject = format!("{INTERNAL_TASK_STATUS_SUBJECT_PREFIX}.*");
     let mut sub = match nats.subscribe(subject.clone()).await {
         Ok(sub) => sub,
@@ -358,7 +395,7 @@ async fn spawn_task_status_handler(nats: NatsClient, pool: PgPool, signing_gate:
     tracing::info!(%subject, "task status handler ready");
 
     while let Some(msg) = sub.next().await {
-        handle_task_status_message(&pool, signing_gate.as_deref(), &msg).await;
+        handle_task_status_message(&pool, signing_gate.as_deref(), &task_lifecycle_sink, &msg).await;
     }
 }
 
@@ -368,7 +405,12 @@ async fn spawn_task_status_handler(nats: NatsClient, pool: PgPool, signing_gate:
 /// read; [`SigningGate::verify_inbound`] is called before any DB *write*
 /// path inside [`apply_task_status_event`]. Verify failures in Strict
 /// drop the message before deserialization or commit.
-async fn handle_task_status_message(pool: &PgPool, signing_gate: Option<&SigningGate>, msg: &async_nats::Message) {
+async fn handle_task_status_message(
+    pool: &PgPool,
+    signing_gate: Option<&SigningGate>,
+    task_lifecycle_sink: &TaskLifecycleSink,
+    msg: &async_nats::Message,
+) {
     let Some(task_id) = parse_task_id_from_subject(msg.subject.as_str()) else {
         return;
     };
@@ -381,7 +423,7 @@ async fn handle_task_status_message(pool: &PgPool, signing_gate: Option<&Signing
     }
 
     match serde_json::from_slice::<TaskStatusEvent>(&msg.payload) {
-        Ok(event) => apply_task_status_event(pool, &event).await,
+        Ok(event) => apply_task_status_event(pool, &event, task_lifecycle_sink).await,
         Err(error) => tracing::warn!(%error, "failed to decode task status event"),
     }
 }

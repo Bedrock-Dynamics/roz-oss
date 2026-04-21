@@ -6,6 +6,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::error::AppError;
+use crate::observability::task_lifecycle::TaskLifecycleSink;
 
 #[derive(Debug, Clone)]
 pub struct TaskDispatchRequest {
@@ -33,6 +34,11 @@ pub struct TaskDispatchServices<'a> {
     /// outbound `invoke.{host}.{task}` publish gains a `roz-sig-v1`
     /// header via [`roz_nats::publish_signed`].
     pub signing_gate: Option<&'a crate::signing_gate::SigningGate>,
+    /// Phase 26 OBS-01: broadcast sink for task-status lifecycle events.
+    /// Every `roz_db::tasks::*_with_lifecycle_emit` invocation below routes
+    /// through this sink; subscribers (per-session MCAP `WriterActor`s)
+    /// drain into `/roz/task/lifecycle`.
+    pub task_lifecycle_sink: &'a TaskLifecycleSink,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -171,6 +177,11 @@ pub async fn dispatch_task(
         parent_task_id: request.parent_task_id,
     };
 
+    // Phase 26 OBS-01: every task-status transition on the dispatch path
+    // routes through the lifecycle-emitting helpers so `/roz/task/lifecycle`
+    // sees every "queued" / "failed" edge. `sink_to_emit` is a cheap `Arc`
+    // wrap; reused across the failure paths below.
+    let lifecycle_emit = crate::observability::task_lifecycle::sink_to_emit(services.task_lifecycle_sink.clone());
     let restate_url = format!("{}/TaskWorkflow/{}/run/send", services.restate_ingress_url, task.id);
     match services
         .http_client
@@ -181,14 +192,30 @@ pub async fn dispatch_task(
     {
         Ok(response) => {
             if let Err(error) = response.error_for_status_ref() {
-                let _ = roz_db::tasks::update_status(&mut *conn, task.id, "failed").await;
+                let _ = roz_db::tasks::update_status_with_lifecycle_emit(
+                    services.pool,
+                    task.id,
+                    "failed",
+                    Some("restate workflow start rejected"),
+                    Some("system:dispatch"),
+                    &lifecycle_emit,
+                )
+                .await;
                 return Err(TaskDispatchError::Internal(format!(
                     "failed to start workflow: {error}"
                 )));
             }
         }
         Err(error) => {
-            let _ = roz_db::tasks::update_status(&mut *conn, task.id, "failed").await;
+            let _ = roz_db::tasks::update_status_with_lifecycle_emit(
+                services.pool,
+                task.id,
+                "failed",
+                Some("restate workflow start unreachable"),
+                Some("system:dispatch"),
+                &lifecycle_emit,
+            )
+            .await;
             return Err(TaskDispatchError::Internal(format!(
                 "failed to start Restate workflow: {error}"
             )));
@@ -236,7 +263,15 @@ pub async fn dispatch_task(
         {
             Ok(header_value) => {
                 if let Err(error) = roz_nats::publish_signed(nats, subject, payload, &header_value).await {
-                    let _ = roz_db::tasks::update_status(&mut *conn, task.id, "failed").await;
+                    let _ = roz_db::tasks::update_status_with_lifecycle_emit(
+                        services.pool,
+                        task.id,
+                        "failed",
+                        Some("nats publish_signed failed"),
+                        Some("system:dispatch"),
+                        &lifecycle_emit,
+                    )
+                    .await;
                     return Err(TaskDispatchError::Internal(format!(
                         "failed to publish task invocation: {error}"
                     )));
@@ -250,7 +285,15 @@ pub async fn dispatch_task(
                     task_id = %task.id,
                     "sign_outbound failed"
                 );
-                let _ = roz_db::tasks::update_status(&mut *conn, task.id, "failed").await;
+                let _ = roz_db::tasks::update_status_with_lifecycle_emit(
+                    services.pool,
+                    task.id,
+                    "failed",
+                    Some("sign_outbound failed"),
+                    Some("system:dispatch"),
+                    &lifecycle_emit,
+                )
+                .await;
                 return Err(TaskDispatchError::Internal(format!(
                     "failed to sign task invocation: {error}"
                 )));
@@ -259,15 +302,36 @@ pub async fn dispatch_task(
     } else if let Err(error) = nats.publish(subject, payload.into()).await {
         // Legacy unsigned path — retained so non-Phase-23 callers (none
         // currently) and tests that don't wire a signing gate still work.
-        let _ = roz_db::tasks::update_status(&mut *conn, task.id, "failed").await;
+        let _ = roz_db::tasks::update_status_with_lifecycle_emit(
+            services.pool,
+            task.id,
+            "failed",
+            Some("nats publish failed"),
+            Some("system:dispatch"),
+            &lifecycle_emit,
+        )
+        .await;
         return Err(TaskDispatchError::Internal(format!(
             "failed to publish task invocation: {error}"
         )));
     }
 
-    roz_db::tasks::update_status(&mut *conn, task.id, "queued")
-        .await?
-        .ok_or_else(|| TaskDispatchError::Internal("task disappeared after dispatch".to_string()))
+    // Phase 26 OBS-01: the final "queued" transition goes through the pool
+    // (not `conn`) so the lifecycle-emit helper can acquire its own
+    // connection for the prev-read + UPDATE pair. The caller's `conn` above
+    // was used for the `create` / `assign_host` / earlier reads inside a
+    // tx-like flow; the queued transition is a terminal write with no
+    // further work scoped to that connection.
+    roz_db::tasks::update_status_with_lifecycle_emit(
+        services.pool,
+        task.id,
+        "queued",
+        None,
+        Some("system:dispatch"),
+        &lifecycle_emit,
+    )
+    .await?
+    .ok_or_else(|| TaskDispatchError::Internal("task disappeared after dispatch".to_string()))
 }
 
 #[cfg(test)]

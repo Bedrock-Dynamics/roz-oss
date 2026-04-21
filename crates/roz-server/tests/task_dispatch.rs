@@ -202,6 +202,7 @@ async fn trust_rejection_happens_before_workflow_or_publish() {
 
     let before = count_tasks(&pool, tenant_id).await;
     let mut conn = pool.acquire().await.expect("acquire connection");
+    let task_lifecycle_sink = roz_server::observability::task_lifecycle::new_task_lifecycle_sink();
     let err = dispatch_task(
         &mut conn,
         TaskDispatchServices {
@@ -211,6 +212,7 @@ async fn trust_rejection_happens_before_workflow_or_publish() {
             nats_client: Some(&nats),
             trust_policy: &trust_policy,
             signing_gate: None,
+            task_lifecycle_sink: &task_lifecycle_sink,
         },
         TaskDispatchRequest {
             tenant_id,
@@ -286,6 +288,7 @@ async fn dispatch_starts_workflow_before_publish_and_preserves_request_shape() {
         .expect("subscribe");
 
     let mut conn = pool.acquire().await.expect("acquire connection");
+    let task_lifecycle_sink = roz_server::observability::task_lifecycle::new_task_lifecycle_sink();
     let task = dispatch_task(
         &mut conn,
         TaskDispatchServices {
@@ -295,6 +298,7 @@ async fn dispatch_starts_workflow_before_publish_and_preserves_request_shape() {
             nats_client: Some(&nats),
             trust_policy: &trust_policy,
             signing_gate: None,
+            task_lifecycle_sink: &task_lifecycle_sink,
         },
         TaskDispatchRequest {
             tenant_id,

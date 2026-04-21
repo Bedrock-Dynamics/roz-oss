@@ -302,6 +302,7 @@ async fn scheduled_task_workflow_survives_endpoint_restart_and_dispatches_again(
             restate_ingress_url: restate.url().to_string(),
             nats_client: Some(nats.clone()),
             trust_policy: std::sync::Arc::new(roz_server::trust::permissive_policy_for_integration_tests()),
+            task_lifecycle_sink: roz_server::observability::task_lifecycle::new_task_lifecycle_sink(),
             signing_gate: std::sync::Arc::new(roz_server::signing_gate::SigningGate::new(
                 pool.clone(),
                 moka::future::Cache::builder()

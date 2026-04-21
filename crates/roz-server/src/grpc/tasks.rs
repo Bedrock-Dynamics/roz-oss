@@ -52,6 +52,11 @@ pub struct TaskServiceImpl {
     /// underlying collaborators (verifying-key cache, key provider,
     /// enforcement mode) live exactly once per process.
     signing_gate: Arc<crate::signing_gate::SigningGate>,
+    /// Phase 26 OBS-01: broadcast sink for task-status lifecycle events.
+    /// `cancel_task` and the `create_task` dispatch path both route through
+    /// `roz_db::tasks::*_with_lifecycle_emit` using this sink; subscribers
+    /// (per-session MCAP `WriterActor`s) land events on `/roz/task/lifecycle`.
+    task_lifecycle_sink: crate::observability::task_lifecycle::TaskLifecycleSink,
 }
 
 impl TaskServiceImpl {
@@ -62,6 +67,7 @@ impl TaskServiceImpl {
         nats_client: Option<async_nats::Client>,
         trust_policy: Arc<TrustPolicy>,
         signing_gate: Arc<crate::signing_gate::SigningGate>,
+        task_lifecycle_sink: crate::observability::task_lifecycle::TaskLifecycleSink,
     ) -> Self {
         Self {
             pool,
@@ -70,6 +76,7 @@ impl TaskServiceImpl {
             nats_client,
             trust_policy,
             signing_gate,
+            task_lifecycle_sink,
         }
     }
 }
@@ -461,6 +468,9 @@ impl TaskService for TaskServiceImpl {
                 // shared `SigningGate`. Mirrors the REST hot path in
                 // `routes::tasks::create`.
                 signing_gate: Some(self.signing_gate.as_ref()),
+                // Phase 26 OBS-01: thread the per-service broadcast sink
+                // down through dispatch_task so every transition emits.
+                task_lifecycle_sink: &self.task_lifecycle_sink,
             },
             SharedTaskDispatchRequest {
                 tenant_id,
@@ -598,9 +608,20 @@ impl TaskService for TaskServiceImpl {
             return Err(Status::not_found("task not found"));
         }
 
-        roz_db::tasks::update_status(&self.pool, task_id, "cancelled")
-            .await
-            .map_err(|e| db_err_to_status(&e))?;
+        // Phase 26 OBS-01: gRPC cancel flows through the lifecycle-emitting
+        // helper so `/roz/task/lifecycle` captures the edge alongside the
+        // REST cancel path (`routes::tasks::delete`).
+        let emit = crate::observability::task_lifecycle::sink_to_emit(self.task_lifecycle_sink.clone());
+        roz_db::tasks::update_status_with_lifecycle_emit(
+            &self.pool,
+            task_id,
+            "cancelled",
+            Some("grpc cancel"),
+            Some(&format!("tenant:{tenant_id}")),
+            &emit,
+        )
+        .await
+        .map_err(|e| db_err_to_status(&e))?;
 
         Ok(Response::new(CancelTaskResponse {}))
     }

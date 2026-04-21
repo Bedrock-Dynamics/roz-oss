@@ -464,6 +464,7 @@ async fn grpc_untrusted_host_rejected() {
             None,
             roz_server::config::SignedDispatchEnforcement::Off,
         )),
+        roz_server::observability::task_lifecycle::new_task_lifecycle_sink(),
     );
 
     let mut req = Request::new(CreateTaskRequest {
@@ -528,6 +529,7 @@ async fn grpc_trusted_host_passes_gate() {
             None,
             roz_server::config::SignedDispatchEnforcement::Off,
         )),
+        roz_server::observability::task_lifecycle::new_task_lifecycle_sink(),
     );
 
     let mut req = Request::new(CreateTaskRequest {
