@@ -625,6 +625,14 @@ async fn main() {
         });
     }
 
+    // Phase 26 OBS-01 §Q11: clone the active_writers registry before we
+    // move `state` into `app()` below — the SIGTERM drain below needs it
+    // after the server future is constructed. (Cloning an
+    // `Arc<Mutex<HashMap>>` is a refcount bump; the underlying map is
+    // shared, so sessions registered by gRPC/REST handlers are visible
+    // to the drain.)
+    let active_writers_for_shutdown = state.active_writers.clone();
+
     let grpc = grpc_router(&state);
     let rest = app(state);
 
@@ -638,7 +646,47 @@ async fn main() {
     tracing::info!("Starting roz-server (REST + gRPC) on {addr}");
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, tower::make::Shared::new(combined)).await.unwrap();
+
+    // Phase 26 OBS-01 §Q11: MCAP drain on shutdown. Races the server
+    // future against SIGINT / SIGTERM; on signal, sends
+    // WriteCommand::Finalize { Shutdown } to every active writer with a
+    // 10 s bound before exiting the process. RESEARCH §Pitfall 1 —
+    // never rely on Writer::drop for durability.
+    let server_future = axum::serve(listener, tower::make::Shared::new(combined));
+    let shutdown = async {
+        let ctrl_c = tokio::signal::ctrl_c();
+        #[cfg(unix)]
+        {
+            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install SIGTERM handler");
+            tokio::select! {
+                _ = ctrl_c => {},
+                _ = sigterm.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = ctrl_c.await;
+        }
+    };
+
+    tokio::select! {
+        serve_result = server_future => {
+            if let Err(error) = serve_result {
+                tracing::error!(%error, "server future exited with error");
+            } else {
+                tracing::info!("server future completed");
+            }
+        }
+        () = shutdown => {
+            tracing::info!("shutdown signal received; draining active MCAP writers");
+            roz_server::observability::mcap_archive::drain_active_writers(
+                &active_writers_for_shutdown,
+                std::time::Duration::from_secs(10),
+            )
+            .await;
+        }
+    }
 }
 
 #[cfg(test)]
