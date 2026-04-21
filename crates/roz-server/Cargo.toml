@@ -6,6 +6,15 @@ rust-version.workspace = true
 license.workspace      = true
 authors.workspace      = true
 
+[features]
+# Phase 26 Plan 26-11 — expose `emit_session_event_for_tests` as a public
+# wrapper around the `pub(crate)` `emit_session_event` converter path so the
+# SC5 fixture in `tests/export_roundtrip.rs` can drive `/roz/session/events`
+# traffic through the production integration path (not via direct
+# `ChannelKey::SessionEvents` injection). Off by default; enabled only under
+# `cargo test -p roz-server --features test-helpers`.
+test-helpers = []
+
 [dependencies]
 roz-core = { path = "../roz-core" }
 roz-db = { path = "../roz-db" }

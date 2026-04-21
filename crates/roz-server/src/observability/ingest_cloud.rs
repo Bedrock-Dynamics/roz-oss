@@ -164,6 +164,30 @@ pub(crate) async fn emit_session_event(
     }
 }
 
+/// Test-only public wrapper around [`emit_session_event`] (which is
+/// `pub(crate)`).
+///
+/// External integration tests in `crates/roz-server/tests/` link against the
+/// public library surface and therefore cannot reach `pub(crate)` items.
+/// Plan 26-11 SC5 requires the `/roz/session/events` anti-regression
+/// assertion to drive approvals through the *same* converter path as
+/// production (`emit_session_event` → `encode_session_event_proto` →
+/// `event_mapper::event_envelope_to_session_response`), so any future
+/// revert of `encode_session_event_proto` to a `None`-stub surfaces as a
+/// failing assertion.
+///
+/// **Not for production use.** Behavior is identical to
+/// `emit_session_event`, but the public surface is gated behind the
+/// `test-helpers` feature flag so accidental production callers are
+/// rejected at compile time.
+#[cfg(feature = "test-helpers")]
+pub async fn emit_session_event_for_tests(
+    tx: &mpsc::Sender<WriteCommand>,
+    envelope: &roz_core::session::event::EventEnvelope,
+) {
+    emit_session_event(tx, envelope).await;
+}
+
 /// Convert a core `EventEnvelope` into the serialized
 /// `roz.v1.SessionEventEnvelope` payload the `/roz/session/events` MCAP
 /// channel is registered with.
