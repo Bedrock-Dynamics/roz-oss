@@ -128,9 +128,14 @@ impl ObservabilityService for ObservabilityServiceImpl {
         let rows_owned = rows;
 
         tokio::spawn(async move {
-            for (idx, row) in rows_owned.iter().enumerate() {
+            for row in &rows_owned {
                 let path = PathBuf::from(&row.path);
-                let archive_status = if idx == 0 { Some(row.status.clone()) } else { None };
+                // `archive_status` is taken on the first chunk of EACH file
+                // (matches proto doc "archive_status appears on the first
+                // chunk of each rollover file"). Wrapping in Option<String>
+                // + Option::take() ensures exactly-once emission per file,
+                // regardless of how many output chunks the file produces.
+                let mut archive_status: Option<String> = Some(row.status.clone());
                 // `rollover_index` is a DB INT4 (`i32`) and is always >= 0 per
                 // the schema CHECK. Cast is safe for any well-formed row.
                 #[allow(clippy::cast_sign_loss)]
@@ -148,7 +153,7 @@ impl ObservabilityService for ObservabilityServiceImpl {
                                     if tx
                                         .send(Ok(ExportSessionChunk {
                                             data: chunk.to_vec(),
-                                            archive_status: archive_status.clone(),
+                                            archive_status: archive_status.take(),
                                             rollover_index,
                                         }))
                                         .await
@@ -182,7 +187,7 @@ impl ObservabilityService for ObservabilityServiceImpl {
                                 if tx
                                     .send(Ok(ExportSessionChunk {
                                         data: bytes_chunk,
-                                        archive_status: archive_status.clone(),
+                                        archive_status: archive_status.take(),
                                         rollover_index,
                                     }))
                                     .await
@@ -205,6 +210,23 @@ impl ObservabilityService for ObservabilityServiceImpl {
                             .await;
                         return;
                     }
+                }
+
+                // Edge case: a zero-byte file (or filter-to-empty) would
+                // leave `archive_status` unconsumed. Emit a trailing empty
+                // chunk so clients still see the file's status marker. This
+                // keeps the "one status per file" contract intact.
+                if let Some(status) = archive_status.take()
+                    && tx
+                        .send(Ok(ExportSessionChunk {
+                            data: Vec::new(),
+                            archive_status: Some(status),
+                            rollover_index,
+                        }))
+                        .await
+                        .is_err()
+                {
+                    return;
                 }
             }
         });

@@ -323,7 +323,16 @@ async fn export_streams_rollovers_in_order_with_archive_status_on_first_chunk() 
         let mut w = mcap::Writer::new(Cursor::new(&mut bytes_1)).expect("writer");
         w.finish().expect("finish");
     }
+    // Pad each file past `EXPORT_CHUNK_BYTES` (256 KiB) so the stream emits
+    // multiple chunks per file; lets us assert archive_status is present on
+    // the FIRST chunk of each file and absent on later chunks of the same
+    // file. A fixed-byte tail (0xAB / 0xCD) plus a file-specific trailer
+    // makes the gathered bytes compare check meaningful.
+    let pad_bytes_0 = 300 * 1024;
+    let pad_bytes_1 = 300 * 1024;
+    bytes_0.extend(std::iter::repeat_n(0xABu8, pad_bytes_0));
     bytes_0.extend_from_slice(b"\n__TRAILER0__");
+    bytes_1.extend(std::iter::repeat_n(0xCDu8, pad_bytes_1));
     bytes_1.extend_from_slice(b"\n__TRAILER1__");
     std::fs::write(&path_0, &bytes_0).expect("write 0");
     std::fs::write(&path_1, &bytes_1).expect("write 1");
@@ -356,12 +365,14 @@ async fn export_streams_rollovers_in_order_with_archive_status_on_first_chunk() 
         .into_inner();
 
     let mut per_file_bytes: std::collections::BTreeMap<u32, Vec<u8>> = std::collections::BTreeMap::new();
+    let mut per_file_chunk_count: std::collections::BTreeMap<u32, usize> = std::collections::BTreeMap::new();
     let mut per_file_first_had_status: std::collections::BTreeMap<u32, bool> = std::collections::BTreeMap::new();
     let mut per_file_later_had_status: std::collections::BTreeMap<u32, bool> = std::collections::BTreeMap::new();
     while let Some(chunk) = stream.message().await.expect("stream item") {
         let idx = chunk.rollover_index.expect("rollover_index always set");
         let first_seen = !per_file_bytes.contains_key(&idx);
         per_file_bytes.entry(idx).or_default().extend_from_slice(&chunk.data);
+        *per_file_chunk_count.entry(idx).or_insert(0) += 1;
         if first_seen {
             per_file_first_had_status.insert(idx, chunk.archive_status.is_some());
         } else if chunk.archive_status.is_some() {
@@ -378,17 +389,37 @@ async fn export_streams_rollovers_in_order_with_archive_status_on_first_chunk() 
     // Content round-trip: concatenated bytes match the on-disk contents.
     assert_eq!(per_file_bytes[&0], bytes_0, "rollover 0 bytes must match");
     assert_eq!(per_file_bytes[&1], bytes_1, "rollover 1 bytes must match");
-    // archive_status appears only on the FIRST chunk of the FIRST file — the
-    // handler only tags file 0, not subsequent rollovers (the per-file
-    // `archive_status` in the proto is populated when `idx == 0`, otherwise
-    // None, per the handler in `grpc/observability.rs`).
+    // Each file must have produced >1 chunk so the "later chunks" assertion
+    // below is not vacuous.
+    assert!(
+        per_file_chunk_count[&0] > 1,
+        "rollover 0 must emit >1 chunk (expected, got {})",
+        per_file_chunk_count[&0]
+    );
+    assert!(
+        per_file_chunk_count[&1] > 1,
+        "rollover 1 must emit >1 chunk (expected, got {})",
+        per_file_chunk_count[&1]
+    );
+    // archive_status appears on the FIRST chunk of EACH rollover file (proto
+    // doc: "populated on the first chunk of each rollover file") and NOT on
+    // subsequent chunks of the same file. The handler implements this via
+    // `Option::take()` once per file.
     assert!(
         per_file_first_had_status.get(&0).copied().unwrap_or(false),
         "first chunk of rollover 0 must carry archive_status"
     );
     assert!(
+        per_file_first_had_status.get(&1).copied().unwrap_or(false),
+        "first chunk of rollover 1 must carry archive_status"
+    );
+    assert!(
         !per_file_later_had_status.get(&0).copied().unwrap_or(false),
         "later chunks of rollover 0 must NOT carry archive_status"
+    );
+    assert!(
+        !per_file_later_had_status.get(&1).copied().unwrap_or(false),
+        "later chunks of rollover 1 must NOT carry archive_status"
     );
 }
 
