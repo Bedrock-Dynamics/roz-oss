@@ -610,10 +610,13 @@ impl TaskService for TaskServiceImpl {
 
         // Phase 26 OBS-01: gRPC cancel flows through the lifecycle-emitting
         // helper so `/roz/task/lifecycle` captures the edge alongside the
-        // REST cancel path (`routes::tasks::delete`).
+        // REST cancel path (`routes::tasks::delete`). Acquires a dedicated
+        // connection so the prev-read + UPDATE pair runs on the same
+        // session (the emit helper requires `&mut PgConnection`).
         let emit = crate::observability::task_lifecycle::sink_to_emit(self.task_lifecycle_sink.clone());
+        let mut conn = self.pool.acquire().await.map_err(|e| db_err_to_status(&e))?;
         roz_db::tasks::update_status_with_lifecycle_emit(
-            &self.pool,
+            &mut *conn,
             task_id,
             "cancelled",
             Some("grpc cancel"),

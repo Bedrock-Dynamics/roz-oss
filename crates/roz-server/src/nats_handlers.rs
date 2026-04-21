@@ -104,18 +104,27 @@ async fn apply_task_status_event(pool: &PgPool, event: &TaskStatusEvent, task_li
         }
         // Phase 26 OBS-01: route the run-completion through the lifecycle-
         // emitting helper. The worker supplies the authoritative status +
-        // detail; actor is always "worker" at this boundary.
+        // detail; actor is always "worker" at this boundary. Acquires a
+        // dedicated connection so the helper's prev-read + UPDATE pair
+        // observes the same session (helper takes `&mut PgConnection`).
         let emit = crate::observability::task_lifecycle::sink_to_emit(task_lifecycle_sink.clone());
-        if let Err(error) = roz_db::tasks::complete_active_run_for_task_with_lifecycle_emit(
-            pool,
-            event.task_id,
-            &event.status,
-            event.detail.as_deref(),
-            &emit,
-        )
-        .await
-        {
-            tracing::warn!(%error, task_id = %event.task_id, "failed to complete active task run");
+        match pool.acquire().await {
+            Ok(mut conn) => {
+                if let Err(error) = roz_db::tasks::complete_active_run_for_task_with_lifecycle_emit(
+                    &mut *conn,
+                    event.task_id,
+                    &event.status,
+                    event.detail.as_deref(),
+                    &emit,
+                )
+                .await
+                {
+                    tracing::warn!(%error, task_id = %event.task_id, "failed to complete active task run");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, task_id = %event.task_id, "failed to acquire connection for complete_active_run_for_task");
+            }
         }
     }
 
@@ -124,17 +133,24 @@ async fn apply_task_status_event(pool: &PgPool, event: &TaskStatusEvent, task_li
     // this handler processes worker→server status events on the
     // `roz.internal.tasks.status.*` subject.
     let emit = crate::observability::task_lifecycle::sink_to_emit(task_lifecycle_sink.clone());
-    if let Err(error) = roz_db::tasks::update_status_with_lifecycle_emit(
-        pool,
-        event.task_id,
-        &event.status,
-        event.detail.as_deref(),
-        Some("worker"),
-        &emit,
-    )
-    .await
-    {
-        tracing::warn!(%error, task_id = %event.task_id, status = %event.status, "failed to update task status");
+    match pool.acquire().await {
+        Ok(mut conn) => {
+            if let Err(error) = roz_db::tasks::update_status_with_lifecycle_emit(
+                &mut *conn,
+                event.task_id,
+                &event.status,
+                event.detail.as_deref(),
+                Some("worker"),
+                &emit,
+            )
+            .await
+            {
+                tracing::warn!(%error, task_id = %event.task_id, status = %event.status, "failed to update task status");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, task_id = %event.task_id, "failed to acquire connection for update_status");
+        }
     }
 }
 

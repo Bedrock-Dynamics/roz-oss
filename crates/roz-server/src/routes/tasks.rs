@@ -233,10 +233,12 @@ pub async fn delete(
         return Err(AppError::not_found("task not found"));
     }
     // Phase 26 OBS-01: REST cancel transitions to "cancelled" via the
-    // lifecycle-emitting helper so `/roz/task/lifecycle` captures the edge.
-    // The UPDATE runs on the pool rather than the Tx extractor — lifecycle
-    // reporting is best-effort (T-26-80) and cancellations are terminal
-    // writes with no subsequent rollback path in this handler.
+    // lifecycle-emitting helper. The UPDATE runs on the Tx extractor's
+    // connection (`&mut **tx`) so it shares the same tenant-scoped
+    // transaction as the get_by_id lookup above — commit/rollback is
+    // handled uniformly by the tx_layer middleware. The helper uses
+    // `&mut PgConnection` so the prev-read + UPDATE pair observes
+    // the same transactional view.
     let emit = crate::observability::task_lifecycle::sink_to_emit(state.task_lifecycle_sink.clone());
     let actor = match &auth {
         AuthIdentity::User { user_id, .. } => format!("user:{user_id}"),
@@ -244,7 +246,7 @@ pub async fn delete(
         AuthIdentity::Worker { worker_id, .. } => format!("worker:{worker_id}"),
     };
     let updated = roz_db::tasks::update_status_with_lifecycle_emit(
-        &state.pool,
+        &mut **tx,
         id,
         "cancelled",
         Some("rest cancel"),

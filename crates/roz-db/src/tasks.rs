@@ -344,23 +344,25 @@ where
 
 /// Phase 26 OBS-01 companion to [`update_status`].
 ///
-/// Reads the previous `roz_tasks.status` value, runs the legacy UPDATE SQL
-/// verbatim, then emits a [`TaskLifecycleData`] on `emit` when the row
-/// exists and the status actually transitioned (`prev_status != new_status`).
+/// Reads the previous `roz_tasks.status` value on the caller's connection,
+/// runs the legacy UPDATE SQL verbatim on the same connection, then emits a
+/// [`TaskLifecycleData`] on `emit` when the row exists and the status
+/// actually transitioned (`prev_status != new_status`).
 ///
-/// The prev-read and the UPDATE share a single `&PgPool` for simplicity — per
-/// Phase 26 threat register T-26-81, a racy concurrent UPDATE between the
-/// read and write is acceptable for lifecycle reporting. The archive is
-/// best-effort; the authoritative state is the row itself.
+/// Takes `&mut PgConnection` (not `&PgPool`) so the prev-read + UPDATE run on
+/// the same connection as any surrounding `tx.begin()` / `pool.acquire()` —
+/// critical for callers holding an open transaction (e.g. the `Tx`
+/// extractor), since a separate pool connection would not see uncommitted
+/// inserts under READ COMMITTED.
 pub async fn update_status_with_lifecycle_emit(
-    pool: &sqlx::PgPool,
+    conn: &mut sqlx::PgConnection,
     id: Uuid,
     status: &str,
     reason: Option<&str>,
     actor: Option<&str>,
     emit: &TaskLifecycleEmit,
 ) -> Result<Option<TaskRow>, sqlx::Error> {
-    let prev_status = read_task_prev_status(pool, id).await?;
+    let prev_status = read_task_prev_status(&mut *conn, id).await?;
 
     // Legacy update_status SQL verbatim.
     let row = sqlx::query_as::<_, TaskRow>(
@@ -372,7 +374,7 @@ pub async fn update_status_with_lifecycle_emit(
     )
     .bind(id)
     .bind(status)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
 
     if let (Some(prev), Some(new_row)) = (prev_status.as_ref(), row.as_ref())
@@ -392,25 +394,25 @@ pub async fn update_status_with_lifecycle_emit(
 
 /// Phase 26 OBS-01 companion to [`complete_run`].
 ///
-/// Runs the legacy `UPDATE roz_task_runs` SQL verbatim and, when the status
-/// transitioned at the task level (pre-read prev_status != new status),
-/// emits a [`TaskLifecycleData`]. Callers pass `task_id` explicitly so the
-/// prev-read can look up the owning task — the legacy `complete_run`
-/// signature only carries `run_id`.
+/// Runs the legacy `UPDATE roz_task_runs` SQL verbatim on the caller's
+/// connection and, when the status transitioned at the task level (pre-read
+/// prev_status != new status), emits a [`TaskLifecycleData`]. Callers pass
+/// `task_id` explicitly so the prev-read can look up the owning task — the
+/// legacy `complete_run` signature only carries `run_id`.
 ///
 /// The run's `error_message` is surfaced as `TaskLifecycleData.reason` so
 /// downstream consumers see the failure detail. `actor` is `None` at this
 /// boundary since legacy `complete_run` has no actor parameter; callers
 /// that know the actor should use `update_status_with_lifecycle_emit` instead.
 pub async fn complete_run_with_lifecycle_emit(
-    pool: &sqlx::PgPool,
+    conn: &mut sqlx::PgConnection,
     run_id: Uuid,
     task_id: Uuid,
     status: &str,
     error_message: Option<&str>,
     emit: &TaskLifecycleEmit,
 ) -> Result<Option<TaskRunRow>, sqlx::Error> {
-    let prev_status = read_task_prev_status(pool, task_id).await?;
+    let prev_status = read_task_prev_status(&mut *conn, task_id).await?;
 
     // Legacy complete_run SQL verbatim — only updates roz_task_runs.
     let run_row = sqlx::query_as::<_, TaskRunRow>(
@@ -424,7 +426,7 @@ pub async fn complete_run_with_lifecycle_emit(
     .bind(run_id)
     .bind(status)
     .bind(error_message)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
 
     if let (Some(prev), Some(_)) = (prev_status.as_ref(), run_row.as_ref())
@@ -444,21 +446,22 @@ pub async fn complete_run_with_lifecycle_emit(
 
 /// Phase 26 OBS-01 companion to [`complete_active_run_for_task`].
 ///
-/// Runs the legacy `UPDATE roz_task_runs` SQL verbatim (targeting the most
-/// recent unfinished run for `task_id`), reads the task-level prev_status
-/// first, and emits a [`TaskLifecycleData`] when the status changed.
+/// Runs the legacy `UPDATE roz_task_runs` SQL verbatim on the caller's
+/// connection (targeting the most recent unfinished run for `task_id`),
+/// reads the task-level prev_status first, and emits a
+/// [`TaskLifecycleData`] when the status changed.
 ///
 /// As with [`complete_run_with_lifecycle_emit`], `error_message` is surfaced
 /// as the lifecycle `reason` and `actor` is `None` (the legacy function
 /// carries neither).
 pub async fn complete_active_run_for_task_with_lifecycle_emit(
-    pool: &sqlx::PgPool,
+    conn: &mut sqlx::PgConnection,
     task_id: Uuid,
     status: &str,
     error_message: Option<&str>,
     emit: &TaskLifecycleEmit,
 ) -> Result<Option<TaskRunRow>, sqlx::Error> {
-    let prev_status = read_task_prev_status(pool, task_id).await?;
+    let prev_status = read_task_prev_status(&mut *conn, task_id).await?;
 
     // Legacy complete_active_run_for_task SQL verbatim.
     let run_row = sqlx::query_as::<_, TaskRunRow>(
@@ -475,7 +478,7 @@ pub async fn complete_active_run_for_task_with_lifecycle_emit(
     .bind(task_id)
     .bind(status)
     .bind(error_message)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
 
     if let (Some(prev), Some(_)) = (prev_status.as_ref(), run_row.as_ref())
@@ -1034,8 +1037,9 @@ mod tests {
             captured_clone.lock().expect("mutex poisoned").push(data);
         });
 
+        let mut conn = pool.acquire().await.expect("acquire conn");
         let updated = update_status_with_lifecycle_emit(
-            &pool,
+            &mut *conn,
             task.id,
             "running",
             Some("worker accepted"),
@@ -1084,7 +1088,8 @@ mod tests {
         });
 
         // Transition to the same status — should not emit.
-        let _ = update_status_with_lifecycle_emit(&pool, task.id, "pending", None, None, &emit)
+        let mut conn = pool.acquire().await.expect("acquire conn");
+        let _ = update_status_with_lifecycle_emit(&mut *conn, task.id, "pending", None, None, &emit)
             .await
             .expect("no-op update");
         let events = captured.lock().expect("mutex poisoned").clone();
@@ -1118,10 +1123,12 @@ mod tests {
             captured_clone.lock().expect("mutex poisoned").push(data);
         });
 
-        let completed = complete_run_with_lifecycle_emit(&pool, run.id, task.id, "failed", Some("motor stall"), &emit)
-            .await
-            .expect("complete_run_with_lifecycle_emit")
-            .expect("run row");
+        let mut conn = pool.acquire().await.expect("acquire conn");
+        let completed =
+            complete_run_with_lifecycle_emit(&mut *conn, run.id, task.id, "failed", Some("motor stall"), &emit)
+                .await
+                .expect("complete_run_with_lifecycle_emit")
+                .expect("run row");
         assert_eq!(completed.status, "failed");
 
         let events = captured.lock().expect("mutex poisoned").clone();
@@ -1166,11 +1173,17 @@ mod tests {
             captured_clone.lock().expect("mutex poisoned").push(data);
         });
 
-        let completed =
-            complete_active_run_for_task_with_lifecycle_emit(&pool, task.id, "timed_out", Some("timed out"), &emit)
-                .await
-                .expect("complete_active_run_for_task_with_lifecycle_emit")
-                .expect("run row");
+        let mut conn = pool.acquire().await.expect("acquire conn");
+        let completed = complete_active_run_for_task_with_lifecycle_emit(
+            &mut *conn,
+            task.id,
+            "timed_out",
+            Some("timed out"),
+            &emit,
+        )
+        .await
+        .expect("complete_active_run_for_task_with_lifecycle_emit")
+        .expect("run row");
         assert_eq!(completed.status, "timed_out");
 
         let events = captured.lock().expect("mutex poisoned").clone();
@@ -1181,5 +1194,56 @@ mod tests {
         assert_eq!(evt.new_status, "timed_out");
         assert_eq!(evt.reason.as_deref(), Some("timed out"));
         assert!(evt.actor.is_none());
+    }
+
+    /// Regression for the Phase 26-08 advisor fix: callers that hold an open
+    /// transaction (REST dispatch path, scheduled dispatch path) must be able
+    /// to invoke `update_status_with_lifecycle_emit` on the same `&mut tx`
+    /// and see the freshly-inserted task row. Under READ COMMITTED, a
+    /// separate pool connection cannot observe an uncommitted INSERT, so
+    /// passing `&PgPool` would cause the UPDATE to affect zero rows and
+    /// return `None`. This test pins the `&mut PgConnection` signature.
+    #[tokio::test]
+    async fn update_status_with_lifecycle_emit_sees_uncommitted_insert_on_same_tx() {
+        use std::sync::Mutex;
+
+        let pool = setup().await;
+        let tenant_id = create_test_tenant(&pool).await;
+        let env_id = create_test_environment(&pool, tenant_id).await;
+
+        let captured: Arc<Mutex<Vec<TaskLifecycleData>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let emit: TaskLifecycleEmit = Arc::new(move |data| {
+            captured_clone.lock().expect("mutex poisoned").push(data);
+        });
+
+        let mut tx = pool.begin().await.expect("begin tx");
+        let task = create(
+            &mut *tx,
+            tenant_id,
+            "tx-visibility-regression",
+            env_id,
+            None,
+            serde_json::json!([]),
+            None,
+        )
+        .await
+        .expect("create task inside tx");
+        assert_eq!(task.status, "pending");
+
+        // Transition on the SAME tx — must see the uncommitted row.
+        let updated =
+            update_status_with_lifecycle_emit(&mut *tx, task.id, "queued", None, Some("system:dispatch"), &emit)
+                .await
+                .expect("update_status_with_lifecycle_emit inside tx")
+                .expect("row must be visible on same tx");
+        assert_eq!(updated.status, "queued");
+
+        tx.commit().await.expect("commit tx");
+
+        let events = captured.lock().expect("mutex poisoned").clone();
+        assert_eq!(events.len(), 1, "expected one lifecycle event");
+        assert_eq!(events[0].prev_status, "pending");
+        assert_eq!(events[0].new_status, "queued");
     }
 }

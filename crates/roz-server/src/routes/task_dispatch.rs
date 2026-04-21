@@ -193,7 +193,7 @@ pub async fn dispatch_task(
         Ok(response) => {
             if let Err(error) = response.error_for_status_ref() {
                 let _ = roz_db::tasks::update_status_with_lifecycle_emit(
-                    services.pool,
+                    &mut *conn,
                     task.id,
                     "failed",
                     Some("restate workflow start rejected"),
@@ -208,7 +208,7 @@ pub async fn dispatch_task(
         }
         Err(error) => {
             let _ = roz_db::tasks::update_status_with_lifecycle_emit(
-                services.pool,
+                &mut *conn,
                 task.id,
                 "failed",
                 Some("restate workflow start unreachable"),
@@ -264,7 +264,7 @@ pub async fn dispatch_task(
             Ok(header_value) => {
                 if let Err(error) = roz_nats::publish_signed(nats, subject, payload, &header_value).await {
                     let _ = roz_db::tasks::update_status_with_lifecycle_emit(
-                        services.pool,
+                        &mut *conn,
                         task.id,
                         "failed",
                         Some("nats publish_signed failed"),
@@ -286,7 +286,7 @@ pub async fn dispatch_task(
                     "sign_outbound failed"
                 );
                 let _ = roz_db::tasks::update_status_with_lifecycle_emit(
-                    services.pool,
+                    &mut *conn,
                     task.id,
                     "failed",
                     Some("sign_outbound failed"),
@@ -303,7 +303,7 @@ pub async fn dispatch_task(
         // Legacy unsigned path — retained so non-Phase-23 callers (none
         // currently) and tests that don't wire a signing gate still work.
         let _ = roz_db::tasks::update_status_with_lifecycle_emit(
-            services.pool,
+            &mut *conn,
             task.id,
             "failed",
             Some("nats publish failed"),
@@ -316,14 +316,14 @@ pub async fn dispatch_task(
         )));
     }
 
-    // Phase 26 OBS-01: the final "queued" transition goes through the pool
-    // (not `conn`) so the lifecycle-emit helper can acquire its own
-    // connection for the prev-read + UPDATE pair. The caller's `conn` above
-    // was used for the `create` / `assign_host` / earlier reads inside a
-    // tx-like flow; the queued transition is a terminal write with no
-    // further work scoped to that connection.
+    // Phase 26 OBS-01: the final "queued" transition runs on the caller's
+    // `conn` so the prev-read + UPDATE pair observes the uncommitted INSERT
+    // performed earlier in this function (critical when `conn` is a tx —
+    // REST dispatch + scheduled dispatch both wrap dispatch_task in a tx).
+    // Under READ COMMITTED a separate pool connection would not see the
+    // uncommitted row and the UPDATE would affect zero rows.
     roz_db::tasks::update_status_with_lifecycle_emit(
-        services.pool,
+        &mut *conn,
         task.id,
         "queued",
         None,

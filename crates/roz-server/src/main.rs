@@ -2295,15 +2295,31 @@ mod tests {
         // signature — the metrics endpoint under test reads the row, not
         // the broadcast, so emit drops are inconsequential here.
         let metrics_test_emit: roz_db::tasks::TaskLifecycleEmit = std::sync::Arc::new(|_| {});
-        roz_db::tasks::update_status_with_lifecycle_emit(&pool, t2.id, "running", None, None, &metrics_test_emit)
-            .await
-            .unwrap();
+        let mut metrics_conn = pool.acquire().await.unwrap();
+        roz_db::tasks::update_status_with_lifecycle_emit(
+            &mut *metrics_conn,
+            t2.id,
+            "running",
+            None,
+            None,
+            &metrics_test_emit,
+        )
+        .await
+        .unwrap();
         let t3 = roz_db::tasks::create(&pool, tenant_id, "done-task", env.id, None, serde_json::json!([]), None)
             .await
             .expect("create done task");
-        roz_db::tasks::update_status_with_lifecycle_emit(&pool, t3.id, "succeeded", None, None, &metrics_test_emit)
-            .await
-            .unwrap();
+        roz_db::tasks::update_status_with_lifecycle_emit(
+            &mut *metrics_conn,
+            t3.id,
+            "succeeded",
+            None,
+            None,
+            &metrics_test_emit,
+        )
+        .await
+        .unwrap();
+        drop(metrics_conn);
 
         // GET /v1/metrics/tasks
         let req = Request::builder()
