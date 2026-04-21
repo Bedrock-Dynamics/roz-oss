@@ -188,6 +188,27 @@ pub async fn emit_session_event_for_tests(
     emit_session_event(tx, envelope).await;
 }
 
+/// Test-only public wrapper around `spawn_session_telemetry_ingest`.
+///
+/// Mirrors `emit_session_event_for_tests` (Plan 26-11). Forwards to the
+/// `pub(crate)` ingest fn so Plan 26-12's integration test in
+/// `crates/roz-worker/tests/telemetry_proto_reaches_mcap.rs` can exercise
+/// the production worker -> NATS -> signing verify -> proto decode ->
+/// projection -> MCAP chain without a `pub(crate)` escape.
+///
+/// DO NOT use outside tests — gated on `#[cfg(feature = "test-helpers")]`
+/// to prevent accidental production callers.
+#[cfg(feature = "test-helpers")]
+pub async fn spawn_session_telemetry_ingest_for_tests(
+    nats: &async_nats::Client,
+    signing_gate: &Arc<crate::signing_gate::SigningGate>,
+    worker_name: &str,
+    writer_tx: mpsc::Sender<WriteCommand>,
+    cancel: CancellationToken,
+) {
+    spawn_session_telemetry_ingest(nats, signing_gate, worker_name, writer_tx, cancel).await;
+}
+
 /// Convert a core `EventEnvelope` into the serialized
 /// `roz.v1.SessionEventEnvelope` payload the `/roz/session/events` MCAP
 /// channel is registered with.
