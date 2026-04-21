@@ -14,6 +14,7 @@
 //!   * `export`          — time-range seek + gRPC streaming (Wave 7)
 
 pub mod channels;
+pub mod export;
 pub mod idle_monitor;
 pub mod ingest_cloud;
 pub mod ingest_edge;
@@ -22,7 +23,7 @@ pub mod projection;
 pub mod rollover;
 pub mod schema_registry;
 pub mod task_lifecycle;
-// Later-wave modules: pub mod recovery; pub mod retention; pub mod export;
+// Later-wave modules: pub mod recovery; pub mod retention;
 
 use uuid::Uuid;
 

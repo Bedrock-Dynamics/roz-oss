@@ -7,6 +7,7 @@ pub mod event_mapper;
 pub mod mcp;
 pub mod media;
 pub mod media_fetch;
+pub mod observability;
 pub mod session_bus;
 pub mod skills;
 pub mod tasks;

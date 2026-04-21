@@ -180,6 +180,13 @@ fn grpc_router(state: &AppState) -> Router {
         state.session_bus.clone(),
     );
 
+    // Phase 26 OBS-03: ObservabilityService exposes ExportSession streaming.
+    // Tenant scope is enforced at the handler via `auth_ext::tenant_from_extensions`
+    // + a defense-in-depth loop guard. Path safety (canonicalize +
+    // starts_with(mcap_dir)) is enforced before any file is opened.
+    let observability_svc =
+        roz_server::grpc::observability::ObservabilityServiceImpl::new(state.pool.clone(), state.mcap_dir.clone());
+
     let grpc_auth_state = roz_server::middleware::grpc_auth::GrpcAuthState {
         auth: state.auth.clone(),
         pool: state.pool.clone(),
@@ -202,6 +209,10 @@ fn grpc_router(state: &AppState) -> Router {
     .add_service(roz_server::grpc::roz_v1::embodiment_service_server::EmbodimentServiceServer::new(embodiment_svc))
     .add_service(skills_svc.into_server())
     .add_service(mcp_svc.into_server())
+    // Phase 26 OBS-03: ObservabilityService (ExportSession streaming).
+    .add_service(roz_server::grpc::roz_v1::observability_service_server::ObservabilityServiceServer::new(
+        observability_svc,
+    ))
     .add_service(
         tonic_reflection::server::Builder::configure()
             .register_encoded_file_descriptor_set(roz_server::grpc::roz_v1::FILE_DESCRIPTOR_SET)
