@@ -11,6 +11,18 @@
     clippy::similar_names
 )]
 
+/// Generated protobuf types from `proto/roz/v1/agent.proto` (Phase 26-12
+/// OBS-01 wire-format migration).
+///
+/// The worker uses `TelemetryUpdate`, `Pose`, and `JointState` from the
+/// `roz.v1` package to publish protobuf-bytes telemetry on
+/// `telemetry.{worker_id}.state` instead of the pre-migration serde_json
+/// payload. `build.rs` disables server/client codegen — the worker never
+/// acts as a gRPC server or client for this service, only encodes messages.
+pub mod roz_v1 {
+    tonic::include_proto!("roz.v1");
+}
+
 pub mod adapter;
 pub mod camera;
 pub mod checkpoint_writer;

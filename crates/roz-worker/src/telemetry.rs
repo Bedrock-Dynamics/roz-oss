@@ -268,6 +268,139 @@ pub async fn publish_state_signed_with_buffer(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 26-12 OBS-01: protobuf-bytes telemetry publishers (wire-format
+// migration)
+// ---------------------------------------------------------------------------
+//
+// These functions are opaque-bytes siblings of the JSON publishers above.
+// The caller pre-encodes a `roz.v1.TelemetryUpdate` via
+// `prost::Message::encode_to_vec` and passes the bytes in. Subject, signing,
+// WAL, backpressure, drop-counter, and `publish_signed` semantics are
+// identical to the JSON path — only the serialization step is skipped.
+//
+// The WAL append path treats the payload as opaque bytes, so
+// `telemetry_replay.rs` re-signs stored protobuf frames the same way it
+// re-signs the pre-migration JSON frames — no replay-path changes needed.
+
+/// Publish a pre-encoded protobuf telemetry payload (unsigned legacy path).
+///
+/// Mirrors [`publish_state`] but takes raw bytes instead of `&serde_json::Value`.
+/// Production workers that have enrolled a device signing key should call
+/// [`publish_state_proto_signed`] or [`publish_state_proto_signed_with_buffer`].
+pub async fn publish_state_proto(nats: &async_nats::Client, worker_id: &str, payload: &[u8]) -> anyhow::Result<()> {
+    let subject = Subjects::telemetry_state(worker_id).map_err(|e| anyhow::anyhow!("invalid worker_id: {e}"))?;
+    nats.publish(subject, payload.to_vec().into()).await?;
+    Ok(())
+}
+
+/// Publish a pre-encoded protobuf telemetry payload signed via `roz-sig-v1`
+/// (Phase 23 FS-04).
+///
+/// Mirrors [`publish_state_signed`] but takes raw bytes.
+///
+/// # Errors
+///
+/// - Invalid `worker_id` (rejected by `Subjects::telemetry_state`).
+/// - Signing failure (missing/corrupt device key → D-09 worker hard-stop).
+/// - NATS transport failure.
+pub async fn publish_state_proto_signed(
+    nats: &async_nats::Client,
+    signing_ctx: &WorkerSigningContext,
+    worker_id: &str,
+    correlation_id: Uuid,
+    payload: &[u8],
+) -> anyhow::Result<()> {
+    let subject = Subjects::telemetry_state(worker_id).map_err(|e| anyhow::anyhow!("invalid worker_id: {e}"))?;
+    let header = signing_ctx
+        .sign_outbound_worker(correlation_id, payload)
+        .map_err(|e| anyhow::anyhow!("sign telemetry publish: {e}"))?;
+    publish_signed(nats, subject, payload.to_vec(), &header)
+        .await
+        .map_err(|e| anyhow::anyhow!("publish_signed telemetry: {e}"))?;
+    Ok(())
+}
+
+/// Publish a signed protobuf telemetry frame with WAL store-and-forward
+/// fallback (FS-02).
+///
+/// Mirrors [`publish_state_signed_with_buffer`] but takes raw bytes. The WAL
+/// stores the raw payload; `telemetry_replay.rs` treats the bytes as opaque
+/// and re-signs + re-publishes verbatim on reconnect — no replay-path
+/// changes needed for this migration.
+///
+/// # Errors
+///
+/// Same as [`publish_state_signed_with_buffer`]: signing failure or
+/// WAL-append failure returns `Err`; pure NATS publish errors are absorbed
+/// into the fallback path and return `Ok(())`.
+#[allow(clippy::too_many_arguments)]
+pub async fn publish_state_proto_signed_with_buffer(
+    nats: &async_nats::Client,
+    signing_ctx: &WorkerSigningContext,
+    worker_id: &str,
+    correlation_id: Uuid,
+    payload: &[u8],
+    wal: &Arc<WalStore>,
+    backpressure: &TelemetryBackpressure,
+    drop_counter: &DropCounter,
+    append_counter: &AtomicU64,
+) -> anyhow::Result<()> {
+    let subject = Subjects::telemetry_state(worker_id).map_err(|e| anyhow::anyhow!("invalid worker_id: {e}"))?;
+    let header = signing_ctx
+        .sign_outbound_worker(correlation_id, payload)
+        .map_err(|e| anyhow::anyhow!("sign telemetry publish: {e}"))?;
+
+    match publish_signed(nats, subject, payload.to_vec(), &header).await {
+        Ok(()) => Ok(()),
+        Err(nats_err) => {
+            // Fallback: buffer the frame. Replay re-signs each frame with a
+            // fresh correlation + sequence; we do NOT persist the header here.
+            // WAL treats payload as opaque bytes — protobuf or JSON, identical
+            // path.
+            let seq = wal
+                .append_telemetry_frame(worker_id, "state", payload)
+                .map_err(|e| anyhow::anyhow!("wal append_telemetry_frame: {e}"))?;
+
+            let used = wal
+                .telemetry_bytes_used()
+                .map_err(|e| anyhow::anyhow!("telemetry_bytes_used: {e}"))?;
+            let usage_pct = percent_full(used, DEFAULT_TELEMETRY_BYTE_QUOTA);
+            backpressure.update(usage_pct);
+
+            let n = append_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_multiple_of(ENFORCE_QUOTA_EVERY) {
+                let dropped = wal
+                    .enforce_fifo_quota(DEFAULT_TELEMETRY_BYTE_QUOTA, DEFAULT_TELEMETRY_TTL_SECS)
+                    .map_err(|e| anyhow::anyhow!("enforce_fifo_quota: {e}"))?;
+                if dropped > 0 {
+                    for _ in 0..dropped {
+                        let (total, should_log) = drop_counter.record_and_should_log();
+                        if should_log {
+                            tracing::warn!(
+                                worker_id = %worker_id,
+                                total_dropped = total,
+                                "telemetry frame dropped under FIFO quota (log cap 1/100)"
+                            );
+                        }
+                    }
+                }
+            }
+
+            tracing::debug!(
+                worker_id = %worker_id,
+                seq,
+                size = payload.len(),
+                used_bytes = used,
+                usage_pct,
+                nats_error = %nats_err,
+                "telemetry (proto) buffered to WAL (NATS partitioned)"
+            );
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,6 +497,31 @@ mod tests {
         let wal = Arc::new(WalStore::open(":memory:").unwrap());
         let ctx = WorkerSigningContext::new(Arc::new(RwLock::new(material)), wal);
         (tmp, ctx)
+    }
+
+    #[tokio::test]
+    async fn publish_state_proto_signed_produces_valid_header_for_payload() {
+        // Phase 26-12 OBS-01: prove the signed-header path is wire-format-
+        // agnostic by feeding a protobuf-shaped byte pattern instead of
+        // serde_json. Mirrors `publish_state_signed_produces_valid_header_for_payload`.
+        let (_tmp, ctx) = build_signing_ctx().await;
+        let worker_id = "host1";
+        let correlation = Uuid::new_v4();
+        // A deterministic byte pattern stands in for a real prost-encoded
+        // TelemetryUpdate — the signing path does not inspect payload contents.
+        let payload: Vec<u8> = vec![0x08, 0x96, 0x01, 0x10, 0x2a, 0x20, 0x01];
+        let header = ctx.sign_outbound_worker(correlation, &payload).unwrap();
+        let env = SignatureEnvelope::decode_header(&header).unwrap();
+        assert_eq!(env.fields.correlation_id, correlation);
+        assert_eq!(
+            env.fields.payload_hash,
+            roz_core::signing::payload_sha256_hex(&payload)
+        );
+        assert_eq!(
+            Subjects::telemetry_state(worker_id).unwrap(),
+            format!("telemetry.{worker_id}.state")
+        );
+        assert_eq!(HEADER_NAME, "roz-sig-v1");
     }
 
     #[tokio::test]

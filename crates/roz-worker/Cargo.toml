@@ -42,6 +42,12 @@ thiserror.workspace = true
 arc-swap = "1"
 moka = { workspace = true }
 mcap.workspace = true
+# Phase 26-12 OBS-01 wire-format migration: worker publishes prost-encoded
+# `roz.v1.TelemetryUpdate` instead of serde_json on `telemetry.{worker_id}.state`.
+# `build.rs` generates the `roz.v1` module from proto/roz/v1/agent.proto.
+prost = "0.13"
+prost-types = "0.13"
+tonic = "0.13"
 sha2.workspace = true
 hex.workspace = true
 crc32fast.workspace = true
@@ -66,9 +72,21 @@ object_store = { workspace = true }
 v4l = { workspace = true }
 inotify = { workspace = true }
 
+[build-dependencies]
+# Phase 26-12 OBS-01: compile proto/roz/v1/agent.proto to `roz.v1` module
+# (TelemetryUpdate, Pose, JointState). Server/client codegen disabled —
+# worker only encodes/decodes these messages, never hosts gRPC.
+tonic-build = "0.13"
+
 [dev-dependencies]
 tempfile = "3"
 roz-test = { path = "../roz-test" }
+# Phase 26-12 OBS-01: integration test `tests/telemetry_proto_reaches_mcap.rs`
+# drives the worker → NATS → ingest_cloud → MCAP chain end-to-end. `test-helpers`
+# exposes `spawn_session_telemetry_ingest_for_tests` as a public wrapper around
+# the `pub(crate)` ingest fn.
+roz-server = { path = "../roz-server", features = ["test-helpers"] }
+tokio-util = { workspace = true }
 rand = { workspace = true }
 nix = { version = "0.29", features = ["signal"] }
 # Plan 24-17 phase24_e2e outage test reaches for `Toxic` / `ToxicKind` /
