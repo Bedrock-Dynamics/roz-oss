@@ -78,7 +78,8 @@ pub fn register_all_channels(
     let tf = writer.add_channel(tf_schema, CHANNEL_TF, SCHEMA_ENCODING_PROTOBUF, &empty)?;
     let pose = writer.add_channel(pose_schema, CHANNEL_POSE, SCHEMA_ENCODING_PROTOBUF, &empty)?;
     let log = writer.add_channel(log_schema, CHANNEL_LOG, SCHEMA_ENCODING_PROTOBUF, &empty)?;
-    let session_events = writer.add_channel(session_schema, CHANNEL_SESSION_EVENTS, SCHEMA_ENCODING_PROTOBUF, &empty)?;
+    let session_events =
+        writer.add_channel(session_schema, CHANNEL_SESSION_EVENTS, SCHEMA_ENCODING_PROTOBUF, &empty)?;
     let task_lifecycle = writer.add_channel(task_schema, CHANNEL_TASK_LIFECYCLE, SCHEMA_ENCODING_PROTOBUF, &empty)?;
     let tool_calls = writer.add_channel(tool_schema, CHANNEL_TOOL_CALLS, SCHEMA_ENCODING_PROTOBUF, &empty)?;
 
