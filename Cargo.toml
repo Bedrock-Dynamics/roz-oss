@@ -110,6 +110,10 @@ webbrowser = "1"
 
 # Phase 3 additions — Streams
 mcap = "0.24"
+# Phase 26 OBS-01 D-04: recovery path uses mcap::read::Options (an EnumSetType)
+# with mcap::MessageStream::new_with_options. enumset is mcap's own transitive
+# dep, surfaced here for direct use in crates/roz-server/src/observability/recovery.rs.
+enumset = "1"
 
 # Phase 4a additions
 reqwest-eventsource = "0.6"

@@ -20,10 +20,12 @@ pub mod ingest_cloud;
 pub mod ingest_edge;
 pub mod mcap_archive;
 pub mod projection;
+pub mod recovery;
 pub mod rollover;
 pub mod schema_registry;
 pub mod task_lifecycle;
-// Later-wave modules: pub mod recovery; pub mod retention;
+// Wave 8 addition: retention sweeper (26-10).
+// pub mod retention; (added in Task 2)
 
 use uuid::Uuid;
 

@@ -7041,6 +7041,7 @@ dependencies = [
  "chrono",
  "cron",
  "ed25519-dalek",
+ "enumset",
  "eventsource-stream",
  "figment",
  "flate2",
