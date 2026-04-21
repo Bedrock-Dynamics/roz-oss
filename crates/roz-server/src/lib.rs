@@ -5,6 +5,7 @@ pub mod extractors;
 pub mod grpc;
 pub mod middleware;
 pub mod nats_handlers;
+pub mod observability;
 pub mod response;
 pub mod restate;
 pub mod routes;

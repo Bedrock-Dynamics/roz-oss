@@ -55,6 +55,8 @@ tempfile = { workspace = true }
 semver = { workspace = true }
 serde_yaml = { workspace = true }
 secrecy = { workspace = true }
+# Phase 26 OBS-01 — per-session MCAP writer (unified observability).
+mcap = { workspace = true }
 # Phase 23 Plan 23-04 — verifying-key LRU cache (D-11).
 moka = { workspace = true }
 # Phase 23 Plan 23-04 — VerifyingKey type held in the cache value slot.

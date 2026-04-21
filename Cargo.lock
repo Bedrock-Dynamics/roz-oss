@@ -7049,6 +7049,7 @@ dependencies = [
  "hickory-resolver",
  "image",
  "logfire",
+ "mcap",
  "moka",
  "nkeys",
  "object_store",
