@@ -143,6 +143,8 @@ pub async fn start_server_with_fetcher(
         .expect("bind grpc server");
     let addr = listener.local_addr().expect("addr");
 
+    let (mcap_a, mcap_b, mcap_c, mcap_d, mcap_e) =
+        roz_server::observability::ingest_cloud::test_mcap_args(pool.clone());
     let agent_svc = AgentServiceImpl::new(
         pool.clone(),
         reqwest::Client::new(),
@@ -163,6 +165,11 @@ pub async fn start_server_with_fetcher(
         Arc::new(roz_mcp::Registry::new()),
         Arc::new(roz_core::key_provider::StaticKeyProvider::from_key_bytes([7u8; 32])),
         Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
+        mcap_a,
+        mcap_b,
+        mcap_c,
+        mcap_d,
+        mcap_e,
     );
 
     spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);

@@ -130,6 +130,12 @@ fn grpc_router(state: &AppState) -> Router {
             }
         };
     let media_fetcher = Arc::new(roz_server::grpc::media_fetch::MediaFetcher::new());
+    // Phase 26 OBS-01 (T-26-50): share the same SigningGate collaborator
+    // with the telemetry handler + REST/gRPC/Restate dispatch paths so the
+    // per-session MCAP telemetry ingestor re-invokes the identical inbound
+    // verification logic. Same construction pattern as TaskServiceImpl
+    // above (line 97) + the internal NATS spawn handler (line 486).
+    let agent_signing_gate = Arc::new(roz_server::signing_gate::SigningGate::from_app_state(state));
     let agent_svc = roz_server::grpc::agent::AgentServiceImpl::new(
         state.pool.clone(),
         state.http_client.clone(),
@@ -152,6 +158,11 @@ fn grpc_router(state: &AppState) -> Router {
         state.mcp_registry.clone(),
         state.key_provider.clone(),
         state.session_bus.clone(),
+        state.mcap_dir.clone(),
+        state.active_writers.clone(),
+        state.task_lifecycle_sink.clone(),
+        state.schema_descriptors.clone(),
+        agent_signing_gate,
     );
 
     let embodiment_svc =

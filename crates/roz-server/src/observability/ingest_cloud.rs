@@ -353,6 +353,59 @@ pub(crate) async fn spawn_session_telemetry_ingest(
     info!(%subject, "MCAP session telemetry ingest exiting");
 }
 
+/// Test-only helper: build the 5 `AgentServiceImpl::new` args this plan
+/// added (`mcap_dir`, `active_writers`, `task_lifecycle_sink`,
+/// `schema_descriptors`, `signing_gate`) with sane defaults for
+/// integration tests. Callers supply a live `PgPool` so the signing
+/// gate has a functioning backing store.
+///
+/// Not `#[cfg(test)]` because integration tests are a separate
+/// compilation unit that link against the public library surface —
+/// a `cfg(test)` guard would hide this from them. Guarded with
+/// `#[doc(hidden)]` instead to signal non-production use.
+#[doc(hidden)]
+#[must_use]
+pub fn test_mcap_args(
+    pool: sqlx::PgPool,
+) -> (
+    std::path::PathBuf,
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, mpsc::Sender<WriteCommand>>>>,
+    crate::observability::task_lifecycle::TaskLifecycleSink,
+    crate::observability::schema_registry::SchemaDescriptors,
+    Arc<crate::signing_gate::SigningGate>,
+) {
+    let mcap_dir = std::env::temp_dir().join(format!("roz-mcap-test-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&mcap_dir).expect("create test mcap dir");
+
+    let active_writers = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let task_lifecycle_sink = crate::observability::task_lifecycle::new_task_lifecycle_sink();
+    let schema_descriptors =
+        crate::observability::schema_registry::SchemaDescriptors::load().expect("schema descriptors load");
+
+    let cache: moka::future::Cache<(uuid::Uuid, uuid::Uuid, u32), ed25519_dalek::VerifyingKey> =
+        moka::future::Cache::builder()
+            .max_capacity(10_000)
+            .time_to_live(std::time::Duration::from_secs(60))
+            .build();
+    let key_provider: Arc<dyn roz_core::key_provider::KeyProvider> =
+        Arc::new(roz_openai::auth::null_key::NullKeyProvider);
+    let signing_gate = Arc::new(crate::signing_gate::SigningGate::new(
+        pool,
+        cache,
+        key_provider,
+        None,
+        crate::config::SignedDispatchEnforcement::Audit,
+    ));
+
+    (
+        mcap_dir,
+        active_writers,
+        task_lifecycle_sink,
+        schema_descriptors,
+        signing_gate,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{envelope_timestamp_ns, log_level_for_event, now_wall_clock_ns};

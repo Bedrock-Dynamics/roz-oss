@@ -253,6 +253,8 @@ async fn setup_harness() -> Harness {
     let key_provider_dyn: Arc<dyn KeyProvider> = key_provider.clone();
     let session_bus = Arc::new(roz_server::grpc::session_bus::SessionBus::default());
 
+    let (mcap_a, mcap_b, mcap_c, mcap_d, mcap_e) =
+        roz_server::observability::ingest_cloud::test_mcap_args(pool.clone());
     let agent_svc = AgentServiceImpl::new(
         pool.clone(),
         reqwest::Client::new(),
@@ -273,6 +275,11 @@ async fn setup_harness() -> Harness {
         registry.clone(),
         key_provider_dyn.clone(),
         session_bus.clone(),
+        mcap_a,
+        mcap_b,
+        mcap_c,
+        mcap_d,
+        mcap_e,
     );
     let mcp_svc = McpServerServiceImpl::new(pool.clone(), key_provider_dyn, registry.clone(), session_bus);
 

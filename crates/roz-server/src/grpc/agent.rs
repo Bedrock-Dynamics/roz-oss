@@ -119,6 +119,16 @@ struct Session {
     /// to re-install it onto a freshly rehydrated runtime.
     #[allow(dead_code)]
     frozen_skills: Vec<roz_db::skills::SkillSummary>,
+    /// Phase 26 OBS-01: `CancellationToken` returned by `spawn_cloud_ingestors`.
+    /// Triggered on `SessionCompleted` / session-loop exit so the three
+    /// MCAP fan-in tasks shut down cleanly before `WriteCommand::Finalize`
+    /// flushes the writer.
+    mcap_cancel: Option<tokio_util::sync::CancellationToken>,
+    /// Phase 26 OBS-01: sender to the per-session `WriterActor` mpsc.
+    /// Kept on `Session` for fast `Finalize` + drop on session end; also
+    /// mirrored into `AppState.active_writers` for SIGTERM drain
+    /// (Plan 26-07).
+    mcap_writer_tx: Option<tokio::sync::mpsc::Sender<crate::observability::mcap_archive::WriteCommand>>,
 }
 
 #[derive(Debug, Clone)]
@@ -242,6 +252,24 @@ enum TurnCompletion {
     Failed(roz_core::session::activity::RuntimeFailureKind),
 }
 
+/// Phase 26 OBS-01: bundle of dependencies threaded into `run_session_loop`
+/// so the cloud-session branch can spawn a `WriterActor` and its three
+/// fan-in producer tasks (see `crate::observability::ingest_cloud`).
+struct McapIngestContext {
+    mcap_dir: std::path::PathBuf,
+    active_writers: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                uuid::Uuid,
+                tokio::sync::mpsc::Sender<crate::observability::mcap_archive::WriteCommand>,
+            >,
+        >,
+    >,
+    task_lifecycle_sink: crate::observability::task_lifecycle::TaskLifecycleSink,
+    schema_descriptors: crate::observability::schema_registry::SchemaDescriptors,
+    signing_gate: Arc<crate::signing_gate::SigningGate>,
+}
+
 // ---------------------------------------------------------------------------
 // AgentServiceImpl
 // ---------------------------------------------------------------------------
@@ -286,6 +314,32 @@ pub struct AgentServiceImpl {
     key_provider: Arc<dyn KeyProvider>,
     /// Phase 20 Plan 07: cross-RPC session bus for MCP OAuth approval flows.
     session_bus: Arc<SessionBus>,
+    /// Phase 26 OBS-01: MCAP archive root from `AppState.mcap_dir`, used
+    /// when spawning per-session `WriterActor`s for cloud-hosted sessions.
+    mcap_dir: std::path::PathBuf,
+    /// Phase 26 OBS-01: registry of per-session `WriterActor` command
+    /// senders cloned from `AppState.active_writers`. SIGTERM drain
+    /// (Plan 26-07) iterates this map.
+    active_writers: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                uuid::Uuid,
+                tokio::sync::mpsc::Sender<crate::observability::mcap_archive::WriteCommand>,
+            >,
+        >,
+    >,
+    /// Phase 26 OBS-01: broadcast sink for `TaskLifecycleEvent` cloned
+    /// from `AppState.task_lifecycle_sink`; subscribed per-session.
+    task_lifecycle_sink: crate::observability::task_lifecycle::TaskLifecycleSink,
+    /// Phase 26 OBS-02: pre-loaded schema descriptor bytes cloned from
+    /// `AppState.schema_descriptors`; passed to `WriterActor::open`.
+    schema_descriptors: crate::observability::schema_registry::SchemaDescriptors,
+    /// Phase 26 OBS-01 (T-26-50): shared `SigningGate` for verifying
+    /// `telemetry.{worker}.state` frames inside cloud-session ingestors.
+    /// Constructed in `main::grpc_router` via
+    /// `Arc::new(SigningGate::from_app_state(&state))` to share the same
+    /// gate collaborators as REST / gRPC / Restate dispatch paths.
+    signing_gate: Arc<crate::signing_gate::SigningGate>,
 }
 
 impl AgentServiceImpl {
@@ -310,6 +364,18 @@ impl AgentServiceImpl {
         mcp_registry: Arc<roz_mcp::Registry>,
         key_provider: Arc<dyn KeyProvider>,
         session_bus: Arc<SessionBus>,
+        mcap_dir: std::path::PathBuf,
+        active_writers: Arc<
+            std::sync::Mutex<
+                std::collections::HashMap<
+                    uuid::Uuid,
+                    tokio::sync::mpsc::Sender<crate::observability::mcap_archive::WriteCommand>,
+                >,
+            >,
+        >,
+        task_lifecycle_sink: crate::observability::task_lifecycle::TaskLifecycleSink,
+        schema_descriptors: crate::observability::schema_registry::SchemaDescriptors,
+        signing_gate: Arc<crate::signing_gate::SigningGate>,
     ) -> Self {
         Self {
             pool,
@@ -331,6 +397,11 @@ impl AgentServiceImpl {
             mcp_registry,
             key_provider,
             session_bus,
+            mcap_dir,
+            active_writers,
+            task_lifecycle_sink,
+            schema_descriptors,
+            signing_gate,
         }
     }
 }
@@ -361,6 +432,12 @@ impl AgentService for AgentServiceImpl {
         let mcp_registry = self.mcp_registry.clone();
         let key_provider = self.key_provider.clone();
         let session_bus = self.session_bus.clone();
+        // Phase 26 OBS-01: MCAP ingest deps for cloud sessions.
+        let mcap_dir = self.mcap_dir.clone();
+        let active_writers = self.active_writers.clone();
+        let task_lifecycle_sink = self.task_lifecycle_sink.clone();
+        let schema_descriptors = self.schema_descriptors.clone();
+        let signing_gate = self.signing_gate.clone();
 
         // Extract AuthIdentity from request extensions (set by grpc_auth_middleware)
         // BEFORE consuming the request via into_inner().
@@ -395,6 +472,13 @@ impl AgentService for AgentServiceImpl {
                 &mcp_registry,
                 &key_provider,
                 &session_bus,
+                McapIngestContext {
+                    mcap_dir,
+                    active_writers,
+                    task_lifecycle_sink,
+                    schema_descriptors,
+                    signing_gate,
+                },
             )
             .await;
         });
@@ -863,7 +947,7 @@ impl StreamingTurnExecutor for ServerStreamingExecutor {
 
 #[tracing::instrument(
     name = "agent_session.stream",
-    skip(tx, pool, model_config, inbound, nats_client, meter, auth_identity, mcp_registry, key_provider),
+    skip(tx, pool, model_config, inbound, nats_client, meter, auth_identity, mcp_registry, key_provider, mcap),
     fields(session_id = tracing::field::Empty, tenant_id = tracing::field::Empty, environment_id = tracing::field::Empty, model = %default_model)
 )]
 #[expect(
@@ -887,6 +971,7 @@ async fn run_session_loop(
     mcp_registry: &Arc<roz_mcp::Registry>,
     key_provider: &Arc<dyn KeyProvider>,
     session_bus: &Arc<SessionBus>,
+    mcap: McapIngestContext,
 ) {
     let mut session: Option<Session> = None;
     let mut cancelled = false;
@@ -1028,7 +1113,7 @@ async fn run_session_loop(
                 {
                     break;
                 }
-                if let Some(ref sess) = session {
+                if let Some(ref mut sess) = session {
                     let history_messages = {
                         if let Some(runtime) = &sess.runtime {
                             let runtime = runtime.lock().await;
@@ -1112,6 +1197,73 @@ async fn run_session_loop(
                         } else {
                             drop(fact_rx);
                             tracing::info!("MEM-03: fact extraction disabled (ROZ_GEMINI_API_KEY not set)");
+                        }
+                    }
+
+                    // Phase 26 OBS-01 (D-12 cloud path): spawn per-session MCAP
+                    // WriterActor + 3 fan-in producer tasks (session events,
+                    // task lifecycle broadcast, signed telemetry NATS) for
+                    // cloud-hosted sessions. Edge sessions are served by the
+                    // worker and handled in Plan 26-06.
+                    if !sess.is_edge {
+                        match crate::observability::mcap_archive::spawn_writer(
+                            mcap.mcap_dir.clone(),
+                            sess.tenant_id,
+                            sess.id,
+                            mcap.schema_descriptors.clone(),
+                            pool.clone(),
+                            None, // uses DEFAULT_MCAP_MAX_FILE_BYTES
+                        )
+                        .await
+                        {
+                            Ok(writer_tx) => {
+                                // Register in active_writers for SIGTERM drain.
+                                if let Ok(mut guard) = mcap.active_writers.lock() {
+                                    guard.insert(sess.id, writer_tx.clone());
+                                } else {
+                                    tracing::warn!(
+                                        session_id = %sess.id,
+                                        "MCAP active_writers lock poisoned; proceeding without registry entry"
+                                    );
+                                }
+                                // Subscribe a second event_rx for the MCAP
+                                // ingestor — the existing cloud drainer owns
+                                // the first subscriber.
+                                let mcap_event_rx = if let Some(runtime) = &sess.runtime {
+                                    let runtime = runtime.lock().await;
+                                    Some(runtime.subscribe_events())
+                                } else {
+                                    None
+                                };
+                                if let Some(event_rx) = mcap_event_rx {
+                                    let task_lifecycle_rx = mcap.task_lifecycle_sink.subscribe();
+                                    let cancel = crate::observability::ingest_cloud::spawn_cloud_ingestors(
+                                        sess.id,
+                                        sess.worker_name.clone(),
+                                        &writer_tx,
+                                        event_rx,
+                                        task_lifecycle_rx,
+                                        nats_client.cloned(),
+                                        Some(mcap.signing_gate.clone()),
+                                    );
+                                    sess.mcap_cancel = Some(cancel);
+                                    sess.mcap_writer_tx = Some(writer_tx);
+                                    tracing::info!(session_id = %sess.id, "MCAP writer + ingestors spawned");
+                                } else {
+                                    tracing::warn!(
+                                        session_id = %sess.id,
+                                        "no runtime available for event subscription; MCAP ingestors not spawned"
+                                    );
+                                    sess.mcap_writer_tx = Some(writer_tx);
+                                }
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    %error,
+                                    session_id = %sess.id,
+                                    "failed to spawn MCAP writer; session continues without archive"
+                                );
+                            }
                         }
                     }
 
@@ -1860,6 +2012,29 @@ async fn run_session_loop(
         }
     }
 
+    // Phase 26 OBS-01: finalize per-session MCAP archive. Order matters —
+    // send WriteCommand::Finalize FIRST so in-flight fan-in messages are
+    // drained by the WriterActor, THEN cancel the ingestors, THEN drop
+    // the sender out of active_writers. The WriterActor transitions the
+    // Postgres `status` row synchronously with the file close.
+    if let Some(ref mut s) = session {
+        if let Some(ref tx_mcap) = s.mcap_writer_tx {
+            let _ = tx_mcap
+                .send(crate::observability::mcap_archive::WriteCommand::Finalize {
+                    reason: crate::observability::mcap_archive::FinalizeReason::SessionCompleted,
+                })
+                .await;
+        }
+        if let Some(cancel) = s.mcap_cancel.take() {
+            cancel.cancel();
+        }
+        // Drop the sender stored on `Session` + the mirror in `active_writers`.
+        s.mcap_writer_tx = None;
+        if let Ok(mut guard) = mcap.active_writers.lock() {
+            guard.remove(&s.id);
+        }
+    }
+
     // Cleanup: mark session with the appropriate terminal status.
     let status = if cancelled { "cancelled" } else { "completed" };
     if let Some(ref s) = session {
@@ -2485,6 +2660,10 @@ async fn handle_start(
         edge_mirror,
         event_rx,
         frozen_skills,
+        // Phase 26 OBS-01: populated by run_session_loop post-handle_start
+        // when the cloud branch spawns the MCAP WriterActor.
+        mcap_cancel: None,
+        mcap_writer_tx: None,
     });
 
     true

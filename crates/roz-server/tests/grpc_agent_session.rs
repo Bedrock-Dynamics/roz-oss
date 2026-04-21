@@ -546,6 +546,8 @@ async fn full_agent_session_lifecycle() {
         .expect("build gemini backend"),
     );
     let media_fetcher = Arc::new(roz_server::grpc::media_fetch::MediaFetcher::new());
+    let (mcap_a, mcap_b, mcap_c, mcap_d, mcap_e) =
+        roz_server::observability::ingest_cloud::test_mcap_args(pool.clone());
     let agent_svc = AgentServiceImpl::new(
         pool.clone(),
         reqwest::Client::new(),
@@ -566,6 +568,11 @@ async fn full_agent_session_lifecycle() {
         Arc::new(roz_mcp::Registry::new()),
         Arc::new(roz_core::key_provider::StaticKeyProvider::from_key_bytes([7u8; 32])),
         Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
+        mcap_a,
+        mcap_b,
+        mcap_c,
+        mcap_d,
+        mcap_e,
     );
     spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);
     // Brief wait for the gRPC server to start accepting connections.
@@ -840,6 +847,8 @@ async fn execute_code_nested_physical_tool_approval_resumes_turn() {
         .expect("bind grpc server");
     let addr = listener.local_addr().expect("grpc server addr");
     let (media_backend, media_fetcher) = default_media_deps(&gateway_url);
+    let (mcap_a, mcap_b, mcap_c, mcap_d, mcap_e) =
+        roz_server::observability::ingest_cloud::test_mcap_args(pool.clone());
     let agent_svc = AgentServiceImpl::new(
         pool.clone(),
         reqwest::Client::new(),
@@ -860,6 +869,11 @@ async fn execute_code_nested_physical_tool_approval_resumes_turn() {
         Arc::new(roz_mcp::Registry::new()),
         Arc::new(roz_core::key_provider::StaticKeyProvider::from_key_bytes([7u8; 32])),
         Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
+        mcap_a,
+        mcap_b,
+        mcap_c,
+        mcap_d,
+        mcap_e,
     );
     spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1055,6 +1069,8 @@ async fn skill_loaded_event_uses_same_turn_correlation_in_cloud_session() {
         .expect("bind grpc server");
     let addr = listener.local_addr().expect("grpc server addr");
     let (media_backend, media_fetcher) = default_media_deps(&gateway_url);
+    let (mcap_a, mcap_b, mcap_c, mcap_d, mcap_e) =
+        roz_server::observability::ingest_cloud::test_mcap_args(pool.clone());
     let agent_svc = AgentServiceImpl::new(
         pool.clone(),
         reqwest::Client::new(),
@@ -1075,6 +1091,11 @@ async fn skill_loaded_event_uses_same_turn_correlation_in_cloud_session() {
         Arc::new(roz_mcp::Registry::new()),
         Arc::new(roz_core::key_provider::StaticKeyProvider::from_key_bytes([7u8; 32])),
         Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
+        mcap_a,
+        mcap_b,
+        mcap_c,
+        mcap_d,
+        mcap_e,
     );
     spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1219,6 +1240,8 @@ async fn mcp_tools_appear_on_session_start() {
         .expect("bind grpc server");
     let addr = listener.local_addr().expect("grpc server addr");
     let (media_backend, media_fetcher) = default_media_deps(&gateway_url);
+    let (mcap_a, mcap_b, mcap_c, mcap_d, mcap_e) =
+        roz_server::observability::ingest_cloud::test_mcap_args(pool.clone());
     let agent_svc = AgentServiceImpl::new(
         pool.clone(),
         reqwest::Client::new(),
@@ -1239,6 +1262,11 @@ async fn mcp_tools_appear_on_session_start() {
         registry.clone(),
         Arc::new(roz_core::key_provider::StaticKeyProvider::from_key_bytes([7u8; 32])),
         Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
+        mcap_a,
+        mcap_b,
+        mcap_c,
+        mcap_d,
+        mcap_e,
     );
     spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1394,6 +1422,8 @@ async fn mcp_server_degradation_emits_event_and_prunes_tools() {
         .expect("bind grpc server");
     let addr = listener.local_addr().expect("grpc server addr");
     let (media_backend, media_fetcher) = default_media_deps(&gateway_url);
+    let (mcap_a, mcap_b, mcap_c, mcap_d, mcap_e) =
+        roz_server::observability::ingest_cloud::test_mcap_args(pool.clone());
     let agent_svc = AgentServiceImpl::new(
         pool.clone(),
         reqwest::Client::new(),
@@ -1414,6 +1444,11 @@ async fn mcp_server_degradation_emits_event_and_prunes_tools() {
         registry.clone(),
         Arc::new(roz_core::key_provider::StaticKeyProvider::from_key_bytes([7u8; 32])),
         Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
+        mcap_a,
+        mcap_b,
+        mcap_c,
+        mcap_d,
+        mcap_e,
     );
     let mcp_svc = McpServerServiceImpl::new(
         pool.clone(),
@@ -1695,6 +1730,8 @@ async fn register_tools_hot_swap_updates_subsequent_model_requests() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind grpc");
     let addr = listener.local_addr().expect("addr");
     let (media_backend, media_fetcher) = default_media_deps(&gateway_url);
+    let (mcap_a, mcap_b, mcap_c, mcap_d, mcap_e) =
+        roz_server::observability::ingest_cloud::test_mcap_args(pool.clone());
     let agent_svc = AgentServiceImpl::new(
         pool.clone(),
         reqwest::Client::new(),
@@ -1715,6 +1752,11 @@ async fn register_tools_hot_swap_updates_subsequent_model_requests() {
         Arc::new(roz_mcp::Registry::new()),
         Arc::new(roz_core::key_provider::StaticKeyProvider::from_key_bytes([7u8; 32])),
         Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
+        mcap_a,
+        mcap_b,
+        mcap_c,
+        mcap_d,
+        mcap_e,
     );
     spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1951,6 +1993,8 @@ async fn project_context_included_in_system_prompt() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind grpc");
     let addr = listener.local_addr().expect("addr");
     let (media_backend, media_fetcher) = default_media_deps(&gateway_url);
+    let (mcap_a, mcap_b, mcap_c, mcap_d, mcap_e) =
+        roz_server::observability::ingest_cloud::test_mcap_args(pool.clone());
     let agent_svc = AgentServiceImpl::new(
         pool.clone(),
         reqwest::Client::new(),
@@ -1971,6 +2015,11 @@ async fn project_context_included_in_system_prompt() {
         Arc::new(roz_mcp::Registry::new()),
         Arc::new(roz_core::key_provider::StaticKeyProvider::from_key_bytes([7u8; 32])),
         Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
+        mcap_a,
+        mcap_b,
+        mcap_c,
+        mcap_d,
+        mcap_e,
     );
     spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2167,6 +2216,8 @@ async fn start_session_with_host_id_stores_in_session() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind grpc");
     let addr = listener.local_addr().expect("addr");
     let (media_backend, media_fetcher) = default_media_deps(&gateway_url);
+    let (mcap_a, mcap_b, mcap_c, mcap_d, mcap_e) =
+        roz_server::observability::ingest_cloud::test_mcap_args(pool.clone());
     let agent_svc = AgentServiceImpl::new(
         pool.clone(),
         reqwest::Client::new(),
@@ -2187,6 +2238,11 @@ async fn start_session_with_host_id_stores_in_session() {
         Arc::new(roz_mcp::Registry::new()),
         Arc::new(roz_core::key_provider::StaticKeyProvider::from_key_bytes([7u8; 32])),
         Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
+        mcap_a,
+        mcap_b,
+        mcap_c,
+        mcap_d,
+        mcap_e,
     );
     spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2292,6 +2348,8 @@ async fn model_tier_names_resolve_to_actual_models() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let (media_backend, media_fetcher) = default_media_deps(&gateway_url);
+    let (mcap_a, mcap_b, mcap_c, mcap_d, mcap_e) =
+        roz_server::observability::ingest_cloud::test_mcap_args(pool.clone());
     let agent_svc = AgentServiceImpl::new(
         pool.clone(),
         reqwest::Client::new(),
@@ -2312,6 +2370,11 @@ async fn model_tier_names_resolve_to_actual_models() {
         Arc::new(roz_mcp::Registry::new()),
         Arc::new(roz_core::key_provider::StaticKeyProvider::from_key_bytes([7u8; 32])),
         Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
+        mcap_a,
+        mcap_b,
+        mcap_c,
+        mcap_d,
+        mcap_e,
     );
     spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2412,6 +2475,8 @@ async fn session_with_host_receives_telemetry() {
         .expect("bind grpc server");
     let addr = listener.local_addr().expect("grpc server addr");
     let (media_backend, media_fetcher) = default_media_deps(&gateway_url);
+    let (mcap_a, mcap_b, mcap_c, mcap_d, mcap_e) =
+        roz_server::observability::ingest_cloud::test_mcap_args(pool.clone());
     let agent_svc = AgentServiceImpl::new(
         pool.clone(),
         reqwest::Client::new(),
@@ -2432,6 +2497,11 @@ async fn session_with_host_receives_telemetry() {
         Arc::new(roz_mcp::Registry::new()),
         Arc::new(roz_core::key_provider::StaticKeyProvider::from_key_bytes([7u8; 32])),
         Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
+        mcap_a,
+        mcap_b,
+        mcap_c,
+        mcap_d,
+        mcap_e,
     );
     spawn_grpc_server_with_auth(pool.clone(), agent_svc, listener);
     tokio::time::sleep(Duration::from_millis(50)).await;
