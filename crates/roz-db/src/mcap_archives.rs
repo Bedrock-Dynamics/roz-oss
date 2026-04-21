@@ -134,6 +134,29 @@ where
     .await
 }
 
+/// Retention size-cap pass (D-02). Returns ALL finalized rows
+/// (`status <> 'open'`) newest-first so the sweeper can sum bytes from
+/// the head and drop everything beyond the `ROZ_MCAP_MAX_BYTES` threshold.
+///
+/// Distinct from [`list_retention_candidates`], which filters by TTL.
+/// The size-cap pass needs every non-open row (regardless of age) so the
+/// running total is accurate; the TTL pass deletes separately based on
+/// `opened_at` age.
+///
+/// Callers: `crates/roz-server/src/observability/retention.rs`.
+pub async fn list_finalized_ordered<'e, E>(executor: E) -> Result<Vec<McapArchiveRow>, sqlx::Error>
+where
+    E: Executor<'e, Database = Postgres>,
+{
+    sqlx::query_as::<_, McapArchiveRow>(
+        "SELECT * FROM roz_session_mcap_archives \
+         WHERE status <> 'open' \
+         ORDER BY opened_at DESC",
+    )
+    .fetch_all(executor)
+    .await
+}
+
 /// Delete a finalized row after the corresponding file has been deleted on disk.
 /// Retention callers invoke this after `unlink(path)` succeeds.
 pub async fn delete_by_id<'e, E>(executor: E, id: Uuid) -> Result<u64, sqlx::Error>
