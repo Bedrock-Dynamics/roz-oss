@@ -30,10 +30,11 @@ use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::observability::McapArchiveError;
 use crate::observability::channels::{ChannelIds, register_all_channels};
 use crate::observability::idle_monitor::{IDLE_CHECK_INTERVAL, idle_timeout_from_env};
+use crate::observability::rollover::max_file_bytes_from_env;
 use crate::observability::schema_registry::SchemaDescriptors;
-use crate::observability::{DEFAULT_MCAP_MAX_FILE_BYTES, McapArchiveError};
 
 /// Target channel for a write command. The `WriterActor` maps this to a
 /// concrete `ChannelIds` field without hashing.
@@ -439,13 +440,14 @@ pub async fn spawn_writer_at_rollover(
     rollover_index: i32,
 ) -> Result<mpsc::Sender<WriteCommand>, McapArchiveError> {
     let idle_timeout = idle_timeout_from_env();
+    let resolved_max_file_bytes = max_file_bytes.unwrap_or_else(max_file_bytes_from_env);
     let actor = WriterActor::open(
         mcap_dir,
         tenant_id,
         session_id,
         descriptors,
         pool,
-        max_file_bytes.unwrap_or(DEFAULT_MCAP_MAX_FILE_BYTES),
+        resolved_max_file_bytes,
         rollover_index,
         idle_timeout,
     )
