@@ -9,7 +9,7 @@ requires:
     provides: "WriterActor + spawn_writer (26-04); AppState.active_writers registry (26-05); cloud + edge ingestion wiring (26-05/26-06)"
 provides:
   - "crates/roz-server/src/observability/idle_monitor::{IDLE_CHECK_INTERVAL, idle_timeout_from_env} — idle tick cadence (30s) + env-resolved timeout (ROZ_MCAP_IDLE_TIMEOUT_SECS, default 600s per D-05)"
-  - "crates/roz-server/src/observability/rollover::rollover_writer — public entry for external rollover callers (future recovery paths); production rollover path is in-place reopen inside WriterActor::run"
+  - "crates/roz-server/src/observability/rollover::{rollover_writer, max_file_bytes_from_env} — rollover_writer is the public entry for external callers (future recovery paths); max_file_bytes_from_env reads ROZ_MCAP_MAX_FILE_BYTES (default 1 GB per D-03). Production rollover path is in-place reopen inside WriterActor::run using the env-resolved threshold."
   - "crates/roz-server/src/observability/mcap_archive::spawn_writer_at_rollover — parallel to spawn_writer taking an explicit starting rollover_index; spawn_writer delegates to it with rollover_index=0"
   - "crates/roz-server/src/observability/mcap_archive::drain_active_writers(writers, timeout) — bounded SIGTERM drain helper: iterates active_writers, sends WriteCommand::Finalize{Shutdown} to each, awaits bounded completion (10s in main.rs)"
   - "crates/roz-server/src/observability/mcap_archive::WriterActor — now carries an idle_timeout field; run() uses tokio::select! with an idle tick branch; on size threshold OR explicit WriteCommand::Rollover the actor reopens the next indexed file in place (same mpsc channel, same task, same AppState::active_writers entry)"
@@ -110,16 +110,17 @@ completed: 2026-04-21
 |---|------|--------|------|
 | 1 | idle timeout + in-place rollover + `drain_active_writers` | `d58f2b1` | feat |
 | 2 | SIGTERM + `ctrl_c` drain of active MCAP writers in main.rs | `86a76d9` | feat |
+| 3 | honor `ROZ_MCAP_MAX_FILE_BYTES` env var (post-review fix) | `7472d71` | fix |
 
-Both committed atomically via `git commit --no-verify` (parallel-executor worktree).
+Tasks committed atomically via `git commit --no-verify` (parallel-executor worktree).
 
 ## Files Created/Modified
 
 | File | Type | Commit | Purpose |
 |------|------|--------|---------|
-| `crates/roz-server/src/observability/idle_monitor.rs` | **created** | `d58f2b1` | 47 lines + 3 tests; env parse + IDLE_CHECK_INTERVAL constant |
-| `crates/roz-server/src/observability/rollover.rs` | **created** | `d58f2b1` | 53 lines; public wrapper around `spawn_writer_at_rollover` for external callers |
-| `crates/roz-server/src/observability/mcap_archive.rs` | modified | `d58f2b1` | +idle_timeout field, +reopen_next_file, +spawn_writer_at_rollover, +drain_active_writers, rewritten run loop, dead_code expect attributes removed on newly-read fields |
+| `crates/roz-server/src/observability/idle_monitor.rs` | **created** | `d58f2b1` | 79 lines + 3 tests; env parse + IDLE_CHECK_INTERVAL constant |
+| `crates/roz-server/src/observability/rollover.rs` | **created** | `d58f2b1`, `7472d71` | 112 lines; `rollover_writer` wrapper + `max_file_bytes_from_env` + 2 env tests |
+| `crates/roz-server/src/observability/mcap_archive.rs` | modified | `d58f2b1`, `7472d71` | +idle_timeout field, +reopen_next_file, +spawn_writer_at_rollover, +drain_active_writers, rewritten run loop, dead_code expect attributes removed on newly-read fields, `max_file_bytes_from_env` fallback wired |
 | `crates/roz-server/src/observability/mod.rs` | modified | `d58f2b1` | +pub mod idle_monitor; +pub mod rollover |
 | `crates/roz-server/src/main.rs` | modified | `86a76d9` | +active_writers clone before app(state); +shutdown future with ctrl_c + SIGTERM; +tokio::select! + drain_active_writers(10s) |
 
@@ -183,6 +184,14 @@ Both committed atomically via `git commit --no-verify` (parallel-executor worktr
 - **Files modified:** `crates/roz-server/src/observability/idle_monitor.rs`
 - **Commit:** `d58f2b1`
 
+**7. [Rule 2 — Missing critical functionality]** `ROZ_MCAP_MAX_FILE_BYTES` env var was declared in `mod.rs` but never read from the environment.
+
+- **Found during:** post-review advisor pass before declaring done.
+- **Issue:** The initial `spawn_writer_at_rollover` implementation fell back to the 1 GB default constant when the caller passed `None` for `max_file_bytes`. Production call sites in `grpc/agent.rs` pass `None`, so the operator-facing `ROZ_MCAP_MAX_FILE_BYTES` knob was inert — a stated success criterion and plan must_have ("Rollover at `ROZ_MCAP_MAX_FILE_BYTES`") was not actually honored.
+- **Fix:** Added `rollover::max_file_bytes_from_env` (mirrors `idle_monitor::idle_timeout_from_env`), reads the env var, parses as u64, falls back to `DEFAULT_MCAP_MAX_FILE_BYTES`. Changed `spawn_writer_at_rollover` from `max_file_bytes.unwrap_or(DEFAULT_MCAP_MAX_FILE_BYTES)` to `max_file_bytes.unwrap_or_else(max_file_bytes_from_env)` so explicit callers still win and the default-caller path consults the env var. Added two env-parse tests (ENV_LOCK-serialized).
+- **Files modified:** `crates/roz-server/src/observability/rollover.rs`, `crates/roz-server/src/observability/mcap_archive.rs`
+- **Commit:** `7472d71`
+
 No architectural deviations requiring a checkpoint. No auth gates. No decision checkpoints reached.
 
 ## Verification
@@ -191,17 +200,18 @@ No architectural deviations requiring a checkpoint. No auth gates. No decision c
 - `cargo clippy -p roz-server --no-deps -- -D warnings` — **clean** (lib + bin).
 - `cargo clippy -p roz-server --no-deps --tests -- -D warnings` — **clean**.
 - `cargo fmt -p roz-server --check` — **clean**.
-- `cargo test -p roz-server --lib observability` — **31/31 passing** (27 from 26-06 + 4 new: 3 `idle_monitor` + 1 `drain_on_empty_registry_returns_immediately`).
-- `cargo test -p roz-server --lib` — **414/414 passing** (+4 vs. 26-06's 410).
+- `cargo test -p roz-server --lib observability` — **33/33 passing** (27 from 26-06 + 6 new: 3 `idle_monitor` + 2 `rollover` env-parse + 1 `drain_on_empty_registry_returns_immediately`).
+- `cargo test -p roz-server --lib` — **416/416 passing** (+6 vs. 26-06's 410).
 - Plan verify checks (grep-based):
   - `pub async fn drain_active_writers` in `mcap_archive.rs` — **FOUND**
   - `drain_active_writers` in `main.rs` — **FOUND**
   - `tokio::signal` in `main.rs` — **FOUND**
   - `pub fn idle_timeout_from_env` in `idle_monitor.rs` — **FOUND**
+  - `pub fn max_file_bytes_from_env` in `rollover.rs` — **FOUND**
   - `pub async fn spawn_writer_at_rollover` in `mcap_archive.rs` — **FOUND**
   - `FinalizeReason::IdleTimeout` in `mcap_archive.rs` — **FOUND**
 - `grep -rn "unimplemented!\|todo!" crates/roz-server/src/observability/` — **zero matches (PASS)**.
-- Env constant references: `ENV_MCAP_IDLE_TIMEOUT_SECS` in idle_monitor.rs — **FOUND**; `DEFAULT_MCAP_MAX_FILE_BYTES` in mcap_archive.rs — **FOUND**.
+- Env reads (plan success criterion): `std::env::var(ENV_MCAP_IDLE_TIMEOUT_SECS)` in `idle_monitor.rs` — **FOUND**; `std::env::var(ENV_MCAP_MAX_FILE_BYTES)` in `rollover.rs` — **FOUND**.
 
 ## Threat Surface Scan
 
@@ -232,8 +242,8 @@ None. No new network endpoints, auth paths, file-access patterns, or schema chan
 Files verified via `test -f`:
 
 - `crates/roz-server/src/observability/idle_monitor.rs` — **FOUND** (commit `d58f2b1`, 79 lines including tests)
-- `crates/roz-server/src/observability/rollover.rs` — **FOUND** (commit `d58f2b1`, 53 lines)
-- `crates/roz-server/src/observability/mcap_archive.rs` — **FOUND** (commit `d58f2b1`, ~530 lines)
+- `crates/roz-server/src/observability/rollover.rs` — **FOUND** (commits `d58f2b1` + `7472d71`, ~112 lines including tests)
+- `crates/roz-server/src/observability/mcap_archive.rs` — **FOUND** (commits `d58f2b1` + `7472d71`, ~535 lines)
 - `crates/roz-server/src/observability/mod.rs` — **FOUND** (with `pub mod idle_monitor;` + `pub mod rollover;`)
 - `crates/roz-server/src/main.rs` — **FOUND** (with `drain_active_writers` call on SIGTERM/ctrl_c)
 
@@ -241,16 +251,20 @@ Commits verified via `git log --oneline`:
 
 - `d58f2b1` — **FOUND** (feat(26-07): idle timeout + in-place rollover + drain_active_writers)
 - `86a76d9` — **FOUND** (feat(26-07): SIGTERM + ctrl_c drain of active MCAP writers in main.rs)
+- `7472d71` — **FOUND** (fix(26-07): honor ROZ_MCAP_MAX_FILE_BYTES env var)
 
 Invariants:
 
 - `grep -rn "unimplemented!\|todo!" crates/roz-server/src/observability/` → **zero matches (PASS)**.
 - `grep -q "pub fn idle_timeout_from_env" crates/roz-server/src/observability/idle_monitor.rs` → **PASS**.
+- `grep -q "pub fn max_file_bytes_from_env" crates/roz-server/src/observability/rollover.rs` → **PASS**.
 - `grep -q "pub async fn spawn_writer_at_rollover" crates/roz-server/src/observability/mcap_archive.rs` → **PASS**.
 - `grep -q "pub async fn drain_active_writers" crates/roz-server/src/observability/mcap_archive.rs` → **PASS**.
 - `grep -q "drain_active_writers" crates/roz-server/src/main.rs` → **PASS**.
 - `grep -q "tokio::signal" crates/roz-server/src/main.rs` → **PASS**.
 - `grep -q "FinalizeReason::IdleTimeout" crates/roz-server/src/observability/mcap_archive.rs` → **PASS**.
+- `std::env::var(ENV_MCAP_IDLE_TIMEOUT_SECS)` in `idle_monitor.rs` → **PASS**.
+- `std::env::var(ENV_MCAP_MAX_FILE_BYTES)` in `rollover.rs` → **PASS**.
 
 Build + lint + tests:
 
