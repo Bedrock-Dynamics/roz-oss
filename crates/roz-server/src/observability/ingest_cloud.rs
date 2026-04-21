@@ -250,7 +250,11 @@ fn envelope_timestamp_ns(ts: Option<&prost_types::Timestamp>) -> u64 {
 /// failures are logged at `debug` and the frame is skipped silently.
 ///
 /// `pub(crate)` so Plan 26-06 (edge-session ingest) can reuse this exact
-/// loop.
+/// loop. The D-12 edge path at
+/// [`crate::observability::ingest_edge::spawn_edge_ingestors`] calls this
+/// helper in parallel with its own `session.{worker}.{session}.response`
+/// fan-in task so the telemetry verify + decode + project pipeline stays
+/// single-sourced across cloud and edge origins.
 pub(crate) async fn spawn_session_telemetry_ingest(
     nats: &async_nats::Client,
     signing_gate: &Arc<crate::signing_gate::SigningGate>,

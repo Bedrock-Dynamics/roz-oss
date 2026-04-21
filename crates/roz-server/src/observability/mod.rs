@@ -15,6 +15,7 @@
 
 pub mod channels;
 pub mod ingest_cloud;
+pub mod ingest_edge;
 pub mod mcap_archive;
 pub mod projection;
 pub mod schema_registry;
