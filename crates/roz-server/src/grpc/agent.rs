@@ -1293,13 +1293,71 @@ async fn run_session_loop(
                                     host_name = %host.name,
                                     "routing session to edge worker"
                                 );
+
+                                // Phase 26 OBS-01 (D-12 edge path): spawn per-session MCAP
+                                // WriterActor + 3 fan-in producer tasks (edge session-response
+                                // NATS subscription, task lifecycle broadcast, signed
+                                // telemetry NATS). Symmetric with the cloud branch above;
+                                // populates sess.mcap_writer_tx + sess.mcap_cancel so the
+                                // unified finalize path at the end of run_session_loop
+                                // sends WriteCommand::Finalize and removes from
+                                // active_writers for both origins.
+                                match crate::observability::mcap_archive::spawn_writer(
+                                    mcap.mcap_dir.clone(),
+                                    sess.tenant_id,
+                                    sess.id,
+                                    mcap.schema_descriptors.clone(),
+                                    pool.clone(),
+                                    None, // uses DEFAULT_MCAP_MAX_FILE_BYTES
+                                )
+                                .await
+                                {
+                                    Ok(writer_tx) => {
+                                        if let Ok(mut guard) = mcap.active_writers.lock() {
+                                            guard.insert(sess.id, writer_tx.clone());
+                                        } else {
+                                            tracing::warn!(
+                                                session_id = %sess.id,
+                                                "MCAP active_writers lock poisoned; proceeding without registry entry"
+                                            );
+                                        }
+                                        let task_lifecycle_rx = mcap.task_lifecycle_sink.subscribe();
+                                        let cancel = crate::observability::ingest_edge::spawn_edge_ingestors(
+                                            sess.id,
+                                            sess.tenant_id,
+                                            host_uuid,
+                                            sess.worker_name.clone(),
+                                            &writer_tx,
+                                            task_lifecycle_rx,
+                                            nats,
+                                            &mcap.signing_gate,
+                                        );
+                                        sess.mcap_cancel = Some(cancel);
+                                        sess.mcap_writer_tx = Some(writer_tx);
+                                        tracing::info!(session_id = %sess.id, "MCAP edge writer + ingestors spawned");
+                                    }
+                                    Err(error) => {
+                                        tracing::error!(
+                                            %error,
+                                            session_id = %sess.id,
+                                            "failed to spawn MCAP writer for edge session; session continues without archive"
+                                        );
+                                    }
+                                }
+
                                 let bootstrap = sess
                                     .edge_mirror
                                     .clone()
                                     .expect("edge sessions must retain mirrored checkpoint state");
                                 run_edge_relay(tx, nats, &host.name, &sess.id.to_string(), bootstrap, inbound).await;
                                 relay_cancel.cancel();
-                                return; // session done
+                                // Fall through to the unified finalize block at the
+                                // bottom of run_session_loop — `break` the outer loop
+                                // so WriteCommand::Finalize is sent and active_writers
+                                // is cleaned up. Previously this path used `return`,
+                                // which skipped finalize entirely (pre-Phase-26 when
+                                // edge sessions had no MCAP archive).
+                                break;
                             }
                             Ok(None) => {
                                 send_error(tx, "not_found", "host not found for edge placement", false).await;
