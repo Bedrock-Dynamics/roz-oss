@@ -577,39 +577,17 @@ pub async fn spawn_telemetry_state_handler(nats: NatsClient, signing_gate: Arc<S
     tracing::info!(%subject, "telemetry state handler ready");
 
     while let Some(msg) = sub.next().await {
-        // 1. Structural pre-verify: headers present + roz-sig-v1 present.
-        //    Mirrors handle_worker_online_message lines 779-793.
-        let Some(headers) = msg.headers.as_ref() else {
-            tracing::warn!(subject = %msg.subject, "telemetry state: missing headers; dropping");
-            continue;
-        };
-        let Some(header_value) = headers.get(HEADER_NAME) else {
-            tracing::warn!(subject = %msg.subject, "telemetry state: missing roz-sig-v1 header; dropping");
-            continue;
-        };
-        let envelope = match SignatureEnvelope::decode_header(header_value.as_str()) {
+        // 1 + 2: structural pre-verify (headers + roz-sig-v1) + full gate
+        //        (signature + cache + replay + DB advance). Factored into
+        //        `verify_telemetry_inbound` so Plan 26-05's per-session
+        //        MCAP ingest can reuse the exact same path.
+        let envelope = match verify_telemetry_inbound(&signing_gate, msg.headers.as_ref(), &msg.payload).await {
             Ok(env) => env,
-            Err(e) => {
-                tracing::warn!(error = %e, subject = %msg.subject, "telemetry state: decode_header failed; dropping");
+            Err(reason) => {
+                tracing::warn!(subject = %msg.subject, reason = %reason, "telemetry state: dropped");
                 continue;
             }
         };
-
-        // 2. Full gate: signature + cache + replay + DB advance. Context is
-        //    derived from the envelope's own tenant/host — verify_inbound
-        //    binds those to the DB-trusted device key, so the cross-host
-        //    check from 23-06 remains non-tautological.
-        let ctx = crate::signing_gate::InboundContext {
-            tenant_id: envelope.fields.tenant_id,
-            host_id: envelope.fields.host_id,
-        };
-        if let Err(e) = signing_gate
-            .verify_inbound(msg.headers.as_ref(), &msg.payload, ctx)
-            .await
-        {
-            tracing::warn!(error = %e, subject = %msg.subject, "telemetry state: verify_inbound failed; dropping");
-            continue;
-        }
 
         // 3. Parse worker_id from subject. Use the subject (not the
         //    envelope) because the dedup map is keyed by the worker's
@@ -633,6 +611,45 @@ pub async fn spawn_telemetry_state_handler(nats: NatsClient, signing_gate: Arc<S
     }
 
     tracing::info!(%subject, "telemetry state handler exiting");
+}
+
+/// Shared verify helper for inbound telemetry frames.
+///
+/// Factored out of [`spawn_telemetry_state_handler`] so the Phase 26 cloud
+/// MCAP ingestor in `crate::observability::ingest_cloud::spawn_session_telemetry_ingest`
+/// can re-invoke the identical verification path without duplicating the
+/// header-parse + `SigningGate::verify_inbound` logic. T-26-50 mitigation
+/// depends on this helper being the single source of truth.
+///
+/// Sequence:
+/// 1. Headers present + `roz-sig-v1` entry present.
+/// 2. Decode the `SignatureEnvelope` from the header string.
+/// 3. Call [`SigningGate::verify_inbound`] with the envelope's
+///    `(tenant_id, host_id)` derived context.
+///
+/// # Errors
+///
+/// Returns the rejection reason as a `&'static str`; callers log + drop the
+/// frame.
+pub(crate) async fn verify_telemetry_inbound(
+    signing_gate: &SigningGate,
+    headers: Option<&async_nats::HeaderMap>,
+    payload: &[u8],
+) -> Result<SignatureEnvelope, &'static str> {
+    let hdr_map = headers.ok_or("missing headers")?;
+    let header_value = hdr_map.get(HEADER_NAME).ok_or("missing roz-sig-v1 header")?;
+    let envelope = SignatureEnvelope::decode_header(header_value.as_str()).map_err(|_| "decode_header failed")?;
+
+    let ctx = crate::signing_gate::InboundContext {
+        tenant_id: envelope.fields.tenant_id,
+        host_id: envelope.fields.host_id,
+    };
+    signing_gate
+        .verify_inbound(headers, payload, ctx)
+        .await
+        .map_err(|_| "verify_inbound failed")?;
+
+    Ok(envelope)
 }
 
 #[cfg(test)]

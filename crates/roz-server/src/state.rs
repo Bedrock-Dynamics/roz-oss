@@ -123,7 +123,10 @@ pub struct AppState {
     /// active-session entries is negligible and never on the hot write path.
     pub active_writers: Arc<
         std::sync::Mutex<
-            std::collections::HashMap<Uuid, tokio::sync::mpsc::Sender<crate::observability::mcap_archive::WriteCommand>>,
+            std::collections::HashMap<
+                Uuid,
+                tokio::sync::mpsc::Sender<crate::observability::mcap_archive::WriteCommand>,
+            >,
         >,
     >,
     /// Phase 26 OBS-01: broadcast sink for `TaskLifecycleEvent`.

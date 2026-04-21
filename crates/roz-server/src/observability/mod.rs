@@ -14,6 +14,7 @@
 //!   * `export`          — time-range seek + gRPC streaming (Wave 7)
 
 pub mod channels;
+pub mod ingest_cloud;
 pub mod mcap_archive;
 pub mod projection;
 pub mod schema_registry;
