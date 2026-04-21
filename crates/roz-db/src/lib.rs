@@ -10,6 +10,7 @@ pub mod embodiments;
 pub mod environments;
 pub mod hosts;
 pub mod leases;
+pub mod mcap_archives;
 pub mod mcp_servers;
 pub mod message_feedback;
 pub mod model_endpoints;
