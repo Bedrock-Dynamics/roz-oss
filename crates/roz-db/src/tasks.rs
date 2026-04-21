@@ -1,4 +1,54 @@
+use std::sync::Arc;
+
 use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// Phase 26 OBS-01: task-lifecycle emit helpers
+// ---------------------------------------------------------------------------
+
+/// Phase 26 OBS-01: structured data for a task status transition.
+///
+/// roz-server wraps this into a proto `TaskLifecycleEvent` at emit time.
+/// Kept local to roz-db to avoid a cyclic `roz-db → roz-server` dependency
+/// (the proto types live under `roz-server::grpc::roz_v1`). The roz-server
+/// side builds a closure that translates this into a proto event and calls
+/// `broadcast::Sender::send`.
+#[derive(Debug, Clone)]
+pub struct TaskLifecycleData {
+    /// The task whose status just transitioned.
+    pub task_id: Uuid,
+    /// Wall-clock timestamp captured at emit time (post-UPDATE).
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Previous `roz_tasks.status` value, read in the same executor before the UPDATE.
+    pub prev_status: String,
+    /// New `roz_tasks.status` value (or run-level `status` when the task status is unchanged).
+    pub new_status: String,
+    /// Optional failure / cancellation reason. For run-level companions this is the run's `error_message`.
+    pub reason: Option<String>,
+    /// Optional actor identity that caused the transition (e.g. "user:{uuid}", "system:timeout").
+    pub actor: Option<String>,
+}
+
+/// Erased lifecycle emitter. roz-server wraps its `TaskLifecycleSink` in
+/// an `Arc<dyn Fn ...>` so the DB layer need not name any roz-server or
+/// proto types. Clone-cheap; callers pass `&emit` by reference.
+pub type TaskLifecycleEmit = Arc<dyn Fn(TaskLifecycleData) + Send + Sync>;
+
+/// Read the current `roz_tasks.status` for a task before an UPDATE so the
+/// lifecycle companion helpers can report a `prev_status` value to subscribers.
+///
+/// Returns `None` if the task row does not exist (caller should skip emit in
+/// that case since there is no transition to report).
+pub(crate) async fn read_task_prev_status<'e, E>(executor: E, task_id: Uuid) -> Result<Option<String>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let row: Option<(String,)> = sqlx::query_as("SELECT status FROM roz_tasks WHERE id = $1")
+        .bind(task_id)
+        .fetch_optional(executor)
+        .await?;
+    Ok(row.map(|(s,)| s))
+}
 
 // ---------------------------------------------------------------------------
 // Row types
@@ -286,6 +336,161 @@ where
     .bind(error_message)
     .fetch_optional(executor)
     .await
+}
+
+// ---------------------------------------------------------------------------
+// Phase 26 OBS-01: lifecycle-emitting companion helpers
+// ---------------------------------------------------------------------------
+
+/// Phase 26 OBS-01 companion to [`update_status`].
+///
+/// Reads the previous `roz_tasks.status` value, runs the legacy UPDATE SQL
+/// verbatim, then emits a [`TaskLifecycleData`] on `emit` when the row
+/// exists and the status actually transitioned (`prev_status != new_status`).
+///
+/// The prev-read and the UPDATE share a single `&PgPool` for simplicity — per
+/// Phase 26 threat register T-26-81, a racy concurrent UPDATE between the
+/// read and write is acceptable for lifecycle reporting. The archive is
+/// best-effort; the authoritative state is the row itself.
+pub async fn update_status_with_lifecycle_emit(
+    pool: &sqlx::PgPool,
+    id: Uuid,
+    status: &str,
+    reason: Option<&str>,
+    actor: Option<&str>,
+    emit: &TaskLifecycleEmit,
+) -> Result<Option<TaskRow>, sqlx::Error> {
+    let prev_status = read_task_prev_status(pool, id).await?;
+
+    // Legacy update_status SQL verbatim.
+    let row = sqlx::query_as::<_, TaskRow>(
+        "UPDATE roz_tasks \
+         SET status     = $2, \
+             updated_at = now() \
+         WHERE id = $1 \
+         RETURNING *",
+    )
+    .bind(id)
+    .bind(status)
+    .fetch_optional(pool)
+    .await?;
+
+    if let (Some(prev), Some(new_row)) = (prev_status.as_ref(), row.as_ref())
+        && prev != status
+    {
+        (emit)(TaskLifecycleData {
+            task_id: new_row.id,
+            timestamp: chrono::Utc::now(),
+            prev_status: prev.clone(),
+            new_status: status.to_string(),
+            reason: reason.map(String::from),
+            actor: actor.map(String::from),
+        });
+    }
+    Ok(row)
+}
+
+/// Phase 26 OBS-01 companion to [`complete_run`].
+///
+/// Runs the legacy `UPDATE roz_task_runs` SQL verbatim and, when the status
+/// transitioned at the task level (pre-read prev_status != new status),
+/// emits a [`TaskLifecycleData`]. Callers pass `task_id` explicitly so the
+/// prev-read can look up the owning task — the legacy `complete_run`
+/// signature only carries `run_id`.
+///
+/// The run's `error_message` is surfaced as `TaskLifecycleData.reason` so
+/// downstream consumers see the failure detail. `actor` is `None` at this
+/// boundary since legacy `complete_run` has no actor parameter; callers
+/// that know the actor should use `update_status_with_lifecycle_emit` instead.
+pub async fn complete_run_with_lifecycle_emit(
+    pool: &sqlx::PgPool,
+    run_id: Uuid,
+    task_id: Uuid,
+    status: &str,
+    error_message: Option<&str>,
+    emit: &TaskLifecycleEmit,
+) -> Result<Option<TaskRunRow>, sqlx::Error> {
+    let prev_status = read_task_prev_status(pool, task_id).await?;
+
+    // Legacy complete_run SQL verbatim — only updates roz_task_runs.
+    let run_row = sqlx::query_as::<_, TaskRunRow>(
+        "UPDATE roz_task_runs \
+         SET status        = $2, \
+             completed_at  = now(), \
+             error_message = $3 \
+         WHERE id = $1 \
+         RETURNING *",
+    )
+    .bind(run_id)
+    .bind(status)
+    .bind(error_message)
+    .fetch_optional(pool)
+    .await?;
+
+    if let (Some(prev), Some(_)) = (prev_status.as_ref(), run_row.as_ref())
+        && prev != status
+    {
+        (emit)(TaskLifecycleData {
+            task_id,
+            timestamp: chrono::Utc::now(),
+            prev_status: prev.clone(),
+            new_status: status.to_string(),
+            reason: error_message.map(String::from),
+            actor: None,
+        });
+    }
+    Ok(run_row)
+}
+
+/// Phase 26 OBS-01 companion to [`complete_active_run_for_task`].
+///
+/// Runs the legacy `UPDATE roz_task_runs` SQL verbatim (targeting the most
+/// recent unfinished run for `task_id`), reads the task-level prev_status
+/// first, and emits a [`TaskLifecycleData`] when the status changed.
+///
+/// As with [`complete_run_with_lifecycle_emit`], `error_message` is surfaced
+/// as the lifecycle `reason` and `actor` is `None` (the legacy function
+/// carries neither).
+pub async fn complete_active_run_for_task_with_lifecycle_emit(
+    pool: &sqlx::PgPool,
+    task_id: Uuid,
+    status: &str,
+    error_message: Option<&str>,
+    emit: &TaskLifecycleEmit,
+) -> Result<Option<TaskRunRow>, sqlx::Error> {
+    let prev_status = read_task_prev_status(pool, task_id).await?;
+
+    // Legacy complete_active_run_for_task SQL verbatim.
+    let run_row = sqlx::query_as::<_, TaskRunRow>(
+        "UPDATE roz_task_runs \
+         SET status = $2, completed_at = now(), error_message = $3 \
+         WHERE id = (
+             SELECT id FROM roz_task_runs
+             WHERE task_id = $1 AND completed_at IS NULL
+             ORDER BY started_at DESC
+             LIMIT 1
+         ) \
+         RETURNING *",
+    )
+    .bind(task_id)
+    .bind(status)
+    .bind(error_message)
+    .fetch_optional(pool)
+    .await?;
+
+    if let (Some(prev), Some(_)) = (prev_status.as_ref(), run_row.as_ref())
+        && prev != status
+    {
+        (emit)(TaskLifecycleData {
+            task_id,
+            timestamp: chrono::Utc::now(),
+            prev_status: prev.clone(),
+            new_status: status.to_string(),
+            reason: error_message.map(String::from),
+            actor: None,
+        });
+    }
+    Ok(run_row)
 }
 
 // ---------------------------------------------------------------------------
@@ -796,5 +1001,185 @@ mod tests {
             .execute(&pool)
             .await
             .ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 26 OBS-01: lifecycle-emit helper coverage
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn update_status_with_lifecycle_emit_fires_on_transition() {
+        use std::sync::Mutex;
+
+        let pool = setup().await;
+        let tenant_id = create_test_tenant(&pool).await;
+        let env_id = create_test_environment(&pool, tenant_id).await;
+
+        let task = create(
+            &pool,
+            tenant_id,
+            "lifecycle-emit",
+            env_id,
+            None,
+            serde_json::json!([]),
+            None,
+        )
+        .await
+        .expect("create task");
+        assert_eq!(task.status, "pending");
+
+        let captured: Arc<Mutex<Vec<TaskLifecycleData>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let emit: TaskLifecycleEmit = Arc::new(move |data| {
+            captured_clone.lock().expect("mutex poisoned").push(data);
+        });
+
+        let updated = update_status_with_lifecycle_emit(
+            &pool,
+            task.id,
+            "running",
+            Some("worker accepted"),
+            Some("system:dispatch"),
+            &emit,
+        )
+        .await
+        .expect("update_status_with_lifecycle_emit")
+        .expect("row exists");
+        assert_eq!(updated.status, "running");
+
+        let events = captured.lock().expect("mutex poisoned").clone();
+        assert_eq!(events.len(), 1, "expected exactly one lifecycle event");
+        let evt = &events[0];
+        assert_eq!(evt.task_id, task.id);
+        assert_eq!(evt.prev_status, "pending");
+        assert_eq!(evt.new_status, "running");
+        assert_eq!(evt.reason.as_deref(), Some("worker accepted"));
+        assert_eq!(evt.actor.as_deref(), Some("system:dispatch"));
+    }
+
+    #[tokio::test]
+    async fn update_status_with_lifecycle_emit_skips_identity_transition() {
+        use std::sync::Mutex;
+
+        let pool = setup().await;
+        let tenant_id = create_test_tenant(&pool).await;
+        let env_id = create_test_environment(&pool, tenant_id).await;
+
+        let task = create(
+            &pool,
+            tenant_id,
+            "identity-transition",
+            env_id,
+            None,
+            serde_json::json!([]),
+            None,
+        )
+        .await
+        .expect("create task");
+
+        let captured: Arc<Mutex<Vec<TaskLifecycleData>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let emit: TaskLifecycleEmit = Arc::new(move |data| {
+            captured_clone.lock().expect("mutex poisoned").push(data);
+        });
+
+        // Transition to the same status — should not emit.
+        let _ = update_status_with_lifecycle_emit(&pool, task.id, "pending", None, None, &emit)
+            .await
+            .expect("no-op update");
+        let events = captured.lock().expect("mutex poisoned").clone();
+        assert!(events.is_empty(), "identity transition should not emit, got {events:?}");
+    }
+
+    #[tokio::test]
+    async fn complete_run_with_lifecycle_emit_reports_error_message_as_reason() {
+        use std::sync::Mutex;
+
+        let pool = setup().await;
+        let tenant_id = create_test_tenant(&pool).await;
+        let env_id = create_test_environment(&pool, tenant_id).await;
+
+        let task = create(
+            &pool,
+            tenant_id,
+            "complete-run-emit",
+            env_id,
+            None,
+            serde_json::json!([]),
+            None,
+        )
+        .await
+        .expect("create task");
+        let run = create_run(&pool, task.id, None).await.expect("create run");
+
+        let captured: Arc<Mutex<Vec<TaskLifecycleData>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let emit: TaskLifecycleEmit = Arc::new(move |data| {
+            captured_clone.lock().expect("mutex poisoned").push(data);
+        });
+
+        let completed = complete_run_with_lifecycle_emit(&pool, run.id, task.id, "failed", Some("motor stall"), &emit)
+            .await
+            .expect("complete_run_with_lifecycle_emit")
+            .expect("run row");
+        assert_eq!(completed.status, "failed");
+
+        let events = captured.lock().expect("mutex poisoned").clone();
+        assert_eq!(events.len(), 1);
+        let evt = &events[0];
+        assert_eq!(evt.task_id, task.id);
+        assert_eq!(evt.prev_status, "pending", "task-level prev_status");
+        assert_eq!(evt.new_status, "failed");
+        assert_eq!(evt.reason.as_deref(), Some("motor stall"));
+        assert!(evt.actor.is_none());
+    }
+
+    #[tokio::test]
+    async fn complete_active_run_for_task_with_lifecycle_emit_fires() {
+        use std::sync::Mutex;
+
+        let pool = setup().await;
+        let tenant_id = create_test_tenant(&pool).await;
+        let env_id = create_test_environment(&pool, tenant_id).await;
+        let host_id = create_test_host(&pool, tenant_id).await;
+
+        let task = create(
+            &pool,
+            tenant_id,
+            "complete-active-emit",
+            env_id,
+            None,
+            serde_json::json!([]),
+            None,
+        )
+        .await
+        .expect("create task");
+        let mut conn = pool.acquire().await.expect("acquire conn");
+        let _run = ensure_active_run(&mut *conn, task.id, Some(host_id))
+            .await
+            .expect("ensure active run");
+        drop(conn);
+
+        let captured: Arc<Mutex<Vec<TaskLifecycleData>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_clone = captured.clone();
+        let emit: TaskLifecycleEmit = Arc::new(move |data| {
+            captured_clone.lock().expect("mutex poisoned").push(data);
+        });
+
+        let completed =
+            complete_active_run_for_task_with_lifecycle_emit(&pool, task.id, "timed_out", Some("timed out"), &emit)
+                .await
+                .expect("complete_active_run_for_task_with_lifecycle_emit")
+                .expect("run row");
+        assert_eq!(completed.status, "timed_out");
+
+        let events = captured.lock().expect("mutex poisoned").clone();
+        assert_eq!(events.len(), 1);
+        let evt = &events[0];
+        assert_eq!(evt.task_id, task.id);
+        assert_eq!(evt.prev_status, "pending");
+        assert_eq!(evt.new_status, "timed_out");
+        assert_eq!(evt.reason.as_deref(), Some("timed out"));
+        assert!(evt.actor.is_none());
     }
 }
