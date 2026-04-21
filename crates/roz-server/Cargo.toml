@@ -93,3 +93,12 @@ tempfile = { workspace = true }
 
 [lints]
 workspace = true
+
+# Phase 26 Plan 26-11 — SC5 fixture imports `emit_session_event_for_tests`,
+# which is gated behind the `test-helpers` feature. Declaring
+# `required-features` tells cargo to skip this test target when the feature
+# is not enabled (so `cargo clippy -p roz-server --all-targets -- -D warnings`
+# is clean without the flag, matching the workspace CI pattern).
+[[test]]
+name = "export_roundtrip"
+required-features = ["test-helpers"]
