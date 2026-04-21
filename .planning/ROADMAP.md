@@ -161,7 +161,7 @@ Plans:
 - [ ] 25-15-PLAN.md (DEFERRED to Phase 27 SC5/SC6/SC7) — Wave 6: MAV-03 readiness fixtures — 6 `.tlog` files (ready/not_ready/degraded × PX4/ArduPilot) + `ReadinessBuilder` replay harness with exact-field-value assertions
 - [x] 25-16-PLAN.md — Wave 6: MAV-01 SC5 QGC coexistence integration test (signed + unsigned variants on shared UDP port) + `docs/mavlink-coexistence.md` runbook (companion-ID table, link-ID allocation, port footgun, signing posture, known limitations)
 
-### Phase 26: Unified MCAP observability with Foxglove-native schema projection
+### Phase 26: Unified MCAP observability with Foxglove-native schema projection — COMPLETE 2026-04-21 (12/12 plans)
 
 **Goal**: Operators open a single MCAP file per session in Foxglove Studio and see a unified 3D + timeline view of the drone's pose, frames, session events, task lifecycle, and tool calls — with no plugin install and no duplicate data on disk.
 **Depends on**: Phase 24 (task-lifecycle + session events must be stable; telemetry frames flow reliably)
@@ -172,7 +172,19 @@ Plans:
   3. roz-semantic channels are registered with their existing roz protobuf schemas: `/roz/session/events` (SessionEvent), `/roz/task/lifecycle` (TaskLifecycleEvent), `/roz/tool/calls` (tool-call envelope); MCAP `schemaEncoding = protobuf` throughout; Foxglove-schema channels register Foxglove's published schemas sourced from `foxglove-schemas-protobuf`.
   4. A fresh Foxglove Studio install opens a roz MCAP and renders the three panels via stock Foxglove panels — Log panel on `/roz/log`, Raw Messages on the three roz-semantic channels, 3D on `/tf` + `/roz/telemetry/pose` — with no custom schema plugin and no custom panel code. Operator may configure panel layout manually once.
   5. `roz session export <session_id> --format mcap` CLI + matching gRPC endpoint stream a valid MCAP to disk or stdout with incremental time-range seek; scripted 30 s fixture session (1500 telemetry frames + 20 tool calls + 5 approvals) round-trips through export, re-reads cleanly via the `mcap` crate, and loads in Foxglove Studio.
-**Plans**: TBD
+**Plans**:
+- [x] 26-01-PLAN.md — Wave 1: vendor Foxglove proto schemas + `proto/roz/v1/observability.proto` (TaskLifecycleEvent + ToolCallEvent) + `build.rs` wiring
+- [x] 26-02-PLAN.md — Wave 1: `roz_session_mcap_archives` migration (D-01/D-06) + `crates/roz-db/src/mcap_archives.rs` CRUD module
+- [x] 26-03-PLAN.md — Wave 2: `observability/` module skeleton + `projection.rs` (quaternion reorder + pose + log-summary formatter) + `schema_registry.rs` (descriptor cache)
+- [x] 26-04-PLAN.md — Wave 3: per-session `WriterActor` (single-owner tokio task + mpsc) + 6-channel up-front registration + `TaskLifecycleSink` broadcast
+- [x] 26-05-PLAN.md — Wave 4: cloud-session ingestors fanning session events + telemetry + task-lifecycle into WriterActor; AppState extension with `active_writers`/`task_lifecycle_sink`/`schema_descriptors`
+- [x] 26-06-PLAN.md — Wave 5: D-12 edge-session ingestion via `EdgeSessionMirror` NATS relay; shared `active_writers` registry
+- [x] 26-07-PLAN.md — Wave 6: idle-timeout finalize + in-place rollover + SIGTERM/ctrl_c bounded drain of active MCAP writers
+- [x] 26-08-PLAN.md — Wave 6: TaskLifecycleEvent emit at 3 `roz_tasks.status` UPDATE sites + re-routed call sites through `*_with_lifecycle_emit` companions (&mut PgConnection for tx visibility)
+- [x] 26-09-PLAN.md — Wave 7: `ObservabilityService.ExportSession` gRPC + `roz session export` CLI with time-range seek + tenant-scope authz at handler boundary (OBS-03)
+- [x] 26-10-PLAN.md — Wave 8: D-04 startup recovery via `mcap::read::Options::IgnoreEndMagic` + D-02 retention sweeper (size cap + TTL + FIFO drop-oldest)
+- [x] 26-11-PLAN.md — Wave 9: SC5 integration test (30 s fixture round-trip + quaternion decode assertion) + export-roundtrip test + D-10 ROADMAP SC4 + REQUIREMENTS OBS-02 amendments
+- [x] 26-12-PLAN.md — Wave 10: worker telemetry wire-format migration from JSON to prost `roz.v1.TelemetryUpdate` (closes OBS-01 production-data gap for `/tf` + `/roz/telemetry/pose`)
 
 ### Phase 27: Nightly PX4 SITL integration CI with induced NATS outage + live-FCU task-layer wiring
 
@@ -218,6 +230,6 @@ v3.0 Production Robotics milestone is in the planning stage. Phase 22 is planned
 | 23. Signed dispatch | v3.0 | 0/0 | Not started | — |
 | 24. Edge safety + WAL resilience | v3.0 | 9/13 | Gap closure (4 new plans 24-10..24-13) | — |
 | 25. Native MAVLink backend | v3.0 | 0/16 | Plans drafted 2026-04-19 | — |
-| 26. Unified MCAP observability | v3.0 | 0/0 | Not started | — |
+| 26. Unified MCAP observability | v3.0 | 12/12 | Complete | 2026-04-21 |
 | 27. Nightly PX4 SITL CI | v3.0 | 0/0 | Not started | — |
 | 28. HITL docs + Pixhawk quickstart | v3.0 | 0/0 | Not started | — |
