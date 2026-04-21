@@ -9,6 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "../../proto/roz/v1/agent.proto",
                 "../../proto/roz/v1/embodiment.proto",
                 "../../proto/roz/v1/skills.proto",
+                "../../proto/roz/v1/observability.proto", // Phase 26 OBS-03
             ],
             &["../../proto"],
         )?;

@@ -132,6 +132,8 @@ pub enum Commands {
     Trigger(commands::trigger::TriggerArgs),
     /// Scheduled task management.
     Schedule(commands::schedule::ScheduleArgs),
+    /// Session archive export (Phase 26 OBS-03).
+    Session(commands::session::SessionArgs),
     /// Skill management.
     Skill(commands::skill::SkillArgs),
     /// Stream management.
