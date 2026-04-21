@@ -531,6 +531,36 @@ async fn main() {
         mcap_dir,
     };
 
+    // Phase 26 OBS-01 D-04: startup recovery for partial MCAP archives.
+    //
+    // Scans `roz_session_mcap_archives` for `status='open'` rows left by a
+    // prior crash / SIGKILL, reads each partial via
+    // `mcap::read::Options::IgnoreEndMagic`, copy-streams surviving
+    // messages into a fresh Writer, atomic-renames over the original, and
+    // transitions the row to `status='recovered_incomplete'`. Per-row
+    // best-effort — a single row's failure logs `error!` and boot
+    // continues (RESEARCH §Pitfall 3 + threat T-26-103).
+    //
+    // Insertion site note (Waves 6/7/8 coexistence): this runs BEFORE
+    // `axum::serve` at the end of `main`. 26-07 installs its SIGTERM
+    // drain site at the terminal `tokio::select!` AFTER serve; 26-09
+    // installs `ObservabilityService` in `grpc_router` (a distinct
+    // function). All three sites are non-overlapping.
+    match roz_server::observability::recovery::recover_all_open_archives(&state.pool, &state.mcap_dir).await {
+        Ok(n) => tracing::info!(recovered = n, "MCAP startup recovery complete"),
+        Err(error) => tracing::error!(%error, "MCAP startup recovery failed (continuing boot)"),
+    }
+
+    // Phase 26 OBS-01 D-02: retention sweeper.
+    //
+    // Periodic 5-min FIFO sweeper: TTL pass drops rows older than
+    // `ROZ_MCAP_TTL_SECS` (default 7 days); size-cap pass drops oldest
+    // non-open rows until total bytes <= `ROZ_MCAP_MAX_BYTES` (default
+    // 10 GB). The CancellationToken is held for the process lifetime;
+    // process exit reaps the task implicitly. Retention is non-durable,
+    // so a missed tick at shutdown is automatically retried on next boot.
+    let _retention_cancel = roz_server::observability::retention::spawn_retention_sweeper(state.pool.clone());
+
     // Spawn internal NATS request-reply handlers (e.g. spawn_worker tool bypass).
     if let Some(nats) = &state.nats_client {
         // Phase 23 Plan 23-10 (FS-04): internal spawn handler signs the
