@@ -1357,6 +1357,8 @@ async fn publish_session_event(
         parent_event_id: None,
         timestamp: chrono::Utc::now(),
         event,
+        trace_id: None,
+        span_id: None,
     };
     publish_event_envelope(
         nats,

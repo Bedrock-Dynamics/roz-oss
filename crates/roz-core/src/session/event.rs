@@ -59,6 +59,14 @@ pub struct EventEnvelope {
     pub parent_event_id: Option<EventId>,
     pub timestamp: DateTime<Utc>,
     pub event: SessionEvent,
+    /// Phase 26.3 D-10: W3C trace context. `None` on legacy pre-26.3 envelopes or
+    /// when no OTel context was active at emit time. Populated in
+    /// `emit_session_event` via `Span::current()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<[u8; 16]>,
+    /// Phase 26.3 D-10: W3C span_id. See `trace_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_id: Option<[u8; 8]>,
 }
 
 /// Canonical transport envelope for session events over non-proto transports.
@@ -75,6 +83,13 @@ pub struct CanonicalSessionEventEnvelope {
     pub timestamp: DateTime<Utc>,
     pub event_type: String,
     pub event_payload: serde_json::Value,
+    /// Phase 26.3 D-11: W3C trace context mirror of `EventEnvelope.trace_id`.
+    /// `None` on legacy pre-26.3 envelopes or when no OTel context was active at emit time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<[u8; 16]>,
+    /// Phase 26.3 D-11: W3C span_id mirror. See `trace_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_id: Option<[u8; 8]>,
 }
 
 impl CanonicalSessionEventEnvelope {
@@ -88,6 +103,8 @@ impl CanonicalSessionEventEnvelope {
             event_type: canonical_event_type_name(&envelope.event).to_string(),
             event_payload: serde_json::to_value(&envelope.event)
                 .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::default())),
+            trace_id: envelope.trace_id,
+            span_id: envelope.span_id,
         }
     }
 
@@ -109,6 +126,8 @@ impl CanonicalSessionEventEnvelope {
             parent_event_id: self.parent_event_id.map(EventId),
             timestamp: self.timestamp,
             event,
+            trace_id: self.trace_id,
+            span_id: self.span_id,
         })
     }
 }
@@ -481,6 +500,8 @@ mod tests {
             parent_event_id: None,
             timestamp: Utc::now(),
             event,
+            trace_id: None,
+            span_id: None,
         }
     }
 
@@ -648,6 +669,8 @@ mod tests {
                 tool_name: "move_joint".into(),
                 result_summary: "success".into(),
             },
+            trace_id: None,
+            span_id: None,
         };
         let json = serde_json::to_string(&env).unwrap();
         let back: EventEnvelope = serde_json::from_str(&json).unwrap();
@@ -703,6 +726,8 @@ mod tests {
                 content: "hello".into(),
             })
             .unwrap(),
+            trace_id: None,
+            span_id: None,
         };
 
         let error = canonical

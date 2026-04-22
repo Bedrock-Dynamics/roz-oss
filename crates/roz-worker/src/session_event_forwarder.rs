@@ -39,6 +39,8 @@ pub fn spawn_session_event_forwarder(
                 parent_event_id: None,
                 timestamp: chrono::Utc::now(),
                 event,
+                trace_id: None,
+                span_id: None,
             };
             // Best-effort; broadcast drops frames when no receivers exist.
             let _ = broadcast_tx.send(envelope);

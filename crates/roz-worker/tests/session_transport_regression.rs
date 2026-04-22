@@ -179,6 +179,8 @@ fn canonical_envelope() -> EventEnvelope {
         parent_event_id: None,
         timestamp: DateTime::from_timestamp(1_767_225_600, 0).unwrap(), // 2026-01-01T00:00:00Z
         event: SessionEvent::TurnStarted { turn_index: 7 },
+        trace_id: None,
+        span_id: None,
     }
 }
 

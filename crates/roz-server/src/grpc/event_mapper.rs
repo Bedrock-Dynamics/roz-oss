@@ -500,8 +500,10 @@ fn event_envelope_proto(envelope: &EventEnvelope) -> roz_v1::SessionEventEnvelop
         timestamp: Some(timestamp_to_proto(envelope.timestamp)),
         event_type: event_to_proto_type(&envelope.event).to_string(),
         typed_event: typed_event_proto(&envelope.event),
-        trace_id: Vec::new(), // Phase 26.3 Plan 03 replaces with envelope.trace_id.
-        span_id: Vec::new(),
+        // Phase 26.3 D-15: copy W3C trace context bytes into proto. `None` →
+        // empty Vec (proto-3 default; decoders treat as "field unset").
+        trace_id: envelope.trace_id.map(|b| b.to_vec()).unwrap_or_default(),
+        span_id: envelope.span_id.map(|b| b.to_vec()).unwrap_or_default(),
     }
 }
 
@@ -518,8 +520,11 @@ fn canonical_json_envelope_proto(envelope: &CanonicalSessionEventEnvelope) -> ro
         timestamp: Some(timestamp_to_proto(envelope.timestamp)),
         event_type: envelope.event_type.clone(),
         typed_event,
-        trace_id: Vec::new(), // Phase 26.3 Plan 03 replaces with envelope.trace_id.
-        span_id: Vec::new(),
+        // Phase 26.3 D-15: copy W3C trace context bytes from canonical envelope
+        // into proto. `None` → empty Vec (proto-3 default; decoders treat as
+        // "field unset").
+        trace_id: envelope.trace_id.map(|b| b.to_vec()).unwrap_or_default(),
+        span_id: envelope.span_id.map(|b| b.to_vec()).unwrap_or_default(),
     }
 }
 
@@ -549,6 +554,8 @@ pub fn canonical_session_event_to_response(
         parent_event_id: None,
         timestamp: Utc::now(),
         event,
+        trace_id: None,
+        span_id: None,
     };
     canonical_event_envelope_to_session_response(&envelope)
 }
@@ -1222,6 +1229,8 @@ mod tests {
                 message: "busy".into(),
                 retryable: false,
             },
+            trace_id: None,
+            span_id: None,
         };
 
         match event_envelope_to_session_response(&envelope) {

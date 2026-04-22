@@ -33,6 +33,28 @@ use crate::observability::mcap_archive::{ChannelKey, WriteCommand};
 use crate::observability::projection::{self, LogLevel};
 use crate::observability::task_lifecycle::TaskLifecycleReceiver;
 
+/// Phase 26.3 D-12: read `Span::current()` OTel context via the shared roz-core
+/// helper; if valid, clone the envelope and stamp `trace_id` / `span_id` bytes.
+/// Returns `None` when no active OTel context (helper returned empty vecs).
+///
+/// The `TryInto<[u8; N]>` path is safer than `unwrap()` — if the helper ever
+/// returns a wrong-length vec (cannot happen today but future-proofs) the
+/// wrapper silently falls back to "no stamp" instead of panicking.
+fn stamp_trace_context(
+    src: &roz_core::session::event::EventEnvelope,
+) -> Option<roz_core::session::event::EventEnvelope> {
+    let (trace_bytes, span_bytes) = roz_core::observability::trace_bytes_from_current_span();
+    if trace_bytes.is_empty() {
+        return None;
+    }
+    let trace_id: [u8; 16] = trace_bytes.as_slice().try_into().ok()?;
+    let span_id: [u8; 8] = span_bytes.as_slice().try_into().ok()?;
+    let mut out = src.clone();
+    out.trace_id = Some(trace_id);
+    out.span_id = Some(span_id);
+    Some(out)
+}
+
 /// Spawn the three cloud-side producer tasks against a `WriterActor` sender.
 ///
 /// Returns a [`CancellationToken`] the caller triggers when the session ends
@@ -133,6 +155,15 @@ pub(crate) async fn emit_session_event(
     tx: &mpsc::Sender<WriteCommand>,
     envelope: &roz_core::session::event::EventEnvelope,
 ) {
+    // Phase 26.3 D-12: one-touch trace stamping. Re-bind the `envelope` name to
+    // either the stamped clone (if an OTel context is active) or the original
+    // borrow. Every `envelope` reference below (including the
+    // `encode_session_event_proto` call) automatically picks up the stamped
+    // version, which propagates trace_id/span_id into the MCAP proto bytes via
+    // `event_envelope_proto`.
+    let stamped = stamp_trace_context(envelope);
+    let envelope: &roz_core::session::event::EventEnvelope = stamped.as_ref().unwrap_or(envelope);
+
     let now_ns = now_wall_clock_ns();
     let level = log_level_for_event(envelope);
     let summary = format!("{envelope:?}");
@@ -471,6 +502,8 @@ mod tests {
             parent_event_id: None,
             timestamp: Utc::now(),
             event,
+            trace_id: None,
+            span_id: None,
         }
     }
 
