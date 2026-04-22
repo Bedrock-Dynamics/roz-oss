@@ -13,7 +13,13 @@ authors.workspace      = true
 # traffic through the production integration path (not via direct
 # `ChannelKey::SessionEvents` injection). Off by default; enabled only under
 # `cargo test -p roz-server --features test-helpers`.
-test-helpers = []
+#
+# Phase 26.2 Plan 05 (REVIEWS.md H1): transitively activates
+# `roz-agent/test-helpers` so the deterministic mock provider at
+# `roz_agent::model::mock_provider_v1` (relocated from roz-test per Plan 03)
+# is reachable from `tests/mcap_agent_session_live.rs`. Without this
+# propagation the integration test would not see the `pub use` re-export.
+test-helpers = ["roz-agent/test-helpers"]
 
 [dependencies]
 roz-core = { path = "../roz-core" }
@@ -101,4 +107,18 @@ workspace = true
 # is clean without the flag, matching the workspace CI pattern).
 [[test]]
 name = "export_roundtrip"
+required-features = ["test-helpers"]
+
+# Phase 26.2 Plan 05 — mcap_agent_session_live drives a 1-turn mock-provider
+# agent session via roz-agent's AgentLoop + SessionRuntime (Path B), subscribes
+# spawn_cloud_ingestors to the MCAP writer, and asserts presence of all D-10
+# required SessionEvent variants (TurnStarted, ModelCallCompleted,
+# ToolCall{Requested,Started,Finished}, TurnFinished). Requires the
+# `test-helpers` feature; per REVIEWS.md H1 the mock provider lives at
+# `roz_agent::model::mock_provider_v1` behind `roz-agent/test-helpers`,
+# which roz-server's `test-helpers` feature transitively activates.
+# Gating matches the export_roundtrip pattern so `cargo clippy -p roz-server
+# --all-targets -- -D warnings` stays clean without the flag.
+[[test]]
+name = "mcap_agent_session_live"
 required-features = ["test-helpers"]
