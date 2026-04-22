@@ -500,6 +500,8 @@ fn event_envelope_proto(envelope: &EventEnvelope) -> roz_v1::SessionEventEnvelop
         timestamp: Some(timestamp_to_proto(envelope.timestamp)),
         event_type: event_to_proto_type(&envelope.event).to_string(),
         typed_event: typed_event_proto(&envelope.event),
+        trace_id: Vec::new(), // Phase 26.3 Plan 03 replaces with envelope.trace_id.
+        span_id: Vec::new(),
     }
 }
 
@@ -516,6 +518,8 @@ fn canonical_json_envelope_proto(envelope: &CanonicalSessionEventEnvelope) -> ro
         timestamp: Some(timestamp_to_proto(envelope.timestamp)),
         event_type: envelope.event_type.clone(),
         typed_event,
+        trace_id: Vec::new(), // Phase 26.3 Plan 03 replaces with envelope.trace_id.
+        span_id: Vec::new(),
     }
 }
 

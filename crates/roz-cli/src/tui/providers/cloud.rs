@@ -501,6 +501,8 @@ mod tests {
             timestamp: None,
             event_type: event_type.into(),
             typed_event: Some(typed_event),
+            trace_id: Vec::new(),
+            span_id: Vec::new(),
         }
     }
 
@@ -856,6 +858,8 @@ body = '{"pitch": {{head_pitch}}, "duration": {{duration}}}'
                     message_id: None,
                 },
             )),
+            trace_id: Vec::new(),
+            span_id: Vec::new(),
         };
 
         let mapped = session_event_to_agent_event(&event);
@@ -876,6 +880,8 @@ body = '{"pitch": {{head_pitch}}, "duration": {{duration}}}'
                     reason: "not_registered".into(),
                 },
             )),
+            trace_id: Vec::new(),
+            span_id: Vec::new(),
         };
 
         let mapped = session_event_to_agent_event(&event);
@@ -903,6 +909,8 @@ body = '{"pitch": {{head_pitch}}, "duration": {{duration}}}'
                     reason: "limit exceeded".into(),
                 },
             )),
+            trace_id: Vec::new(),
+            span_id: Vec::new(),
         };
 
         let mapped = session_event_to_agent_event(&event);
@@ -928,6 +936,8 @@ body = '{"pitch": {{head_pitch}}, "duration": {{duration}}}'
                     reason: "candidate divergence exceeded limit".into(),
                 },
             )),
+            trace_id: Vec::new(),
+            span_id: Vec::new(),
         };
 
         let mapped = session_event_to_agent_event(&event);
