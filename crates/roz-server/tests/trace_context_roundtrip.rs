@@ -51,7 +51,7 @@ use roz_server::observability::ingest_cloud::spawn_cloud_ingestors;
 use roz_server::observability::mcap_archive::{FinalizeReason, WriteCommand, spawn_writer};
 use roz_server::observability::schema_registry::SchemaDescriptors;
 use roz_server::observability::task_lifecycle::new_task_lifecycle_sink;
-use roz_test::make_pinned_span_context;
+use roz_test::{install_test_otel_subscriber, make_pinned_span_context};
 use tempfile::TempDir;
 use tokio::sync::{broadcast, mpsc};
 use tracing::Instrument;
@@ -174,6 +174,17 @@ impl StreamingTurnExecutor for TestStreamingExecutor {
 #[tokio::test]
 #[ignore = "requires testcontainers Postgres + --features test-helpers"]
 async fn trace_context_roundtrip_stamps_pinned_trace_id_on_every_event() {
+    // 0. Install a global `tracing-opentelemetry` layer so `set_parent`
+    //    actually stores the pinned Context on the span's extensions.
+    //    Without this, `set_parent` silently no-ops (`#[cfg(test)]` binaries
+    //    do not run `logfire::configure()`), and
+    //    `trace_bytes_from_current_span` inside the D-12 stamp site returns
+    //    empty for every envelope. Per Plan 01
+    //    (roz-nats/src/trace.rs:151-152): "Full round-trip is covered in
+    //    Plan 07's integration test which runs under an active subscriber."
+    //    This helper is that active subscriber.
+    install_test_otel_subscriber();
+
     // 1. Construct the pinned OTel context + root span.
     //    This is the only step OUTSIDE the instrumented future — it has no
     //    `.await` (no span context to lose).
