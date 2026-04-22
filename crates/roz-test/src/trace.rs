@@ -233,18 +233,26 @@ pub async fn otel_collector_container(fixture_yaml_path: &Path) -> OtelCollector
 /// gRPC span exporter pointed at `endpoint` (e.g. the URL returned by
 /// [`OtelCollectorGuard::endpoint`]).
 ///
-/// Uses `SimpleSpanProcessor` (via `with_simple_exporter`) rather than the
-/// batch processor so every span export is synchronous at `on_end` time —
-/// no 5s batch-flush delay to fight against in a test. The returned
-/// [`SdkTracerProvider`] exposes `.force_flush()` and `.shutdown()` which
-/// tests MUST call before reading the collector's JSONL file, otherwise
-/// the gRPC export may still be in-flight when `std::fs::read_to_string`
-/// runs.
+/// Uses `BatchSpanProcessor` (via `with_batch_exporter`) rather than the
+/// simple processor. `SimpleSpanProcessor` + `with_tonic()` deadlocks on
+/// a single-threaded tokio runtime because tonic's gRPC client requires
+/// the runtime to drive the export call while the caller thread is
+/// blocked inside `on_end`. Even on a multi-thread runtime the batch
+/// processor is what `opentelemetry-otlp`'s own smoke tests use
+/// (`tests/smoke.rs`), and it is the option upstream recommends for any
+/// real workload.
+///
+/// Tests MUST still call `.force_flush()` + `.shutdown()` on the returned
+/// provider before reading the collector's JSONL file so the final batch
+/// is drained.
 ///
 /// Unlike [`install_test_otel_subscriber`] this helper is NOT idempotent
 /// across test binaries — it calls `set_global_default` and returns an
 /// owning handle. SC6 lives in its own `cross_process_trace_stitch` test
 /// binary so it does not conflict with SC5's no-exporter subscriber.
+///
+/// # Panics
+/// Panics if the OTLP/gRPC exporter cannot be built against `endpoint`.
 #[must_use]
 pub fn install_otlp_tracer_provider(endpoint: &str) -> SdkTracerProvider {
     use tracing_subscriber::layer::SubscriberExt as _;
@@ -256,7 +264,7 @@ pub fn install_otlp_tracer_provider(endpoint: &str) -> SdkTracerProvider {
         .expect("build OTLP/gRPC span exporter");
 
     let provider = SdkTracerProvider::builder()
-        .with_simple_exporter(exporter)
+        .with_batch_exporter(exporter)
         .build();
 
     let tracer = provider.tracer("roz-test");
