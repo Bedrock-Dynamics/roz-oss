@@ -7110,6 +7110,7 @@ dependencies = [
  "chrono",
  "flume",
  "noxious-client",
+ "opentelemetry",
  "roz-core",
  "serde_json",
  "testcontainers",
