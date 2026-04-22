@@ -59,6 +59,16 @@ impl SchemaDescriptors {
         all_files.extend(foxglove.file);
         all_files.extend(roz.file);
 
+        // Dedup by file name. Both foxglove_descriptor.bin and roz_v1_descriptor.bin
+        // transitively carry `google/protobuf/timestamp.proto` (and roz-v1 adds
+        // `google/protobuf/struct.proto`). Without dedup, `extract_single_schema_fds`
+        // emits a FileDescriptorSet with two copies of the same well-known file,
+        // which Foxglove Studio's reflection database rejects as
+        // "duplicate name 'Timestamp' in Namespace .google.protobuf". First-seen
+        // wins: foxglove entries (extended first above) take precedence.
+        let mut seen: HashSet<String> = HashSet::new();
+        all_files.retain(|f| f.name.as_deref().map_or(true, |name| seen.insert(name.to_string())));
+
         let targets = [
             SCHEMA_FRAME_TRANSFORM,
             SCHEMA_POSE_IN_FRAME,
