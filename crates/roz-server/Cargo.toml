@@ -98,6 +98,13 @@ proptest = "1.6"
 image = { workspace = true }
 serial_test = { workspace = true }
 tempfile = { workspace = true }
+# Phase 26.3 Plan 08 (SC6): `cross_process_trace_stitch` needs
+# `opentelemetry_sdk::propagation::TraceContextPropagator` directly to
+# extract the W3C `Context` from NATS headers without routing through
+# `Span::current()` (a freshly spawned tokio task has no ambient span,
+# so the production helper `extract_and_link_parent` no-ops there). Dev-
+# dep only — roz-server itself does not ship the propagator.
+opentelemetry_sdk = { workspace = true }
 
 [lints]
 workspace = true
@@ -137,4 +144,16 @@ required-features = ["test-helpers"]
 # other test-helpers targets.
 [[test]]
 name = "trace_context_roundtrip"
+required-features = ["test-helpers"]
+
+# Phase 26.3 Plan 08 — cross_process_trace_stitch (SC6). In-process rig
+# (Task 0 audit chose in-process over subprocess per D/E/F failures)
+# pointing at a testcontainer OTel collector; publishes a NATS message
+# inside a `tasks.create` span via `roz_nats::trace::inject_trace_headers`,
+# subscribes in a sibling tokio task that calls `extract_and_link_parent`
+# and opens `worker.execute_task`, then asserts via the collector's JSONL
+# that both spans share trace_id and worker.parent_span_id == server.span_id.
+# Gating matches the other test-helpers targets.
+[[test]]
+name = "cross_process_trace_stitch"
 required-features = ["test-helpers"]

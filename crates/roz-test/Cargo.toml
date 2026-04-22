@@ -34,6 +34,15 @@ opentelemetry_sdk = { workspace = true }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Phase 26.3 Plan 08 (SC6): `otel_collector_container` bind-mounts a host
+# tempdir to `/spans` inside the collector container so the test can read
+# the exported JSONL file after force-flushing the tracer provider.
+tempfile = { workspace = true }
+# Phase 26.3 Plan 08 (SC6): `install_otlp_tracer_provider` builds a
+# `SpanExporter::builder().with_tonic().with_endpoint(...)` pointed at the
+# collector testcontainer. Feature `grpc-tonic` required; see root
+# `Cargo.toml` for the workspace-level pin and rationale.
+opentelemetry-otlp = { workspace = true }
 
 [lints]
 workspace = true

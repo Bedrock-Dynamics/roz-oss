@@ -1,0 +1,34 @@
+# Phase 26.3 Plan 08 (SC6): minimal OTel collector pipeline.
+#
+# Used by `crates/roz-server/tests/cross_process_trace_stitch.rs` via
+# `roz_test::trace::otel_collector_container` to prove that spans published
+# via NATS from a server-side `tasks.create` span and stamped onto a
+# worker-side `worker.execute_task` span arrive at a collector sharing the
+# same `trace_id` and with `worker.parent_span_id == server.span_id`.
+#
+# Receivers: OTLP over gRPC on 4317 (container-internal; testcontainers
+# maps this to an ephemeral host port).
+#
+# Exporters: `debug` with `verbosity: detailed`. The collector prints every
+# received span as JSON-formatted text to stderr; the test pulls this via
+# `docker logs` and parses the structured output for span name, trace_id,
+# span_id, and parent_span_id. We do NOT use the `file` exporter because
+# collector-contrib 0.120.0 on Docker Desktop macOS intermittently creates
+# the target file but never flushes data to it (empirically reproduced:
+# file is always 0 bytes even when debug exporter logs "spans: 2"). The
+# `debug` exporter's stdout/stderr path is more robust for local dev and
+# keeps the rig dependency-free of the file exporter's Alpha-stage
+# quirks.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  debug:
+    verbosity: detailed
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [debug]

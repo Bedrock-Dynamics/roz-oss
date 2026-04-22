@@ -5139,6 +5139,8 @@ dependencies = [
  "prost 0.13.5",
  "reqwest 0.12.28",
  "thiserror 2.0.18",
+ "tokio",
+ "tonic 0.13.1",
 ]
 
 [[package]]
@@ -7060,6 +7062,7 @@ dependencies = [
  "nkeys",
  "object_store",
  "opentelemetry",
+ "opentelemetry_sdk",
  "parking_lot",
  "proptest",
  "prost 0.13.5",
@@ -7111,9 +7114,11 @@ dependencies = [
  "flume",
  "noxious-client",
  "opentelemetry",
+ "opentelemetry-otlp",
  "opentelemetry_sdk",
  "roz-core",
  "serde_json",
+ "tempfile",
  "testcontainers",
  "testcontainers-modules",
  "tokio",
