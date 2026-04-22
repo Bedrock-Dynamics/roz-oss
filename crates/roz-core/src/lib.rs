@@ -33,6 +33,7 @@ pub mod model_endpoint;
 pub use model_endpoint::{
     AuthMode, EndpointRegistry, ModelEndpoint, OAuthCredentials, ReasoningFormat, RegistryError, WireApi,
 };
+pub mod observability;
 pub mod phases;
 pub mod primitives;
 pub mod provenance;
