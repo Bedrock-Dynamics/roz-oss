@@ -124,3 +124,17 @@ required-features = ["test-helpers"]
 [[test]]
 name = "mcap_agent_session_live"
 required-features = ["test-helpers"]
+
+# Phase 26.3 Plan 07 — trace_context_roundtrip pins a known root SpanContext
+# (trace_id=[0xFF;16], span_id=[0xFE;8], SAMPLED), drives one mock-provider
+# agent turn via AgentLoop + SessionRuntime (Path B, forked from
+# mcap_agent_session_live.rs), finalizes the MCAP, and asserts every
+# /roz/session/events envelope carries the pinned trace_id byte-for-byte.
+# Validates SC5 (narrowed per Plan 04 Task 2 — /roz/tool/calls excluded; no
+# production ToolCallEvent producer exists today). Reviewer HIGH #7 fix: the
+# test body uses `.instrument(root_span).await` on the entire awaited work
+# block (RAII guard does not survive `.await`). Same gating pattern as the
+# other test-helpers targets.
+[[test]]
+name = "trace_context_roundtrip"
+required-features = ["test-helpers"]
