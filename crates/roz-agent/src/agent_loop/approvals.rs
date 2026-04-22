@@ -235,9 +235,62 @@ impl AgentLoop {
                 // and are captured separately via the tool-call error path.
                 self.checkpoint_signal
                     .approval_received(&tool_ctx.task_id, step_counter, &call.id);
-                self.dispatcher.dispatch(&effective_call, tool_ctx).await
+
+                // Phase 26.2 Gap 4 (REVIEWS.md H3): ToolCallStarted fires only
+                // on the granted approval path — AFTER safety + approval gates
+                // have cleared and actual dispatch is about to run.
+                self.agent_event_hook
+                    .on_agent_event(roz_core::session::event::SessionEvent::ToolCallStarted {
+                        call_id: effective_call.id.clone(),
+                        tool_name: effective_call.tool.clone(),
+                        category: "physical".to_owned(),
+                    });
+
+                let dispatch_result = self.dispatcher.dispatch(&effective_call, tool_ctx).await;
+
+                // Phase 26.2 Gap 5: ToolCallFinished for granted-path dispatch
+                // (success and error both flow here). Summary is char-truncated
+                // to 256 to bound broadcast-bus / MCAP payload size.
+                let summary = dispatch_result.error.as_deref().map_or_else(
+                    || {
+                        serde_json::to_string(&dispatch_result)
+                            .unwrap_or_default()
+                            .chars()
+                            .take(256)
+                            .collect::<String>()
+                    },
+                    |err| format!("error: {err}").chars().take(256).collect::<String>(),
+                );
+                self.agent_event_hook
+                    .on_agent_event(roz_core::session::event::SessionEvent::ToolCallFinished {
+                        call_id: effective_call.id.clone(),
+                        tool_name: effective_call.tool.clone(),
+                        result_summary: summary,
+                    });
+
+                dispatch_result
             }
-            ApprovalGateResult::Rejected(result) => result,
+            ApprovalGateResult::Rejected(result) => {
+                // Phase 26.2 Gap 5 + REVIEWS.md H3: denied / timeout / invalid-
+                // modifier paths emit ToolCallFinished only; no Started ever
+                // fires for these branches.
+                let summary = result.error.as_deref().map_or_else(
+                    || "approval rejected".to_owned(),
+                    |err| {
+                        format!("approval rejected: {err}")
+                            .chars()
+                            .take(256)
+                            .collect::<String>()
+                    },
+                );
+                self.agent_event_hook
+                    .on_agent_event(roz_core::session::event::SessionEvent::ToolCallFinished {
+                        call_id: call.id.clone(),
+                        tool_name: call.tool.clone(),
+                        result_summary: summary,
+                    });
+                result
+            }
         }
     }
 

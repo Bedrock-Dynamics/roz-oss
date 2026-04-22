@@ -149,6 +149,15 @@ impl ToolExecutor for RemoteToolExecutor {
         }
     }
 
+    /// Phase 26.2 D-14 H4: remote executors are bridged to a client via
+    /// `request_tx`; the SessionRuntime drains that channel and emits
+    /// `ToolCallRequested` from `session_runtime/mod.rs:1489`. Signal to
+    /// `agent_loop::dispatch` that the in-process Requested emit must be
+    /// suppressed to avoid double-emit.
+    fn is_remote(&self) -> bool {
+        true
+    }
+
     async fn execute(
         &self,
         params: Value,

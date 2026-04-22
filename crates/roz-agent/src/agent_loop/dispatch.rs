@@ -5,7 +5,9 @@
 //! `ToolDispatcher`, and `truncate_tool_output`. Inside this file,
 //! reference the other module as `crate::dispatch::...`.
 
+use roz_core::session::event::SessionEvent;
 use roz_core::spatial::WorldState;
+use roz_core::tools::ToolCategory;
 use tokio::sync::mpsc;
 
 use super::AgentLoop;
@@ -13,6 +15,29 @@ use super::input::PresenceSignal;
 use crate::dispatch::ToolContext;
 use crate::model::types::Message;
 use crate::safety::SafetyResult;
+
+/// Phase 26.2 D-14 M2: canonical string form of [`ToolCategory`] used in
+/// [`SessionEvent::ToolCallStarted::category`]. `ToolCategory` does not
+/// implement `Display`; this match mirrors the serde `rename_all = "snake_case"`
+/// wire form so emitted events match the rest of the catalog.
+const fn category_str(category: ToolCategory) -> &'static str {
+    match category {
+        ToolCategory::Physical => "physical",
+        ToolCategory::Pure => "pure",
+        ToolCategory::CodeSandbox => "code_sandbox",
+    }
+}
+
+/// Phase 26.2 D-14 H3: bound `ToolCallFinished::result_summary` so oversized
+/// tool payloads do not bloat the broadcast bus / MCAP. Char-based truncation
+/// (not byte-based) keeps UTF-8 multi-byte codepoints intact per T-26.2-08.
+fn finished_summary_from_ok(result_json: &str) -> String {
+    result_json.chars().take(256).collect::<String>()
+}
+
+fn finished_summary_from_error(err: &str) -> String {
+    format!("error: {err}").chars().take(256).collect::<String>()
+}
 
 impl AgentLoop {
     /// Dispatches tool calls in their original order while parallelizing only
@@ -79,15 +104,51 @@ impl AgentLoop {
                         // boundary for every tool call (pure and physical).
                         self.checkpoint_signal
                             .tool_call_started(&tool_ctx.task_id, step_counter, &c.id);
-                        async move { (idx, c.id.clone(), self.dispatcher.dispatch(c, tool_ctx).await) }
+
+                        // Phase 26.2 Gap 3 (REVIEWS.md H4): emit ToolCallRequested
+                        // ONLY for in-process executors. Remote executors emit from
+                        // session_runtime/mod.rs:1489 via the tool_call_rx drain.
+                        if !self.dispatcher.is_remote(&c.tool) {
+                            self.agent_event_hook.on_agent_event(SessionEvent::ToolCallRequested {
+                                call_id: c.id.clone(),
+                                tool_name: c.tool.clone(),
+                                parameters: c.params.clone(),
+                                timeout_ms: 30_000,
+                            });
+                        }
+                        // Phase 26.2 Gap 4 (REVIEWS.md H3, M2): ToolCallStarted fires
+                        // at the actual execution site. Pure tools are not safety-
+                        // gated, so Started is emitted immediately before dispatch.
+                        // The `category` field is required per event.rs:247.
+                        self.agent_event_hook.on_agent_event(SessionEvent::ToolCallStarted {
+                            call_id: c.id.clone(),
+                            tool_name: c.tool.clone(),
+                            category: category_str(ToolCategory::Pure).to_owned(),
+                        });
+                        async move {
+                            let res = self.dispatcher.dispatch(c, tool_ctx).await;
+                            (idx, c.id.clone(), c.tool.clone(), res)
+                        }
                     })
                     .collect();
 
                 let pure_results = futures::future::join_all(pure_futures).await;
-                for (idx, call_id, res) in pure_results {
+                for (idx, call_id, tool_name, res) in pure_results {
                     // Emit ToolCallCompleted on both success and error paths.
                     self.checkpoint_signal
                         .tool_call_completed(&tool_ctx.task_id, step_counter, &call_id);
+
+                    // Phase 26.2 Gap 5: ToolCallFinished — fires for success and error.
+                    let summary = res.error.as_deref().map_or_else(
+                        || finished_summary_from_ok(&serde_json::to_string(&res).unwrap_or_default()),
+                        finished_summary_from_error,
+                    );
+                    self.agent_event_hook.on_agent_event(SessionEvent::ToolCallFinished {
+                        call_id: call_id.clone(),
+                        tool_name,
+                        result_summary: summary,
+                    });
+
                     indexed_results[idx] = Some(res);
                 }
 
@@ -108,16 +169,64 @@ impl AgentLoop {
                 self.checkpoint_signal
                     .tool_call_started(&tool_ctx.task_id, step_counter, &call.id);
 
+                // Phase 26.2 Gap 3 (REVIEWS.md H4): emit ToolCallRequested
+                // BEFORE safety evaluation — this is the "model asked for
+                // this tool" signal. Scoped to in-process executors only
+                // (remote executors emit from session_runtime/mod.rs:1489).
+                if !self.dispatcher.is_remote(&call.tool) {
+                    self.agent_event_hook.on_agent_event(SessionEvent::ToolCallRequested {
+                        call_id: call.id.clone(),
+                        tool_name: call.tool.clone(),
+                        parameters: call.params.clone(),
+                        timeout_ms: 30_000,
+                    });
+                }
+
                 let safety_result = self.safety.evaluate(call, spatial_ctx).await;
 
+                // Phase 26.2 Gap 4 + 5 (REVIEWS.md H3): ToolCallStarted fires AFTER
+                // safety/approval resolution — only on paths that actually execute.
+                // Blocked / denied / timeout paths emit ToolCallFinished but NEVER
+                // ToolCallStarted (REVIEWS.md H3). `wait_for_human_approval` emits
+                // its own Started/Finished internally for the granted-approval path.
                 let tool_result = match safety_result {
-                    SafetyResult::Approved(approved_call) => self.dispatcher.dispatch(&approved_call, tool_ctx).await,
+                    SafetyResult::Approved(approved_call) => {
+                        self.agent_event_hook.on_agent_event(SessionEvent::ToolCallStarted {
+                            call_id: approved_call.id.clone(),
+                            tool_name: approved_call.tool.clone(),
+                            category: category_str(ToolCategory::Physical).to_owned(),
+                        });
+                        let dispatch_result = self.dispatcher.dispatch(&approved_call, tool_ctx).await;
+                        let summary = dispatch_result.error.as_deref().map_or_else(
+                            || finished_summary_from_ok(&serde_json::to_string(&dispatch_result).unwrap_or_default()),
+                            finished_summary_from_error,
+                        );
+                        self.agent_event_hook.on_agent_event(SessionEvent::ToolCallFinished {
+                            call_id: approved_call.id.clone(),
+                            tool_name: approved_call.tool.clone(),
+                            result_summary: summary,
+                        });
+                        dispatch_result
+                    }
                     SafetyResult::Blocked { ref guard, ref reason } => {
                         tracing::warn!(guard = %guard, reason = %reason, "tool blocked by safety guard");
+                        // H3: no Started on block path; Finished fires with block summary.
+                        self.agent_event_hook.on_agent_event(SessionEvent::ToolCallFinished {
+                            call_id: call.id.clone(),
+                            tool_name: call.tool.clone(),
+                            result_summary: format!("blocked by safety guard {guard}: {reason}")
+                                .chars()
+                                .take(256)
+                                .collect::<String>(),
+                        });
                         roz_core::tools::ToolResult::error(format!("Blocked by {guard}: {reason}"))
                     }
                     SafetyResult::NeedsHuman { reason, timeout_secs } => {
                         if let Some(ref approval_runtime) = self.approval_runtime {
+                            // wait_for_human_approval emits ToolCallStarted internally
+                            // on the granted path and ToolCallFinished on every return
+                            // (granted-dispatch-success, granted-dispatch-error,
+                            // denied, timeout). See agent_loop/approvals.rs.
                             self.wait_for_human_approval(
                                 call,
                                 &reason,
@@ -131,6 +240,16 @@ impl AgentLoop {
                             .await
                         } else {
                             tracing::error!(tool = %call.tool, reason = %reason, "human approval required but no runtime approval authority is configured");
+                            // H3: no Started on "approval runtime missing" path;
+                            // Finished fires with the error summary.
+                            self.agent_event_hook.on_agent_event(SessionEvent::ToolCallFinished {
+                                call_id: call.id.clone(),
+                                tool_name: call.tool.clone(),
+                                result_summary: format!("approval runtime missing; needs-human denied: {reason}")
+                                    .chars()
+                                    .take(256)
+                                    .collect::<String>(),
+                            });
                             roz_core::tools::ToolResult::error(format!(
                                 "Human approval required but no approval runtime is configured: {reason}"
                             ))

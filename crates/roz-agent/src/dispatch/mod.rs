@@ -55,6 +55,18 @@ pub trait ToolExecutor: Send + Sync {
         params: Value,
         ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Phase 26.2 D-14 H4: whether this executor forwards to a remote surface
+    /// (e.g. `RemoteToolExecutor` bridging to a client over gRPC). Remote tools
+    /// already emit `SessionEvent::ToolCallRequested` from the SessionRuntime's
+    /// `tool_call_rx` drain (`session_runtime/mod.rs:1489`). The in-process
+    /// dispatch loop in `agent_loop/dispatch.rs` suppresses its own Requested
+    /// emit for executors where this returns `true` to avoid double-emit.
+    ///
+    /// Defaults to `false` — only `RemoteToolExecutor` overrides.
+    fn is_remote(&self) -> bool {
+        false
+    }
 }
 
 /// Type-safe tool executor with auto-generated JSON Schema.
@@ -227,6 +239,16 @@ impl ToolDispatcher {
     /// the safety stack rather than being dispatched concurrently.
     pub fn category(&self, name: &str) -> ToolCategory {
         self.tools.get(name).map_or(ToolCategory::Physical, |e| e.category)
+    }
+
+    /// Phase 26.2 D-14 H4: returns `true` if the registered executor for
+    /// `name` is a remote bridge (e.g. [`remote::RemoteToolExecutor`]).
+    /// Used by `agent_loop::dispatch` to suppress the in-process
+    /// `ToolCallRequested` emit for tools that already emit it from the
+    /// SessionRuntime's `tool_call_rx` drain. Unknown tools return `false`.
+    #[must_use]
+    pub fn is_remote(&self, name: &str) -> bool {
+        self.tools.get(name).is_some_and(|e| e.executor.is_remote())
     }
 
     /// Register the `advance_phase` Pure tool in a disabled state.
