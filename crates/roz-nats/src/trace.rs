@@ -59,6 +59,29 @@ pub fn extract_and_link_parent(headers: &HeaderMap) {
     tracing::Span::current().set_parent(cx);
 }
 
+/// Parse a legacy body `traceparent` string and set it as the parent of the current span.
+///
+/// Phase 26.3 D-09: used only by the rolling-deploy fallback path at
+/// `crates/roz-worker/src/main.rs:2558` for the window when an old server (pre-26.3)
+/// is still sending body-only traceparent and a new worker (26.3+) is receiving.
+///
+/// Silent no-op when `traceparent` is malformed; the W3C propagator returns an empty
+/// context in that case and `set_parent` accepts it without panicking. Reviewer
+/// HIGH #4: this is the parser the old plan was missing.
+pub fn extract_and_link_parent_from_traceparent(traceparent: &str) {
+    let mut synth = HeaderMap::new();
+    // `HeaderValue: From<&str>` is infallible on async-nats 0.38 (matches Plan 01's
+    // injector idiom of going through `HeaderValue::from_str` for belt-and-braces
+    // `\r`/`\n` rejection; here we use `from_str` to preserve that safety).
+    if let (Ok(name), Ok(val)) = (
+        "traceparent".parse::<HeaderName>(),
+        HeaderValue::from_str(traceparent),
+    ) {
+        synth.insert(name, val);
+    }
+    extract_and_link_parent(&synth);
+}
+
 struct NatsHeaderInjector<'a>(&'a mut HeaderMap);
 
 impl Injector for NatsHeaderInjector<'_> {
@@ -120,6 +143,24 @@ mod tests {
         // Missing headers → propagator returns empty context → set_parent is a no-op.
         let headers = HeaderMap::new();
         extract_and_link_parent(&headers);
+        // No panic = pass.
+    }
+
+    #[test]
+    fn extract_from_valid_traceparent_is_noop_when_no_active_span() {
+        // Reviewer HIGH #4 prep: without an active span the set_parent call has nothing
+        // to overwrite, but the function must not panic on a well-formed W3C traceparent.
+        extract_and_link_parent_from_traceparent("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01");
+        // No panic = pass. Full round-trip (set_parent actually linking) is covered in
+        // Plan 07's integration test which runs under an active subscriber.
+    }
+
+    #[test]
+    fn extract_from_malformed_traceparent_is_noop() {
+        // Malformed strings must not panic. The W3C propagator returns an empty context
+        // which set_parent accepts as a no-op.
+        extract_and_link_parent_from_traceparent("not-a-valid-traceparent");
+        extract_and_link_parent_from_traceparent("");
         // No panic = pass.
     }
 
