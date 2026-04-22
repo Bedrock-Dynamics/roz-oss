@@ -15,8 +15,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
-opentelemetry = "0.30"
-tracing-opentelemetry = "0.31"
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 nkeys = { workspace = true }
 nats-io-jwt = { workspace = true }
 bytes = { workspace = true }
