@@ -263,9 +263,7 @@ pub fn install_otlp_tracer_provider(endpoint: &str) -> SdkTracerProvider {
         .build()
         .expect("build OTLP/gRPC span exporter");
 
-    let provider = SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
-        .build();
+    let provider = SdkTracerProvider::builder().with_batch_exporter(exporter).build();
 
     let tracer = provider.tracer("roz-test");
     let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);

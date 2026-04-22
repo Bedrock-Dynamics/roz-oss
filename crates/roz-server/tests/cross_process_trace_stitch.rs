@@ -115,10 +115,7 @@ async fn cross_process_trace_stitch_server_worker_share_trace_id() {
         use opentelemetry::propagation::{Extractor, TextMapPropagator};
         use opentelemetry_sdk::propagation::TraceContextPropagator;
 
-        let mut sub = worker_client
-            .subscribe(TEST_SUBJECT)
-            .await
-            .expect("worker subscribe");
+        let mut sub = worker_client.subscribe(TEST_SUBJECT).await.expect("worker subscribe");
 
         let msg = tokio::time::timeout(Duration::from_secs(10), sub.next())
             .await
@@ -131,27 +128,30 @@ async fn cross_process_trace_stitch_server_worker_share_trace_id() {
         // `Context` instead of trying to set it on `Span::current()`
         // (which would no-op here because the spawned task has no
         // ambient span).
-        let extracted_cx = msg.headers.as_ref().map_or_else(opentelemetry::Context::new, |headers| {
-            struct NatsHeaderExtractor<'a>(&'a async_nats::HeaderMap);
-            impl Extractor for NatsHeaderExtractor<'_> {
-                fn get(&self, key: &str) -> Option<&str> {
-                    self.0.get(key).map(async_nats::HeaderValue::as_str).or_else(|| {
-                        self.0
-                            .iter()
-                            .find(|(name, _)| {
-                                let name_str: &str = name.as_ref();
-                                name_str.eq_ignore_ascii_case(key)
-                            })
-                            .and_then(|(_, values)| values.first().map(async_nats::HeaderValue::as_str))
-                    })
+        let extracted_cx = msg
+            .headers
+            .as_ref()
+            .map_or_else(opentelemetry::Context::new, |headers| {
+                struct NatsHeaderExtractor<'a>(&'a async_nats::HeaderMap);
+                impl Extractor for NatsHeaderExtractor<'_> {
+                    fn get(&self, key: &str) -> Option<&str> {
+                        self.0.get(key).map(async_nats::HeaderValue::as_str).or_else(|| {
+                            self.0
+                                .iter()
+                                .find(|(name, _)| {
+                                    let name_str: &str = name.as_ref();
+                                    name_str.eq_ignore_ascii_case(key)
+                                })
+                                .and_then(|(_, values)| values.first().map(async_nats::HeaderValue::as_str))
+                        })
+                    }
+                    fn keys(&self) -> Vec<&str> {
+                        vec!["traceparent", "tracestate"]
+                    }
                 }
-                fn keys(&self) -> Vec<&str> {
-                    vec!["traceparent", "tracestate"]
-                }
-            }
-            let propagator = TraceContextPropagator::new();
-            propagator.extract(&NatsHeaderExtractor(headers))
-        });
+                let propagator = TraceContextPropagator::new();
+                propagator.extract(&NatsHeaderExtractor(headers))
+            });
 
         // Create the `worker.execute_task` span and explicitly parent
         // it on the extracted server context. Same span name as
@@ -230,11 +230,7 @@ async fn cross_process_trace_stitch_server_worker_share_trace_id() {
             .iter()
             .any(|s| s.pointer("/name").and_then(|n| n.as_str()) == Some(WORKER_SPAN_NAME));
         if have_server && have_worker {
-            eprintln!(
-                "spans ready after {}s ({} total)",
-                attempt + 1,
-                all_spans.len()
-            );
+            eprintln!("spans ready after {}s ({} total)", attempt + 1, all_spans.len());
             break;
         }
     }
