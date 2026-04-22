@@ -73,10 +73,7 @@ pub fn extract_and_link_parent_from_traceparent(traceparent: &str) {
     // `HeaderValue: From<&str>` is infallible on async-nats 0.38 (matches Plan 01's
     // injector idiom of going through `HeaderValue::from_str` for belt-and-braces
     // `\r`/`\n` rejection; here we use `from_str` to preserve that safety).
-    if let (Ok(name), Ok(val)) = (
-        "traceparent".parse::<HeaderName>(),
-        HeaderValue::from_str(traceparent),
-    ) {
+    if let (Ok(name), Ok(val)) = ("traceparent".parse::<HeaderName>(), HeaderValue::from_str(traceparent)) {
         synth.insert(name, val);
     }
     extract_and_link_parent(&synth);

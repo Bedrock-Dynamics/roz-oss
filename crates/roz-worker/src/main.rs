@@ -420,6 +420,13 @@ async fn consume_team_approval_events(
                         break;
                     }
                 };
+                // Phase 26.3 D-06: extract W3C trace context on the first line so
+                // the rest of this closure runs under the server's trace. JetStream
+                // `Message` derefs to `async_nats::Message`, so `msg.headers` is
+                // `Option<HeaderMap>`.
+                if let Some(ref headers) = msg.headers {
+                    roz_nats::trace::extract_and_link_parent(headers);
+                }
                 if let Err(error) = msg.ack().await {
                     tracing::warn!(%error, %approval_owner_task_id, task_id = %worker_task_id, "failed to ack team approval event");
                 }
@@ -1852,6 +1859,12 @@ async fn main() -> Result<()> {
                                 tracing::warn!("policy push subscription ended");
                                 return;
                             };
+                            // Phase 26.3 D-06: extract server's trace on first line so
+                            // the rest of the closure (signature verify, policy apply)
+                            // runs under the server's span.
+                            if let Some(ref headers) = msg.headers {
+                                roz_nats::trace::extract_and_link_parent(headers);
+                            }
                             let header = msg
                                 .headers
                                 .as_ref()
@@ -1964,6 +1977,12 @@ async fn main() -> Result<()> {
                                 tracing::warn!("resume-instruction subscription ended");
                                 return;
                             };
+                            // Phase 26.3 D-06: extract server's trace on first line
+                            // so resume-instruction handling stitches under the
+                            // originating server span.
+                            if let Some(ref headers) = msg.headers {
+                                roz_nats::trace::extract_and_link_parent(headers);
+                            }
                             let header = msg
                                 .headers
                                 .as_ref()
@@ -2473,6 +2492,15 @@ async fn main() -> Result<()> {
     while let Some(msg) = sub.next().await {
         watchdog.pet();
 
+        // Phase 26.3 D-06 — SC6-critical: extract server's trace context on the
+        // FIRST line (before e-stop check, signature verify, deserialize) so the
+        // `worker.execute_task` span created at ~:2633 inherits the server's
+        // `task_dispatch` span. Without this line, SC6 (cross-process trace
+        // stitch) fails.
+        if let Some(ref headers) = msg.headers {
+            roz_nats::trace::extract_and_link_parent(headers);
+        }
+
         // 1. E-stop short-circuit (pre-existing). Must come BEFORE signature
         //    verify per RESEARCH.md integration-point pitfall 2: a tripped
         //    e-stop means we reject the message regardless of signature
@@ -2555,8 +2583,20 @@ async fn main() -> Result<()> {
             }
         };
 
+        // Phase 26.3 D-09 + reviewer HIGH #4: header-wins migration with real
+        // body-fallback. Headers are the canonical path (the extract call at the
+        // top of this `while let` already ran `extract_and_link_parent` on the
+        // subscribe closure's first line when headers were present). This branch
+        // is the rolling-deploy fallback: old server (pre-26.3) that still sends
+        // body-only traceparent → we parse it and set_parent the worker's span so
+        // cross-process stitching still works until the entire fleet is on 26.3+.
         if let Some(ref tp) = invocation.traceparent {
-            tracing::info!(traceparent = %tp, task_id = %invocation.task_id, "linking to server trace");
+            roz_nats::trace::extract_and_link_parent_from_traceparent(tp);
+            tracing::debug!(
+                traceparent = %tp,
+                task_id = %invocation.task_id,
+                "legacy body traceparent parsed + set_parent (rolling-deploy fallback — prefer NATS headers)"
+            );
         }
 
         tracing::info!(
