@@ -398,6 +398,11 @@ message SessionEventEnvelope {
     SkillLoadedPayload skill_loaded = 45;
     SkillCrystallizedPayload skill_crystallized = 46;
   }
+
+  // Phase 26.3 SC1: W3C trace context (big-endian bytes).
+  // 16-byte trace_id / 8-byte span_id. Empty when no OTel context was active at emit.
+  bytes trace_id = 100;
+  bytes span_id  = 101;
 }
 
 message SessionPermissionRulePayload {

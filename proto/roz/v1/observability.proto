@@ -33,6 +33,9 @@ message TaskLifecycleEvent {
   TaskStatus new_status = 4;
   optional string reason = 5;
   optional string actor  = 6;
+  // Phase 26.3 SC1: W3C trace context. See agent.proto SessionEventEnvelope.
+  bytes trace_id = 100;
+  bytes span_id  = 101;
 }
 
 // D-08: Field sets reuse agent.proto's ToolCall*Payload shapes verbatim
@@ -62,6 +65,9 @@ message ToolCallEvent {
     ToolCallRequested requested = 4;
     ToolCallFinished  finished  = 5;
   }
+  // Phase 26.3 SC1: W3C trace context. See agent.proto SessionEventEnvelope.
+  bytes trace_id = 100;
+  bytes span_id  = 101;
 }
 
 // Phase 26 OBS-03: export endpoint.
