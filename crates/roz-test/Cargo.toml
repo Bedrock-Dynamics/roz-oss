@@ -16,6 +16,24 @@ tokio = { workspace = true }
 zenoh = { workspace = true }
 flume = { workspace = true }
 serde_json = { workspace = true }
+# Phase 26.3 Plan 07: `make_pinned_span_context` helper constructs a
+# `SpanContext` via the base `opentelemetry` crate (not the SDK) so SC5 and
+# SC6 integration tests can pin a known W3C trace context before driving an
+# agent turn. Plan 01 did not enumerate roz-test as an OTel consumer, but
+# this helper needs the base crate directly for `SpanContext::new` and
+# `Context::with_remote_span_context`.
+opentelemetry = { workspace = true }
+# Phase 26.3 Plan 07 (Rule 2 — missing critical functionality): Plan 01
+# notes at roz-nats/src/trace.rs:151-152 that SC5's integration test must
+# "run under an active subscriber" — because `OpenTelemetrySpanExt::set_parent`
+# silently no-ops without a registered `tracing-opentelemetry` layer, and
+# `trace_bytes_from_current_span` then returns empty even on the pinned span.
+# `install_test_otel_subscriber` builds an `SdkTracerProvider`, wraps it in
+# the `tracing-opentelemetry` layer, and sets it as the global subscriber.
+opentelemetry_sdk = { workspace = true }
+tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

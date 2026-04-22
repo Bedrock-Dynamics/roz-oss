@@ -26,7 +26,7 @@ use std::sync::Arc;
 use prost::Message as _;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 use uuid::Uuid;
 
 use crate::observability::mcap_archive::{ChannelKey, WriteCommand};
@@ -79,24 +79,36 @@ pub fn spawn_cloud_ingestors(
     let cancel = CancellationToken::new();
 
     // Task 1: session event broadcast → /roz/log + /roz/session/events.
+    //
+    // Phase 26.3 Plan 07 fix (Rule 1 bug): the spawned future is wrapped in
+    // `.in_current_span()` so the caller's `Span::current()` flows into the
+    // spawned task. Without this, `tokio::spawn` starts the task with an
+    // empty detached span context, and the D-12 stamp inside
+    // `emit_session_event` (which reads `Span::current()` via
+    // `trace_bytes_from_current_span`) never sees the caller's trace_id —
+    // every envelope passes through unstamped. Discovered by SC5's
+    // byte-for-byte assertion on pinned trace_id.
     {
         let tx = writer_tx.clone();
         let cancel = cancel.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    () = cancel.cancelled() => break,
-                    msg = session_event_rx.recv() => match msg {
-                        Ok(envelope) => emit_session_event(&tx, &envelope).await,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            warn!(session = %session_id, dropped = n, "MCAP session-event subscriber lagged");
+        tokio::spawn(
+            async move {
+                loop {
+                    tokio::select! {
+                        () = cancel.cancelled() => break,
+                        msg = session_event_rx.recv() => match msg {
+                            Ok(envelope) => emit_session_event(&tx, &envelope).await,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                warn!(session = %session_id, dropped = n, "MCAP session-event subscriber lagged");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
+                info!(session = %session_id, "MCAP cloud session-event ingestor exiting");
             }
-            info!(session = %session_id, "MCAP cloud session-event ingestor exiting");
-        });
+            .in_current_span(),
+        );
     }
 
     // Task 2: task lifecycle broadcast → /roz/task/lifecycle.
