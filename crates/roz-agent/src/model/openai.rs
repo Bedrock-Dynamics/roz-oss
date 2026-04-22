@@ -625,12 +625,38 @@ impl Model for OpenAiProvider {
         caps
     }
 
+    #[tracing::instrument(
+        name = "gen_ai.openai.chat",
+        skip(self, req),
+        fields(
+            gen_ai.system = "openai",
+            gen_ai.operation.name = "chat",
+            gen_ai.request.model = %self.model,
+            gen_ai.request.max_tokens = req.max_tokens,
+            gen_ai.response.model = tracing::field::Empty,
+            gen_ai.response.finish_reasons = tracing::field::Empty,
+            gen_ai.usage.input_tokens = tracing::field::Empty,
+            gen_ai.usage.output_tokens = tracing::field::Empty,
+        )
+    )]
     async fn complete(
         &self,
         req: &CompletionRequest,
     ) -> Result<CompletionResponse, Box<dyn std::error::Error + Send + Sync>> {
-        // First call.
+        // First call. Note: `run_stream_and_assemble` is NOT independently instrumented — this
+        // outer #[tracing::instrument] on the trait-boundary is the sole span boundary (avoids
+        // double spans per plan 26.3-06 Task 1 Step 2a).
         let response1 = self.run_stream_and_assemble(req).await.map_err(box_err)?;
+
+        // Record late-binding GenAI attrs from the assembled response (OTel 1.27 semconv).
+        // Security: never record assistant text or tool_call arguments.
+        tracing::Span::current().record("gen_ai.usage.input_tokens", response1.usage.input_tokens);
+        tracing::Span::current().record("gen_ai.usage.output_tokens", response1.usage.output_tokens);
+        tracing::Span::current().record(
+            "gen_ai.response.finish_reasons",
+            tracing::field::display(format!("[{:?}]", response1.stop_reason)),
+        );
+        tracing::Span::current().record("gen_ai.response.model", tracing::field::display(&self.model));
 
         // If no structured-output requested, we're done.
         let Some(schema) = req.response_schema.as_ref() else {
@@ -706,6 +732,25 @@ impl Model for OpenAiProvider {
         &self,
         req: &CompletionRequest,
     ) -> Result<StreamResponse, Box<dyn std::error::Error + Send + Sync>> {
+        use tracing::Instrument as _;
+
+        // Reviewer HIGH #6: info_span! + .instrument(span) on the stream-building future, with
+        // a cloned span handle passed into the async_stream body so late-binding .record()
+        // calls land on the instrumented span regardless of which runtime task polls chunks.
+        let span = tracing::info_span!(
+            "gen_ai.openai.chat",
+            gen_ai.system = "openai",
+            gen_ai.operation.name = "chat",
+            gen_ai.request.model = %self.model,
+            gen_ai.request.max_tokens = req.max_tokens,
+            gen_ai.response.model = tracing::field::Empty,
+            gen_ai.response.finish_reasons = tracing::field::Empty,
+            gen_ai.usage.input_tokens = tracing::field::Empty,
+            gen_ai.usage.output_tokens = tracing::field::Empty,
+        );
+
+        async move {
+        let chunk_span = tracing::Span::current();
         let (mut inner, _wire) = self.open_stream(req).await.map_err(box_err)?;
 
         let stream = async_stream::stream! {
@@ -771,6 +816,10 @@ impl Model for OpenAiProvider {
                         if let Some(u) = token_usage {
                             usage = to_roz_usage(&u);
                         }
+                        // Reviewer HIGH #6: record on the instrumented span handle from the
+                        // final usage payload. Safe: no prompt / completion text.
+                        chunk_span.record("gen_ai.usage.input_tokens", usage.input_tokens);
+                        chunk_span.record("gen_ai.usage.output_tokens", usage.output_tokens);
                         yield Ok(StreamChunk::Usage(usage));
                     }
                     ResponseEvent::Created | ResponseEvent::ServerReasoningIncluded(_) => {}
@@ -794,6 +843,11 @@ impl Model for OpenAiProvider {
                 parts.push(ContentPart::Text { text: final_text });
             }
             parts.extend(tool_parts);
+            // Record finish_reasons on terminal Done chunk (reviewer HIGH #6 late-binding).
+            chunk_span.record(
+                "gen_ai.response.finish_reasons",
+                tracing::field::display(format!("[{stop_reason:?}]")),
+            );
             yield Ok(StreamChunk::Done(CompletionResponse {
                 parts,
                 stop_reason,
@@ -801,7 +855,10 @@ impl Model for OpenAiProvider {
             }));
         };
 
-        Ok(Box::pin(stream))
+        Ok(Box::pin(stream) as StreamResponse)
+        }
+        .instrument(span)
+        .await
     }
 }
 
