@@ -85,6 +85,8 @@ pub fn sink_to_emit(sink: TaskLifecycleSink) -> roz_db::tasks::TaskLifecycleEmit
             new_status: map_status(&data.new_status),
             reason: data.reason,
             actor: data.actor,
+            trace_id: Vec::new(), // Phase 26.3 Plan 04 replaces with Span::current() bytes.
+            span_id: Vec::new(),
         };
         let _ = sink.send(event);
     })
