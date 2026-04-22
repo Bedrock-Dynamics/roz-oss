@@ -214,7 +214,7 @@ Success Criteria (what must be TRUE):
 Plans:
 - [x] 26.2-01-PLAN.md — Wave 1: audit matrix — append `## Coverage Matrix` section to `26.2-CONTEXT.md` with 42-row variant × emit-site × proto-mapper × status × wiring-action table (D-01/D-02/D-03/D-04)
 - [x] 26.2-02-PLAN.md — Wave 1: trait seam — create `crates/roz-core/src/agent_event_hook.rs` (AgentEventHook trait + NoopAgentEventHook) + wire `agent_event_hook` field + `with_agent_event_hook` builder into `AgentLoop`; zero emit sites added (Plan 04 owns those)
-- [ ] 26.2-03-PLAN.md — Wave 1: deterministic mock provider — create `crates/roz-test/src/mock_provider.rs::mock_provider_v1()` wrapping `StreamingMockModel` with the D-06 canned 1-turn response (thinking + hello_world tool_use + "Done." text + EndTurn + 42/13 tokens); re-export from lib.rs; add roz-agent path dep
+- [x] 26.2-03-PLAN.md — Wave 1: deterministic mock provider — create `crates/roz-agent/src/model/mock_provider.rs::mock_provider_v1()` (relocated from roz-test per REVIEWS.md H1 to avoid dev-dep cycle) with new `MockProviderV1` struct implementing `Model` trait and overriding BOTH `complete()` AND `stream()` with the D-06 canned 1-turn response (thinking + hello_world tool_use + "Done." text + EndTurn + 42/13 tokens); gated behind new `test-helpers` feature on roz-agent; re-exported from `model/mod.rs`; roz-test untouched
 - [ ] 26.2-04-PLAN.md — Wave 2 (depends on 02): wiring gap closure — emit ModelCallCompleted + ReasoningTrace at 2 core.rs model-call sites + ToolCall{Requested,Started,Finished} at 4 dispatch.rs sites, all routed through AgentEventHook → SessionRuntimeEventHook adapter → runtime EventEmitter; install via `with_agent_event_hook` in grpc/agent.rs at session construction (D-14 Gaps 1-5)
 - [ ] 26.2-05-PLAN.md — Wave 3 (depends on 03 + 04): new integration test `crates/roz-server/tests/mcap_agent_session_live.rs` — Path B direct AgentLoop+SessionRuntime drive, testcontainers Postgres, subscribes spawn_cloud_ingestors to MCAP writer, asserts all 6 D-10 BLOCKING variants present on `/roz/session/events` with payload fidelity (model_id="test-mock-v1", input_tokens=42, tool_name="hello_world"); `#[ignore]` + `required-features=["test-helpers"]` gating (D-09/D-10 SC3)
 - [ ] 26.2-06-PLAN.md — Wave 3 (depends on 03 + 04): extend SC5 fixture `crates/roz-server/tests/export_roundtrip.rs` with one scripted agent turn via mock_provider_v1 + SessionRuntime path (NOT direct WriteCommand::Event); update count assertions to lower-bound including `AGENT_TURN_SESSION_EVENTS_MIN=6`; add post-assertion decoding `/roz/session/events` to verify D-10 BLOCKING variants; preserve telemetry/quaternion/archive baseline assertions (D-11/D-12/D-13 SC4)
@@ -386,7 +386,7 @@ v3.0 Production Robotics milestone is in the planning stage. Phase 22 is planned
 | 25. Native MAVLink backend | v3.0 | 0/16 | Plans drafted 2026-04-19 | — |
 | 26. Unified MCAP observability | v3.0 | 12/12 | Complete | 2026-04-21 |
 | 26.1. MCAP schema descriptor dedup (Foxglove) | v3.0 | 1/1 | Complete (human UAT deferred) | 2026-04-21 |
-| 26.2. Agent-layer MCAP emit audit + wire | v3.0 | 0/6 | Planned 2026-04-22 | — |
+| 26.2. Agent-layer MCAP emit audit + wire | v3.0 | 3/6 | In progress (01, 02, 03 complete) | — |
 | 26.3. W3C trace context propagation | v3.0 | 0/0 | Not started | — |
 | 26.4. Session metadata index (fleet query plane) | v3.0 | 0/0 | Not started | — |
 | 26.5. MCAP multimedia channels | v3.0 | 0/0 | Not started | — |
