@@ -21,6 +21,7 @@ use std::future::{Future, pending};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use roz_core::agent_event_hook::AgentEventHook;
 use roz_core::recovery::{RecoveryAction, RecoveryConfig, recovery_action_for};
 use roz_core::session::activity::{ResumeRequirements, RuntimeActivity, RuntimeFailureKind, SafePauseState};
 use roz_core::session::control::CognitionMode;
@@ -2575,6 +2576,130 @@ mod tests {
         let decision = rx.await.expect("approval decision should resolve");
         assert!(decision.approved);
         assert_eq!(decision.modifier, Some(json!({"speed": 0.25})));
+    }
+}
+
+/// Phase 26.2 D-14: adapter that routes [`AgentEventHook`] callbacks into the
+/// runtime's [`EventEmitter`] broadcast bus.
+///
+/// Installed on [`crate::agent_loop::AgentLoop::with_agent_event_hook`] at
+/// session construction in `crates/roz-server/src/grpc/agent.rs`. Fire-and-
+/// forget: `EventEmitter::emit` already silently drops when no subscribers
+/// are attached per [`EventEmitter::emit`] contract, so the hook inherits the
+/// same semantics and cannot panic on broadcast-channel lag.
+pub struct SessionRuntimeEventHook {
+    emitter: EventEmitter,
+}
+
+impl SessionRuntimeEventHook {
+    /// Create a new hook wrapping the given [`EventEmitter`]. Callers typically
+    /// obtain the emitter via [`SessionRuntime::event_emitter`] (which already
+    /// clones the underlying broadcast sender).
+    #[must_use]
+    pub const fn new(emitter: EventEmitter) -> Self {
+        Self { emitter }
+    }
+}
+
+impl AgentEventHook for SessionRuntimeEventHook {
+    fn on_agent_event(&self, event: SessionEvent) {
+        // `EventEmitter::emit` handles the no-subscriber / lag cases
+        // internally — never panics, drops the send result silently.
+        let _ = self.emitter.emit(event);
+    }
+}
+
+#[cfg(test)]
+mod agent_event_hook_adapter_tests {
+    //! Phase 26.2 REVIEWS.md S2: proves `SessionRuntimeEventHook` routes
+    //! `AgentEventHook` calls through the runtime's `EventEmitter` so
+    //! subscribers observe the forwarded `SessionEvent`.
+
+    use super::{EventEmitter, SessionRuntimeEventHook};
+    use roz_core::agent_event_hook::AgentEventHook;
+    use roz_core::session::event::SessionEvent;
+
+    #[tokio::test]
+    async fn session_runtime_event_hook_routes_model_call_completed_to_subscriber() {
+        let emitter = EventEmitter::new(16);
+        let mut rx = emitter.subscribe();
+
+        let hook = SessionRuntimeEventHook::new(emitter.clone());
+
+        let event =
+            crate::observability::ModelCallTracker::build_event("test-mock-v1", "mock", 42, 13, 1, 0, "end_turn");
+
+        hook.on_agent_event(event);
+
+        let envelope = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("subscriber should receive within 500ms")
+            .expect("recv ok");
+
+        match envelope.event {
+            SessionEvent::ModelCallCompleted {
+                model_id,
+                provider,
+                input_tokens,
+                output_tokens,
+                stop_reason,
+                ..
+            } => {
+                assert_eq!(model_id, "test-mock-v1");
+                assert_eq!(provider, "mock");
+                assert_eq!(input_tokens, 42);
+                assert_eq!(output_tokens, 13);
+                assert_eq!(stop_reason, "end_turn");
+            }
+            other => panic!("expected ModelCallCompleted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_runtime_event_hook_routes_tool_call_started_to_subscriber() {
+        let emitter = EventEmitter::new(16);
+        let mut rx = emitter.subscribe();
+
+        let hook = SessionRuntimeEventHook::new(emitter.clone());
+
+        hook.on_agent_event(SessionEvent::ToolCallStarted {
+            call_id: "toolu_1".into(),
+            tool_name: "hello_world".into(),
+            category: "physical".into(),
+        });
+
+        let envelope = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+            .await
+            .expect("subscriber should receive within 500ms")
+            .expect("recv ok");
+
+        match envelope.event {
+            SessionEvent::ToolCallStarted {
+                call_id,
+                tool_name,
+                category,
+            } => {
+                assert_eq!(call_id, "toolu_1");
+                assert_eq!(tool_name, "hello_world");
+                assert_eq!(category, "physical");
+            }
+            other => panic!("expected ToolCallStarted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_runtime_event_hook_no_subscribers_does_not_panic() {
+        // No `subscribe()` call — tokio broadcast returns `SendError` when
+        // there are zero receivers; `EventEmitter::emit` silently discards it.
+        let emitter = EventEmitter::new(16);
+        let hook = SessionRuntimeEventHook::new(emitter);
+
+        hook.on_agent_event(SessionEvent::ToolCallStarted {
+            call_id: "toolu_2".into(),
+            tool_name: "noop".into(),
+            category: "pure".into(),
+        });
+        // Reaching this line proves the adapter did not panic.
     }
 }
 

@@ -31,7 +31,8 @@ use roz_agent::dispatch::remote::{PendingResults, RemoteToolCall, RemoteToolExec
 use roz_agent::model::types::StreamChunk;
 use roz_agent::safety::SafetyStack;
 use roz_agent::session_runtime::{
-    SessionRuntime, StreamingTurnExecutor, StreamingTurnHandle, StreamingTurnResult, TurnExecutionFailure, TurnOutput,
+    SessionRuntime, SessionRuntimeEventHook, StreamingTurnExecutor, StreamingTurnHandle, StreamingTurnResult,
+    TurnExecutionFailure, TurnOutput,
 };
 use roz_agent::spatial_provider::{
     NullWorldStateProvider, bootstrap_runtime_world_state_provider, format_runtime_world_state_bootstrap_note,
@@ -1621,11 +1622,21 @@ async fn run_session_loop(
                 tool_extensions.insert(auth_identity.clone());
                 tool_extensions.insert(turn_event_emitter.clone());
 
+                // Phase 26.2 D-14: install SessionRuntimeEventHook so agent-loop
+                // emits (ModelCallCompleted, in-process ToolCall{Requested,Started,
+                // Finished}) route through the runtime's EventEmitter and onto
+                // /roz/session/events. The emitter is cloned from the runtime's
+                // existing `event_emitter()` accessor (REVIEWS.md L1).
+                let agent_event_emitter = {
+                    let runtime = turn_runtime.lock().await;
+                    runtime.event_emitter()
+                };
                 let agent_loop = AgentLoop::new(model, dispatcher, safety, spatial)
                     .with_extensions(tool_extensions)
                     .with_approval_runtime(approval_runtime.clone())
                     .with_meter(meter.clone())
-                    .with_turn_emitter_opt(turn_emitter.clone());
+                    .with_turn_emitter_opt(turn_emitter.clone())
+                    .with_agent_event_hook(Arc::new(SessionRuntimeEventHook::new(agent_event_emitter)));
 
                 let turn_cancel = tokio_util::sync::CancellationToken::new();
                 let message_id = msg
