@@ -5,8 +5,15 @@ pub mod openai;
 pub mod router;
 pub mod structured_output;
 pub mod types;
+
+#[cfg(feature = "test-helpers")]
+mod mock_provider;
+
 pub use fallback::{FallbackChain, FallbackModel};
 pub use types::*;
+
+#[cfg(feature = "test-helpers")]
+pub use mock_provider::{MockProviderV1, mock_provider_v1};
 
 use std::sync::Arc;
 

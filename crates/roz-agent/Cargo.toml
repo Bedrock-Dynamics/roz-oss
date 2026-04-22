@@ -6,6 +6,13 @@ rust-version.workspace = true
 license.workspace      = true
 authors.workspace      = true
 
+[features]
+# Opt-in surface exposing deterministic test helpers (e.g. `mock_provider_v1`).
+# Never enabled by production binaries. Activated by dev-dep graphs of
+# roz-server / roz-worker integration tests via `required-features`.
+# See `crates/roz-agent/src/model/mock_provider.rs` (Phase 26.2 Plan 03).
+test-helpers = []
+
 [dependencies]
 roz-core = { path = "../roz-core" }
 roz-copper = { path = "../roz-copper", default-features = false }
