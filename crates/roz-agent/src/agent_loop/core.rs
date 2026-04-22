@@ -18,6 +18,7 @@ use crate::dispatch::ToolContext;
 use crate::error::AgentError;
 use crate::meter::BudgetStatus;
 use crate::model::types::{CompletionRequest, Message, StopReason, StreamChunk, TokenUsage, ToolChoiceStrategy};
+use crate::observability::ModelCallTracker;
 use roz_core::session::control::CognitionMode;
 use roz_core::spatial::WorldState;
 
@@ -221,11 +222,35 @@ impl AgentLoop {
                     tool_choice: None,
                     response_schema: None,
                 };
+                // DEFERRED: ReasoningTrace per Phase 26.3 (D-10 WARN tolerance; REVIEWS.md M1).
+                // The trace builder in `crate::observability` requires a turn_index which
+                // AgentLoop does not currently carry; plumbing it is scoped to Phase 26.3.
+                let summary_call_start = std::time::Instant::now();
                 if let Ok(resp) = if input.streaming {
                     self.stream_and_forward_with_retry(&summary_req, &chunk_tx).await
                 } else {
                     self.complete_with_retry(&summary_req).await
                 } {
+                    // Phase 26.2 Gap 1: ModelCallCompleted — emit before consuming resp
+                    // fields that move out of it (resp.text(), resp.parts).
+                    let summary_latency_ms =
+                        u64::try_from(summary_call_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    let provider = input.model_name.split(':').next().unwrap_or("unknown");
+                    let stop_reason_str = match resp.stop_reason {
+                        StopReason::EndTurn => "end_turn",
+                        StopReason::ToolUse => "tool_use",
+                        StopReason::MaxTokens => "max_tokens",
+                    };
+                    self.agent_event_hook.on_agent_event(ModelCallTracker::build_event(
+                        &input.model_name,
+                        provider,
+                        resp.usage.input_tokens,
+                        resp.usage.output_tokens,
+                        summary_latency_ms,
+                        resp.usage.cache_read_tokens,
+                        stop_reason_str,
+                    ));
+
                     if let Some(text) = resp.text() {
                         final_response = Some(text);
                     }
@@ -371,12 +396,39 @@ impl AgentLoop {
                 response_schema: None,
             };
 
+            // DEFERRED: ReasoningTrace per Phase 26.3 (D-10 WARN tolerance; REVIEWS.md M1).
+            // The trace builder in `crate::observability` requires a turn_index which
+            // AgentLoop does not currently carry; plumbing it is scoped to Phase 26.3.
+            let model_call_start = std::time::Instant::now();
             let resp = if input.streaming {
                 self.stream_and_forward_with_retry(&req, &chunk_tx).await?
             } else {
                 self.complete_with_retry(&req).await?
             };
             cycles += 1;
+
+            // Phase 26.2 Gap 1: ModelCallCompleted — emit before usage totals so
+            // the event carries this cycle's per-call usage, not the cumulative
+            // total. Routed through the AgentEventHook installed in grpc/agent.rs.
+            {
+                let latency_ms = u64::try_from(model_call_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let provider = input.model_name.split(':').next().unwrap_or("unknown");
+                let stop_reason_str = match resp.stop_reason {
+                    StopReason::EndTurn => "end_turn",
+                    StopReason::ToolUse => "tool_use",
+                    StopReason::MaxTokens => "max_tokens",
+                };
+                self.agent_event_hook.on_agent_event(ModelCallTracker::build_event(
+                    &input.model_name,
+                    provider,
+                    resp.usage.input_tokens,
+                    resp.usage.output_tokens,
+                    latency_ms,
+                    resp.usage.cache_read_tokens,
+                    stop_reason_str,
+                ));
+            }
+
             total_usage.input_tokens += resp.usage.input_tokens;
             total_usage.output_tokens += resp.usage.output_tokens;
             total_usage.cache_read_tokens += resp.usage.cache_read_tokens;
