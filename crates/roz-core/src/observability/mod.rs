@@ -23,10 +23,7 @@ pub fn trace_bytes_from_current_span() -> (Vec<u8>, Vec<u8>) {
     if sc.trace_id() == opentelemetry::trace::TraceId::INVALID {
         return (Vec::new(), Vec::new());
     }
-    (
-        sc.trace_id().to_bytes().to_vec(),
-        sc.span_id().to_bytes().to_vec(),
-    )
+    (sc.trace_id().to_bytes().to_vec(), sc.span_id().to_bytes().to_vec())
 }
 
 #[cfg(test)]
