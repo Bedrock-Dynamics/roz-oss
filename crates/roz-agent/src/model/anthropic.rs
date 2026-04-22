@@ -776,12 +776,47 @@ impl Model for AnthropicProvider {
         vec![ModelCapability::TextReasoning]
     }
 
+    #[tracing::instrument(
+        name = "gen_ai.anthropic.chat",
+        skip(self, req),
+        fields(
+            gen_ai.system = "anthropic",
+            gen_ai.operation.name = "chat",
+            gen_ai.request.model = %self.config.model,
+            gen_ai.request.max_tokens = req.max_tokens,
+            gen_ai.response.model = tracing::field::Empty,
+            gen_ai.response.finish_reasons = tracing::field::Empty,
+            gen_ai.usage.input_tokens = tracing::field::Empty,
+            gen_ai.usage.output_tokens = tracing::field::Empty,
+            gen_ai.usage.cache_read_input_tokens = tracing::field::Empty,
+            gen_ai.usage.cache_creation_input_tokens = tracing::field::Empty,
+        )
+    )]
     async fn complete(
         &self,
         req: &CompletionRequest,
     ) -> Result<CompletionResponse, Box<dyn std::error::Error + Send + Sync>> {
         let api_req = Self::build_api_request(&self.config, req, false);
         let resp = self.send_messages_request(&api_req).await?;
+
+        // Record late-binding GenAI attrs at point of availability (OTel 1.27 semconv).
+        // Security: NEVER record resp.content — it carries completion text.
+        tracing::Span::current().record("gen_ai.response.model", tracing::field::display(&resp.model));
+        tracing::Span::current().record("gen_ai.usage.input_tokens", resp.usage.input_tokens);
+        tracing::Span::current().record("gen_ai.usage.output_tokens", resp.usage.output_tokens);
+        tracing::Span::current().record(
+            "gen_ai.usage.cache_read_input_tokens",
+            resp.usage.cache_read_input_tokens,
+        );
+        tracing::Span::current().record(
+            "gen_ai.usage.cache_creation_input_tokens",
+            resp.usage.cache_creation_input_tokens,
+        );
+        tracing::Span::current().record(
+            "gen_ai.response.finish_reasons",
+            tracing::field::display(format!("[{}]", resp.stop_reason.as_deref().unwrap_or("unknown"))),
+        );
+
         let mut converted = Self::convert_response(&resp);
 
         // Structured-output (response_schema): the synthetic `respond` tool
@@ -857,78 +892,133 @@ impl Model for AnthropicProvider {
     ) -> Result<StreamResponse, Box<dyn std::error::Error + Send + Sync>> {
         use eventsource_stream::Eventsource;
         use futures::StreamExt as _;
+        use tracing::Instrument as _;
 
-        let (system, messages) = Self::convert_messages(&req.messages);
-        let tools = if req.tools.is_empty() {
-            None
-        } else {
-            Some(Self::convert_tools(&req.tools))
-        };
+        // Reviewer HIGH #6: use info_span! + .instrument(span) on the stream future so the
+        // span stays alive for the full stream lifetime. A bare #[tracing::instrument] on an
+        // async-fn-returning-Stream ends the span at function-return, before polling.
+        let span = tracing::info_span!(
+            "gen_ai.anthropic.chat",
+            gen_ai.system = "anthropic",
+            gen_ai.operation.name = "chat",
+            gen_ai.request.model = %self.config.model,
+            gen_ai.request.max_tokens = req.max_tokens,
+            gen_ai.response.model = tracing::field::Empty,
+            gen_ai.response.finish_reasons = tracing::field::Empty,
+            gen_ai.usage.input_tokens = tracing::field::Empty,
+            gen_ai.usage.output_tokens = tracing::field::Empty,
+            gen_ai.usage.cache_read_input_tokens = tracing::field::Empty,
+            gen_ai.usage.cache_creation_input_tokens = tracing::field::Empty,
+        );
 
-        let api_req = AnthropicRequest {
-            model: self.config.model.clone(),
-            max_tokens: req.max_tokens,
-            system,
-            messages,
-            tools,
-            tool_choice: if req.tools.is_empty() {
+        async move {
+            // Clone a handle to the instrumented span so we can .record() attrs from inside
+            // the async_stream — Span handles keep the span alive and writes succeed regardless
+            // of whether the span is the currently-active one at record time.
+            let chunk_span = tracing::Span::current();
+
+            let (system, messages) = Self::convert_messages(&req.messages);
+            let tools = if req.tools.is_empty() {
                 None
             } else {
-                Some(Self::map_tool_choice(req.tool_choice.as_ref()))
-            },
-            thinking: self.config.thinking.clone(),
-            stream: true,
-            metadata: None,
-        };
+                Some(Self::convert_tools(&req.tools))
+            };
 
-        // Send request manually to capture error response bodies.
-        let response = self.base_request().json(&api_req).send().await?;
+            let api_req = AnthropicRequest {
+                model: self.config.model.clone(),
+                max_tokens: req.max_tokens,
+                system,
+                messages,
+                tools,
+                tool_choice: if req.tools.is_empty() {
+                    None
+                } else {
+                    Some(Self::map_tool_choice(req.tool_choice.as_ref()))
+                },
+                thinking: self.config.thinking.clone(),
+                stream: true,
+                metadata: None,
+            };
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            tracing::error!(status = %status, body = %body, "anthropic API error");
-            return Err(format!("Anthropic API error {status}: {body}").into());
-        }
+            // Send request manually to capture error response bodies.
+            let response = self.base_request().json(&api_req).send().await?;
 
-        // Parse SSE events from the successful response body.
-        let event_stream = response.bytes_stream().eventsource();
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                tracing::error!(status = %status, body = %body, "anthropic API error");
+                return Err(format!("Anthropic API error {status}: {body}").into());
+            }
 
-        Ok(Box::pin(async_stream::stream! {
-            let mut asm = StreamAssembler::new();
+            // Parse SSE events from the successful response body.
+            let event_stream = response.bytes_stream().eventsource();
 
-            tokio::pin!(event_stream);
-            while let Some(event) = event_stream.next().await {
-                match event {
-                    Ok(ev) => {
-                        let stream_event: StreamEvent = match serde_json::from_str(&ev.data) {
-                            Ok(ev) => ev,
-                            Err(e) => {
-                                tracing::warn!(data = %ev.data, error = %e, "failed to parse SSE event");
-                                yield Err(e.into());
-                                break;
-                            }
-                        };
+            Ok(Box::pin(async_stream::stream! {
+                let mut asm = StreamAssembler::new();
 
-                        match asm.handle_event(stream_event) {
-                            Ok(chunks) => {
-                                for chunk in chunks {
-                                    yield Ok(chunk);
+                tokio::pin!(event_stream);
+                while let Some(event) = event_stream.next().await {
+                    match event {
+                        Ok(ev) => {
+                            let stream_event: StreamEvent = match serde_json::from_str(&ev.data) {
+                                Ok(ev) => ev,
+                                Err(e) => {
+                                    tracing::warn!(data = %ev.data, error = %e, "failed to parse SSE event");
+                                    yield Err(e.into());
+                                    break;
+                                }
+                            };
+
+                            match asm.handle_event(stream_event) {
+                                Ok(chunks) => {
+                                    for chunk in chunks {
+                                        // Reviewer HIGH #6: record late-binding GenAI attrs on the
+                                        // instrumented span handle captured above. Security: never
+                                        // record text/tool-use payloads, only numeric counters and
+                                        // the discrete finish reason.
+                                        match &chunk {
+                                            StreamChunk::Usage(u) => {
+                                                chunk_span.record("gen_ai.usage.input_tokens", u.input_tokens);
+                                                chunk_span.record("gen_ai.usage.output_tokens", u.output_tokens);
+                                                chunk_span.record(
+                                                    "gen_ai.usage.cache_read_input_tokens",
+                                                    u.cache_read_tokens,
+                                                );
+                                                chunk_span.record(
+                                                    "gen_ai.usage.cache_creation_input_tokens",
+                                                    u.cache_creation_tokens,
+                                                );
+                                            }
+                                            StreamChunk::Done(resp) => {
+                                                chunk_span.record(
+                                                    "gen_ai.response.finish_reasons",
+                                                    tracing::field::display(format!(
+                                                        "[{:?}]",
+                                                        resp.stop_reason
+                                                    )),
+                                                );
+                                            }
+                                            _ => {}
+                                        }
+                                        yield Ok(chunk);
+                                    }
+                                }
+                                Err(msg) => {
+                                    yield Err(msg.into());
+                                    break;
                                 }
                             }
-                            Err(msg) => {
-                                yield Err(msg.into());
-                                break;
-                            }
+                        }
+                        Err(e) => {
+                            yield Err(e.into());
+                            break;
                         }
                     }
-                    Err(e) => {
-                        yield Err(e.into());
-                        break;
-                    }
                 }
-            }
-        }))
+            }) as StreamResponse)
+        }
+        .instrument(span)
+        .await
     }
 }
 

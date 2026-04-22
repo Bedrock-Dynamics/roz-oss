@@ -159,31 +159,91 @@ impl Model for MockProviderV1 {
         vec![ModelCapability::TextReasoning]
     }
 
+    #[tracing::instrument(
+        name = "gen_ai.mock.chat",
+        skip(self, _req),
+        fields(
+            gen_ai.system = "mock",
+            gen_ai.operation.name = "chat",
+            gen_ai.request.model = "test-mock-v1",
+            gen_ai.response.model = tracing::field::Empty,
+            gen_ai.response.finish_reasons = tracing::field::Empty,
+            gen_ai.usage.input_tokens = tracing::field::Empty,
+            gen_ai.usage.output_tokens = tracing::field::Empty,
+        )
+    )]
     async fn complete(
         &self,
         _req: &CompletionRequest,
     ) -> Result<CompletionResponse, Box<dyn std::error::Error + Send + Sync>> {
         // Explicitly override: do NOT fall back to any `StreamingMockModel`
         // placeholder — both entry points must observe the D-06 payload.
-        Ok(self.next_response())
+        let response = self.next_response();
+        // Plan 26.3-06 SC5: mock provider emits full synthetic GenAI attrs so
+        // SC5 exercises the same .record() code paths as production providers.
+        tracing::Span::current().record("gen_ai.response.model", tracing::field::display("test-mock-v1"));
+        tracing::Span::current().record("gen_ai.usage.input_tokens", response.usage.input_tokens);
+        tracing::Span::current().record("gen_ai.usage.output_tokens", response.usage.output_tokens);
+        tracing::Span::current().record(
+            "gen_ai.response.finish_reasons",
+            tracing::field::display(format!("[{:?}]", response.stop_reason)),
+        );
+        Ok(response)
     }
 
     async fn stream(
         &self,
         _req: &CompletionRequest,
     ) -> Result<StreamResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let response = self.next_response();
-        let chunks = if response.stop_reason == StopReason::ToolUse {
-            Self::tool_use_stream_chunks(response)
-        } else {
-            Self::end_turn_stream_chunks(response)
-        };
+        use tracing::Instrument as _;
 
-        Ok(Box::pin(async_stream::stream! {
-            for chunk in chunks {
-                yield Ok(chunk);
-            }
-        }))
+        // Reviewer HIGH #6: info_span! + .instrument() keeps the span alive for the full
+        // stream lifetime. A cloned span handle records late-binding attrs from inside the
+        // async_stream body.
+        let span = tracing::info_span!(
+            "gen_ai.mock.chat",
+            gen_ai.system = "mock",
+            gen_ai.operation.name = "chat",
+            gen_ai.request.model = "test-mock-v1",
+            gen_ai.response.model = tracing::field::Empty,
+            gen_ai.response.finish_reasons = tracing::field::Empty,
+            gen_ai.usage.input_tokens = tracing::field::Empty,
+            gen_ai.usage.output_tokens = tracing::field::Empty,
+        );
+
+        async move {
+            let chunk_span = tracing::Span::current();
+            let response = self.next_response();
+            let chunks = if response.stop_reason == StopReason::ToolUse {
+                Self::tool_use_stream_chunks(response)
+            } else {
+                Self::end_turn_stream_chunks(response)
+            };
+
+            Ok(Box::pin(async_stream::stream! {
+                for chunk in chunks {
+                    // Mirror production: record synthetic attrs on Usage + Done so SC5
+                    // exercises the same .record() code paths.
+                    match &chunk {
+                        StreamChunk::Usage(u) => {
+                            chunk_span.record("gen_ai.response.model", tracing::field::display("test-mock-v1"));
+                            chunk_span.record("gen_ai.usage.input_tokens", u.input_tokens);
+                            chunk_span.record("gen_ai.usage.output_tokens", u.output_tokens);
+                        }
+                        StreamChunk::Done(resp) => {
+                            chunk_span.record(
+                                "gen_ai.response.finish_reasons",
+                                tracing::field::display(format!("[{:?}]", resp.stop_reason)),
+                            );
+                        }
+                        _ => {}
+                    }
+                    yield Ok(chunk);
+                }
+            }) as StreamResponse)
+        }
+        .instrument(span)
+        .await
     }
 }
 

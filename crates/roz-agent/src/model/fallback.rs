@@ -63,20 +63,38 @@ impl Model for FallbackModel {
         self.primary.capabilities()
     }
 
+    #[tracing::instrument(
+        name = "gen_ai.fallback.chat",
+        skip(self, req),
+        fields(
+            gen_ai.system = "fallback",
+            gen_ai.operation.name = "chat",
+            gen_ai.request.max_tokens = req.max_tokens,
+            attempt_outcome = tracing::field::Empty,
+        )
+    )]
     async fn complete(
         &self,
         req: &CompletionRequest,
     ) -> Result<CompletionResponse, Box<dyn std::error::Error + Send + Sync>> {
         match self.primary.complete(req).await {
-            Ok(resp) => Ok(resp),
+            Ok(resp) => {
+                tracing::Span::current().record("attempt_outcome", "primary");
+                Ok(resp)
+            }
             Err(e) if Self::is_fallback_eligible(&*e) => {
                 tracing::warn!(
                     error = %e,
                     "primary model unavailable, delegating to fallback"
                 );
-                self.fallback.complete(req).await
+                let result = self.fallback.complete(req).await;
+                tracing::Span::current().record("attempt_outcome", if result.is_ok() { "fallback" } else { "failure" });
+                result
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                tracing::Span::current().record("attempt_outcome", "failure");
+                Err(e)
+            }
         }
     }
 
@@ -84,17 +102,43 @@ impl Model for FallbackModel {
         &self,
         req: &CompletionRequest,
     ) -> Result<StreamResponse, Box<dyn std::error::Error + Send + Sync>> {
-        match self.primary.stream(req).await {
-            Ok(resp) => Ok(resp),
-            Err(e) if Self::is_fallback_eligible(&*e) => {
-                tracing::warn!(
-                    error = %e,
-                    "primary model stream unavailable, delegating to fallback"
-                );
-                self.fallback.stream(req).await
+        use tracing::Instrument as _;
+
+        // Reviewer HIGH #6: streaming path uses info_span! + .instrument(span) so the
+        // outer fallback span stays alive while the downstream caller polls the stream.
+        // Inner provider spans (anthropic/openai/mock) nest as natural children.
+        let span = tracing::info_span!(
+            "gen_ai.fallback.chat",
+            gen_ai.system = "fallback",
+            gen_ai.operation.name = "chat",
+            gen_ai.request.max_tokens = req.max_tokens,
+            attempt_outcome = tracing::field::Empty,
+        );
+
+        async move {
+            let chunk_span = tracing::Span::current();
+            match self.primary.stream(req).await {
+                Ok(resp) => {
+                    chunk_span.record("attempt_outcome", "primary");
+                    Ok(resp)
+                }
+                Err(e) if Self::is_fallback_eligible(&*e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "primary model stream unavailable, delegating to fallback"
+                    );
+                    let result = self.fallback.stream(req).await;
+                    chunk_span.record("attempt_outcome", if result.is_ok() { "fallback" } else { "failure" });
+                    result
+                }
+                Err(e) => {
+                    chunk_span.record("attempt_outcome", "failure");
+                    Err(e)
+                }
             }
-            Err(e) => Err(e),
         }
+        .instrument(span)
+        .await
     }
 }
 
@@ -166,13 +210,25 @@ impl Model for FallbackChain {
         self.models.first().map_or_else(Vec::new, |(_, m)| m.capabilities())
     }
 
+    #[tracing::instrument(
+        name = "gen_ai.fallback_chain.chat",
+        skip(self, req),
+        fields(
+            gen_ai.system = "fallback_chain",
+            gen_ai.operation.name = "chat",
+            gen_ai.request.max_tokens = req.max_tokens,
+            attempt_count = tracing::field::Empty,
+            selected_model_index = tracing::field::Empty,
+        )
+    )]
     async fn complete(
         &self,
         req: &CompletionRequest,
     ) -> Result<CompletionResponse, Box<dyn std::error::Error + Send + Sync>> {
         let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+        let mut attempt_count: u32 = 0;
 
-        for (name, model) in &self.models {
+        for (idx, (name, model)) in self.models.iter().enumerate() {
             if !self.meets_min_tier(name) {
                 tracing::debug!(model = %name, "skipping model below minimum tier");
                 continue;
@@ -182,8 +238,13 @@ impl Model for FallbackChain {
                 continue;
             }
 
+            attempt_count += 1;
             match model.complete(req).await {
-                Ok(resp) => return Ok(resp),
+                Ok(resp) => {
+                    tracing::Span::current().record("attempt_count", attempt_count);
+                    tracing::Span::current().record("selected_model_index", idx as u32);
+                    return Ok(resp);
+                }
                 Err(e) => {
                     if FallbackModel::is_fallback_eligible(&*e) {
                         tracing::warn!(model = %name, error = %e, "model failed, trying next in chain");
@@ -191,11 +252,13 @@ impl Model for FallbackChain {
                         last_error = Some(e);
                         continue;
                     }
+                    tracing::Span::current().record("attempt_count", attempt_count);
                     return Err(e);
                 }
             }
         }
 
+        tracing::Span::current().record("attempt_count", attempt_count);
         Err(last_error.unwrap_or_else(|| "all models exhausted or on cooldown".into()))
     }
 
@@ -203,32 +266,56 @@ impl Model for FallbackChain {
         &self,
         req: &CompletionRequest,
     ) -> Result<StreamResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+        use tracing::Instrument as _;
 
-        for (name, model) in &self.models {
-            if !self.meets_min_tier(name) {
-                tracing::debug!(model = %name, "skipping model below minimum tier");
-                continue;
-            }
-            if self.is_on_cooldown(name) {
-                continue;
-            }
+        let span = tracing::info_span!(
+            "gen_ai.fallback_chain.chat",
+            gen_ai.system = "fallback_chain",
+            gen_ai.operation.name = "chat",
+            gen_ai.request.max_tokens = req.max_tokens,
+            attempt_count = tracing::field::Empty,
+            selected_model_index = tracing::field::Empty,
+        );
 
-            match model.stream(req).await {
-                Ok(resp) => return Ok(resp),
-                Err(e) => {
-                    if FallbackModel::is_fallback_eligible(&*e) {
-                        tracing::warn!(model = %name, error = %e, "model stream failed, trying next");
-                        self.set_cooldown(name);
-                        last_error = Some(e);
-                        continue;
+        async move {
+            let chunk_span = tracing::Span::current();
+            let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+            let mut attempt_count: u32 = 0;
+
+            for (idx, (name, model)) in self.models.iter().enumerate() {
+                if !self.meets_min_tier(name) {
+                    tracing::debug!(model = %name, "skipping model below minimum tier");
+                    continue;
+                }
+                if self.is_on_cooldown(name) {
+                    continue;
+                }
+
+                attempt_count += 1;
+                match model.stream(req).await {
+                    Ok(resp) => {
+                        chunk_span.record("attempt_count", attempt_count);
+                        chunk_span.record("selected_model_index", idx as u32);
+                        return Ok(resp);
                     }
-                    return Err(e);
+                    Err(e) => {
+                        if FallbackModel::is_fallback_eligible(&*e) {
+                            tracing::warn!(model = %name, error = %e, "model stream failed, trying next");
+                            self.set_cooldown(name);
+                            last_error = Some(e);
+                            continue;
+                        }
+                        chunk_span.record("attempt_count", attempt_count);
+                        return Err(e);
+                    }
                 }
             }
-        }
 
-        Err(last_error.unwrap_or_else(|| "all models exhausted or on cooldown".into()))
+            chunk_span.record("attempt_count", attempt_count);
+            Err(last_error.unwrap_or_else(|| "all models exhausted or on cooldown".into()))
+        }
+        .instrument(span)
+        .await
     }
 }
 
