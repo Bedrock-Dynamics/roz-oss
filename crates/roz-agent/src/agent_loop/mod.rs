@@ -25,6 +25,7 @@ use crate::error::AgentError;
 use crate::model::types::{ContentPart, Message, MessageRole, Model, StreamChunk};
 use crate::safety::SafetyStack;
 use crate::spatial_provider::WorldStateProvider;
+use roz_core::agent_event_hook::{AgentEventHook, NoopAgentEventHook};
 use roz_core::checkpoint_signal::{CheckpointSignal, NoopCheckpointSignal};
 pub use roz_core::session::control::CognitionMode;
 use tokio::sync::mpsc;
@@ -74,6 +75,13 @@ pub struct AgentLoop {
     /// tests see zero behavior change. Swapped in at construction time via
     /// [`Self::with_checkpoint_signal`].
     pub(super) checkpoint_signal: std::sync::Arc<dyn CheckpointSignal>,
+    /// Phase 26.2 D-14: `SessionEvent` hook for agent-loop-originated variants
+    /// (`ModelCallCompleted`, `ReasoningTrace`, in-process
+    /// `ToolCallRequested` / `ToolCallStarted` / `ToolCallFinished`).
+    /// Defaults to [`NoopAgentEventHook`]. Swapped in via
+    /// [`Self::with_agent_event_hook`]. Plan 04 adds the emit call sites;
+    /// this plan only installs the seam.
+    pub(super) agent_event_hook: std::sync::Arc<dyn AgentEventHook>,
 }
 
 impl AgentLoop {
@@ -100,6 +108,7 @@ impl AgentLoop {
             meter: std::sync::Arc::new(crate::meter::NoOpMeter),
             turn_emitter: None,
             checkpoint_signal: std::sync::Arc::new(NoopCheckpointSignal),
+            agent_event_hook: std::sync::Arc::new(NoopAgentEventHook),
         }
     }
 
@@ -114,6 +123,14 @@ impl AgentLoop {
     #[must_use]
     pub fn with_checkpoint_signal(mut self, signal: std::sync::Arc<dyn CheckpointSignal>) -> Self {
         self.checkpoint_signal = signal;
+        self
+    }
+
+    /// Phase 26.2 D-14: install a custom `AgentEventHook`. Plan 04 uses this
+    /// to route agent-loop `SessionEvent`s into `SessionRuntime`'s event bus.
+    #[must_use]
+    pub fn with_agent_event_hook(mut self, hook: std::sync::Arc<dyn AgentEventHook>) -> Self {
+        self.agent_event_hook = hook;
         self
     }
 
