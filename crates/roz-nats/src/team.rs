@@ -56,7 +56,12 @@ pub async fn publish_team_event(
         event: event.clone(),
     })
     .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-    js.publish(subject, payload.into()).await?.await?;
+    // Phase 26.3 D-05: inject W3C traceparent + tracestate on every JetStream team
+    // event publish so approval / team-coordination hops carry trace context. Switch
+    // from `js.publish(..)` to `js.publish_with_headers(..)` to carry the headers.
+    let mut headers = async_nats::HeaderMap::new();
+    crate::trace::inject_trace_headers(&mut headers);
+    js.publish_with_headers(subject, headers, payload.into()).await?.await?;
     Ok(())
 }
 
