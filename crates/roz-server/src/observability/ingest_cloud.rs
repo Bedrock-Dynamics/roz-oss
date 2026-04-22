@@ -471,6 +471,8 @@ mod tests {
             parent_event_id: None,
             timestamp: Utc::now(),
             event,
+            trace_id: None,
+            span_id: None,
         }
     }
 

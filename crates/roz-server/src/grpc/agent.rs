@@ -3025,6 +3025,8 @@ fn canonicalize_session_started_envelope(
             model_name: Some(model_name.to_string()),
             permissions: permissions.to_vec(),
         },
+        trace_id: envelope.trace_id,
+        span_id: envelope.span_id,
     }
 }
 
@@ -3536,6 +3538,8 @@ mod tests {
                     reason: None,
                 }],
             },
+            trace_id: None,
+            span_id: None,
         };
 
         let response =
@@ -3571,6 +3575,8 @@ mod tests {
                 robot_safe: true,
                 unblock_event: None,
             },
+            trace_id: None,
+            span_id: None,
         };
 
         let response = edge_event_envelope_to_response(&envelope, "ignored").expect("activity event should map");
@@ -3598,6 +3604,8 @@ mod tests {
             parent_event_id: None,
             timestamp: chrono::Utc::now(),
             event: SessionEvent::TurnStarted { turn_index: 3 },
+            trace_id: None,
+            span_id: None,
         };
 
         let response = edge_event_envelope_to_response(&envelope, "ignored").expect("turn-started event should map");
@@ -3627,6 +3635,8 @@ mod tests {
             timestamp: chrono::Utc::now(),
             event_type: "text_delta".into(),
             event_payload: serde_json::json!({"not": "a tagged session event"}),
+            trace_id: None,
+            span_id: None,
         };
 
         let response = edge_canonical_json_envelope_to_response(&envelope, "ignored")
@@ -3670,6 +3680,8 @@ mod tests {
                 model_name: None,
                 permissions: vec![],
             },
+            trace_id: None,
+            span_id: None,
         };
         let permissions = vec![SessionPermissionRule {
             tool_pattern: "capture_frame".into(),
@@ -3710,6 +3722,8 @@ mod tests {
                 robot_safe: true,
                 unblock_event: None,
             },
+            trace_id: None,
+            span_id: None,
         };
 
         let response = cloud_event_envelope_to_response(&envelope, "ignored", &[]);

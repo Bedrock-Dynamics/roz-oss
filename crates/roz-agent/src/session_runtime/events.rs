@@ -38,6 +38,8 @@ impl EventEmitter {
             parent_event_id: None,
             timestamp: Utc::now(),
             event,
+            trace_id: None,
+            span_id: None,
         };
         // send returns Err only when there are no receivers; that's fine.
         let _ = self.tx.send(envelope.clone());
@@ -52,6 +54,8 @@ impl EventEmitter {
             parent_event_id: Some(parent.clone()),
             timestamp: Utc::now(),
             event,
+            trace_id: None,
+            span_id: None,
         };
         let _ = self.tx.send(envelope.clone());
         envelope

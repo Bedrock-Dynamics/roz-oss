@@ -33,6 +33,8 @@ fn fixture_envelope() -> EventEnvelope {
         parent_event_id: None,
         timestamp: DateTime::from_timestamp(1_767_225_600, 0).expect("valid"),
         event: SessionEvent::TurnStarted { turn_index: 7 },
+        trace_id: None,
+        span_id: None,
     }
 }
 

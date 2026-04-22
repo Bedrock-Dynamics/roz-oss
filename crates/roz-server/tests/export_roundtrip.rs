@@ -267,6 +267,8 @@ async fn sc5_30s_fixture_roundtrips_via_mcap_message_stream() {
                         outcome: ApprovalOutcome::Approved,
                     }
                 },
+                trace_id: None,
+                span_id: None,
             };
             emit_session_event_for_tests(&tx, &envelope).await;
         }

@@ -1997,6 +1997,8 @@ async fn main() -> Result<()> {
                                         parent_event_id: None,
                                         timestamp: chrono::Utc::now(),
                                         event,
+                                        trace_id: None,
+                                        span_id: None,
                                     };
                                     if let Err(e) = rt_session_tx.send(envelope) {
                                         tracing::debug!(
@@ -2348,6 +2350,8 @@ async fn main() -> Result<()> {
                         parent_event_id: None,
                         timestamp: chrono::Utc::now(),
                         event,
+                        trace_id: None,
+                        span_id: None,
                     };
                     // `.send` returns Err only when there are no live receivers;
                     // the _session_event_rx_keepalive at worker main keeps at

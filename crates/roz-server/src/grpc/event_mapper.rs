@@ -549,6 +549,8 @@ pub fn canonical_session_event_to_response(
         parent_event_id: None,
         timestamp: Utc::now(),
         event,
+        trace_id: None,
+        span_id: None,
     };
     canonical_event_envelope_to_session_response(&envelope)
 }
@@ -1222,6 +1224,8 @@ mod tests {
                 message: "busy".into(),
                 retryable: false,
             },
+            trace_id: None,
+            span_id: None,
         };
 
         match event_envelope_to_session_response(&envelope) {
