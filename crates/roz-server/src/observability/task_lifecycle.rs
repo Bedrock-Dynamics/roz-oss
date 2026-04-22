@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 
+use roz_core::observability::trace_bytes_from_current_span;
 use tokio::sync::broadcast;
 
 use crate::grpc::roz_v1::TaskLifecycleEvent;
@@ -75,6 +76,7 @@ pub fn map_status(status: &str) -> i32 {
 #[must_use]
 pub fn sink_to_emit(sink: TaskLifecycleSink) -> roz_db::tasks::TaskLifecycleEmit {
     Arc::new(move |data: roz_db::tasks::TaskLifecycleData| {
+        let (trace_id, span_id) = trace_bytes_from_current_span();
         let event = TaskLifecycleEvent {
             task_id: data.task_id.to_string(),
             timestamp: Some(prost_types::Timestamp {
@@ -85,8 +87,8 @@ pub fn sink_to_emit(sink: TaskLifecycleSink) -> roz_db::tasks::TaskLifecycleEmit
             new_status: map_status(&data.new_status),
             reason: data.reason,
             actor: data.actor,
-            trace_id: Vec::new(), // Phase 26.3 Plan 04 replaces with Span::current() bytes.
-            span_id: Vec::new(),
+            trace_id,
+            span_id,
         };
         let _ = sink.send(event);
     })
