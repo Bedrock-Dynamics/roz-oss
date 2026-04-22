@@ -7111,11 +7111,15 @@ dependencies = [
  "flume",
  "noxious-client",
  "opentelemetry",
+ "opentelemetry_sdk",
  "roz-core",
  "serde_json",
  "testcontainers",
  "testcontainers-modules",
  "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
  "zenoh",
 ]
 
