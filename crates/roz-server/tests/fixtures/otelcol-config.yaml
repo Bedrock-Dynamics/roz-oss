@@ -1,0 +1,31 @@
+# Phase 26.3 Plan 08 (SC6): minimal OTel collector pipeline.
+#
+# Used by `crates/roz-server/tests/cross_process_trace_stitch.rs` via
+# `roz_test::trace::otel_collector_container` to prove that spans published
+# via NATS from a server-side `tasks.create` span and stamped onto a
+# worker-side `worker.execute_task` span arrive at a collector sharing the
+# same `trace_id` and with `worker.parent_span_id == server.span_id`.
+#
+# Receivers: OTLP over gRPC on 4317 (container-internal; testcontainers
+# maps this to an ephemeral host port).
+#
+# Exporters: file exporter to `/spans/spans.jsonl` inside the container.
+# The test binds a host tempdir to `/spans` so it can read the resulting
+# JSONL after flushing the tracer provider.
+#
+# Parser shape: OTLP batch per line (one `ExportTraceServiceRequest` per
+# line) — verified against opentelemetry-collector-contrib 0.120.0 file
+# exporter semantics (Option A in Task 0 Audit H).
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+exporters:
+  file:
+    path: /spans/spans.jsonl
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [file]

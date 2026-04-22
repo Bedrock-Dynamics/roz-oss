@@ -65,6 +65,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 opentelemetry = "0.30"
 opentelemetry_sdk = "0.30"
+# Phase 26.3 Plan 08 (SC6, Rule 2 — missing critical functionality):
+# `otel_collector_container` + the in-process cross-process-trace-stitch
+# rig need an OTLP/gRPC span exporter to push spans to the collector
+# testcontainer. `grpc-tonic` matches tonic 0.13 already pinned workspace-wide.
+opentelemetry-otlp = { version = "0.30", default-features = false, features = ["grpc-tonic", "trace"] }
 tracing-opentelemetry = "0.31"
 
 # CLI
