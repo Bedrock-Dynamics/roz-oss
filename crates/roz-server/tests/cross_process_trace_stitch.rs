@@ -64,7 +64,7 @@ const TEST_SUBJECT: &str = "invoke.test-worker.00000000-0000-0000-0000-000000000
 // against the exporter task because both want the only worker thread.
 // Upstream's own smoke test uses `flavor = "multi_thread"` for the same
 // reason (`opentelemetry-otlp-0.30.0/tests/smoke.rs`).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires testcontainers + docker running + --features test-helpers"]
 async fn cross_process_trace_stitch_server_worker_share_trace_id() {
     // 1. Launch the OTel collector testcontainer.
@@ -198,135 +198,153 @@ async fn cross_process_trace_stitch_server_worker_share_trace_id() {
     worker_task.await.expect("worker task panic");
 
     // 8. Force-flush + shut down the tracer provider so every span is
-    //    exported to the collector before we read the JSONL.
+    //    exported to the collector before we read its stderr.
     provider.force_flush().expect("force_flush spans");
     provider.shutdown().expect("shutdown tracer provider");
 
-    // 9. Give the collector a moment to stream the gRPC batch into the
-    //    file exporter. Even with `SimpleSpanProcessor` the server-side
-    //    OTLP → collector-side file-write hop is async; empirically 2s
-    //    is comfortably more than collector-contrib needs.
-    //
-    //    Poll up to `MAX_POLL_SECS`; break early once both named spans
-    //    appear so a fast machine does not wait the full duration.
+    // 9. Poll the collector's stderr until both named spans appear (up
+    //    to MAX_POLL_SECS). The `debug` exporter emits a text block per
+    //    span; parser walks the `Span #N` records and indexes by Name.
+    //    Using stderr rather than the `file` exporter's JSONL because
+    //    the file exporter silently fails to flush on collector-contrib
+    //    0.120.0 + Docker Desktop macOS (file is created but always
+    //    0 bytes even when the debug exporter confirms spans arrived).
+    //    See `otelcol-config.yaml` for the full rationale.
     const MAX_POLL_SECS: u64 = 15;
-    let spans_path = collector.spans_file();
-    let mut all_spans: Vec<serde_json::Value> = Vec::new();
+    let mut parsed: Vec<CollectorSpan> = Vec::new();
     for attempt in 0..MAX_POLL_SECS {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        // File may not exist yet (collector flush race) OR be empty
-        // OR contain partial JSON; treat all three identically and poll.
-        let Ok(text) = std::fs::read_to_string(&spans_path) else {
+        let Ok(stderr_bytes) = collector.stderr_bytes().await else {
             continue;
         };
-        if text.trim().is_empty() {
-            continue;
-        }
-        all_spans = parse_collector_jsonl(&text);
-        let have_server = all_spans
-            .iter()
-            .any(|s| s.pointer("/name").and_then(|n| n.as_str()) == Some(SERVER_SPAN_NAME));
-        let have_worker = all_spans
-            .iter()
-            .any(|s| s.pointer("/name").and_then(|n| n.as_str()) == Some(WORKER_SPAN_NAME));
+        let stderr_text = String::from_utf8_lossy(&stderr_bytes);
+        parsed = parse_collector_debug_stderr(&stderr_text);
+        let have_server = parsed.iter().any(|s| s.name == SERVER_SPAN_NAME);
+        let have_worker = parsed.iter().any(|s| s.name == WORKER_SPAN_NAME);
         if have_server && have_worker {
-            eprintln!("spans ready after {}s ({} total)", attempt + 1, all_spans.len());
+            eprintln!("spans ready after {}s ({} total)", attempt + 1, parsed.len());
             break;
         }
     }
 
-    assert!(
-        !all_spans.is_empty(),
-        "collector wrote no spans to {spans_path:?} within {MAX_POLL_SECS}s"
-    );
+    assert!(!parsed.is_empty(), "collector emitted no spans within {MAX_POLL_SECS}s");
 
     // 10. Locate the two target spans.
-    let server_span_json = all_spans
-        .iter()
-        .find(|s| s.pointer("/name").and_then(|n| n.as_str()) == Some(SERVER_SPAN_NAME))
-        .unwrap_or_else(|| {
-            panic!(
-                "server span `{SERVER_SPAN_NAME}` not found in collector output; names seen: {:?}",
-                span_names(&all_spans)
-            )
-        });
-    let worker_span_json = all_spans
-        .iter()
-        .find(|s| s.pointer("/name").and_then(|n| n.as_str()) == Some(WORKER_SPAN_NAME))
-        .unwrap_or_else(|| {
-            panic!(
-                "worker span `{WORKER_SPAN_NAME}` not found in collector output; names seen: {:?}",
-                span_names(&all_spans)
-            )
-        });
+    let server_span_json = parsed.iter().find(|s| s.name == SERVER_SPAN_NAME).unwrap_or_else(|| {
+        panic!(
+            "server span `{SERVER_SPAN_NAME}` not found in collector output; names seen: {:?}",
+            parsed.iter().map(|s| s.name.clone()).collect::<Vec<_>>()
+        )
+    });
+    let worker_span_json = parsed.iter().find(|s| s.name == WORKER_SPAN_NAME).unwrap_or_else(|| {
+        panic!(
+            "worker span `{WORKER_SPAN_NAME}` not found in collector output; names seen: {:?}",
+            parsed.iter().map(|s| s.name.clone()).collect::<Vec<_>>()
+        )
+    });
 
     // 11. SC6 assertions.
-    let server_trace_id = server_span_json
-        .pointer("/traceId")
-        .and_then(|v| v.as_str())
-        .expect("server traceId");
-    let worker_trace_id = worker_span_json
-        .pointer("/traceId")
-        .and_then(|v| v.as_str())
-        .expect("worker traceId");
     assert_eq!(
-        server_trace_id, worker_trace_id,
+        server_span_json.trace_id, worker_span_json.trace_id,
         "SC6: server and worker must share trace_id"
     );
-
-    let server_span_id = server_span_json
-        .pointer("/spanId")
-        .and_then(|v| v.as_str())
-        .expect("server spanId");
-    let worker_parent_id = worker_span_json
-        .pointer("/parentSpanId")
-        .and_then(|v| v.as_str())
-        .expect("worker parentSpanId");
     assert_eq!(
-        worker_parent_id, server_span_id,
+        worker_span_json.parent_id, server_span_json.span_id,
         "SC6: worker.parent_span_id must equal server.span_id"
     );
 
     eprintln!(
-        "SC6 PASS: server {SERVER_SPAN_NAME} (span_id={server_span_id}) + worker \
-         {WORKER_SPAN_NAME} (parent={worker_parent_id}) share trace_id={server_trace_id}"
+        "SC6 PASS: server {SERVER_SPAN_NAME} (span_id={}) + worker {WORKER_SPAN_NAME} (parent={}) share trace_id={}",
+        server_span_json.span_id, worker_span_json.parent_id, server_span_json.trace_id
     );
 }
 
 // ---------------------------------------------------------------------------
-// Option A parser: one `ExportTraceServiceRequest` per line
+// Debug exporter parser
 // ---------------------------------------------------------------------------
 //
-// `otel/opentelemetry-collector-contrib:0.120.0`'s file exporter writes JSON
-// one OTLP batch per line containing `resourceSpans[].scopeSpans[].spans[]`.
-// Flatten to a single `Vec<Value>` of span objects for simple name-based
-// lookup.
-fn parse_collector_jsonl(text: &str) -> Vec<serde_json::Value> {
-    let mut out = Vec::new();
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
-        let Ok(batch) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let Some(resource_spans) = batch.pointer("/resourceSpans").and_then(|v| v.as_array()) else {
-            continue;
-        };
-        for rs in resource_spans {
-            let Some(scope_spans) = rs.pointer("/scopeSpans").and_then(|v| v.as_array()) else {
-                continue;
-            };
-            for ss in scope_spans {
-                if let Some(spans) = ss.pointer("/spans").and_then(|v| v.as_array()) {
-                    out.extend(spans.iter().cloned());
-                }
-            }
-        }
-    }
-    out
+// `otel/opentelemetry-collector-contrib:0.120.0`'s `debug` exporter with
+// `verbosity: detailed` emits one text block per span on stderr:
+//
+//   Span #N
+//       Trace ID       : <32 hex chars>
+//       Parent ID      : <16 hex chars>
+//       ID             : <16 hex chars>
+//       Name           : <span name>
+//       Kind           : <kind>
+//       Start time     : <rfc3339>
+//       End time       : <rfc3339>
+//       Status code    : <status>
+//       Status message :
+//   Attributes:
+//       ...
+//
+// The parser walks blocks delimited by `Span #\d+` headers, extracts
+// the four fields we care about, and returns a `Vec<CollectorSpan>`.
+// This is robust even when the collector also logs dozens of tonic/h2
+// infrastructure spans — the `Name` filter isolates our two target
+// spans and the other test-generated noise.
+#[derive(Debug, Clone)]
+struct CollectorSpan {
+    name: String,
+    trace_id: String,
+    span_id: String,
+    parent_id: String,
 }
 
-fn span_names(spans: &[serde_json::Value]) -> Vec<String> {
-    spans
-        .iter()
-        .filter_map(|s| s.pointer("/name").and_then(|v| v.as_str()).map(str::to_owned))
-        .collect()
+fn parse_collector_debug_stderr(text: &str) -> Vec<CollectorSpan> {
+    let mut out = Vec::new();
+    let mut current: Option<(String, String, String, String)> = None; // (name, trace_id, span_id, parent_id)
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Span #") {
+            // Flush previous block.
+            if let Some((name, trace_id, span_id, parent_id)) = current.take()
+                && !name.is_empty()
+            {
+                out.push(CollectorSpan {
+                    name,
+                    trace_id,
+                    span_id,
+                    parent_id,
+                });
+            }
+            current = Some((String::new(), String::new(), String::new(), String::new()));
+            continue;
+        }
+        let Some(cur) = current.as_mut() else {
+            continue;
+        };
+        // The debug exporter formats each field as
+        //     "<FieldName>     : <value>"
+        // (variable whitespace padding between the name and `:`).
+        // Strip padding FIRST, then the `:`, then any trailing padding,
+        // to land on the value.
+        let extract = |prefix: &str, line: &str| -> Option<String> {
+            line.strip_prefix(prefix)
+                .map(|rest| rest.trim_start().trim_start_matches(':').trim().to_owned())
+        };
+        if let Some(val) = extract("Trace ID", trimmed) {
+            cur.1 = val;
+        } else if let Some(val) = extract("Parent ID", trimmed) {
+            cur.3 = val;
+        } else if let Some(val) = extract("ID", trimmed) {
+            // Avoid matching "Trace ID"; already handled above by order.
+            cur.2 = val;
+        } else if let Some(val) = extract("Name", trimmed) {
+            cur.0 = val;
+        }
+    }
+    // Flush the last block.
+    if let Some((name, trace_id, span_id, parent_id)) = current.take()
+        && !name.is_empty()
+    {
+        out.push(CollectorSpan {
+            name,
+            trace_id,
+            span_id,
+            parent_id,
+        });
+    }
+    out
 }

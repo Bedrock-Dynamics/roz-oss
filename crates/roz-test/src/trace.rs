@@ -119,10 +119,13 @@ pub fn install_test_otel_subscriber() {
 ///   *after* calling `force_flush` + `shutdown` on the tracer provider,
 ///   otherwise you will race the exporter's batch flush and miss spans.
 pub struct OtelCollectorGuard {
-    // `ContainerAsync` is stopped on drop; wrapping in `Option` would let
-    // callers `std::mem::forget` — we intentionally do NOT, because SC6
-    // tests must clean the collector up deterministically.
-    _container: ContainerAsync<GenericImage>,
+    // Named (not underscore-prefixed) because `stderr_bytes()` reads from
+    // it — clippy's `used_underscore_binding` lint fires if we access a
+    // `_foo` field from a method. `ContainerAsync` is stopped on drop;
+    // wrapping in `Option` would let callers `std::mem::forget` — we
+    // intentionally do NOT, because SC6 tests must clean the collector
+    // up deterministically.
+    container: ContainerAsync<GenericImage>,
     endpoint: String,
     spans_dir: PathBuf,
     // tempdir must outlive the container; drop order is declaration order,
@@ -137,11 +140,30 @@ impl OtelCollectorGuard {
         &self.endpoint
     }
 
-    /// Host-side path of the JSONL span file written by the collector's
-    /// `file` exporter. Only read after force-flushing the tracer provider.
+    /// Host-side path of the (reserved) JSONL span file mount point.
+    ///
+    /// The fixture currently uses the `debug` exporter (not the `file`
+    /// exporter), so this path is empty in practice. Kept as an API
+    /// escape hatch in case a future revision switches back to file
+    /// export — see `otelcol-config.yaml` for the rationale on `debug`.
     #[must_use]
     pub fn spans_file(&self) -> PathBuf {
         self.spans_dir.join("spans.jsonl")
+    }
+
+    /// Read the collector's stderr stream (where the `debug` exporter
+    /// prints each received span batch in the `Span #N / Name / Trace
+    /// ID / ID / Parent ID` text format).
+    ///
+    /// Call only after the tracer provider has been force-flushed +
+    /// shut down, so the final batch has made the OTLP round-trip and
+    /// the collector has written it to its stderr.
+    ///
+    /// # Errors
+    /// Propagates any testcontainers-rs IO error from
+    /// `ContainerAsync::stderr_to_vec`.
+    pub async fn stderr_bytes(&self) -> Result<Vec<u8>, testcontainers::TestcontainersError> {
+        self.container.stderr_to_vec().await
     }
 }
 
@@ -219,10 +241,36 @@ pub async fn otel_collector_container(fixture_yaml_path: &Path) -> OtelCollector
         found.unwrap_or_else(|| panic!("failed to get collector host port after retries: {last_err:?}"))
     };
 
+    // TCP readiness probe: `WaitFor::message_on_stderr` fires when the
+    // collector LOGS "Everything is ready", but the OTLP/gRPC TCP
+    // listener can still be a few hundred ms behind the log line. On a
+    // cold machine the first export call from `opentelemetry-otlp`'s
+    // tonic client then lands on a half-open port, tonic drops the batch
+    // silently, and no further retry happens → whole-batch loss, test
+    // sees "no spans" even though collector is fully functional.
+    //
+    // Probe the port directly before handing the guard back so the
+    // caller's first export is guaranteed to land on a live listener.
+    for attempt in 0..20 {
+        let probe = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            tokio::net::TcpStream::connect(format!("{host}:{port}")),
+        )
+        .await;
+        if matches!(probe, Ok(Ok(_))) {
+            break;
+        }
+        assert!(
+            attempt != 19,
+            "collector port {host}:{port} never accepted TCP connections within ~5s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+
     let endpoint = format!("http://{host}:{port}");
 
     OtelCollectorGuard {
-        _container: container,
+        container,
         endpoint,
         spans_dir,
         _tempdir: tempdir,

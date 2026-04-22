@@ -9,23 +9,26 @@
 # Receivers: OTLP over gRPC on 4317 (container-internal; testcontainers
 # maps this to an ephemeral host port).
 #
-# Exporters: file exporter to `/spans/spans.jsonl` inside the container.
-# The test binds a host tempdir to `/spans` so it can read the resulting
-# JSONL after flushing the tracer provider.
-#
-# Parser shape: OTLP batch per line (one `ExportTraceServiceRequest` per
-# line) — verified against opentelemetry-collector-contrib 0.120.0 file
-# exporter semantics (Option A in Task 0 Audit H).
+# Exporters: `debug` with `verbosity: detailed`. The collector prints every
+# received span as JSON-formatted text to stderr; the test pulls this via
+# `docker logs` and parses the structured output for span name, trace_id,
+# span_id, and parent_span_id. We do NOT use the `file` exporter because
+# collector-contrib 0.120.0 on Docker Desktop macOS intermittently creates
+# the target file but never flushes data to it (empirically reproduced:
+# file is always 0 bytes even when debug exporter logs "spans: 2"). The
+# `debug` exporter's stdout/stderr path is more robust for local dev and
+# keeps the rig dependency-free of the file exporter's Alpha-stage
+# quirks.
 receivers:
   otlp:
     protocols:
       grpc:
         endpoint: 0.0.0.0:4317
 exporters:
-  file:
-    path: /spans/spans.jsonl
+  debug:
+    verbosity: detailed
 service:
   pipelines:
     traces:
       receivers: [otlp]
-      exporters: [file]
+      exporters: [debug]
