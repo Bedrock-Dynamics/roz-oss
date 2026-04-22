@@ -106,7 +106,12 @@ pub struct TaskInvocation {
     pub parent_task_id: Option<Uuid>,
     pub restate_url: String,
     /// W3C traceparent for distributed trace propagation (e.g., "00-{trace_id}-{span_id}-01").
-    /// Populated by the server, consumed by the worker to link spans across NATS.
+    ///
+    /// **Deprecated as of Phase 26.3.** W3C trace context now travels via the
+    /// NATS `traceparent`/`tracestate` headers (see `roz_nats::trace`). This body
+    /// field is retained for one milestone as a rolling-deploy fallback; the
+    /// worker reads the header first and falls back to this field only when
+    /// headers are absent. Removal deferred per D-08.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traceparent: Option<String>,
     /// Ordered phase specs for the agent loop. Empty = single React phase (default).
@@ -242,6 +247,10 @@ pub async fn publish_signed(
     let mut headers = HeaderMap::new();
     let hv = HeaderValue::from_str(header_value).map_err(|_| PublishSignedError::InvalidHeader)?;
     headers.insert(HEADER_NAME, hv);
+    // Phase 26.3 D-05: inject W3C traceparent + tracestate alongside roz-sig-v1 so
+    // the ~6 publish call sites (task_dispatch, nats_handlers, grpc/agent) propagate
+    // trace context with zero caller churn.
+    crate::trace::inject_trace_headers(&mut headers);
     client
         .publish_with_headers(subject, headers, payload.into())
         .await
