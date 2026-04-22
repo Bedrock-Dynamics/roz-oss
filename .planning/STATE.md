@@ -1,33 +1,32 @@
 ---
 gsd_state_version: 1.0
-milestone: v3.0
-milestone_name: Production Robotics
+milestone: v2.2
+milestone_name: Runtime Event Contracts and Completeness
 status: executing
-last_updated: "2026-04-20T18:55:00.000Z"
-last_activity: 2026-04-20 -- Phase 25 execution complete (14/16 plans; 25-14 + 25-15 deferred to Phase 27)
+last_updated: "2026-04-22T12:00:00.000Z"
+last_activity: 2026-04-22 -- Phase 26.2 plan 01 complete (Coverage Matrix appended to 26.2-CONTEXT.md)
 progress:
-  total_phases: 8
-  completed_phases: 4
-  total_plans: 60
-  completed_plans: 48
-  percent: 80
+  total_phases: 1
+  completed_phases: 0
+  total_plans: 6
+  completed_plans: 4
 ---
 
 # State
 
 ## Current Position
 
-Phase: 25 (native-mavlink-backend-in-crates-roz-mavlink-plus-bridge-proto-semantics-clean-up) — COMPLETE WITH DEFERRED GAP 2026-04-20
-Plan: 14 of 16 complete; 25-14 compliance fixtures + 25-15 readiness fixtures deferred to Phase 27 SC5/SC6/SC7 (live-FCU infra required — 20 `.tlog` recordings)
-Status: Next — /gsd-discuss-phase 26 (unified MCAP observability with Foxglove-native schema projection)
-Last activity: 2026-04-20 -- Phase 25 execution complete (14/16 plans; 25-14 + 25-15 deferred to Phase 27)
+Phase: 26.2 (agent-layer-mcap-emit-audit-and-wiring-openclaw-for-robotics) — EXECUTING
+Plan: 2 of 6 (next: 26.2-02 trait seam — AgentEventHook in roz-core)
+Status: Executing Phase 26.2
+Last activity: 2026-04-22 -- Phase 26.2 plan 01 complete (Coverage Matrix appended to 26.2-CONTEXT.md; 42 rows, 18✅/5⚠️/19❌; 5 D-10 gaps flagged for Plan 04, 2 D-17 proto-lossy deferred, 14 D-15 deferred)
 
 ## Project Reference
 
 See: `.planning/PROJECT.md` (updated 2026-04-16)
 
 **Core value:** A reliable, secure, and well-tested platform that operators trust for physical robot deployments.
-**Current focus:** Phase 25 complete (MAVLink backend shipped; compliance + readiness fixtures deferred to Phase 27); next is Phase 26 — unified MCAP observability with Foxglove-native schema projection.
+**Current focus:** Phase 26.2 — agent-layer-mcap-emit-audit-and-wiring-openclaw-for-robotics
 
 ## Accumulated Context
 
@@ -45,7 +44,8 @@ See: `.planning/PROJECT.md` (updated 2026-04-16)
 ### Roadmap Evolution
 
 - Phase 21.1 inserted after Phase 21: Typed skill events, cross-surface correlation coverage, and skill reload contract (URGENT)
-- v3.0 phases 22-28 drafted 2026-04-16 — no decimal insertions yet.
+- v3.0 phases 22-28 drafted 2026-04-16.
+- Phase 26.1 inserted after Phase 26: MCAP schema descriptor dedup for Foxglove Studio compatibility (URGENT — Phase 26 UAT surfaced `duplicate name 'Timestamp' in Namespace .google.protobuf` across all 6 channels; root cause in `schema_registry.rs::load` concat of foxglove_descriptor.bin + roz_v1_descriptor.bin without filename dedup)
 
 ### Research Artifacts
 
@@ -90,3 +90,7 @@ See: `.planning/PROJECT.md` (updated 2026-04-16)
 - ✅ v2.0 Platform Hardening (2026-04-14) — 8 phases, 38 plans, 42 tasks
 - ✅ v1.1 Embodiment Streaming, CLI, and Extensions (2026-04-10)
 - ✅ v1.0 Roz Embodiment Protos (2026-04-08)
+
+**Planned Phase:** 26.2 (Agent-layer MCAP emit audit and wiring (openclaw-for-robotics observability substrate)) — 6 plans — 2026-04-22T11:13:41.819Z
+
+**Completed Phase:** 26.1 plan 01 (schema_registry dedup) — commits `8df8cfb` (fix) + `2a7ee15` (test) — Phase 26 SC4 structurally unblocked — 2026-04-22T02:03:22Z
