@@ -912,110 +912,110 @@ impl Model for AnthropicProvider {
         );
 
         async move {
-        // Clone a handle to the instrumented span so we can .record() attrs from inside
-        // the async_stream — Span handles keep the span alive and writes succeed regardless
-        // of whether the span is the currently-active one at record time.
-        let chunk_span = tracing::Span::current();
+            // Clone a handle to the instrumented span so we can .record() attrs from inside
+            // the async_stream — Span handles keep the span alive and writes succeed regardless
+            // of whether the span is the currently-active one at record time.
+            let chunk_span = tracing::Span::current();
 
-        let (system, messages) = Self::convert_messages(&req.messages);
-        let tools = if req.tools.is_empty() {
-            None
-        } else {
-            Some(Self::convert_tools(&req.tools))
-        };
-
-        let api_req = AnthropicRequest {
-            model: self.config.model.clone(),
-            max_tokens: req.max_tokens,
-            system,
-            messages,
-            tools,
-            tool_choice: if req.tools.is_empty() {
+            let (system, messages) = Self::convert_messages(&req.messages);
+            let tools = if req.tools.is_empty() {
                 None
             } else {
-                Some(Self::map_tool_choice(req.tool_choice.as_ref()))
-            },
-            thinking: self.config.thinking.clone(),
-            stream: true,
-            metadata: None,
-        };
+                Some(Self::convert_tools(&req.tools))
+            };
 
-        // Send request manually to capture error response bodies.
-        let response = self.base_request().json(&api_req).send().await?;
+            let api_req = AnthropicRequest {
+                model: self.config.model.clone(),
+                max_tokens: req.max_tokens,
+                system,
+                messages,
+                tools,
+                tool_choice: if req.tools.is_empty() {
+                    None
+                } else {
+                    Some(Self::map_tool_choice(req.tool_choice.as_ref()))
+                },
+                thinking: self.config.thinking.clone(),
+                stream: true,
+                metadata: None,
+            };
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            tracing::error!(status = %status, body = %body, "anthropic API error");
-            return Err(format!("Anthropic API error {status}: {body}").into());
-        }
+            // Send request manually to capture error response bodies.
+            let response = self.base_request().json(&api_req).send().await?;
 
-        // Parse SSE events from the successful response body.
-        let event_stream = response.bytes_stream().eventsource();
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                tracing::error!(status = %status, body = %body, "anthropic API error");
+                return Err(format!("Anthropic API error {status}: {body}").into());
+            }
 
-        Ok(Box::pin(async_stream::stream! {
-            let mut asm = StreamAssembler::new();
+            // Parse SSE events from the successful response body.
+            let event_stream = response.bytes_stream().eventsource();
 
-            tokio::pin!(event_stream);
-            while let Some(event) = event_stream.next().await {
-                match event {
-                    Ok(ev) => {
-                        let stream_event: StreamEvent = match serde_json::from_str(&ev.data) {
-                            Ok(ev) => ev,
-                            Err(e) => {
-                                tracing::warn!(data = %ev.data, error = %e, "failed to parse SSE event");
-                                yield Err(e.into());
-                                break;
-                            }
-                        };
+            Ok(Box::pin(async_stream::stream! {
+                let mut asm = StreamAssembler::new();
 
-                        match asm.handle_event(stream_event) {
-                            Ok(chunks) => {
-                                for chunk in chunks {
-                                    // Reviewer HIGH #6: record late-binding GenAI attrs on the
-                                    // instrumented span handle captured above. Security: never
-                                    // record text/tool-use payloads, only numeric counters and
-                                    // the discrete finish reason.
-                                    match &chunk {
-                                        StreamChunk::Usage(u) => {
-                                            chunk_span.record("gen_ai.usage.input_tokens", u.input_tokens);
-                                            chunk_span.record("gen_ai.usage.output_tokens", u.output_tokens);
-                                            chunk_span.record(
-                                                "gen_ai.usage.cache_read_input_tokens",
-                                                u.cache_read_tokens,
-                                            );
-                                            chunk_span.record(
-                                                "gen_ai.usage.cache_creation_input_tokens",
-                                                u.cache_creation_tokens,
-                                            );
+                tokio::pin!(event_stream);
+                while let Some(event) = event_stream.next().await {
+                    match event {
+                        Ok(ev) => {
+                            let stream_event: StreamEvent = match serde_json::from_str(&ev.data) {
+                                Ok(ev) => ev,
+                                Err(e) => {
+                                    tracing::warn!(data = %ev.data, error = %e, "failed to parse SSE event");
+                                    yield Err(e.into());
+                                    break;
+                                }
+                            };
+
+                            match asm.handle_event(stream_event) {
+                                Ok(chunks) => {
+                                    for chunk in chunks {
+                                        // Reviewer HIGH #6: record late-binding GenAI attrs on the
+                                        // instrumented span handle captured above. Security: never
+                                        // record text/tool-use payloads, only numeric counters and
+                                        // the discrete finish reason.
+                                        match &chunk {
+                                            StreamChunk::Usage(u) => {
+                                                chunk_span.record("gen_ai.usage.input_tokens", u.input_tokens);
+                                                chunk_span.record("gen_ai.usage.output_tokens", u.output_tokens);
+                                                chunk_span.record(
+                                                    "gen_ai.usage.cache_read_input_tokens",
+                                                    u.cache_read_tokens,
+                                                );
+                                                chunk_span.record(
+                                                    "gen_ai.usage.cache_creation_input_tokens",
+                                                    u.cache_creation_tokens,
+                                                );
+                                            }
+                                            StreamChunk::Done(resp) => {
+                                                chunk_span.record(
+                                                    "gen_ai.response.finish_reasons",
+                                                    tracing::field::display(format!(
+                                                        "[{:?}]",
+                                                        resp.stop_reason
+                                                    )),
+                                                );
+                                            }
+                                            _ => {}
                                         }
-                                        StreamChunk::Done(resp) => {
-                                            chunk_span.record(
-                                                "gen_ai.response.finish_reasons",
-                                                tracing::field::display(format!(
-                                                    "[{:?}]",
-                                                    resp.stop_reason
-                                                )),
-                                            );
-                                        }
-                                        _ => {}
+                                        yield Ok(chunk);
                                     }
-                                    yield Ok(chunk);
+                                }
+                                Err(msg) => {
+                                    yield Err(msg.into());
+                                    break;
                                 }
                             }
-                            Err(msg) => {
-                                yield Err(msg.into());
-                                break;
-                            }
+                        }
+                        Err(e) => {
+                            yield Err(e.into());
+                            break;
                         }
                     }
-                    Err(e) => {
-                        yield Err(e.into());
-                        break;
-                    }
                 }
-            }
-        }) as StreamResponse)
+            }) as StreamResponse)
         }
         .instrument(span)
         .await

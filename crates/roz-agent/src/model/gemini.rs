@@ -366,6 +366,20 @@ impl Model for GeminiProvider {
         vec![ModelCapability::SpatialReasoning, ModelCapability::VisionAnalysis]
     }
 
+    #[tracing::instrument(
+        name = "gen_ai.google.chat",
+        skip(self, req),
+        fields(
+            gen_ai.system = "google",
+            gen_ai.operation.name = "chat",
+            gen_ai.request.model = %self.config.model,
+            gen_ai.request.max_tokens = req.max_tokens,
+            gen_ai.response.model = tracing::field::Empty,
+            gen_ai.response.finish_reasons = tracing::field::Empty,
+            gen_ai.usage.input_tokens = tracing::field::Empty,
+            gen_ai.usage.output_tokens = tracing::field::Empty,
+        )
+    )]
     async fn complete(
         &self,
         req: &CompletionRequest,
@@ -373,6 +387,17 @@ impl Model for GeminiProvider {
         let api_req = self.build_request(req);
         let resp = self.send_request(&api_req).await?;
         let mut converted = Self::convert_response(resp);
+
+        // Record late-binding GenAI attrs from converted usage + stop_reason. Gemini
+        // wire shape has no top-level response model id; use the configured request
+        // model as a proxy (Google routes unversioned model ids to latest).
+        tracing::Span::current().record("gen_ai.response.model", tracing::field::display(&self.config.model));
+        tracing::Span::current().record("gen_ai.usage.input_tokens", converted.usage.input_tokens);
+        tracing::Span::current().record("gen_ai.usage.output_tokens", converted.usage.output_tokens);
+        tracing::Span::current().record(
+            "gen_ai.response.finish_reasons",
+            tracing::field::display(format!("[{:?}]", converted.stop_reason)),
+        );
 
         // Plan 19-12: when a response_schema is set, treat the assistant text as
         // JSON and run the shared parse/repair pipeline.

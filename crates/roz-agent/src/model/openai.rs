@@ -750,112 +750,112 @@ impl Model for OpenAiProvider {
         );
 
         async move {
-        let chunk_span = tracing::Span::current();
-        let (mut inner, _wire) = self.open_stream(req).await.map_err(box_err)?;
+            let chunk_span = tracing::Span::current();
+            let (mut inner, _wire) = self.open_stream(req).await.map_err(box_err)?;
 
-        let stream = async_stream::stream! {
-            let mut final_text = String::new();
-            let mut final_reasoning = String::new();
-            let mut tool_parts: Vec<ContentPart> = Vec::new();
-            let mut pending_tool: Option<(String, String, String)> = None;
-            let mut usage = TokenUsage::default();
-            let mut stop_reason = StopReason::EndTurn;
+            let stream = async_stream::stream! {
+                let mut final_text = String::new();
+                let mut final_reasoning = String::new();
+                let mut tool_parts: Vec<ContentPart> = Vec::new();
+                let mut pending_tool: Option<(String, String, String)> = None;
+                let mut usage = TokenUsage::default();
+                let mut stop_reason = StopReason::EndTurn;
 
-            while let Some(ev) = inner.next().await {
-                let ev = match ev {
-                    Ok(e) => e,
-                    Err(e) => {
-                        let mapped = map_openai_error(e);
-                        yield Err::<StreamChunk, Box<dyn std::error::Error + Send + Sync>>(box_err(mapped));
-                        return;
-                    }
-                };
-                match ev {
-                    ResponseEvent::OutputTextDelta(s) => {
-                        final_text.push_str(&s);
-                        yield Ok(StreamChunk::TextDelta(s));
-                    }
-                    ResponseEvent::ReasoningContentDelta { delta, .. }
-                    | ResponseEvent::ReasoningSummaryDelta { delta, .. } => {
-                        final_reasoning.push_str(&delta);
-                        yield Ok(StreamChunk::ThinkingDelta(delta));
-                    }
-                    ResponseEvent::ToolCallStart { id, name } => {
-                        if let Some((pid, pname, pargs)) = pending_tool.take() {
-                            let input = serde_json::from_str::<Value>(&pargs).unwrap_or(Value::Null);
-                            tool_parts.push(ContentPart::ToolUse { id: pid, name: pname, input });
+                while let Some(ev) = inner.next().await {
+                    let ev = match ev {
+                        Ok(e) => e,
+                        Err(e) => {
+                            let mapped = map_openai_error(e);
+                            yield Err::<StreamChunk, Box<dyn std::error::Error + Send + Sync>>(box_err(mapped));
+                            return;
                         }
-                        pending_tool = Some((id.clone(), name.clone(), String::new()));
-                        yield Ok(StreamChunk::ToolUseStart { id, name });
-                    }
-                    ResponseEvent::ToolCallArgsDelta(s) => {
-                        if let Some((_, _, args)) = pending_tool.as_mut() {
-                            args.push_str(&s);
+                    };
+                    match ev {
+                        ResponseEvent::OutputTextDelta(s) => {
+                            final_text.push_str(&s);
+                            yield Ok(StreamChunk::TextDelta(s));
                         }
-                        yield Ok(StreamChunk::ToolUseInputDelta(s));
-                    }
-                    ResponseEvent::OutputItemDone(item) => {
-                        if let ResponseItem::FunctionCall { call_id, name, arguments, .. } = item {
-                            let input = serde_json::from_str::<Value>(&arguments).unwrap_or(Value::Null);
-                            if let Some((pid, pname, _)) = &pending_tool
-                                && pid == &call_id
-                                && pname == &name
-                            {
-                                tool_parts.push(ContentPart::ToolUse {
-                                    id: call_id,
-                                    name,
-                                    input,
-                                });
-                                pending_tool = None;
-                                continue;
+                        ResponseEvent::ReasoningContentDelta { delta, .. }
+                        | ResponseEvent::ReasoningSummaryDelta { delta, .. } => {
+                            final_reasoning.push_str(&delta);
+                            yield Ok(StreamChunk::ThinkingDelta(delta));
+                        }
+                        ResponseEvent::ToolCallStart { id, name } => {
+                            if let Some((pid, pname, pargs)) = pending_tool.take() {
+                                let input = serde_json::from_str::<Value>(&pargs).unwrap_or(Value::Null);
+                                tool_parts.push(ContentPart::ToolUse { id: pid, name: pname, input });
                             }
-                            tool_parts.push(ContentPart::ToolUse { id: call_id, name, input });
+                            pending_tool = Some((id.clone(), name.clone(), String::new()));
+                            yield Ok(StreamChunk::ToolUseStart { id, name });
                         }
-                    }
-                    ResponseEvent::Completed { token_usage, .. } => {
-                        if let Some(u) = token_usage {
-                            usage = to_roz_usage(&u);
+                        ResponseEvent::ToolCallArgsDelta(s) => {
+                            if let Some((_, _, args)) = pending_tool.as_mut() {
+                                args.push_str(&s);
+                            }
+                            yield Ok(StreamChunk::ToolUseInputDelta(s));
                         }
-                        // Reviewer HIGH #6: record on the instrumented span handle from the
-                        // final usage payload. Safe: no prompt / completion text.
-                        chunk_span.record("gen_ai.usage.input_tokens", usage.input_tokens);
-                        chunk_span.record("gen_ai.usage.output_tokens", usage.output_tokens);
-                        yield Ok(StreamChunk::Usage(usage));
+                        ResponseEvent::OutputItemDone(item) => {
+                            if let ResponseItem::FunctionCall { call_id, name, arguments, .. } = item {
+                                let input = serde_json::from_str::<Value>(&arguments).unwrap_or(Value::Null);
+                                if let Some((pid, pname, _)) = &pending_tool
+                                    && pid == &call_id
+                                    && pname == &name
+                                {
+                                    tool_parts.push(ContentPart::ToolUse {
+                                        id: call_id,
+                                        name,
+                                        input,
+                                    });
+                                    pending_tool = None;
+                                    continue;
+                                }
+                                tool_parts.push(ContentPart::ToolUse { id: call_id, name, input });
+                            }
+                        }
+                        ResponseEvent::Completed { token_usage, .. } => {
+                            if let Some(u) = token_usage {
+                                usage = to_roz_usage(&u);
+                            }
+                            // Reviewer HIGH #6: record on the instrumented span handle from the
+                            // final usage payload. Safe: no prompt / completion text.
+                            chunk_span.record("gen_ai.usage.input_tokens", usage.input_tokens);
+                            chunk_span.record("gen_ai.usage.output_tokens", usage.output_tokens);
+                            yield Ok(StreamChunk::Usage(usage));
+                        }
+                        ResponseEvent::Created | ResponseEvent::ServerReasoningIncluded(_) => {}
                     }
-                    ResponseEvent::Created | ResponseEvent::ServerReasoningIncluded(_) => {}
                 }
-            }
-            if let Some((pid, pname, pargs)) = pending_tool {
-                let input = serde_json::from_str::<Value>(&pargs).unwrap_or(Value::Null);
-                tool_parts.push(ContentPart::ToolUse { id: pid, name: pname, input });
-            }
-            if !tool_parts.is_empty() {
-                stop_reason = StopReason::ToolUse;
-            }
-            let mut parts: Vec<ContentPart> = Vec::new();
-            if !final_reasoning.is_empty() {
-                parts.push(ContentPart::Thinking {
-                    thinking: final_reasoning,
-                    signature: String::new(),
-                });
-            }
-            if !final_text.is_empty() {
-                parts.push(ContentPart::Text { text: final_text });
-            }
-            parts.extend(tool_parts);
-            // Record finish_reasons on terminal Done chunk (reviewer HIGH #6 late-binding).
-            chunk_span.record(
-                "gen_ai.response.finish_reasons",
-                tracing::field::display(format!("[{stop_reason:?}]")),
-            );
-            yield Ok(StreamChunk::Done(CompletionResponse {
-                parts,
-                stop_reason,
-                usage,
-            }));
-        };
+                if let Some((pid, pname, pargs)) = pending_tool {
+                    let input = serde_json::from_str::<Value>(&pargs).unwrap_or(Value::Null);
+                    tool_parts.push(ContentPart::ToolUse { id: pid, name: pname, input });
+                }
+                if !tool_parts.is_empty() {
+                    stop_reason = StopReason::ToolUse;
+                }
+                let mut parts: Vec<ContentPart> = Vec::new();
+                if !final_reasoning.is_empty() {
+                    parts.push(ContentPart::Thinking {
+                        thinking: final_reasoning,
+                        signature: String::new(),
+                    });
+                }
+                if !final_text.is_empty() {
+                    parts.push(ContentPart::Text { text: final_text });
+                }
+                parts.extend(tool_parts);
+                // Record finish_reasons on terminal Done chunk (reviewer HIGH #6 late-binding).
+                chunk_span.record(
+                    "gen_ai.response.finish_reasons",
+                    tracing::field::display(format!("[{stop_reason:?}]")),
+                );
+                yield Ok(StreamChunk::Done(CompletionResponse {
+                    parts,
+                    stop_reason,
+                    usage,
+                }));
+            };
 
-        Ok(Box::pin(stream) as StreamResponse)
+            Ok(Box::pin(stream) as StreamResponse)
         }
         .instrument(span)
         .await
