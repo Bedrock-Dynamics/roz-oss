@@ -147,6 +147,8 @@ fn extract_single_schema_fds(all_files: &[FileDescriptorProto], target_fqn: &str
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::{FileDescriptorSet, SchemaDescriptors};
     use crate::observability::{
         McapArchiveError, SCHEMA_FRAME_TRANSFORM, SCHEMA_LOG, SCHEMA_POSE_IN_FRAME, SCHEMA_SESSION_EVENT,
@@ -207,5 +209,36 @@ mod tests {
             has_quaternion,
             "Quaternion missing from FrameTransform descriptor closure"
         );
+    }
+
+    #[test]
+    fn extracted_fds_has_no_duplicate_filenames() {
+        // Regression: `SchemaDescriptors::load` merges foxglove_descriptor.bin
+        // and roz_v1_descriptor.bin, both of which transitively carry
+        // `google/protobuf/timestamp.proto`. Without filename dedup, each
+        // extracted per-schema FileDescriptorSet would contain two copies of
+        // the same file, and Foxglove Studio rejects this with
+        // "duplicate name 'Timestamp' in Namespace .google.protobuf".
+        // Verify every one of the six target schemas has unique filenames.
+        let reg = SchemaDescriptors::load().expect("descriptor load");
+        for name in [
+            SCHEMA_FRAME_TRANSFORM,
+            SCHEMA_POSE_IN_FRAME,
+            SCHEMA_LOG,
+            SCHEMA_SESSION_EVENT,
+            SCHEMA_TASK_LIFECYCLE,
+            SCHEMA_TOOL_CALL,
+        ] {
+            let bytes = reg.get(name).unwrap_or_else(|_| panic!("missing {name}"));
+            let fds = FileDescriptorSet::decode(bytes).expect("valid FileDescriptorSet");
+            let mut seen: HashSet<String> = HashSet::new();
+            for f in &fds.file {
+                let file_name = f.name.as_deref().expect("file name present");
+                assert!(
+                    seen.insert(file_name.to_string()),
+                    "duplicate file '{file_name}' in FileDescriptorSet for schema {name}"
+                );
+            }
+        }
     }
 }
