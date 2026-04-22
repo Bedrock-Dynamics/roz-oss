@@ -201,7 +201,7 @@ Plans:
 **Goal:** Confirm or make true that every `SessionEvent` variant representing agent-loop activity actually fires from `crates/roz-agent/src/agent_loop.rs` into the `/roz/session/events` MCAP channel. Produce a coverage matrix, fix any gaps as wiring (no new schemas), and ship an integration test that drives a real 1-turn agent session against a mock model provider and asserts the expected SessionEvent variant set appears in the resulting MCAP with correct payloads. This phase anchors the "openclaw for robotics" thesis: every agent-loop action becomes a first-class MCAP event that substrate can render alongside physical state.
 **Requirements:** none (observability plumbing — no new REQ-ID; reinforces OBS-01/02/03 fidelity)
 **Depends on:** Phase 26.1
-**Plans:** 6/6 plans complete (2026-04-22)
+**Plans:** 6/6 plans complete
 
 Success Criteria (what must be TRUE):
   1. Coverage matrix in `26.2-CONTEXT.md` lists every `SessionEvent::*` variant × emit site × production path × fixture coverage; every variant is either ✅ covered or explicitly marked deferred with reason.
@@ -386,7 +386,7 @@ v3.0 Production Robotics milestone is in the planning stage. Phase 22 is planned
 | 25. Native MAVLink backend | v3.0 | 0/16 | Plans drafted 2026-04-19 | — |
 | 26. Unified MCAP observability | v3.0 | 12/12 | Complete | 2026-04-21 |
 | 26.1. MCAP schema descriptor dedup (Foxglove) | v3.0 | 1/1 | Complete (human UAT deferred) | 2026-04-21 |
-| 26.2. Agent-layer MCAP emit audit + wire | v3.0 | 6/6 | Complete | 2026-04-22 |
+| 26.2. Agent-layer MCAP emit audit + wire | v3.0 | 6/6 | Complete    | 2026-04-22 |
 | 26.3. W3C trace context propagation | v3.0 | 0/0 | Not started | — |
 | 26.4. Session metadata index (fleet query plane) | v3.0 | 0/0 | Not started | — |
 | 26.5. MCAP multimedia channels | v3.0 | 0/0 | Not started | — |

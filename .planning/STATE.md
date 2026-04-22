@@ -2,24 +2,24 @@
 gsd_state_version: 1.0
 milestone: v2.2
 milestone_name: Runtime Event Contracts and Completeness
-status: executing
-last_updated: "2026-04-22T12:00:00.000Z"
-last_activity: 2026-04-22 -- Phase 26.2 plan 01 complete (Coverage Matrix appended to 26.2-CONTEXT.md)
+status: milestone_complete
+last_updated: "2026-04-22T13:33:27.864Z"
+last_activity: 2026-04-22
 progress:
   total_phases: 1
-  completed_phases: 0
-  total_plans: 6
-  completed_plans: 4
+  completed_phases: 1
+  total_plans: 0
+  completed_plans: 3
 ---
 
 # State
 
 ## Current Position
 
-Phase: 26.2 (agent-layer-mcap-emit-audit-and-wiring-openclaw-for-robotics) — EXECUTING
-Plan: 2 of 6 (next: 26.2-02 trait seam — AgentEventHook in roz-core)
-Status: Executing Phase 26.2
-Last activity: 2026-04-22 -- Phase 26.2 plan 01 complete (Coverage Matrix appended to 26.2-CONTEXT.md; 42 rows, 18✅/5⚠️/19❌; 5 D-10 gaps flagged for Plan 04, 2 D-17 proto-lossy deferred, 14 D-15 deferred)
+Phase: 26.2
+Plan: Not started
+Status: Milestone complete
+Last activity: 2026-04-22
 
 ## Project Reference
 
@@ -82,6 +82,9 @@ See: `.planning/PROJECT.md` (updated 2026-04-16)
 - **Transform-at-write MCAP, not duplicate-on-disk** — copper pose / transform data projects once into Foxglove's published schemas at the writer; roz-semantic channels remain only for events with no Foxglove analog.
 - **`substrate.sim.v1` stays wire-compatible for one more milestone** — all v3.0 `bridge.proto` semantics cleanup (Phase 25) is backward-compatible; any wire-incompat change goes to `substrate.sim.v2`.
 - **Free GitHub runners suffice for nightly SITL** — no self-hosted or GPU runner in v3.0; full induced-outage scenario fits in <600 s on free runners.
+- **Phase 26.2 Plan 03 — mock provider location:** Relocated from `crates/roz-test/src/mock_provider.rs` (CONTEXT.md D-05) to `crates/roz-agent/src/model/mock_provider.rs` per REVIEWS.md H1 to avoid a dev-dep cycle (roz-agent/Cargo.toml:55 already dev-deps roz-test).
+- **Phase 26.2 Plan 03 — MockProviderV1 overrides both complete() and stream()** explicitly per REVIEWS.md H2 so no caller falls back to the `StreamingMockModel::complete()` placeholder at types.rs:391.
+- **Phase 26.2 Plan 03 — added `[features] test-helpers = []` to roz-agent/Cargo.toml:** the feature did not yet exist in that crate despite plan claims; downstream roz-server Plans 05/06 must add `test-helpers = ["roz-agent/test-helpers"]` to propagate the feature flag.
 
 ### Recent Milestones
 
@@ -94,3 +97,5 @@ See: `.planning/PROJECT.md` (updated 2026-04-16)
 **Planned Phase:** 26.2 (Agent-layer MCAP emit audit and wiring (openclaw-for-robotics observability substrate)) — 6 plans — 2026-04-22T11:13:41.819Z
 
 **Completed Phase:** 26.1 plan 01 (schema_registry dedup) — commits `8df8cfb` (fix) + `2a7ee15` (test) — Phase 26 SC4 structurally unblocked — 2026-04-22T02:03:22Z
+
+**Completed Plan:** 26.2-03 (deterministic mock model provider `MockProviderV1`) — commit `9082398` — crates/roz-agent/src/model/mock_provider.rs gated behind new `test-helpers` feature; BOTH complete() and stream() return D-06 canned response; 3 unit tests pass; roz-test untouched (no cycle) — 2026-04-22T12:04:41Z
