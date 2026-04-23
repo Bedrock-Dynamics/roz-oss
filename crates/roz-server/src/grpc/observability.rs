@@ -39,6 +39,7 @@ use crate::grpc::roz_v1::{
     ReindexSessionResponse,
 };
 use crate::observability::export::{filter_by_time_range, stream_file_raw, EXPORT_CHUNK_BYTES};
+use crate::observability::metadata_index::{index_session, MetadataIndexError};
 
 /// gRPC implementation of `ObservabilityService`.
 ///
@@ -62,23 +63,132 @@ impl ObservabilityService for ObservabilityServiceImpl {
     type ExportSessionStream = ReceiverStream<Result<ExportSessionChunk, Status>>;
     type ReindexAllStream = ReceiverStream<Result<ReindexProgress, Status>>;
 
-    // Phase 26.4: unimplemented stubs — Plan 07 fills these in with real
-    // RLS-scoped and admin-scoped handlers. Stubs exist so the trait impl
-    // compiles while Wave 2 (indexer) lands before Wave 4 (gRPC handlers).
     async fn reindex_session(
         &self,
-        _request: Request<ReindexSessionRequest>,
+        request: Request<ReindexSessionRequest>,
     ) -> Result<Response<ReindexSessionResponse>, Status> {
-        Err(Status::unimplemented("reindex_session: Phase 26.4 Plan 07 pending"))
+        let caller_tenant = auth_ext::tenant_from_extensions(&request)?;
+        let session_id = Uuid::parse_str(&request.get_ref().session_id)
+            .map_err(|_| Status::invalid_argument("invalid session_id"))?;
+
+        // Determine newly_created BEFORE the upsert so the response can report
+        // whether this call actually inserted a new row. `fetch_metadata` is a
+        // simple SELECT under the caller's tenant (RLS-scoped via the server
+        // pool's default context); the subsequent `index_session` opens its
+        // own transaction and re-fetches archives scoped to `caller_tenant`.
+        let existed_before = roz_db::session_metadata::fetch_metadata(&self.pool, session_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, %session_id, "fetch_metadata failed");
+                Status::internal("metadata lookup failed")
+            })?
+            .is_some();
+
+        match index_session(&self.pool, caller_tenant, session_id).await {
+            Ok(summary) => Ok(Response::new(ReindexSessionResponse {
+                tool_calls_indexed: summary.tool_calls_indexed,
+                newly_created: !existed_before,
+            })),
+            Err(MetadataIndexError::ArchiveNotFound(_)) => Err(Status::not_found("no archives for session")),
+            Err(err) => {
+                tracing::error!(error = %err, %session_id, "reindex_session failed");
+                Err(Status::internal(err.to_string()))
+            }
+        }
     }
 
     async fn reindex_all(
         &self,
-        _request: Request<ReindexAllRequest>,
+        request: Request<ReindexAllRequest>,
     ) -> Result<Response<Self::ReindexAllStream>, Status> {
-        Err(Status::unimplemented("reindex_all: Phase 26.4 Plan 07 pending"))
-    }
+        // Admin gate: identity_from_extensions guarantees an AuthIdentity is
+        // present (middleware invariant). We then demand admin scope per D-15.
+        let identity = auth_ext::identity_from_extensions(&request)?;
+        if !identity.is_admin() {
+            return Err(Status::permission_denied("ReindexAll requires admin scope"));
+        }
 
+        // Channel capacity 16 keeps a small burst of progress messages queued
+        // even if the client is slow to drain. Per-session indexing is the
+        // dominant cost; tx.send backpressure is fine.
+        let (tx, rx) = mpsc::channel::<Result<ReindexProgress, Status>>(16);
+        let pool = self.pool.clone();
+
+        tokio::spawn(async move {
+            // Enumerate tenants. The server pool is a superuser connection, so
+            // list_all_tenants bypasses RLS by design (documented on the helper).
+            let tenants = match roz_db::tenant::list_all_tenants(&pool).await {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = tx.send(Err(Status::internal(format!("list_all_tenants: {e}")))).await;
+                    return;
+                }
+            };
+
+            // Enumerate finalized archives per tenant. We filter out status='open'
+            // because in-progress sessions haven't fully flushed yet; their
+            // metadata would be stale. Any transitioned archive (finalized,
+            // finalized_idle_timeout, recovered_incomplete) is in-scope.
+            //
+            // We bind tenant_id explicitly per tenant instead of setting RLS
+            // context here because `index_session` (called below) opens its
+            // own transaction and the superuser pool bypasses RLS anyway;
+            // explicit tenant binding on every helper is the defense-in-depth
+            // layer (D-15).
+            let mut all_sessions: Vec<(Uuid, Uuid)> = Vec::new();
+            for tenant_id in &tenants {
+                let sessions: Vec<Uuid> = match sqlx::query_scalar::<_, Uuid>(
+                    "SELECT DISTINCT session_id FROM roz_session_mcap_archives \
+                     WHERE tenant_id = $1 AND status <> 'open'",
+                )
+                .bind(tenant_id)
+                .fetch_all(&pool)
+                .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(tenant = %tenant_id, error = %e, "session enumeration failed");
+                        continue;
+                    }
+                };
+                for s in sessions {
+                    all_sessions.push((*tenant_id, s));
+                }
+            }
+
+            let total = u32::try_from(all_sessions.len()).unwrap_or(u32::MAX);
+            for (idx, (tenant_id, session_id)) in all_sessions.iter().enumerate() {
+                let completed = u32::try_from(idx + 1).unwrap_or(u32::MAX);
+                let progress = match index_session(&pool, *tenant_id, *session_id).await {
+                    Ok(summary) => ReindexProgress {
+                        session_id: session_id.to_string(),
+                        completed,
+                        total,
+                        succeeded: true,
+                        error: None,
+                        tool_calls_indexed: Some(summary.tool_calls_indexed),
+                    },
+                    Err(err) => ReindexProgress {
+                        session_id: session_id.to_string(),
+                        completed,
+                        total,
+                        succeeded: false,
+                        error: Some(err.to_string()),
+                        tool_calls_indexed: None,
+                    },
+                };
+                // Client-disconnect detection: tx.send returns Err once the
+                // receiver is dropped. Stop the scan promptly rather than
+                // continuing to index sessions no one is listening for.
+                if tx.send(Ok(progress)).await.is_err() {
+                    tracing::info!("reindex_all: client disconnected; stopping");
+                    return;
+                }
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
 
     async fn export_session(
         &self,
