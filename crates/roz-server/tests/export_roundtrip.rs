@@ -211,25 +211,49 @@ async fn sc5_30s_fixture_roundtrips_via_mcap_message_stream() {
         .expect("send /roz/telemetry/pose");
     }
 
-    // --- 60 tool-call events (3 per triplet: Started / Requested / Finished).
-    //    The real `ToolCallEvent` envelope is exercised elsewhere; here we
-    //    use a `log_line` stub as a message-count fallback because this
-    //    fixture's contract is shape-correct (count + channel presence),
-    //    not payload-correct, for tool calls.
+    // --- 60 tool-call events (20 triplets × 3 variants) — Phase 26.4 BLOCKER 2
+    //     resolution. Previously emitted log_line stubs on /roz/tool/calls (which
+    //     Phase 26.4's indexer does NOT read — D-01 reads /roz/session/events only).
+    //     These are now real SessionEvent::ToolCall{Requested,Started,Finished}
+    //     triplets pushed through the production integration path via
+    //     emit_session_event_for_tests (same path as the approval loop below).
+    //
+    //     Tool names use the `mock_tool_{i}` prefix so the SC6 DB-assertion block
+    //     below can filter out the agent-turn's `hello_world` tool call (emitted
+    //     by the scripted agent-turn block at ~lines 296-404 via the same
+    //     /roz/session/events channel).
     for i in 0..TOOL_CALL_TRIPLETS {
-        let ts = now_ns + i * 1_500_000_000;
-        for variant in 0..3u8 {
-            let stub = log_line(LogLevel::Info, ts, "tool", &format!("tool_{i}_v{variant}"));
-            let mut buf = Vec::new();
-            stub.encode(&mut buf).expect("encode tool call stub");
-            tx.send(WriteCommand::Event {
-                channel: ChannelKey::ToolCalls,
-                log_time_ns: ts,
-                publish_time_ns: ts,
-                bytes: buf,
-            })
-            .await
-            .expect("send /roz/tool/calls");
+        let call_id = format!("mock_call_{i}");
+        let tool_name = format!("mock_tool_{i}");
+        let variants = [
+            SessionEvent::ToolCallRequested {
+                call_id: call_id.clone(),
+                tool_name: tool_name.clone(),
+                parameters: serde_json::json!({}),
+                timeout_ms: 5_000,
+            },
+            SessionEvent::ToolCallStarted {
+                call_id: call_id.clone(),
+                tool_name: tool_name.clone(),
+                category: "pure".into(),
+            },
+            SessionEvent::ToolCallFinished {
+                call_id: call_id.clone(),
+                tool_name: tool_name.clone(),
+                result_summary: "ok".into(),
+            },
+        ];
+        for variant in variants {
+            let envelope = EventEnvelope {
+                event_id: EventId::new(),
+                correlation_id: CorrelationId::new(),
+                parent_event_id: None,
+                timestamp: chrono::Utc::now(),
+                event: variant,
+                trace_id: None,
+                span_id: None,
+            };
+            emit_session_event_for_tests(&tx, &envelope).await;
         }
     }
 
@@ -487,19 +511,28 @@ async fn sc5_30s_fixture_roundtrips_via_mcap_message_stream() {
     // stateful mock's 2nd ModelCallCompleted, SessionStarted if the runtime
     // emits one). Assertions switch from exact-eq to lower-bound.
     //
+    // Phase 26.4 BLOCKER 2: tool calls now flow on /roz/session/events per D-01
+    // (the tool-call loop above emits real SessionEvent::ToolCall{Requested,
+    // Started,Finished} triplets via emit_session_event_for_tests, contributing
+    // TOOL_CALL_TRIPLETS * 3 = 60 additional session events to the floor).
+    //
     // Lower-bound floor:
     //   approval pairs × 2 (Requested + Resolved) = 10
     //   + agent-turn D-10 minimum = 6
-    //   = 16
-    let min_expected_session_events = APPROVAL_PAIRS * 2 + AGENT_TURN_SESSION_EVENTS_MIN;
+    //   + tool-call triplets × 3 = 60
+    //   = 76
+    let min_expected_session_events =
+        APPROVAL_PAIRS * 2 + AGENT_TURN_SESSION_EVENTS_MIN + TOOL_CALL_TRIPLETS * 3;
     assert!(
         session_events_count >= min_expected_session_events,
         "/roz/session/events count {} should be at least {} \
-         (approval pairs × 2 = {} + agent turn D-10 minimum = {})",
+         (approval pairs × 2 = {} + agent turn D-10 minimum = {} \
+         + tool call triplets × 3 = {})",
         session_events_count,
         min_expected_session_events,
         APPROVAL_PAIRS * 2,
-        AGENT_TURN_SESSION_EVENTS_MIN
+        AGENT_TURN_SESSION_EVENTS_MIN,
+        TOOL_CALL_TRIPLETS * 3,
     );
 
     // /roz/log receives the summary line per session event. Lower-bound is
@@ -510,22 +543,30 @@ async fn sc5_30s_fixture_roundtrips_via_mcap_message_stream() {
          (one log line per session event, including agent-turn D-10 minimum)",
     );
 
-    // Fixture totals (lower-bound per D-12):
+    // Fixture totals (lower-bound per D-12, updated for Phase 26.4 BLOCKER 2):
     //   telemetry: 1500 * 2 = 3000                 (/tf + /roz/telemetry/pose)
-    //   tool calls: 20 * 3 = 60                    (/roz/tool/calls)
+    //   tool calls: 20 * 3 = 60 session_events + 60 log = 120
+    //     (moved from /roz/tool/calls per 26.4 D-01; emit_session_event mirrors
+    //      each SessionEvent onto /roz/log 1:1 — verified at
+    //      crates/roz-server/src/observability/ingest_cloud.rs:183-207 where
+    //      every invocation unconditionally sends both a log_line to
+    //      ChannelKey::Log and the encoded proto envelope to
+    //      ChannelKey::SessionEvents; ToolCall{Requested,Started,Finished} all
+    //      map cleanly via event_mapper.rs:142-175 so encode_session_event_proto
+    //      returns Some on every call.)
     //   approvals: 5 * 2 = 10 session_events + 10 log = 20
     //   agent-turn D-10 min: 6 session_events + 6 log = 12
     //   task lifecycle: 20                         (/roz/task/lifecycle)
-    //   MIN TOTAL: 3112
+    //   MIN TOTAL: 3172
     let min_expected = TOTAL_TELEMETRY * 2
-        + TOOL_CALL_TRIPLETS * 3
+        + TOOL_CALL_TRIPLETS * 3 * 2           // tool_call_session_events + tool_call_log_lines
         + APPROVAL_PAIRS * 2 * 2               // approval_session_events + approval_log_lines
         + AGENT_TURN_SESSION_EVENTS_MIN * 2    // agent_turn_session_events + agent_turn_log_lines
         + TASK_LIFECYCLE_TRANSITIONS;
     assert!(
         count >= min_expected,
         "total MCAP message count {count} should be at least {min_expected} \
-         (telemetry + tool calls + approvals + agent turn D-10 min + task lifecycle)",
+         (telemetry + tool calls (session_events + log) + approvals + agent turn D-10 min + task lifecycle)",
     );
     assert!(seen_tf, "/tf channel present");
     assert!(seen_pose, "/roz/telemetry/pose channel present");
