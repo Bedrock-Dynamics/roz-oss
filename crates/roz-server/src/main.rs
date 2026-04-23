@@ -779,7 +779,7 @@ mod tests {
             trust_policy: Arc::new(roz_server::trust::permissive_policy_for_integration_tests()),
             object_store: Arc::new(object_store::memory::InMemory::new()),
             endpoint_registry: Arc::new(roz_core::EndpointRegistry::empty()),
-            key_provider: Arc::new(roz_openai::auth::null_key::NullKeyProvider),
+            key_provider: Arc::new(StaticKeyProvider::from_key_bytes([7u8; 32])),
             mcp_registry: Arc::new(roz_mcp::Registry::new()),
             session_bus: Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
             verifying_key_cache: moka::future::Cache::builder()
@@ -2509,7 +2509,7 @@ mod tests {
             trust_policy: Arc::new(roz_server::trust::permissive_policy_for_integration_tests()),
             object_store: Arc::new(object_store::memory::InMemory::new()),
             endpoint_registry: Arc::new(roz_core::EndpointRegistry::empty()),
-            key_provider: Arc::new(roz_openai::auth::null_key::NullKeyProvider),
+            key_provider: Arc::new(StaticKeyProvider::from_key_bytes([7u8; 32])),
             mcp_registry: Arc::new(roz_mcp::Registry::new()),
             session_bus: Arc::new(roz_server::grpc::session_bus::SessionBus::default()),
             verifying_key_cache: moka::future::Cache::builder()
