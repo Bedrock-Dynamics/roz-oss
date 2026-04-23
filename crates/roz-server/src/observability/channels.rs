@@ -95,7 +95,7 @@ pub fn register_all_channels(
 
 #[cfg(test)]
 mod tests {
-    use super::{ChannelIds, register_all_channels};
+    use super::{ChannelIds, register_all_channels, register_camera_video_schema};
     use crate::observability::schema_registry::SchemaDescriptors;
     use mcap::Writer;
     use std::collections::HashSet;
@@ -103,7 +103,7 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
-    fn registers_all_six_channels_without_error() {
+    fn registers_all_nine_channels_without_error() {
         let descriptors = SchemaDescriptors::load().expect("descriptor load");
         let tmp = NamedTempFile::new().expect("temp file");
         let file = tmp.reopen().expect("reopen");
@@ -111,7 +111,7 @@ mod tests {
         let ids: ChannelIds = register_all_channels(&mut writer, &descriptors).expect("register");
         let _ = writer.finish().expect("finish");
 
-        // All 6 channel IDs must be distinct — `add_channel` allocates sequentially.
+        // All 9 channel IDs must be distinct — `add_channel` allocates sequentially.
         let ids_vec = [
             ids.tf,
             ids.pose,
@@ -119,8 +119,27 @@ mod tests {
             ids.session_events,
             ids.task_lifecycle,
             ids.tool_calls,
+            ids.pointcloud,
+            ids.scene_update,
+            ids.annotations,
         ];
         let unique: HashSet<_> = ids_vec.iter().copied().collect();
-        assert_eq!(unique.len(), 6, "expected 6 distinct channel IDs, got {ids_vec:?}");
+        assert_eq!(unique.len(), 9, "expected 9 distinct channel IDs, got {ids_vec:?}");
+    }
+
+    #[test]
+    fn register_camera_video_schema_is_idempotent() {
+        // mcap 0.24 dedups add_schema on (name, encoding, data) tuple. Calling
+        // register_camera_video_schema AFTER register_all_channels must return
+        // the same u16 that register_all_channels' internal add_schema returned.
+        let descriptors = SchemaDescriptors::load().expect("descriptor load");
+        let tmp = NamedTempFile::new().expect("temp file");
+        let file = tmp.reopen().expect("reopen");
+        let mut writer = Writer::new(BufWriter::new(file)).expect("writer");
+        let _ids = register_all_channels(&mut writer, &descriptors).expect("register");
+        let id1 = register_camera_video_schema(&mut writer, &descriptors).expect("register video schema");
+        let id2 = register_camera_video_schema(&mut writer, &descriptors).expect("re-register video schema");
+        assert_eq!(id1, id2, "add_schema should return same u16 on identical re-registration");
+        let _ = writer.finish().expect("finish");
     }
 }
