@@ -733,10 +733,12 @@ async fn handle_edge_session(
         tracing::debug!(session_id, "mcap_relay not spawned (record=off)");
         None
     } else if let Some(ref cm) = camera_manager {
-        let camera_ids: Vec<roz_core::camera::CameraId> =
-            cm.cameras().into_iter().map(|info| info.id).collect();
+        let camera_ids: Vec<roz_core::camera::CameraId> = cm.cameras().into_iter().map(|info| info.id).collect();
         if camera_ids.is_empty() {
-            tracing::debug!(session_id, "no cameras registered at session start; skipping mcap_relay spawn");
+            tracing::debug!(
+                session_id,
+                "no cameras registered at session start; skipping mcap_relay spawn"
+            );
             None
         } else {
             tracing::info!(
