@@ -16,6 +16,7 @@
 //!   3. Graceful `WriteCommand::Finalize { Shutdown }` sent by the SIGTERM
 //!      drain in `main.rs`.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::PathBuf;
@@ -23,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use mcap::Writer;
 use mcap::records::MessageHeader;
+use roz_core::camera::CameraId;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tokio::sync::mpsc;
@@ -36,9 +38,17 @@ use crate::observability::idle_monitor::{IDLE_CHECK_INTERVAL, idle_timeout_from_
 use crate::observability::rollover::max_file_bytes_from_env;
 use crate::observability::schema_registry::SchemaDescriptors;
 
-/// Target channel for a write command. The `WriterActor` maps this to a
-/// concrete `ChannelIds` field without hashing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Target channel for a write command.
+///
+/// The `WriterActor` maps this to a concrete `ChannelIds` field (or a
+/// camera HashMap lookup for `Camera(id)`) without runtime hashing on
+/// the hot path for the non-camera variants.
+///
+/// Phase 26.5 SC5 removed `Copy` from the derive because `Camera(CameraId)`
+/// carries a heap `String`. All producers construct variants in-place and
+/// move them into `WriteCommand::Event`, so removing `Copy` has no
+/// ergonomic cost.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChannelKey {
     Tf,
     Pose,
@@ -46,20 +56,28 @@ pub enum ChannelKey {
     SessionEvents,
     TaskLifecycle,
     ToolCalls,
+    /// Phase 26.5 SC5: per-camera channel. Registered dynamically by
+    /// `ingest_edge` on first-sighting of a camera_id in the NATS camera
+    /// relay stream (Plan 06). Resolved via `WriterActor::camera_channels`
+    /// HashMap; frames whose camera_id has not been registered are dropped
+    /// with a `warn!` log (D-13).
+    Camera(CameraId),
 }
 
 impl ChannelKey {
-    /// Project the key into the corresponding `channel_id` assigned at
-    /// writer-open time.
+    /// Resolve the channel id, returning `None` if the key is
+    /// `Camera(id)` and `id` is not in the per-writer `camera_channels`
+    /// map. Non-camera variants always resolve.
     #[must_use]
-    pub const fn channel_id(self, ids: &ChannelIds) -> u16 {
+    pub fn resolve(&self, ids: &ChannelIds, camera_channels: &HashMap<CameraId, u16>) -> Option<u16> {
         match self {
-            Self::Tf => ids.tf,
-            Self::Pose => ids.pose,
-            Self::Log => ids.log,
-            Self::SessionEvents => ids.session_events,
-            Self::TaskLifecycle => ids.task_lifecycle,
-            Self::ToolCalls => ids.tool_calls,
+            Self::Tf => Some(ids.tf),
+            Self::Pose => Some(ids.pose),
+            Self::Log => Some(ids.log),
+            Self::SessionEvents => Some(ids.session_events),
+            Self::TaskLifecycle => Some(ids.task_lifecycle),
+            Self::ToolCalls => Some(ids.tool_calls),
+            Self::Camera(id) => camera_channels.get(id).copied(),
         }
     }
 }
@@ -102,6 +120,15 @@ pub enum WriteCommand {
         publish_time_ns: u64,
         bytes: Vec<u8>,
     },
+    /// Phase 26.5 SC5: dynamic per-camera channel registration. Sent by
+    /// `ingest_edge` (Plan 06) on first-sighting of a camera_id for a
+    /// session. Idempotent — re-registering an existing camera returns
+    /// the cached channel id. Registration failure is logged at `warn!`
+    /// but does NOT kill the actor; subsequent frames for the failed
+    /// camera land in the warn-and-drop path of `WriteCommand::Event`.
+    RegisterCamera {
+        camera_id: CameraId,
+    },
     Rollover,
     Finalize {
         reason: FinalizeReason,
@@ -131,6 +158,11 @@ pub struct WriterActor {
     /// `last_message_at.elapsed()` against this and self-emits
     /// `FinalizeReason::IdleTimeout`.
     idle_timeout: Duration,
+    /// Phase 26.5 SC5: per-camera channel ids populated on first-sighting
+    /// by `WriteCommand::RegisterCamera`. Rollover (`reopen_next_file`)
+    /// iterates this HashMap to re-register every camera's channel on
+    /// the new file since channel ids are per-file.
+    camera_channels: HashMap<CameraId, u16>,
 }
 
 impl WriterActor {
@@ -216,6 +248,7 @@ impl WriterActor {
             last_message_at: Instant::now(),
             descriptors,
             idle_timeout,
+            camera_channels: HashMap::new(),
         })
     }
 
@@ -247,8 +280,21 @@ impl WriterActor {
                             publish_time_ns,
                             bytes,
                         }) => {
+                            let Some(channel_id) = channel.resolve(&self.channel_ids, &self.camera_channels) else {
+                                // Phase 26.5 D-13: unknown camera_id in
+                                // `ChannelKey::Camera` — log and drop.
+                                // `ingest_edge` should have sent a
+                                // `RegisterCamera` first; a missed
+                                // registration is non-fatal for the actor.
+                                warn!(
+                                    session = %self.session_id,
+                                    channel = ?channel,
+                                    "dropping Event: ChannelKey resolved to no channel_id (unregistered camera?)"
+                                );
+                                continue;
+                            };
                             let header = MessageHeader {
-                                channel_id: channel.channel_id(&self.channel_ids),
+                                channel_id,
                                 sequence: self.seq,
                                 log_time: log_time_ns,
                                 publish_time: publish_time_ns,
@@ -267,6 +313,22 @@ impl WriterActor {
                                 );
                                 self.reopen_next_file().await?;
                             }
+                        }
+                        Some(WriteCommand::RegisterCamera { camera_id }) => {
+                            // Phase 26.5 SC5: dynamic camera channel
+                            // registration. Failure is logged but does
+                            // not kill the actor — subsequent frames for
+                            // this camera will land in the warn-and-drop
+                            // path above.
+                            if let Err(error) = self.register_camera_channel(&camera_id) {
+                                warn!(
+                                    session = %self.session_id,
+                                    %error,
+                                    camera = %camera_id,
+                                    "failed to register camera channel; frames for this camera will be dropped"
+                                );
+                            }
+                            self.last_message_at = Instant::now();
                         }
                         Some(WriteCommand::Rollover) => {
                             info!(
@@ -350,6 +412,23 @@ impl WriterActor {
         self.hasher = Sha256::new();
         self.last_message_at = Instant::now();
 
+        // Phase 26.5 SC5: re-register every camera's channel on the new
+        // MCAP file. Channel ids are per-file; keys persist. If a camera
+        // registration fails during rollover, log and drop — subsequent
+        // frames for that camera will warn-drop cleanly.
+        let old_cameras: Vec<CameraId> = self.camera_channels.keys().cloned().collect();
+        self.camera_channels.clear();
+        for cam in &old_cameras {
+            if let Err(error) = self.register_camera_channel(cam) {
+                warn!(
+                    session = %self.session_id,
+                    %error,
+                    camera = %cam,
+                    "failed to re-register camera channel on rollover; dropping frames until next rollover"
+                );
+            }
+        }
+
         info!(
             session = %self.session_id,
             tenant = %self.tenant_id,
@@ -357,6 +436,43 @@ impl WriterActor {
             "MCAP rollover complete; new file opened"
         );
         Ok(())
+    }
+
+    /// Phase 26.5 SC5 helper — register a per-camera channel on the
+    /// current writer and record the id in `camera_channels`. Idempotent:
+    /// calling for the same `camera_id` multiple times returns the
+    /// cached id without re-calling `mcap::Writer::add_channel` (mcap
+    /// 0.24 dedups on identical content anyway, but the cached lookup
+    /// skips the descriptor work).
+    ///
+    /// # Errors
+    /// * [`McapArchiveError::McapWrite`] — writer rejected the schema or channel.
+    /// * [`McapArchiveError::SchemaNotFound`] — descriptors missing
+    ///   `foxglove.CompressedVideo` (should never happen after
+    ///   [`SchemaDescriptors::load`] at boot).
+    fn register_camera_channel(&mut self, camera_id: &CameraId) -> Result<u16, McapArchiveError> {
+        if let Some(existing) = self.camera_channels.get(camera_id) {
+            return Ok(*existing);
+        }
+        let video_schema_id =
+            crate::observability::channels::register_camera_video_schema(&mut self.writer, &self.descriptors)?;
+        let topic = format!("/roz/camera/{camera_id}");
+        let empty = std::collections::BTreeMap::new();
+        let channel_id = self.writer.add_channel(
+            video_schema_id,
+            &topic,
+            crate::observability::SCHEMA_ENCODING_PROTOBUF,
+            &empty,
+        )?;
+        self.camera_channels.insert(camera_id.clone(), channel_id);
+        info!(
+            session = %self.session_id,
+            camera = %camera_id,
+            topic = %topic,
+            channel_id = channel_id,
+            "registered dynamic camera channel on MCAP writer"
+        );
+        Ok(channel_id)
     }
 
     /// Explicit finalize: `Writer::finish` + Postgres row transition.
@@ -556,6 +672,7 @@ mod tests {
 
     use super::{ChannelKey, FinalizeReason, drain_active_writers};
     use crate::observability::channels::ChannelIds;
+    use roz_core::camera::CameraId;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -581,12 +698,68 @@ mod tests {
             scene_update: 8,
             annotations: 9,
         };
-        assert_eq!(ChannelKey::Tf.channel_id(&ids), 1);
-        assert_eq!(ChannelKey::Pose.channel_id(&ids), 2);
-        assert_eq!(ChannelKey::Log.channel_id(&ids), 3);
-        assert_eq!(ChannelKey::SessionEvents.channel_id(&ids), 4);
-        assert_eq!(ChannelKey::TaskLifecycle.channel_id(&ids), 5);
-        assert_eq!(ChannelKey::ToolCalls.channel_id(&ids), 6);
+        let cameras: HashMap<CameraId, u16> = HashMap::new();
+        assert_eq!(ChannelKey::Tf.resolve(&ids, &cameras), Some(1));
+        assert_eq!(ChannelKey::Pose.resolve(&ids, &cameras), Some(2));
+        assert_eq!(ChannelKey::Log.resolve(&ids, &cameras), Some(3));
+        assert_eq!(ChannelKey::SessionEvents.resolve(&ids, &cameras), Some(4));
+        assert_eq!(ChannelKey::TaskLifecycle.resolve(&ids, &cameras), Some(5));
+        assert_eq!(ChannelKey::ToolCalls.resolve(&ids, &cameras), Some(6));
+    }
+
+    #[test]
+    fn resolve_returns_none_for_unregistered_camera() {
+        let ids = ChannelIds {
+            tf: 1,
+            pose: 2,
+            log: 3,
+            session_events: 4,
+            task_lifecycle: 5,
+            tool_calls: 6,
+            pointcloud: 7,
+            scene_update: 8,
+            annotations: 9,
+        };
+        let cameras: HashMap<CameraId, u16> = HashMap::new();
+        let key = ChannelKey::Camera(CameraId::new("unknown"));
+        assert_eq!(key.resolve(&ids, &cameras), None);
+    }
+
+    #[test]
+    fn resolve_returns_registered_camera_id() {
+        let ids = ChannelIds {
+            tf: 1,
+            pose: 2,
+            log: 3,
+            session_events: 4,
+            task_lifecycle: 5,
+            tool_calls: 6,
+            pointcloud: 7,
+            scene_update: 8,
+            annotations: 9,
+        };
+        let mut cameras: HashMap<CameraId, u16> = HashMap::new();
+        cameras.insert(CameraId::new("front"), 42);
+        let key = ChannelKey::Camera(CameraId::new("front"));
+        assert_eq!(key.resolve(&ids, &cameras), Some(42));
+    }
+
+    #[test]
+    fn resolve_returns_static_channel_id() {
+        let ids = ChannelIds {
+            tf: 11,
+            pose: 12,
+            log: 13,
+            session_events: 14,
+            task_lifecycle: 15,
+            tool_calls: 16,
+            pointcloud: 17,
+            scene_update: 18,
+            annotations: 19,
+        };
+        let cameras: HashMap<CameraId, u16> = HashMap::new();
+        assert_eq!(ChannelKey::Tf.resolve(&ids, &cameras), Some(11));
+        assert_eq!(ChannelKey::ToolCalls.resolve(&ids, &cameras), Some(16));
     }
 
     #[tokio::test]
