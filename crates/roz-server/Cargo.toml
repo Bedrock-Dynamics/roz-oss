@@ -171,3 +171,17 @@ required-features = ["test-helpers"]
 name = "session_metadata_fleet_query"
 path = "tests/session_metadata_fleet_query.rs"
 required-features = ["test-helpers"]
+
+# Phase 26.5 SC7 — mcap_camera_roundtrip. Two ignored integration tests
+# drive synthetic foxglove.CompressedVideo frames through the per-session
+# WriterActor + re-decode from the MCAP file (R-01 honored). A third
+# NON-ignored test (`cross_crate_compressed_video_wire_compat`) closes the
+# 26.5-warning-02 silent-field-tag-drift gap by encoding with the worker's
+# hand-vendored prost struct and decoding with the server's tonic-generated
+# struct. Requires `test-helpers` because roz-worker's internal
+# `camera::mcap_relay::CompressedVideo` is reached via the dev-dep already
+# declared above.
+[[test]]
+name = "mcap_camera_roundtrip"
+path = "tests/mcap_camera_roundtrip.rs"
+required-features = ["test-helpers"]
