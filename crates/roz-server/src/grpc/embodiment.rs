@@ -394,6 +394,12 @@ impl EmbodimentService for EmbodimentServiceImpl {
                 tokio::select! {
                     msg = sub.next() => {
                         if let Some(nats_msg) = msg {
+                            // Phase 26.3 D-06: extract W3C trace context on the first line so
+                            // the rest of this arm runs under the publisher's trace. Matches
+                            // the pattern Plan 05 landed at `crates/roz-worker/src/main.rs:423`.
+                            if let Some(ref headers) = nats_msg.headers {
+                                roz_nats::trace::extract_and_link_parent(headers);
+                            }
                             let event: roz_nats::dispatch::EmbodimentChangedEvent =
                                 match serde_json::from_slice(&nats_msg.payload) {
                                     Ok(e) => {
@@ -560,6 +566,12 @@ impl EmbodimentService for EmbodimentServiceImpl {
                 tokio::select! {
                     msg = sub.next() => {
                         if let Some(nats_msg) = msg {
+                            // Phase 26.3 D-06: extract W3C trace context on the first line so
+                            // the rest of this arm runs under the publisher's trace. Matches
+                            // the pattern Plan 05 landed at `crates/roz-worker/src/main.rs:423`.
+                            if let Some(ref headers) = nats_msg.headers {
+                                roz_nats::trace::extract_and_link_parent(headers);
+                            }
                             let event: roz_nats::dispatch::EmbodimentChangedEvent =
                                 match serde_json::from_slice(&nats_msg.payload) {
                                     Ok(e) => {
