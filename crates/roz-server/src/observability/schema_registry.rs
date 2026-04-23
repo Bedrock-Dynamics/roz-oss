@@ -17,8 +17,9 @@ use prost::Message;
 use prost_types::{FileDescriptorProto, FileDescriptorSet};
 
 use crate::observability::{
-    McapArchiveError, SCHEMA_FRAME_TRANSFORM, SCHEMA_LOG, SCHEMA_POSE_IN_FRAME, SCHEMA_SESSION_EVENT,
-    SCHEMA_TASK_LIFECYCLE, SCHEMA_TOOL_CALL,
+    McapArchiveError, SCHEMA_COMPRESSED_IMAGE, SCHEMA_COMPRESSED_VIDEO, SCHEMA_FRAME_TRANSFORM,
+    SCHEMA_IMAGE_ANNOTATIONS, SCHEMA_LOG, SCHEMA_POINT_CLOUD, SCHEMA_POSE_IN_FRAME, SCHEMA_RAW_IMAGE,
+    SCHEMA_SCENE_UPDATE, SCHEMA_SESSION_EVENT, SCHEMA_TASK_LIFECYCLE, SCHEMA_TOOL_CALL,
 };
 
 const FOXGLOVE_DESCRIPTOR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/foxglove_descriptor.bin"));
@@ -40,15 +41,15 @@ impl SchemaDescriptors {
     ///
     /// Called once at server startup; stored on `AppState`. Returns an
     /// error if the embedded descriptor bytes fail to decode as
-    /// `FileDescriptorSet`, if any of the six target schemas is missing
+    /// `FileDescriptorSet`, if any of the twelve target schemas is missing
     /// from the union of loaded files, or if re-encoding the extracted
     /// subset fails.
     ///
     /// # Errors
     /// * `McapArchiveError::ProstDecode` — a descriptor file is not a valid
     ///   `FileDescriptorSet`.
-    /// * `McapArchiveError::SchemaNotFound` — one of the six target FQNs is
-    ///   not declared by any loaded file.
+    /// * `McapArchiveError::SchemaNotFound` — one of the twelve target FQNs
+    ///   is not declared by any loaded file.
     /// * `McapArchiveError::ProstEncode` — prost fails to serialize the
     ///   extracted subset (should not happen in practice).
     pub fn load() -> Result<Self, McapArchiveError> {
@@ -76,6 +77,15 @@ impl SchemaDescriptors {
             SCHEMA_SESSION_EVENT,
             SCHEMA_TASK_LIFECYCLE,
             SCHEMA_TOOL_CALL,
+            // Phase 26.5 SC2 additions (R-01 honored: CompressedVideo is the H.264
+            // target; CompressedImage is registered alongside but has no producer
+            // this phase).
+            SCHEMA_COMPRESSED_VIDEO,
+            SCHEMA_COMPRESSED_IMAGE,
+            SCHEMA_RAW_IMAGE,
+            SCHEMA_POINT_CLOUD,
+            SCHEMA_SCENE_UPDATE,
+            SCHEMA_IMAGE_ANNOTATIONS,
         ];
 
         let mut inner = HashMap::new();
@@ -151,13 +161,14 @@ mod tests {
 
     use super::{FileDescriptorSet, SchemaDescriptors};
     use crate::observability::{
-        McapArchiveError, SCHEMA_FRAME_TRANSFORM, SCHEMA_LOG, SCHEMA_POSE_IN_FRAME, SCHEMA_SESSION_EVENT,
-        SCHEMA_TASK_LIFECYCLE, SCHEMA_TOOL_CALL,
+        McapArchiveError, SCHEMA_COMPRESSED_IMAGE, SCHEMA_COMPRESSED_VIDEO, SCHEMA_FRAME_TRANSFORM,
+        SCHEMA_IMAGE_ANNOTATIONS, SCHEMA_LOG, SCHEMA_POINT_CLOUD, SCHEMA_POSE_IN_FRAME, SCHEMA_RAW_IMAGE,
+        SCHEMA_SCENE_UPDATE, SCHEMA_SESSION_EVENT, SCHEMA_TASK_LIFECYCLE, SCHEMA_TOOL_CALL,
     };
     use prost::Message;
 
     #[test]
-    fn loads_all_six_target_schemas() {
+    fn loads_all_twelve_target_schemas() {
         let reg = SchemaDescriptors::load().expect("descriptor load");
         for name in [
             SCHEMA_FRAME_TRANSFORM,
@@ -166,6 +177,13 @@ mod tests {
             SCHEMA_SESSION_EVENT,
             SCHEMA_TASK_LIFECYCLE,
             SCHEMA_TOOL_CALL,
+            // Phase 26.5 additions (R-01):
+            SCHEMA_COMPRESSED_VIDEO,
+            SCHEMA_COMPRESSED_IMAGE,
+            SCHEMA_RAW_IMAGE,
+            SCHEMA_POINT_CLOUD,
+            SCHEMA_SCENE_UPDATE,
+            SCHEMA_IMAGE_ANNOTATIONS,
         ] {
             let bytes = reg.get(name).unwrap_or_else(|_| panic!("missing {name}"));
             assert!(!bytes.is_empty(), "{name} bytes empty");
@@ -213,13 +231,18 @@ mod tests {
 
     #[test]
     fn extracted_fds_has_no_duplicate_filenames() {
-        // Regression: `SchemaDescriptors::load` merges foxglove_descriptor.bin
-        // and roz_v1_descriptor.bin, both of which transitively carry
-        // `google/protobuf/timestamp.proto`. Without filename dedup, each
-        // extracted per-schema FileDescriptorSet would contain two copies of
-        // the same file, and Foxglove Studio rejects this with
+        // Regression for Phase 26.1: `SchemaDescriptors::load` merges
+        // foxglove_descriptor.bin and roz_v1_descriptor.bin, both of which
+        // transitively carry `google/protobuf/timestamp.proto` (and now
+        // `google/protobuf/duration.proto` via SceneEntity — Phase 26.5
+        // addition). Without filename dedup, each extracted per-schema
+        // FileDescriptorSet would contain two copies of the same file, and
+        // Foxglove Studio rejects this with
         // "duplicate name 'Timestamp' in Namespace .google.protobuf".
-        // Verify every one of the six target schemas has unique filenames.
+        // Verify every one of the twelve target schemas has unique
+        // filenames — the first-seen-wins dedup in SchemaDescriptors::load
+        // must keep every extracted per-schema FileDescriptorSet's filename
+        // list unique.
         let reg = SchemaDescriptors::load().expect("descriptor load");
         for name in [
             SCHEMA_FRAME_TRANSFORM,
@@ -228,6 +251,13 @@ mod tests {
             SCHEMA_SESSION_EVENT,
             SCHEMA_TASK_LIFECYCLE,
             SCHEMA_TOOL_CALL,
+            // Phase 26.5 additions:
+            SCHEMA_COMPRESSED_VIDEO,
+            SCHEMA_COMPRESSED_IMAGE,
+            SCHEMA_RAW_IMAGE,
+            SCHEMA_POINT_CLOUD,
+            SCHEMA_SCENE_UPDATE,
+            SCHEMA_IMAGE_ANNOTATIONS,
         ] {
             let bytes = reg.get(name).unwrap_or_else(|_| panic!("missing {name}"));
             let fds = FileDescriptorSet::decode(bytes).expect("valid FileDescriptorSet");
@@ -239,6 +269,36 @@ mod tests {
                     "duplicate file '{file_name}' in FileDescriptorSet for schema {name}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn all_schemas_load_without_error() {
+        // D-26 safeguard: if a SCHEMA_* constant is declared in
+        // observability/mod.rs AND listed in build.rs's compile_protos array
+        // BUT accidentally omitted from the targets list in
+        // SchemaDescriptors::load, this test fails immediately at boot.
+        // Iterate every constant referenced in the targets array above; each
+        // must resolve cleanly.
+        let reg = SchemaDescriptors::load().expect("descriptor load");
+        for name in [
+            SCHEMA_FRAME_TRANSFORM,
+            SCHEMA_POSE_IN_FRAME,
+            SCHEMA_LOG,
+            SCHEMA_SESSION_EVENT,
+            SCHEMA_TASK_LIFECYCLE,
+            SCHEMA_TOOL_CALL,
+            SCHEMA_COMPRESSED_VIDEO,
+            SCHEMA_COMPRESSED_IMAGE,
+            SCHEMA_RAW_IMAGE,
+            SCHEMA_POINT_CLOUD,
+            SCHEMA_SCENE_UPDATE,
+            SCHEMA_IMAGE_ANNOTATIONS,
+        ] {
+            assert!(
+                reg.get(name).is_ok(),
+                "schema {name} did not load — missing from schema_registry targets list?"
+            );
         }
     }
 }
