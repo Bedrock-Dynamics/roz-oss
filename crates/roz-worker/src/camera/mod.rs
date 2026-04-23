@@ -2,6 +2,7 @@ pub mod adaptive;
 pub mod encoder;
 pub mod frame_convert;
 pub mod hotplug;
+pub mod mcap_relay;
 pub mod perception;
 pub mod snapshot;
 pub mod source;

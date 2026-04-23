@@ -7,24 +7,19 @@
 
 /// Per-camera record-mode policy for the MCAP relay.
 ///
-/// * `Off`      — relay task not spawned. Default in production is
-///                `Keyframes` (set in Plan 07).
-/// * `Keyframes`— forward only frames where `EncodedFrame.is_keyframe == true`.
-///                Bandwidth-friendly; suitable for review / debugging.
-/// * `Full`     — forward every frame. High bandwidth; requires fast NATS +
-///                server-side MCAP disk; not recommended over WAN.
-#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+/// * `Off` — relay task not spawned. Default in production is `Keyframes`
+///   (set in Plan 07).
+/// * `Keyframes` — forward only frames where `EncodedFrame.is_keyframe == true`.
+///   Bandwidth-friendly; suitable for review / debugging.
+/// * `Full` — forward every frame. High bandwidth; requires fast NATS +
+///   server-side MCAP disk; not recommended over WAN.
+#[derive(Debug, Default, Clone, Copy, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RecordMode {
+    #[default]
     Keyframes,
     Full,
     Off,
-}
-
-impl Default for RecordMode {
-    fn default() -> Self {
-        Self::Keyframes
-    }
 }
 
 #[cfg(test)]
@@ -51,7 +46,10 @@ mod tests {
             serde_json::from_str::<RecordMode>("\"keyframes\"").unwrap(),
             RecordMode::Keyframes
         );
-        assert_eq!(serde_json::from_str::<RecordMode>("\"full\"").unwrap(), RecordMode::Full);
+        assert_eq!(
+            serde_json::from_str::<RecordMode>("\"full\"").unwrap(),
+            RecordMode::Full
+        );
         assert_eq!(serde_json::from_str::<RecordMode>("\"off\"").unwrap(), RecordMode::Off);
     }
 }
