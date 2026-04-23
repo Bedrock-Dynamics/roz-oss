@@ -390,6 +390,29 @@ impl WriterActor {
             bytes = size,
             "MCAP archive finalized"
         );
+
+        // Phase 26.4 D-07: on terminal finalize (NOT rollover), spawn a
+        // detached metadata indexer. Per SC4 this is fire-and-forget —
+        // failure is logged via `warn!` but NEVER propagates out of
+        // finalize_file so the session lifecycle completes cleanly.
+        if !matches!(reason, FinalizeReason::Rollover) {
+            let pool = self.pool.clone();
+            let tenant_id = self.tenant_id;
+            let session_id = self.session_id;
+            tokio::spawn(async move {
+                if let Err(error) =
+                    crate::observability::metadata_index::index_session(&pool, tenant_id, session_id).await
+                {
+                    warn!(
+                        %error,
+                        %session_id,
+                        %tenant_id,
+                        "session metadata indexing failed — reindex via `roz session reindex` to recover"
+                    );
+                }
+            });
+        }
+
         Ok(())
     }
 }
