@@ -97,9 +97,44 @@ message ExportSessionChunk {
   optional uint32 rollover_index = 3;
 }
 
+// Phase 26.4 D-14: ReindexSession — reindex a single session's MCAP archives
+// into roz_session_metadata + roz_session_tool_calls. RLS-scoped to the
+// caller's tenant.
+message ReindexSessionRequest {
+  string session_id = 1;
+}
+message ReindexSessionResponse {
+  uint32 tool_calls_indexed = 1;
+  // true when the reindex created a new metadata row; false when it
+  // updated an existing row.
+  bool newly_created = 2;
+}
+
+// Phase 26.4 D-14: ReindexAll — admin-scoped bulk backfill across every
+// tenant. Each indexed session emits one ReindexProgress; the stream ends
+// when every session has been attempted.
+message ReindexAllRequest {}
+
+message ReindexProgress {
+  string session_id = 1;
+  uint32 completed  = 2;
+  uint32 total      = 3;
+  bool   succeeded  = 4;
+  optional string error = 5;
+  optional uint32 tool_calls_indexed = 6;
+}
+
 service ObservabilityService {
   // Server-streams the concatenated MCAP archive for the given session, in
   // rollover-index ascending order. When `time_range` is set, each file is
   // filtered via `mcap::MessageStream` before emission.
   rpc ExportSession (ExportSessionRequest) returns (stream ExportSessionChunk);
+
+  // Phase 26.4 D-14: reindex one session. RLS-scoped to caller's tenant.
+  rpc ReindexSession (ReindexSessionRequest) returns (ReindexSessionResponse);
+
+  // Phase 26.4 D-14: reindex every session across every tenant. Admin-scoped
+  // (caller must satisfy `AuthIdentity::is_admin()`); server iterates tenants
+  // and emits one ReindexProgress per session attempted.
+  rpc ReindexAll (ReindexAllRequest) returns (stream ReindexProgress);
 }
