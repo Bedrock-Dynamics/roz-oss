@@ -97,6 +97,9 @@ nix = { version = "0.29", features = ["signal"] }
 # `noxious-client` for its admin-API client; mirror the pattern used in
 # `crates/roz-zenoh/Cargo.toml` dev-dependencies.
 noxious-client = "1.0.4"
+# Phase 26.5 SC6 (plan 07): `observability_config::tests` parses TOML fixtures
+# to verify the nested `[observability.camera]` section deserializes.
+toml = { workspace = true }
 
 [lints]
 workspace = true
