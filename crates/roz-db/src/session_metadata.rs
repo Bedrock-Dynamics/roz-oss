@@ -59,14 +59,54 @@ pub struct ToolCallRow {
 ///
 /// # Errors
 /// Propagates any sqlx failure (FK violation, CHECK violation, connection loss).
-pub async fn upsert_metadata<'e, E>(
-    _executor: E,
-    _row: &SessionMetadataRow,
-) -> Result<SessionMetadataRow, sqlx::Error>
+pub async fn upsert_metadata<'e, E>(executor: E, row: &SessionMetadataRow) -> Result<SessionMetadataRow, sqlx::Error>
 where
     E: Executor<'e, Database = Postgres>,
 {
-    unimplemented!("RED: upsert_metadata implementation lands in the GREEN commit")
+    sqlx::query_as::<_, SessionMetadataRow>(
+        "INSERT INTO roz_session_metadata (\
+            session_id, tenant_id, started_at, ended_at, duration_ms, \
+            turn_count, tool_call_count, approval_count, intervention_count, violation_count, \
+            model_ids, policy_ids, controller_artifact_ids, \
+            first_trace_id, outcome, error_summary, indexed_at\
+         ) VALUES ($1,$2,$3,$4,$5, $6,$7,$8,$9,$10, $11,$12,$13, $14,$15,$16, now()) \
+         ON CONFLICT (session_id) DO UPDATE SET \
+            tenant_id = EXCLUDED.tenant_id, \
+            started_at = EXCLUDED.started_at, \
+            ended_at = EXCLUDED.ended_at, \
+            duration_ms = EXCLUDED.duration_ms, \
+            turn_count = EXCLUDED.turn_count, \
+            tool_call_count = EXCLUDED.tool_call_count, \
+            approval_count = EXCLUDED.approval_count, \
+            intervention_count = EXCLUDED.intervention_count, \
+            violation_count = EXCLUDED.violation_count, \
+            model_ids = EXCLUDED.model_ids, \
+            policy_ids = EXCLUDED.policy_ids, \
+            controller_artifact_ids = EXCLUDED.controller_artifact_ids, \
+            first_trace_id = EXCLUDED.first_trace_id, \
+            outcome = EXCLUDED.outcome, \
+            error_summary = EXCLUDED.error_summary, \
+            indexed_at = now() \
+         RETURNING *",
+    )
+    .bind(row.session_id)
+    .bind(row.tenant_id)
+    .bind(row.started_at)
+    .bind(row.ended_at)
+    .bind(row.duration_ms)
+    .bind(row.turn_count)
+    .bind(row.tool_call_count)
+    .bind(row.approval_count)
+    .bind(row.intervention_count)
+    .bind(row.violation_count)
+    .bind(&row.model_ids)
+    .bind(&row.policy_ids)
+    .bind(&row.controller_artifact_ids)
+    .bind(&row.first_trace_id)
+    .bind(&row.outcome)
+    .bind(&row.error_summary)
+    .fetch_one(executor)
+    .await
 }
 
 /// Upsert a batch of tool-call rows in one statement. Uses
@@ -78,14 +118,68 @@ where
 /// # Errors
 /// Propagates any sqlx failure. Callers running under RLS without
 /// [`crate::set_tenant_context`] will get a CHECK / policy violation.
-pub async fn upsert_tool_calls_batch<'e, E>(
-    _executor: E,
-    _rows: &[ToolCallRow],
-) -> Result<u64, sqlx::Error>
+pub async fn upsert_tool_calls_batch<'e, E>(executor: E, rows: &[ToolCallRow]) -> Result<u64, sqlx::Error>
 where
     E: Executor<'e, Database = Postgres>,
 {
-    unimplemented!("RED: upsert_tool_calls_batch implementation lands in the GREEN commit")
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    // Column-wise unzip for UNNEST. One network round-trip regardless of N.
+    let session_ids: Vec<Uuid> = rows.iter().map(|r| r.session_id).collect();
+    let call_ids: Vec<String> = rows.iter().map(|r| r.call_id.clone()).collect();
+    let tenant_ids: Vec<Uuid> = rows.iter().map(|r| r.tenant_id).collect();
+    let tool_names: Vec<String> = rows.iter().map(|r| r.tool_name.clone()).collect();
+    let categories: Vec<Option<String>> = rows.iter().map(|r| r.category.clone()).collect();
+    let requested_at: Vec<DateTime<Utc>> = rows.iter().map(|r| r.requested_at).collect();
+    let finished_at: Vec<Option<DateTime<Utc>>> = rows.iter().map(|r| r.finished_at).collect();
+    let latency_ms: Vec<Option<i64>> = rows.iter().map(|r| r.latency_ms).collect();
+    let had_approval: Vec<bool> = rows.iter().map(|r| r.had_approval).collect();
+    let outcomes: Vec<String> = rows.iter().map(|r| r.outcome.clone()).collect();
+    let trace_ids: Vec<Option<Vec<u8>>> = rows.iter().map(|r| r.trace_id.clone()).collect();
+    let mcap_offsets: Vec<Option<i64>> = rows.iter().map(|r| r.mcap_offset).collect();
+    let rollover_indexes: Vec<i32> = rows.iter().map(|r| r.rollover_index).collect();
+
+    let result = sqlx::query(
+        "INSERT INTO roz_session_tool_calls (\
+            session_id, call_id, tenant_id, tool_name, category, \
+            requested_at, finished_at, latency_ms, had_approval, outcome, \
+            trace_id, mcap_offset, rollover_index\
+         ) SELECT * FROM UNNEST(\
+            $1::uuid[], $2::text[], $3::uuid[], $4::text[], $5::text[], \
+            $6::timestamptz[], $7::timestamptz[], $8::bigint[], $9::bool[], $10::text[], \
+            $11::bytea[], $12::bigint[], $13::int[]\
+         ) ON CONFLICT (session_id, call_id) DO UPDATE SET \
+            tenant_id = EXCLUDED.tenant_id, \
+            tool_name = EXCLUDED.tool_name, \
+            category = EXCLUDED.category, \
+            requested_at = EXCLUDED.requested_at, \
+            finished_at = EXCLUDED.finished_at, \
+            latency_ms = EXCLUDED.latency_ms, \
+            had_approval = EXCLUDED.had_approval, \
+            outcome = EXCLUDED.outcome, \
+            trace_id = EXCLUDED.trace_id, \
+            mcap_offset = EXCLUDED.mcap_offset, \
+            rollover_index = EXCLUDED.rollover_index",
+    )
+    .bind(&session_ids)
+    .bind(&call_ids)
+    .bind(&tenant_ids)
+    .bind(&tool_names)
+    .bind(&categories)
+    .bind(&requested_at)
+    .bind(&finished_at)
+    .bind(&latency_ms)
+    .bind(&had_approval)
+    .bind(&outcomes)
+    .bind(&trace_ids)
+    .bind(&mcap_offsets)
+    .bind(&rollover_indexes)
+    .execute(executor)
+    .await?;
+
+    Ok(result.rows_affected())
 }
 
 /// Fetch a single metadata row by session_id (tenant-scoped via RLS).
@@ -94,14 +188,14 @@ where
 ///
 /// # Errors
 /// Propagates any sqlx failure.
-pub async fn fetch_metadata<'e, E>(
-    _executor: E,
-    _session_id: Uuid,
-) -> Result<Option<SessionMetadataRow>, sqlx::Error>
+pub async fn fetch_metadata<'e, E>(executor: E, session_id: Uuid) -> Result<Option<SessionMetadataRow>, sqlx::Error>
 where
     E: Executor<'e, Database = Postgres>,
 {
-    unimplemented!("RED: fetch_metadata implementation lands in the GREEN commit")
+    sqlx::query_as::<_, SessionMetadataRow>("SELECT * FROM roz_session_metadata WHERE session_id = $1")
+        .bind(session_id)
+        .fetch_optional(executor)
+        .await
 }
 
 // ===========================================================================
@@ -212,7 +306,9 @@ mod tests {
         assert_eq!(affected, 3);
         // Second batch with mutated latency_ms — count stays 3, rows updated in place.
         let mut rows_v2 = rows.clone();
-        rows_v2.iter_mut().for_each(|r| r.latency_ms = Some(999));
+        for r in &mut rows_v2 {
+            r.latency_ms = Some(999);
+        }
         let _ = upsert_tool_calls_batch(&pool, &rows_v2).await.expect("re-batch");
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM roz_session_tool_calls WHERE session_id = $1")
             .bind(session_id)
