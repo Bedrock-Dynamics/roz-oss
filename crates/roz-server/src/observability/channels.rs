@@ -186,11 +186,11 @@ pub fn register_all_channels(
     })
 }
 
-/// Phase 26.5 SC5 helper — register the CompressedVideo schema on a writer
-/// and return its `u16` id. Called both by [`register_all_channels`] (where
-/// the id is discarded) and by `WriterActor`'s per-camera channel
-/// registration (Plan 04) where the id is needed to parent
-/// `/roz/camera/{camera_id}` channels.
+/// Phase 26.5 SC5 helper — register CompressedVideo and return its `u16` id.
+///
+/// Called both by [`register_all_channels`] (where the id is discarded) and
+/// by `WriterActor`'s per-camera channel registration (Plan 04) where the id
+/// is needed to parent `/roz/camera/{camera_id}` channels.
 ///
 /// mcap 0.24 `add_schema` dedups on the (name, encoding, data) tuple —
 /// calling this after [`register_all_channels`] returns the same `u16` as
