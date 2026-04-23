@@ -35,9 +35,11 @@
 //! the unified finalize path in `run_session_loop` handles both cloud and
 //! edge branches.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use prost::Message as _;
+use roz_core::camera::CameraId;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -130,7 +132,7 @@ pub fn spawn_edge_ingestors(
 
     // Task 3: signed telemetry NATS ingest — reuses the cloud helper so
     //         verify + decode + project lives in one place.
-    if let Some(worker) = worker_name {
+    if let Some(worker) = worker_name.clone() {
         let tx = writer_tx.clone();
         let cancel_child = cancel.clone();
         let nats = nats_client.clone();
@@ -142,6 +144,34 @@ pub fn spawn_edge_ingestors(
         });
     } else {
         debug!(session = %session_id, "no worker bound; skipping edge telemetry ingest");
+    }
+
+    // Task 4 (Phase 26.5 SC5 R-02): camera NATS ingest — subscribe to
+    //         `camera.{worker_id}.{session_id}.*` and route signed
+    //         `foxglove.CompressedVideo` frames to the session's WriterActor
+    //         via `WriteCommand::{RegisterCamera, Event}`. Plan 05's worker
+    //         publishes with `publish_signed`; this task verifies, extracts
+    //         the camera_id from the 4th subject token, and dispatches a
+    //         one-time `RegisterCamera` on first-sighting. The payload bytes
+    //         are forwarded verbatim — they are already a valid prost-encoded
+    //         `foxglove.CompressedVideo` message that WriterActor writes to
+    //         the `/roz/camera/{camera_id}` channel whose schema is
+    //         CompressedVideo (registered by Plan 03). Server-local
+    //         `now_wall_clock_ns()` stamps log_time/publish_time for
+    //         monotonicity with other server-originated channels in the
+    //         same MCAP file; operators wanting capture-time read
+    //         `CompressedVideo.timestamp` off the payload itself.
+    if let Some(worker) = worker_name {
+        let tx = writer_tx.clone();
+        let cancel_child = cancel.clone();
+        let nats = nats_client.clone();
+        let gate = signing_gate.clone();
+        tokio::spawn(async move {
+            run_camera_ingest(session_id, tenant_id, host_id, &worker, &nats, &gate, tx, cancel_child).await;
+            info!(session = %session_id, "MCAP edge camera ingestor exiting");
+        });
+    } else {
+        debug!(session = %session_id, "no worker bound; skipping edge camera ingest");
     }
 
     cancel
@@ -301,6 +331,163 @@ async fn run_session_response_ingest(
     info!(%subject, session = %session_id, "MCAP edge session-response ingest exiting");
 }
 
+/// Phase 26.5 SC5 (R-02): subscribe to `camera.{worker_id}.{session_id}.*`,
+/// verify every frame, extract `camera_id` from the 4th subject token, and
+/// route to the session's WriterActor as:
+///   1. `WriteCommand::RegisterCamera { camera_id }` on first-sighting.
+///   2. `WriteCommand::Event { channel: ChannelKey::Camera(camera_id), ... }`
+///      for every accepted frame.
+///
+/// Payload bytes pass through unmodified — they are already a valid
+/// prost-encoded `foxglove.CompressedVideo` message from the worker's
+/// `mcap_relay` (Plan 05). WriterActor writes them verbatim to the
+/// `/roz/camera/{camera_id}` channel whose schema is `CompressedVideo`
+/// (registered by Plan 03's `register_camera_video_schema`). No decode,
+/// no re-encode — zero round-trip cost.
+///
+/// `log_time_ns` / `publish_time_ns` are stamped with server-local
+/// `now_wall_clock_ns()` for monotonicity with other server-originated
+/// channels in the same MCAP file. Clients needing precise capture
+/// timestamps read `CompressedVideo.timestamp` from the payload.
+#[allow(clippy::too_many_arguments)]
+async fn run_camera_ingest(
+    session_id: Uuid,
+    tenant_id: Uuid,
+    host_id: Uuid,
+    worker_id: &str,
+    nats: &async_nats::Client,
+    signing_gate: &Arc<SigningGate>,
+    writer_tx: mpsc::Sender<WriteCommand>,
+    cancel: CancellationToken,
+) {
+    use futures::StreamExt as _;
+
+    let subject = match roz_nats::subjects::Subjects::camera_session_wildcard(worker_id, &session_id.to_string()) {
+        Ok(s) => s,
+        Err(error) => {
+            warn!(%error, worker = %worker_id, session = %session_id, "failed to build camera wildcard subject");
+            return;
+        }
+    };
+
+    let mut sub = match nats.subscribe(subject.clone()).await {
+        Ok(s) => s,
+        Err(error) => {
+            warn!(%error, %subject, session = %session_id, "failed to subscribe camera ingest");
+            return;
+        }
+    };
+    info!(%subject, session = %session_id, "MCAP edge camera ingest ready");
+
+    let mut seen_cameras: HashSet<CameraId> = HashSet::new();
+
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => break,
+            maybe_msg = sub.next() => {
+                let Some(msg) = maybe_msg else { break };
+
+                // Phase 26.3 D-06: extract W3C trace context on the first
+                // line of the arm so the remainder of this frame's work
+                // runs under the sender's trace. Matches the existing
+                // `run_session_response_ingest` pattern above.
+                if let Some(ref headers) = msg.headers {
+                    roz_nats::trace::extract_and_link_parent(headers);
+                }
+
+                // Phase 23 FS-04: signature verification. Same Off / Audit /
+                // Strict enforcement matrix as the session-response path —
+                // strict failures warn + drop rather than killing the task.
+                if let Err(reason) = signing_gate
+                    .verify_inbound(
+                        msg.headers.as_ref(),
+                        &msg.payload,
+                        InboundContext { tenant_id, host_id },
+                    )
+                    .await
+                {
+                    warn!(
+                        subject = %msg.subject,
+                        session = %session_id,
+                        reason = %reason,
+                        "camera frame signature verification failed; dropping"
+                    );
+                    continue;
+                }
+
+                // Extract camera_id from subject `camera.{worker}.{session}.{camera}`.
+                let Some(camera_id) = camera_id_from_subject(msg.subject.as_str()) else {
+                    debug!(subject = %msg.subject, "camera frame subject malformed; dropping");
+                    continue;
+                };
+
+                // First-sighting: send `RegisterCamera` exactly once per
+                // camera per task. `HashSet::insert` returns true the first
+                // time — gate RegisterCamera dispatch on that. A send error
+                // is non-fatal: the Event send below will exercise the
+                // WriterActor's warn-and-drop path for unknown camera_ids,
+                // which is the intended degradation.
+                if seen_cameras.insert(camera_id.clone())
+                    && let Err(error) = writer_tx
+                        .send(WriteCommand::RegisterCamera {
+                            camera_id: camera_id.clone(),
+                        })
+                        .await
+                {
+                    warn!(
+                        %error,
+                        session = %session_id,
+                        camera = %camera_id,
+                        "failed to send RegisterCamera to WriterActor"
+                    );
+                }
+
+                // Forward the raw prost-encoded CompressedVideo payload verbatim.
+                let now_ns = now_wall_clock_ns();
+                let bytes = msg.payload.to_vec();
+                if let Err(error) = writer_tx
+                    .send(WriteCommand::Event {
+                        channel: ChannelKey::Camera(camera_id.clone()),
+                        log_time_ns: now_ns,
+                        publish_time_ns: now_ns,
+                        bytes,
+                    })
+                    .await
+                {
+                    warn!(
+                        %error,
+                        session = %session_id,
+                        camera = %camera_id,
+                        "failed to send camera Event to WriterActor"
+                    );
+                }
+
+                debug!(
+                    subject = %msg.subject,
+                    camera = %camera_id,
+                    "camera frame forwarded to MCAP"
+                );
+            }
+        }
+    }
+    info!(%subject, session = %session_id, "MCAP edge camera ingest exiting");
+}
+
+/// Parse `camera.{worker_id}.{session_id}.{camera_id}` — returns `None` if
+/// the subject does not match the 4-token shape or the camera slot is empty.
+/// Called per-message in `run_camera_ingest`; cheap split + bounds check.
+fn camera_id_from_subject(subject: &str) -> Option<CameraId> {
+    let parts: Vec<&str> = subject.split('.').collect();
+    if parts.len() != 4 || parts[0] != "camera" {
+        return None;
+    }
+    let cam = parts[3];
+    if cam.is_empty() {
+        return None;
+    }
+    Some(CameraId::new(cam))
+}
+
 /// Convert a canonical JSON envelope to a prost-encoded
 /// `roz.v1.SessionEventEnvelope` for `/roz/session/events`.
 ///
@@ -426,5 +613,36 @@ mod tests {
         let after = now_wall_clock_ns();
         assert!(got >= before);
         assert!(got <= after);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 26.5 SC5 R-02 — camera_id subject parser
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn camera_id_from_subject_parses_valid_subject() {
+        use super::camera_id_from_subject;
+        use roz_core::camera::CameraId;
+        let id = camera_id_from_subject("camera.worker1.sess-abc.cam-front").expect("parse");
+        assert_eq!(id, CameraId::new("cam-front"));
+    }
+
+    #[test]
+    fn camera_id_from_subject_rejects_wrong_prefix() {
+        use super::camera_id_from_subject;
+        assert!(camera_id_from_subject("not-camera.w.s.c").is_none());
+    }
+
+    #[test]
+    fn camera_id_from_subject_rejects_wrong_token_count() {
+        use super::camera_id_from_subject;
+        assert!(camera_id_from_subject("camera.w.s").is_none(), "3 tokens");
+        assert!(camera_id_from_subject("camera.w.s.c.extra").is_none(), "5 tokens");
+    }
+
+    #[test]
+    fn camera_id_from_subject_rejects_empty_camera() {
+        use super::camera_id_from_subject;
+        assert!(camera_id_from_subject("camera.w.s.").is_none());
     }
 }
