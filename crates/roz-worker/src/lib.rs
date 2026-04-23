@@ -35,6 +35,7 @@ pub mod dispatch;
 pub mod estop;
 pub mod event_nats;
 pub mod model_factory;
+pub mod observability_config;
 pub mod policy_cache;
 pub mod policy_enforcement;
 pub mod provisioning;
