@@ -19,12 +19,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &["../../proto"],
         )?;
 
-    // Phase 26 OBS-02: vendored Foxglove schemas. Descriptor bytes only —
-    // mcap::Writer::add_schema consumes FileDescriptorSet bytes directly, so we
-    // suppress tonic server/client codegen. Only the 3 target schemas are
-    // listed; transitive deps (Pose, Quaternion, Vector3) are pulled in via
-    // their imports. `Level` severity is declared inline inside Log.proto and
-    // is available as `foxglove.Log.Level`.
+    // Phase 26 OBS-02 + Phase 26.5 SC1/SC2: vendored Foxglove schemas.
+    // Descriptor bytes are consumed by `mcap::Writer::add_schema`, but
+    // `build_server(false) + build_client(false)` STILL emits `prost::Message`
+    // types in `$OUT_DIR/foxglove.rs` — only service/client stubs are gated
+    // (tonic-build README). `crates/roz-server/src/observability/foxglove_types.rs`
+    // re-exposes them via `tonic::include_proto!("foxglove")`.
+    //
+    // Leaf schemas only are listed here; protoc auto-resolves transitive
+    // imports via the `../../proto` include path (e.g. FrameTransform pulls
+    // Quaternion + Vector3, SceneUpdate pulls SceneEntity + 8 primitives, etc.).
+    // `Level` severity is declared inline inside Log.proto as
+    // `foxglove.Log.Level`.
+    //
+    // R-01 honored: CompressedVideo is the H.264 channel target;
+    // CompressedImage is registered alongside for future JPEG/PNG/WEBP/AVIF
+    // paths with no producer this phase.
     tonic_build::configure()
         .build_server(false)
         .build_client(false)
@@ -34,6 +44,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "../../proto/foxglove/FrameTransform.proto",
                 "../../proto/foxglove/PoseInFrame.proto",
                 "../../proto/foxglove/Log.proto",
+                // Phase 26.5 SC1 additions. R-01 honored: CompressedVideo is
+                // the H.264 target; CompressedImage is registered for future
+                // JPEG/PNG/WEBP/AVIF snapshot paths (no producer this phase).
+                "../../proto/foxglove/CompressedVideo.proto",
+                "../../proto/foxglove/CompressedImage.proto",
+                "../../proto/foxglove/RawImage.proto",
+                "../../proto/foxglove/PointCloud.proto",
+                "../../proto/foxglove/SceneUpdate.proto",
+                "../../proto/foxglove/ImageAnnotations.proto",
             ],
             &["../../proto"],
         )?;
