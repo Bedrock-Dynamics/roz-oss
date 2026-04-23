@@ -40,14 +40,14 @@ pub struct ChannelIds {
     pub tool_calls: u16,
     // Phase 26.5 SC3 additions — future Phase 29+ producers.
     //
-    // `#[allow(dead_code)]` over `#[expect(dead_code)]` is deliberate per D-10:
-    // the module's own test constructs `ChannelIds { .., pointcloud,
-    // scene_update, annotations }` via struct-literal init (a use-site), so
-    // under `cargo clippy --all-targets -- -D warnings` the `dead_code` lint
-    // does NOT fire for the test target. An `#[expect]` attribute would then
+    // Attribute choice per D-10 (revision 26.5-blocker-01): the module's own
+    // test constructs `ChannelIds { .., pointcloud, scene_update, annotations }`
+    // via struct-literal init (a use-site), so under
+    // `cargo clippy --all-targets -- -D warnings` the `dead_code` lint does
+    // NOT fire for the test target. An expectation-style attribute would then
     // be unfulfilled, triggering `unfulfilled_lint_expectations` which
-    // `-D warnings` promotes to an error. `#[allow]` sidesteps this and
-    // matches the repo's 30+ existing `#[allow(dead_code)]` precedents.
+    // `-D warnings` promotes to an error. The allow form below sidesteps this
+    // and matches the repo's 30+ existing precedents in production code.
     #[allow(
         dead_code,
         reason = "Phase 29+ producer wiring lands later; channel pre-registered so MCAP schema contract is stable"
