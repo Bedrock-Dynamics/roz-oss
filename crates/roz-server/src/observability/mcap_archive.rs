@@ -577,6 +577,9 @@ mod tests {
             session_events: 4,
             task_lifecycle: 5,
             tool_calls: 6,
+            pointcloud: 7,
+            scene_update: 8,
+            annotations: 9,
         };
         assert_eq!(ChannelKey::Tf.channel_id(&ids), 1);
         assert_eq!(ChannelKey::Pose.channel_id(&ids), 2);

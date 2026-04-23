@@ -77,9 +77,9 @@ impl SchemaDescriptors {
             SCHEMA_SESSION_EVENT,
             SCHEMA_TASK_LIFECYCLE,
             SCHEMA_TOOL_CALL,
-            // Phase 26.5 SC2 additions (R-01 honored: CompressedVideo is the H.264
-            // target; CompressedImage is registered alongside but has no producer
-            // this phase).
+            // Phase 26.5 SC2/SC3 additions (R-01 honored: CompressedVideo is the
+            // H.264 target; CompressedImage registered alongside but has no producer
+            // this phase). All 6 live in foxglove_descriptor.bin per Plan 01's build.rs.
             SCHEMA_COMPRESSED_VIDEO,
             SCHEMA_COMPRESSED_IMAGE,
             SCHEMA_RAW_IMAGE,
