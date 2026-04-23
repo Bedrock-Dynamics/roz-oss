@@ -521,8 +521,7 @@ async fn sc5_30s_fixture_roundtrips_via_mcap_message_stream() {
     //   + agent-turn D-10 minimum = 6
     //   + tool-call triplets × 3 = 60
     //   = 76
-    let min_expected_session_events =
-        APPROVAL_PAIRS * 2 + AGENT_TURN_SESSION_EVENTS_MIN + TOOL_CALL_TRIPLETS * 3;
+    let min_expected_session_events = APPROVAL_PAIRS * 2 + AGENT_TURN_SESSION_EVENTS_MIN + TOOL_CALL_TRIPLETS * 3;
     assert!(
         session_events_count >= min_expected_session_events,
         "/roz/session/events count {} should be at least {} \
@@ -655,6 +654,121 @@ async fn sc5_30s_fixture_roundtrips_via_mcap_message_stream() {
         "digest_sha256 must be populated on finalize"
     );
     assert!(rows[0].size_bytes > 0, "size_bytes must be positive on finalize");
+
+    // ---------------------------------------------------------------------
+    // Phase 26.4 SC6: validate the session metadata + tool-call index.
+    // ---------------------------------------------------------------------
+    //
+    // The indexer is spawned detached from WriterActor::finalize_file (Plan 05
+    // D-07), so we poll the roz_session_metadata table briefly until the row
+    // appears (or give up after 5s and fail with a clear message).
+    let metadata_row = {
+        let mut found: Option<roz_db::session_metadata::SessionMetadataRow> = None;
+        for _ in 0..50 {
+            if let Some(row) = roz_db::session_metadata::fetch_metadata(&pool, session_id)
+                .await
+                .expect("fetch_metadata")
+            {
+                found = Some(row);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        found.expect("roz_session_metadata row must appear within 5s of finalize")
+    };
+
+    assert_eq!(metadata_row.session_id, session_id);
+    assert_eq!(metadata_row.tenant_id, tenant_id);
+    assert!(
+        metadata_row.turn_count >= 1,
+        "SC6: turn_count must be >= 1 from the scripted agent turn; got {}",
+        metadata_row.turn_count,
+    );
+    // SC6 per D-22: approval_count counts ONLY SessionEvent::ApprovalRequested
+    // events, not ApprovalResolved. The fixture emits 5 pairs (Requested +
+    // Resolved), so approval_count = APPROVAL_PAIRS = 5. (D-30 in 26.4-CONTEXT.md
+    // references "10 approval events" loosely — the indexer follows D-22.)
+    assert_eq!(
+        metadata_row.approval_count,
+        i32::try_from(APPROVAL_PAIRS).expect("APPROVAL_PAIRS fits in i32"),
+        "SC6: expected approval_count = {} (APPROVAL_PAIRS, per D-22: Requested-only); got {}",
+        APPROVAL_PAIRS,
+        metadata_row.approval_count,
+    );
+    // SC6 per D-30: intervention_count = 0 (fixture emits no SafetyIntervention events).
+    assert_eq!(
+        metadata_row.intervention_count, 0,
+        "SC6: expected intervention_count = 0; got {}",
+        metadata_row.intervention_count,
+    );
+    // tool_call_count per D-21 is the count of DISTINCT call_id values (not total
+    // triplet event count). The fixture contributes:
+    //   - TOOL_CALL_TRIPLETS (20) distinct mock_call_* call_ids
+    //   - at least 1 hello_world call_id from the scripted agent turn
+    // => tool_call_count >= TOOL_CALL_TRIPLETS + 1 = 21. We assert a lower bound
+    // because the mock provider could evolve to issue more tool calls per turn;
+    // the scoped assertion below (exactly 60 rows under the mock_tool_%
+    // predicate in roz_session_tool_calls) is the authoritative SC6 check on
+    // the tool-call index.
+    assert!(
+        metadata_row.tool_call_count
+            >= i32::try_from(TOOL_CALL_TRIPLETS + 1).expect("TOOL_CALL_TRIPLETS + 1 fits in i32"),
+        "SC6: tool_call_count must be >= {} (TOOL_CALL_TRIPLETS distinct mock_call_* + at least 1 agent-turn); got {}",
+        TOOL_CALL_TRIPLETS + 1,
+        metadata_row.tool_call_count,
+    );
+
+    // Tool-call-row drill-down assertion under the mock_tool_% predicate
+    // (BLOCKER 2 decision). Per D-02 + D-12 (PRIMARY KEY (session_id, call_id))
+    // the indexer correlates each Requested→Started→Finished triplet into ONE
+    // row per distinct call_id. The fixture emits TOOL_CALL_TRIPLETS (20)
+    // distinct mock_call_* call_ids, so we expect exactly 20 rows under the
+    // mock_tool_% predicate — not 60. (The plan's original "60 rows" number
+    // confused triplet events with distinct call_ids.)
+    let expected_mock_rows = i64::try_from(TOOL_CALL_TRIPLETS).expect("TOOL_CALL_TRIPLETS fits in i64");
+    let mock_tool_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM roz_session_tool_calls \
+         WHERE session_id = $1 AND tool_name LIKE 'mock_tool_%'",
+    )
+    .bind(session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count mock_tool_ rows");
+    assert_eq!(
+        mock_tool_rows, expected_mock_rows,
+        "SC6: expected exactly {expected_mock_rows} rows in roz_session_tool_calls matching tool_name LIKE 'mock_tool_%' \
+         (= TOOL_CALL_TRIPLETS distinct call_ids per D-02/D-12); got {mock_tool_rows}",
+    );
+
+    // Every mock_tool_ row must have latency_ms + finished_at populated (SC6 per D-30).
+    let mock_tool_with_latency: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM roz_session_tool_calls \
+         WHERE session_id = $1 AND tool_name LIKE 'mock_tool_%' \
+           AND latency_ms IS NOT NULL AND finished_at IS NOT NULL",
+    )
+    .bind(session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count mock_tool_ rows with latency");
+    assert_eq!(
+        mock_tool_with_latency, expected_mock_rows,
+        "SC6: every mock_tool_% row must have latency_ms + finished_at populated; got {mock_tool_with_latency}/{expected_mock_rows}",
+    );
+
+    // Outcome derivation sanity — all mock triplets are Requested+Started+Finished, no
+    // ToolUnavailable, so every outcome should be 'succeeded'.
+    let succeeded_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM roz_session_tool_calls \
+         WHERE session_id = $1 AND tool_name LIKE 'mock_tool_%' AND outcome = 'succeeded'",
+    )
+    .bind(session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count succeeded mock_tool_ rows");
+    assert_eq!(
+        succeeded_count, expected_mock_rows,
+        "SC6: every mock_tool_% row should have outcome='succeeded' (no ToolUnavailable emitted); got {succeeded_count}/{expected_mock_rows}",
+    );
 }
 
 // ---------------------------------------------------------------------------
