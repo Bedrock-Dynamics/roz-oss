@@ -157,3 +157,17 @@ required-features = ["test-helpers"]
 [[test]]
 name = "cross_process_trace_stitch"
 required-features = ["test-helpers"]
+
+# Phase 26.4 SC7 regression fence — multi-session fleet-query test.
+# Seeds 5 distinct sessions through per-session WriterActors with varying
+# tool-call + intervention counts, then runs the canonical fleet query
+# `SELECT session_id FROM roz_session_metadata
+#    WHERE tool_call_count > 50 AND intervention_count > 0` and asserts
+# the returned subset matches the 3 predicted rows. Also covers D-32
+# idempotency: `index_session` called twice on one session leaves row
+# counts unchanged. Gated behind `test-helpers` to keep the default
+# test build free of the testcontainers graph.
+[[test]]
+name = "session_metadata_fleet_query"
+path = "tests/session_metadata_fleet_query.rs"
+required-features = ["test-helpers"]
