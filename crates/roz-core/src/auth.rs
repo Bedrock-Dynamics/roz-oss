@@ -95,6 +95,22 @@ impl AuthIdentity {
             Self::User { tenant_id, .. } | Self::ApiKey { tenant_id, .. } | Self::Worker { tenant_id, .. } => tenant_id,
         }
     }
+
+    /// Returns `true` when this identity carries admin authority for
+    /// tenant-global operations (e.g., `ObservabilityService::ReindexAll`).
+    ///
+    /// Policy (matches `crates/roz-server/src/auth/mod.rs::permissions_for_identity`):
+    /// * `ApiKey` carrying [`ApiKeyScope::Admin`] → admin.
+    /// * `User` with [`Role::Admin`] or [`Role::Owner`] → admin.
+    /// * `Worker` → never admin (workers are transport peers, not operators).
+    #[must_use]
+    pub fn is_admin(&self) -> bool {
+        match self {
+            Self::ApiKey { scopes, .. } => scopes.contains(&ApiKeyScope::Admin),
+            Self::User { role, .. } => matches!(role, Role::Admin | Role::Owner),
+            Self::Worker { .. } => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
