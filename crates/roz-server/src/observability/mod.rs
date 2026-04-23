@@ -19,6 +19,7 @@ pub mod idle_monitor;
 pub mod ingest_cloud;
 pub mod ingest_edge;
 pub mod mcap_archive;
+pub mod metadata_index;
 pub mod projection;
 pub mod recovery;
 pub mod retention;
