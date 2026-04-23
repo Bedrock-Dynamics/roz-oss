@@ -131,6 +131,12 @@ pub async fn run_clear_failsafe_subscriber(
             maybe_msg = futures::StreamExt::next(&mut sub) => {
                 match maybe_msg {
                     Some(msg) => {
+                        // Phase 26.3 D-06: extract W3C trace context on the first line so
+                        // the rest of this arm runs under the sender's trace. Matches
+                        // the pattern Plan 05 landed at `crates/roz-worker/src/main.rs:423`.
+                        if let Some(ref headers) = msg.headers {
+                            roz_nats::trace::extract_and_link_parent(headers);
+                        }
                         if let Err(e) = handle_clear_failsafe_message(&signing_ctx, &watchdog, &msg) {
                             tracing::warn!(error = %e, "clear_failsafe message rejected");
                         }

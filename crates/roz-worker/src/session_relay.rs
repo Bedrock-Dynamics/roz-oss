@@ -614,6 +614,12 @@ pub async fn spawn_session_relay(
     let sessions: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(HashMap::new()));
 
     while let Some(msg) = sub.next().await {
+        // Phase 26.3 D-06: extract W3C trace context on the first line so
+        // the rest of this closure runs under the sender's trace. Matches
+        // the pattern Plan 05 landed at `crates/roz-worker/src/main.rs:423`.
+        if let Some(ref headers) = msg.headers {
+            roz_nats::trace::extract_and_link_parent(headers);
+        }
         // Extract session_id from subject: session.{worker_id}.{session_id}.request
         let parts: Vec<&str> = msg.subject.as_str().split('.').collect();
         if parts.len() < 4 {
@@ -790,6 +796,12 @@ async fn handle_edge_session(
 
     // Process subsequent messages on this session's dedicated subscription.
     while let Some(msg) = session_sub.next().await {
+        // Phase 26.3 D-06: extract W3C trace context on the first line so
+        // the rest of this closure runs under the sender's trace. Matches
+        // the pattern Plan 05 landed at `crates/roz-worker/src/main.rs:423`.
+        if let Some(ref headers) = msg.headers {
+            roz_nats::trace::extract_and_link_parent(headers);
+        }
         if *estop_rx.borrow() {
             tracing::error!(session_id, "E-STOP received — terminating edge session");
             session_runtime.handle_failure(RuntimeFailureKind::SafetyBlocked);
@@ -944,6 +956,12 @@ async fn handle_edge_session(
                                     turn_cancel.cancel();
                                     continue;
                                 };
+                                // Phase 26.3 D-06: extract W3C trace context on the first line so
+                                // the rest of this arm runs under the sender's trace. Matches
+                                // the pattern Plan 05 landed at `crates/roz-worker/src/main.rs:423`.
+                                if let Some(ref headers) = msg.headers {
+                                    roz_nats::trace::extract_and_link_parent(headers);
+                                }
                                 let Ok(turn_envelope) = serde_json::from_slice::<serde_json::Value>(&msg.payload) else {
                                     tracing::warn!(session_id, "edge session: failed to deserialize in-flight message");
                                     continue;
