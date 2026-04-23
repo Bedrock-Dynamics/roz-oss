@@ -109,6 +109,26 @@ where
         .await
 }
 
+/// Enumerate every tenant's primary key.
+///
+/// This query bypasses RLS by design — it is intended for admin-scoped
+/// server-side operations (e.g., `ObservabilityService::ReindexAll`) that
+/// iterate tenants to do per-tenant RLS-scoped work. Callers MUST verify
+/// admin authority on the invoking identity BEFORE calling this helper.
+/// Invoking under a non-superuser role without RLS enabled on `roz_tenants`
+/// returns every visible row.
+///
+/// # Errors
+/// Propagates any sqlx failure.
+pub async fn list_all_tenants<'e, E>(executor: E) -> Result<Vec<Uuid>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query_scalar::<_, Uuid>("SELECT id FROM roz_tenants")
+        .fetch_all(executor)
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
