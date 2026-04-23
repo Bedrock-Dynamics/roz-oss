@@ -34,7 +34,10 @@ use uuid::Uuid;
 
 use crate::grpc::auth_ext;
 use crate::grpc::roz_v1::observability_service_server::ObservabilityService;
-use crate::grpc::roz_v1::{ExportSessionChunk, ExportSessionRequest};
+use crate::grpc::roz_v1::{
+    ExportSessionChunk, ExportSessionRequest, ReindexAllRequest, ReindexProgress, ReindexSessionRequest,
+    ReindexSessionResponse,
+};
 use crate::observability::export::{filter_by_time_range, stream_file_raw, EXPORT_CHUNK_BYTES};
 
 /// gRPC implementation of `ObservabilityService`.
@@ -57,6 +60,25 @@ impl ObservabilityServiceImpl {
 #[tonic::async_trait]
 impl ObservabilityService for ObservabilityServiceImpl {
     type ExportSessionStream = ReceiverStream<Result<ExportSessionChunk, Status>>;
+    type ReindexAllStream = ReceiverStream<Result<ReindexProgress, Status>>;
+
+    // Phase 26.4: unimplemented stubs — Plan 07 fills these in with real
+    // RLS-scoped and admin-scoped handlers. Stubs exist so the trait impl
+    // compiles while Wave 2 (indexer) lands before Wave 4 (gRPC handlers).
+    async fn reindex_session(
+        &self,
+        _request: Request<ReindexSessionRequest>,
+    ) -> Result<Response<ReindexSessionResponse>, Status> {
+        Err(Status::unimplemented("reindex_session: Phase 26.4 Plan 07 pending"))
+    }
+
+    async fn reindex_all(
+        &self,
+        _request: Request<ReindexAllRequest>,
+    ) -> Result<Response<Self::ReindexAllStream>, Status> {
+        Err(Status::unimplemented("reindex_all: Phase 26.4 Plan 07 pending"))
+    }
+
 
     async fn export_session(
         &self,
