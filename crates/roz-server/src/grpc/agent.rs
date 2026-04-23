@@ -566,6 +566,13 @@ impl AgentService for AgentServiceImpl {
             loop {
                 match messages.next().await {
                     Some(Ok(msg)) => {
+                        // Phase 26.3 D-06: extract W3C trace context on the first line so
+                        // the rest of this closure runs under the server's trace. JetStream
+                        // `Message` derefs to `async_nats::Message`, so `msg.headers` is
+                        // `Option<HeaderMap>`. Mirrors `crates/roz-worker/src/main.rs:427`.
+                        if let Some(ref headers) = msg.headers {
+                            roz_nats::trace::extract_and_link_parent(headers);
+                        }
                         // Ack the message so it's not redelivered.
                         if let Err(e) = msg.ack().await {
                             tracing::warn!(error = %e, "WatchTeam: failed to ack message");
@@ -2180,6 +2187,12 @@ async fn spawn_telemetry_relay(
                     None => break,
                 },
             };
+            // Phase 26.3 D-06: extract W3C trace context on the first line so
+            // the rest of this loop body runs under the worker's trace. Matches
+            // the pattern Plan 05 landed at `crates/roz-worker/src/main.rs:423`.
+            if let Some(ref headers) = msg.headers {
+                roz_nats::trace::extract_and_link_parent(headers);
+            }
             // Phase 26-12 OBS-01 wire-format migration: the worker
             // publishes prost-encoded `roz.v1.TelemetryUpdate` (not
             // serde_json). Decode via prost; legacy JSON publishers
@@ -2364,6 +2377,12 @@ async fn spawn_webrtc_signaling_relay(
                     None => break,
                 },
             };
+            // Phase 26.3 D-06: extract W3C trace context on the first line so
+            // the rest of this loop body runs under the peer's trace. Matches
+            // the pattern Plan 05 landed at `crates/roz-worker/src/main.rs:423`.
+            if let Some(ref headers) = msg.headers {
+                roz_nats::trace::extract_and_link_parent(headers);
+            }
             let subject_str = msg.subject.as_str();
             // Parse NATS subject segments: webrtc.{worker_id}.{peer_id}.{type}[.{subtype}]
             let segments: Vec<&str> = subject_str.split('.').collect();
@@ -3352,6 +3371,12 @@ async fn run_edge_relay(
                     break;
                 }
             };
+            // Phase 26.3 D-06: extract W3C trace context on the first line so
+            // the rest of this loop body runs under the worker's trace. Matches
+            // the pattern Plan 05 landed at `crates/roz-worker/src/main.rs:423`.
+            if let Some(ref headers) = msg.headers {
+                roz_nats::trace::extract_and_link_parent(headers);
+            }
             if let Ok(envelope) = serde_json::from_slice::<CanonicalSessionEventEnvelope>(&msg.payload) {
                 if let Some(response) = edge_canonical_json_envelope_to_response(&envelope, &relay_model_name) {
                     let session_response = SessionResponse {
