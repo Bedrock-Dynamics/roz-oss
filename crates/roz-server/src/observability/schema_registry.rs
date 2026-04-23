@@ -17,8 +17,9 @@ use prost::Message;
 use prost_types::{FileDescriptorProto, FileDescriptorSet};
 
 use crate::observability::{
-    McapArchiveError, SCHEMA_FRAME_TRANSFORM, SCHEMA_LOG, SCHEMA_POSE_IN_FRAME, SCHEMA_SESSION_EVENT,
-    SCHEMA_TASK_LIFECYCLE, SCHEMA_TOOL_CALL,
+    McapArchiveError, SCHEMA_COMPRESSED_IMAGE, SCHEMA_COMPRESSED_VIDEO, SCHEMA_FRAME_TRANSFORM,
+    SCHEMA_IMAGE_ANNOTATIONS, SCHEMA_LOG, SCHEMA_POINT_CLOUD, SCHEMA_POSE_IN_FRAME, SCHEMA_RAW_IMAGE,
+    SCHEMA_SCENE_UPDATE, SCHEMA_SESSION_EVENT, SCHEMA_TASK_LIFECYCLE, SCHEMA_TOOL_CALL,
 };
 
 const FOXGLOVE_DESCRIPTOR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/foxglove_descriptor.bin"));
@@ -76,6 +77,15 @@ impl SchemaDescriptors {
             SCHEMA_SESSION_EVENT,
             SCHEMA_TASK_LIFECYCLE,
             SCHEMA_TOOL_CALL,
+            // Phase 26.5 SC3 multimedia schemas — extend targets so
+            // `register_all_channels` can look them up via `get`. All 6 live in
+            // foxglove_descriptor.bin per Plan 01's build.rs wiring.
+            SCHEMA_COMPRESSED_VIDEO,
+            SCHEMA_COMPRESSED_IMAGE,
+            SCHEMA_RAW_IMAGE,
+            SCHEMA_POINT_CLOUD,
+            SCHEMA_SCENE_UPDATE,
+            SCHEMA_IMAGE_ANNOTATIONS,
         ];
 
         let mut inner = HashMap::new();
