@@ -211,25 +211,49 @@ async fn sc5_30s_fixture_roundtrips_via_mcap_message_stream() {
         .expect("send /roz/telemetry/pose");
     }
 
-    // --- 60 tool-call events (3 per triplet: Started / Requested / Finished).
-    //    The real `ToolCallEvent` envelope is exercised elsewhere; here we
-    //    use a `log_line` stub as a message-count fallback because this
-    //    fixture's contract is shape-correct (count + channel presence),
-    //    not payload-correct, for tool calls.
+    // --- 60 tool-call events (20 triplets × 3 variants) — Phase 26.4 BLOCKER 2
+    //     resolution. Previously emitted log_line stubs on /roz/tool/calls (which
+    //     Phase 26.4's indexer does NOT read — D-01 reads /roz/session/events only).
+    //     These are now real SessionEvent::ToolCall{Requested,Started,Finished}
+    //     triplets pushed through the production integration path via
+    //     emit_session_event_for_tests (same path as the approval loop below).
+    //
+    //     Tool names use the `mock_tool_{i}` prefix so the SC6 DB-assertion block
+    //     below can filter out the agent-turn's `hello_world` tool call (emitted
+    //     by the scripted agent-turn block at ~lines 296-404 via the same
+    //     /roz/session/events channel).
     for i in 0..TOOL_CALL_TRIPLETS {
-        let ts = now_ns + i * 1_500_000_000;
-        for variant in 0..3u8 {
-            let stub = log_line(LogLevel::Info, ts, "tool", &format!("tool_{i}_v{variant}"));
-            let mut buf = Vec::new();
-            stub.encode(&mut buf).expect("encode tool call stub");
-            tx.send(WriteCommand::Event {
-                channel: ChannelKey::ToolCalls,
-                log_time_ns: ts,
-                publish_time_ns: ts,
-                bytes: buf,
-            })
-            .await
-            .expect("send /roz/tool/calls");
+        let call_id = format!("mock_call_{i}");
+        let tool_name = format!("mock_tool_{i}");
+        let variants = [
+            SessionEvent::ToolCallRequested {
+                call_id: call_id.clone(),
+                tool_name: tool_name.clone(),
+                parameters: serde_json::json!({}),
+                timeout_ms: 5_000,
+            },
+            SessionEvent::ToolCallStarted {
+                call_id: call_id.clone(),
+                tool_name: tool_name.clone(),
+                category: "pure".into(),
+            },
+            SessionEvent::ToolCallFinished {
+                call_id: call_id.clone(),
+                tool_name: tool_name.clone(),
+                result_summary: "ok".into(),
+            },
+        ];
+        for variant in variants {
+            let envelope = EventEnvelope {
+                event_id: EventId::new(),
+                correlation_id: CorrelationId::new(),
+                parent_event_id: None,
+                timestamp: chrono::Utc::now(),
+                event: variant,
+                trace_id: None,
+                span_id: None,
+            };
+            emit_session_event_for_tests(&tx, &envelope).await;
         }
     }
 
@@ -487,19 +511,27 @@ async fn sc5_30s_fixture_roundtrips_via_mcap_message_stream() {
     // stateful mock's 2nd ModelCallCompleted, SessionStarted if the runtime
     // emits one). Assertions switch from exact-eq to lower-bound.
     //
+    // Phase 26.4 BLOCKER 2: tool calls now flow on /roz/session/events per D-01
+    // (the tool-call loop above emits real SessionEvent::ToolCall{Requested,
+    // Started,Finished} triplets via emit_session_event_for_tests, contributing
+    // TOOL_CALL_TRIPLETS * 3 = 60 additional session events to the floor).
+    //
     // Lower-bound floor:
     //   approval pairs × 2 (Requested + Resolved) = 10
     //   + agent-turn D-10 minimum = 6
-    //   = 16
-    let min_expected_session_events = APPROVAL_PAIRS * 2 + AGENT_TURN_SESSION_EVENTS_MIN;
+    //   + tool-call triplets × 3 = 60
+    //   = 76
+    let min_expected_session_events = APPROVAL_PAIRS * 2 + AGENT_TURN_SESSION_EVENTS_MIN + TOOL_CALL_TRIPLETS * 3;
     assert!(
         session_events_count >= min_expected_session_events,
         "/roz/session/events count {} should be at least {} \
-         (approval pairs × 2 = {} + agent turn D-10 minimum = {})",
+         (approval pairs × 2 = {} + agent turn D-10 minimum = {} \
+         + tool call triplets × 3 = {})",
         session_events_count,
         min_expected_session_events,
         APPROVAL_PAIRS * 2,
-        AGENT_TURN_SESSION_EVENTS_MIN
+        AGENT_TURN_SESSION_EVENTS_MIN,
+        TOOL_CALL_TRIPLETS * 3,
     );
 
     // /roz/log receives the summary line per session event. Lower-bound is
@@ -510,22 +542,30 @@ async fn sc5_30s_fixture_roundtrips_via_mcap_message_stream() {
          (one log line per session event, including agent-turn D-10 minimum)",
     );
 
-    // Fixture totals (lower-bound per D-12):
+    // Fixture totals (lower-bound per D-12, updated for Phase 26.4 BLOCKER 2):
     //   telemetry: 1500 * 2 = 3000                 (/tf + /roz/telemetry/pose)
-    //   tool calls: 20 * 3 = 60                    (/roz/tool/calls)
+    //   tool calls: 20 * 3 = 60 session_events + 60 log = 120
+    //     (moved from /roz/tool/calls per 26.4 D-01; emit_session_event mirrors
+    //      each SessionEvent onto /roz/log 1:1 — verified at
+    //      crates/roz-server/src/observability/ingest_cloud.rs:183-207 where
+    //      every invocation unconditionally sends both a log_line to
+    //      ChannelKey::Log and the encoded proto envelope to
+    //      ChannelKey::SessionEvents; ToolCall{Requested,Started,Finished} all
+    //      map cleanly via event_mapper.rs:142-175 so encode_session_event_proto
+    //      returns Some on every call.)
     //   approvals: 5 * 2 = 10 session_events + 10 log = 20
     //   agent-turn D-10 min: 6 session_events + 6 log = 12
     //   task lifecycle: 20                         (/roz/task/lifecycle)
-    //   MIN TOTAL: 3112
+    //   MIN TOTAL: 3172
     let min_expected = TOTAL_TELEMETRY * 2
-        + TOOL_CALL_TRIPLETS * 3
+        + TOOL_CALL_TRIPLETS * 3 * 2           // tool_call_session_events + tool_call_log_lines
         + APPROVAL_PAIRS * 2 * 2               // approval_session_events + approval_log_lines
         + AGENT_TURN_SESSION_EVENTS_MIN * 2    // agent_turn_session_events + agent_turn_log_lines
         + TASK_LIFECYCLE_TRANSITIONS;
     assert!(
         count >= min_expected,
         "total MCAP message count {count} should be at least {min_expected} \
-         (telemetry + tool calls + approvals + agent turn D-10 min + task lifecycle)",
+         (telemetry + tool calls (session_events + log) + approvals + agent turn D-10 min + task lifecycle)",
     );
     assert!(seen_tf, "/tf channel present");
     assert!(seen_pose, "/roz/telemetry/pose channel present");
@@ -614,6 +654,121 @@ async fn sc5_30s_fixture_roundtrips_via_mcap_message_stream() {
         "digest_sha256 must be populated on finalize"
     );
     assert!(rows[0].size_bytes > 0, "size_bytes must be positive on finalize");
+
+    // ---------------------------------------------------------------------
+    // Phase 26.4 SC6: validate the session metadata + tool-call index.
+    // ---------------------------------------------------------------------
+    //
+    // The indexer is spawned detached from WriterActor::finalize_file (Plan 05
+    // D-07), so we poll the roz_session_metadata table briefly until the row
+    // appears (or give up after 5s and fail with a clear message).
+    let metadata_row = {
+        let mut found: Option<roz_db::session_metadata::SessionMetadataRow> = None;
+        for _ in 0..50 {
+            if let Some(row) = roz_db::session_metadata::fetch_metadata(&pool, session_id)
+                .await
+                .expect("fetch_metadata")
+            {
+                found = Some(row);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        found.expect("roz_session_metadata row must appear within 5s of finalize")
+    };
+
+    assert_eq!(metadata_row.session_id, session_id);
+    assert_eq!(metadata_row.tenant_id, tenant_id);
+    assert!(
+        metadata_row.turn_count >= 1,
+        "SC6: turn_count must be >= 1 from the scripted agent turn; got {}",
+        metadata_row.turn_count,
+    );
+    // SC6 per D-22: approval_count counts ONLY SessionEvent::ApprovalRequested
+    // events, not ApprovalResolved. The fixture emits 5 pairs (Requested +
+    // Resolved), so approval_count = APPROVAL_PAIRS = 5. (D-30 in 26.4-CONTEXT.md
+    // references "10 approval events" loosely — the indexer follows D-22.)
+    assert_eq!(
+        metadata_row.approval_count,
+        i32::try_from(APPROVAL_PAIRS).expect("APPROVAL_PAIRS fits in i32"),
+        "SC6: expected approval_count = {} (APPROVAL_PAIRS, per D-22: Requested-only); got {}",
+        APPROVAL_PAIRS,
+        metadata_row.approval_count,
+    );
+    // SC6 per D-30: intervention_count = 0 (fixture emits no SafetyIntervention events).
+    assert_eq!(
+        metadata_row.intervention_count, 0,
+        "SC6: expected intervention_count = 0; got {}",
+        metadata_row.intervention_count,
+    );
+    // tool_call_count per D-21 is the count of DISTINCT call_id values (not total
+    // triplet event count). The fixture contributes:
+    //   - TOOL_CALL_TRIPLETS (20) distinct mock_call_* call_ids
+    //   - at least 1 hello_world call_id from the scripted agent turn
+    // => tool_call_count >= TOOL_CALL_TRIPLETS + 1 = 21. We assert a lower bound
+    // because the mock provider could evolve to issue more tool calls per turn;
+    // the scoped assertion below (exactly 60 rows under the mock_tool_%
+    // predicate in roz_session_tool_calls) is the authoritative SC6 check on
+    // the tool-call index.
+    assert!(
+        metadata_row.tool_call_count
+            >= i32::try_from(TOOL_CALL_TRIPLETS + 1).expect("TOOL_CALL_TRIPLETS + 1 fits in i32"),
+        "SC6: tool_call_count must be >= {} (TOOL_CALL_TRIPLETS distinct mock_call_* + at least 1 agent-turn); got {}",
+        TOOL_CALL_TRIPLETS + 1,
+        metadata_row.tool_call_count,
+    );
+
+    // Tool-call-row drill-down assertion under the mock_tool_% predicate
+    // (BLOCKER 2 decision). Per D-02 + D-12 (PRIMARY KEY (session_id, call_id))
+    // the indexer correlates each Requested→Started→Finished triplet into ONE
+    // row per distinct call_id. The fixture emits TOOL_CALL_TRIPLETS (20)
+    // distinct mock_call_* call_ids, so we expect exactly 20 rows under the
+    // mock_tool_% predicate — not 60. (The plan's original "60 rows" number
+    // confused triplet events with distinct call_ids.)
+    let expected_mock_rows = i64::try_from(TOOL_CALL_TRIPLETS).expect("TOOL_CALL_TRIPLETS fits in i64");
+    let mock_tool_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM roz_session_tool_calls \
+         WHERE session_id = $1 AND tool_name LIKE 'mock_tool_%'",
+    )
+    .bind(session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count mock_tool_ rows");
+    assert_eq!(
+        mock_tool_rows, expected_mock_rows,
+        "SC6: expected exactly {expected_mock_rows} rows in roz_session_tool_calls matching tool_name LIKE 'mock_tool_%' \
+         (= TOOL_CALL_TRIPLETS distinct call_ids per D-02/D-12); got {mock_tool_rows}",
+    );
+
+    // Every mock_tool_ row must have latency_ms + finished_at populated (SC6 per D-30).
+    let mock_tool_with_latency: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM roz_session_tool_calls \
+         WHERE session_id = $1 AND tool_name LIKE 'mock_tool_%' \
+           AND latency_ms IS NOT NULL AND finished_at IS NOT NULL",
+    )
+    .bind(session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count mock_tool_ rows with latency");
+    assert_eq!(
+        mock_tool_with_latency, expected_mock_rows,
+        "SC6: every mock_tool_% row must have latency_ms + finished_at populated; got {mock_tool_with_latency}/{expected_mock_rows}",
+    );
+
+    // Outcome derivation sanity — all mock triplets are Requested+Started+Finished, no
+    // ToolUnavailable, so every outcome should be 'succeeded'.
+    let succeeded_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM roz_session_tool_calls \
+         WHERE session_id = $1 AND tool_name LIKE 'mock_tool_%' AND outcome = 'succeeded'",
+    )
+    .bind(session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count succeeded mock_tool_ rows");
+    assert_eq!(
+        succeeded_count, expected_mock_rows,
+        "SC6: every mock_tool_% row should have outcome='succeeded' (no ToolUnavailable emitted); got {succeeded_count}/{expected_mock_rows}",
+    );
 }
 
 // ---------------------------------------------------------------------------
