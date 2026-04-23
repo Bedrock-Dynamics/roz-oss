@@ -210,6 +210,31 @@ impl Subjects {
         Ok(format!("camera.{worker_id}.request"))
     }
 
+    /// Phase 26.5 SC5 (R-02) — per-session per-camera MCAP relay subject:
+    /// `camera.{worker_id}.{session_id}.{camera_id}`. Worker-side mcap_relay
+    /// publishes signed foxglove.CompressedVideo frames here; server-side
+    /// ingest_edge subscribes and routes to the session's WriterActor via
+    /// `WriteCommand::Event { channel: ChannelKey::Camera(id), ... }`.
+    ///
+    /// Disjoint from the existing `camera.{worker}.event` + `camera.{worker}.request`
+    /// subjects because those are 3-token (no session_id); this is 4-token.
+    pub fn camera_session(worker_id: &str, session_id: &str, camera_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        validate_token("session_id", session_id)?;
+        validate_token("camera_id", camera_id)?;
+        Ok(format!("camera.{worker_id}.{session_id}.{camera_id}"))
+    }
+
+    /// Phase 26.5 SC5 (R-02) — session-scoped wildcard for the Plan 06
+    /// server-side subscriber: `camera.{worker_id}.{session_id}.*`. Captures
+    /// every camera_id for the session in one subscription without requiring
+    /// the server to enumerate cameras up front (R-02 dynamic registration).
+    pub fn camera_session_wildcard(worker_id: &str, session_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        validate_token("session_id", session_id)?;
+        Ok(format!("camera.{worker_id}.{session_id}.*"))
+    }
+
     // -----------------------------------------------------------------------
     // Phase 24 — FS-01 / FS-02 / FS-03 subjects
     // -----------------------------------------------------------------------
@@ -484,6 +509,55 @@ mod tests {
     #[test]
     fn camera_request_subject() {
         assert_eq!(Subjects::camera_request("robot1").unwrap(), "camera.robot1.request");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 26.5 SC5 (R-02) — per-session camera relay subjects
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn camera_session_subject() {
+        assert_eq!(
+            Subjects::camera_session("w1", "sess-abc", "cam-front").unwrap(),
+            "camera.w1.sess-abc.cam-front"
+        );
+    }
+
+    #[test]
+    fn camera_session_rejects_dots() {
+        assert!(
+            Subjects::camera_session("w1", "sess.abc", "cam").is_err(),
+            "dot in session_id rejected"
+        );
+        assert!(
+            Subjects::camera_session("w.1", "sess", "cam").is_err(),
+            "dot in worker_id rejected"
+        );
+        assert!(
+            Subjects::camera_session("w1", "sess", "cam.front").is_err(),
+            "dot in camera_id rejected"
+        );
+    }
+
+    #[test]
+    fn camera_session_rejects_empty() {
+        assert!(Subjects::camera_session("", "sess", "cam").is_err());
+        assert!(Subjects::camera_session("w1", "", "cam").is_err());
+        assert!(Subjects::camera_session("w1", "sess", "").is_err());
+    }
+
+    #[test]
+    fn camera_session_wildcard_subject() {
+        assert_eq!(
+            Subjects::camera_session_wildcard("w1", "sess-abc").unwrap(),
+            "camera.w1.sess-abc.*"
+        );
+    }
+
+    #[test]
+    fn camera_session_wildcard_rejects_bad_tokens() {
+        assert!(Subjects::camera_session_wildcard("", "sess").is_err());
+        assert!(Subjects::camera_session_wildcard("w1", "sess.abc").is_err());
     }
 
     // -----------------------------------------------------------------------
