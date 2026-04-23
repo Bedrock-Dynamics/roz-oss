@@ -9,6 +9,7 @@ pub mod source;
 pub mod stream_hub;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use roz_core::camera::{CameraId, CameraInfo};
 
@@ -17,7 +18,11 @@ use self::stream_hub::StreamHub;
 /// Manages camera lifecycle: discovery, registration with the `StreamHub`,
 /// and enumeration.
 pub struct CameraManager {
-    hub: StreamHub,
+    /// The hub is `Arc`-wrapped so cross-task consumers (e.g. the Phase 26.5
+    /// SC5 camera MCAP relay in `crate::camera::mcap_relay`) can hold an
+    /// owned handle that outlives a single borrow of the manager. Existing
+    /// `mgr.hub()` callers continue to work via deref coercion.
+    hub: Arc<StreamHub>,
     cameras: HashMap<CameraId, CameraInfo>,
 }
 
@@ -26,7 +31,7 @@ impl CameraManager {
     #[must_use]
     pub fn new(hub: StreamHub) -> Self {
         Self {
-            hub,
+            hub: Arc::new(hub),
             cameras: HashMap::new(),
         }
     }
@@ -57,9 +62,22 @@ impl CameraManager {
     }
 
     /// Borrow the underlying `StreamHub`.
+    ///
+    /// Not `const fn` because `Arc::deref` is not `const`; existing callers
+    /// (all `async` contexts) are unaffected by the change.
     #[must_use]
-    pub const fn hub(&self) -> &StreamHub {
+    pub fn hub(&self) -> &StreamHub {
         &self.hub
+    }
+
+    /// Return a cheap-to-clone owned handle to the shared `StreamHub`.
+    ///
+    /// Phase 26.5 SC5 uses this in `session_relay::handle_edge_session` to
+    /// pass an owned `Arc<StreamHub>` into `camera::mcap_relay::spawn_mcap_relay`
+    /// (one relay task per camera cloning the handle).
+    #[must_use]
+    pub fn hub_arc(&self) -> Arc<StreamHub> {
+        Arc::clone(&self.hub)
     }
 }
 

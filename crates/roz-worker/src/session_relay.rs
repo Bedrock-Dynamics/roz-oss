@@ -718,6 +718,50 @@ async fn handle_edge_session(
     let mut session_sub = nats.subscribe(request_subject).await?;
     tracing::info!(session_id, model = %model_name, "edge session started");
 
+    // Phase 26.5 SC5 (R-02): spawn the camera MCAP relay when record mode
+    // is not `Off` and a CameraManager is bound. The relay publishes
+    // encoded H.264 frames on `camera.{worker}.{session}.{camera_id}` for
+    // the server-side ingest path (Plan 06). `camera_ids` is a snapshot
+    // at session start — hotplug cameras added mid-session are NOT
+    // captured in this file (D-14); next session / rollover picks them
+    // up.
+    let mcap_relay_cancel = CancellationToken::new();
+    let mcap_relay_handle = if matches!(
+        config.observability.camera.record,
+        crate::observability_config::RecordMode::Off,
+    ) {
+        tracing::debug!(session_id, "mcap_relay not spawned (record=off)");
+        None
+    } else if let Some(ref cm) = camera_manager {
+        let camera_ids: Vec<roz_core::camera::CameraId> =
+            cm.cameras().into_iter().map(|info| info.id).collect();
+        if camera_ids.is_empty() {
+            tracing::debug!(session_id, "no cameras registered at session start; skipping mcap_relay spawn");
+            None
+        } else {
+            tracing::info!(
+                session_id,
+                camera_count = camera_ids.len(),
+                record = ?config.observability.camera.record,
+                "spawning mcap_relay"
+            );
+            let handle = crate::camera::mcap_relay::spawn_mcap_relay(
+                cm.hub_arc(),
+                camera_ids,
+                session_id.to_string(),
+                worker_id.to_string(),
+                nats.clone(),
+                signing_ctx.clone(),
+                config.observability.camera.record,
+                mcap_relay_cancel.clone(),
+            );
+            Some(handle)
+        }
+    } else {
+        tracing::debug!(session_id, "mcap_relay not spawned (no camera_manager bound)");
+        None
+    };
+
     let mut session_mode = session_mode;
     let shared_vision_config = camera_manager
         .as_ref()
@@ -1195,6 +1239,20 @@ async fn handle_edge_session(
                 &checkpoint_bootstrap,
             )
             .await?;
+        }
+    }
+
+    // Phase 26.5 SC5: cancel + drain the camera MCAP relay with a short
+    // timeout. Per-camera tasks observe cancel on their next recv (sub-ms);
+    // the 2s ceiling keeps session exit bounded in the rare case where a
+    // task is mid-publish to a stalled NATS connection. If the handle does
+    // not drain in time we log warn and detach — the task will exit on
+    // the next broadcast::recv Closed after the manager drops its senders.
+    mcap_relay_cancel.cancel();
+    if let Some(handle) = mcap_relay_handle {
+        match tokio::time::timeout(Duration::from_secs(2), handle).await {
+            Ok(_) => tracing::debug!(session_id, "mcap_relay drained cleanly"),
+            Err(_) => tracing::warn!(session_id, "mcap_relay did not drain within 2s; letting it detach"),
         }
     }
 
