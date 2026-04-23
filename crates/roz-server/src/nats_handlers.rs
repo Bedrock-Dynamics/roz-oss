@@ -184,6 +184,12 @@ async fn spawn_task_handler(
     tracing::info!(%subject, "internal NATS handler ready");
 
     while let Some(msg) = sub.next().await {
+        // Phase 26.3 D-06: extract W3C trace context on the first line so
+        // the rest of this closure runs under the sender's trace. Matches
+        // the pattern Plan 05 landed at `crates/roz-worker/src/main.rs:423`.
+        if let Some(ref headers) = msg.headers {
+            roz_nats::trace::extract_and_link_parent(headers);
+        }
         let Some(reply_subject) = msg.reply.clone() else {
             tracing::warn!("spawn request missing reply subject — dropping");
             continue;
@@ -411,6 +417,12 @@ async fn spawn_task_status_handler(
     tracing::info!(%subject, "task status handler ready");
 
     while let Some(msg) = sub.next().await {
+        // Phase 26.3 D-06: extract W3C trace context on the first line so
+        // the rest of this closure runs under the sender's trace. Matches
+        // the pattern Plan 05 landed at `crates/roz-worker/src/main.rs:423`.
+        if let Some(ref headers) = msg.headers {
+            roz_nats::trace::extract_and_link_parent(headers);
+        }
         handle_task_status_message(&pool, signing_gate.as_deref(), &task_lifecycle_sink, &msg).await;
     }
 }
@@ -635,6 +647,12 @@ pub async fn spawn_telemetry_state_handler(nats: NatsClient, signing_gate: Arc<S
     tracing::info!(%subject, "telemetry state handler ready");
 
     while let Some(msg) = sub.next().await {
+        // Phase 26.3 D-06: extract W3C trace context on the first line so
+        // the rest of this closure runs under the sender's trace. Matches
+        // the pattern Plan 05 landed at `crates/roz-worker/src/main.rs:423`.
+        if let Some(ref headers) = msg.headers {
+            roz_nats::trace::extract_and_link_parent(headers);
+        }
         // 1 + 2: structural pre-verify (headers + roz-sig-v1) + full gate
         //        (signature + cache + replay + DB advance). Factored into
         //        `verify_telemetry_inbound` so Plan 26-05's per-session
@@ -1152,6 +1170,12 @@ pub async fn spawn_worker_online_handler(
     };
     tracing::info!(%subject, "worker_online handler ready");
     while let Some(msg) = sub.next().await {
+        // Phase 26.3 D-06: extract W3C trace context on the first line so
+        // the rest of this closure runs under the sender's trace. Matches
+        // the pattern Plan 05 landed at `crates/roz-worker/src/main.rs:423`.
+        if let Some(ref headers) = msg.headers {
+            roz_nats::trace::extract_and_link_parent(headers);
+        }
         if let Err(error) = handle_worker_online_message(&nats, &signing_gate, lookup.as_ref(), &msg).await {
             tracing::error!(%error, "worker_online handler: failed");
         }
