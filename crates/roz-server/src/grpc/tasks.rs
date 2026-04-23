@@ -833,6 +833,12 @@ impl TaskService for TaskServiceImpl {
 
         tokio::spawn(async move {
             while let Some(msg) = futures::StreamExt::next(&mut sub).await {
+                // Phase 26.3 D-06: extract W3C trace context on the first line so
+                // the rest of this closure runs under the publisher's trace. Matches
+                // the pattern Plan 05 landed at `crates/roz-worker/src/main.rs:423`.
+                if let Some(ref headers) = msg.headers {
+                    roz_nats::trace::extract_and_link_parent(headers);
+                }
                 match serde_json::from_slice::<roz_nats::dispatch::TaskStatusEvent>(&msg.payload) {
                     Ok(event) => {
                         let update = status_update(event.task_id, event.status, event.detail);
