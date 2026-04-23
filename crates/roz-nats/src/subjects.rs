@@ -210,6 +210,25 @@ impl Subjects {
         Ok(format!("camera.{worker_id}.request"))
     }
 
+    /// Phase 26.5 SC5 (R-02) — session-scoped camera-frame wildcard subject:
+    /// `camera.{worker_id}.{session_id}.*`.
+    ///
+    /// Plan 05's worker `mcap_relay` publishes signed
+    /// `foxglove.CompressedVideo` frames to
+    /// `camera.{worker_id}.{session_id}.{camera_id}` (4-token); this wildcard
+    /// captures every camera_id for the session in one subscription without
+    /// the server needing to enumerate cameras up front (R-02 dynamic
+    /// registration on first sighting).
+    ///
+    /// Disjoint from the existing `camera.{worker}.event` +
+    /// `camera.{worker}.request` subjects because those are 3-token (no
+    /// session_id); the wildcard only matches the 4-token session form.
+    pub fn camera_session_wildcard(worker_id: &str, session_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        validate_token("session_id", session_id)?;
+        Ok(format!("camera.{worker_id}.{session_id}.*"))
+    }
+
     // -----------------------------------------------------------------------
     // Phase 24 — FS-01 / FS-02 / FS-03 subjects
     // -----------------------------------------------------------------------
@@ -484,6 +503,28 @@ mod tests {
     #[test]
     fn camera_request_subject() {
         assert_eq!(Subjects::camera_request("robot1").unwrap(), "camera.robot1.request");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 26.5 SC5 R-02 — camera session-scoped subjects
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn camera_session_wildcard_subject() {
+        assert_eq!(
+            Subjects::camera_session_wildcard("w1", "sess-abc").unwrap(),
+            "camera.w1.sess-abc.*"
+        );
+    }
+
+    #[test]
+    fn camera_session_wildcard_rejects_bad_tokens() {
+        assert!(Subjects::camera_session_wildcard("", "sess").is_err());
+        assert!(Subjects::camera_session_wildcard("w1", "").is_err());
+        assert!(Subjects::camera_session_wildcard("w1", "sess.abc").is_err());
+        assert!(Subjects::camera_session_wildcard("w.1", "sess").is_err());
+        assert!(Subjects::camera_session_wildcard("w*", "sess").is_err());
+        assert!(Subjects::camera_session_wildcard("w1", "sess>").is_err());
     }
 
     // -----------------------------------------------------------------------
