@@ -22,7 +22,13 @@ pub fn spawn_estop_listener(mut sub: async_nats::Subscriber) -> tokio::sync::wat
     let (tx, rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         use futures::StreamExt;
-        while let Some(_msg) = sub.next().await {
+        while let Some(msg) = sub.next().await {
+            // Phase 26.3 D-06: extract W3C trace context on the first line so
+            // the rest of this closure runs under the sender's trace. Matches
+            // the pattern Plan 05 landed at `crates/roz-worker/src/main.rs:423`.
+            if let Some(ref headers) = msg.headers {
+                roz_nats::trace::extract_and_link_parent(headers);
+            }
             tracing::error!("E-STOP received — signaling worker halt");
             let _ = tx.send(true);
         }
