@@ -269,4 +269,37 @@ mod tests {
             .await
             .ok();
     }
+
+    // -----------------------------------------------------------------------
+    // list_all_tenants — Phase 26.4 Plan 03
+    //
+    // RLS-bypass helper; callers MUST verify admin authority before invoking.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn list_all_tenants_returns_a_vec() {
+        let pool = setup().await;
+        let all = list_all_tenants(&pool).await.expect("list all");
+        // Cannot assume fresh — other tests seed tenants. Just check it runs
+        // and every returned id is non-nil.
+        for id in &all {
+            assert_ne!(*id, Uuid::nil());
+        }
+    }
+
+    #[tokio::test]
+    async fn list_all_tenants_includes_seeded_tenants() {
+        let pool = setup().await;
+        let slug_a = format!("list-all-a-{}", Uuid::new_v4());
+        let slug_b = format!("list-all-b-{}", Uuid::new_v4());
+        let a = create_tenant(&pool, "List A", &slug_a, "organization")
+            .await
+            .expect("a");
+        let b = create_tenant(&pool, "List B", &slug_b, "organization")
+            .await
+            .expect("b");
+        let all = list_all_tenants(&pool).await.expect("list");
+        assert!(all.contains(&a.id), "seeded tenant A not in list_all_tenants");
+        assert!(all.contains(&b.id), "seeded tenant B not in list_all_tenants");
+    }
 }
