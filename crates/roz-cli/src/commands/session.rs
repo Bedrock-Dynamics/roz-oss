@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context as _};
+use anyhow::{Context as _, anyhow};
 use clap::{Args, Subcommand, ValueEnum};
 use tokio::io::AsyncWriteExt as _;
 use tonic::service::interceptor::InterceptedService;
@@ -15,7 +15,7 @@ use tonic::transport::{Channel, ClientTlsConfig};
 
 use crate::config::CliConfig;
 use crate::tui::proto::roz_v1::observability_service_client::ObservabilityServiceClient;
-use crate::tui::proto::roz_v1::{ExportSessionRequest, TimeRangeNs};
+use crate::tui::proto::roz_v1::{ExportSessionRequest, ReindexAllRequest, ReindexSessionRequest, TimeRangeNs};
 
 /// Wire format for `--format`. Only `mcap` is supported today; kept as a
 /// `ValueEnum` so `json`/`parquet`/etc. can be added without breaking the
@@ -53,6 +53,18 @@ pub enum SessionCommands {
         #[arg(long, short)]
         output: Option<PathBuf>,
     },
+    /// Reindex session metadata + tool-call rows from the session's MCAP
+    /// archive(s). Idempotent — running twice produces the same rows.
+    ///
+    /// Pass a session UUID for the single-session path, or `--all` for the
+    /// admin-scoped bulk backfill across every tenant.
+    Reindex {
+        /// Specific session to reindex. Mutually exclusive with --all.
+        session_id: Option<String>,
+        /// Reindex every session across every tenant (admin-scoped).
+        #[arg(long, conflicts_with = "session_id")]
+        all: bool,
+    },
 }
 
 type Bearer = tonic::metadata::MetadataValue<tonic::metadata::Ascii>;
@@ -80,7 +92,67 @@ pub async fn execute(cmd: &SessionCommands, config: &CliConfig) -> anyhow::Resul
             }
             export(config, session_id, time_range.as_deref(), output.as_deref()).await
         }
+        SessionCommands::Reindex { session_id, all } => match (session_id.as_deref(), *all) {
+            (Some(id), false) => reindex_one(config, id).await,
+            (None, true) => reindex_all(config).await,
+            (Some(_), true) => Err(anyhow!("--all cannot be combined with a session id")),
+            (None, false) => Err(anyhow!("provide a session id or --all")),
+        },
     }
+}
+
+async fn reindex_one(config: &CliConfig, session_id: &str) -> anyhow::Result<()> {
+    let (channel, bearer) = session_channel(config).await?;
+    let mut client = build_client(channel, bearer);
+    let response = client
+        .reindex_session(ReindexSessionRequest {
+            session_id: session_id.to_string(),
+        })
+        .await
+        .map_err(|s| anyhow!("gRPC {}: {}", s.code(), s.message()))?;
+    let r = response.into_inner();
+    let verb = if r.newly_created { "indexed" } else { "reindexed" };
+    eprintln!("session {session_id} {verb} ({} tool calls)", r.tool_calls_indexed);
+    Ok(())
+}
+
+async fn reindex_all(config: &CliConfig) -> anyhow::Result<()> {
+    let (channel, bearer) = session_channel(config).await?;
+    let mut client = build_client(channel, bearer);
+    let response = client
+        .reindex_all(ReindexAllRequest {})
+        .await
+        .map_err(|s| anyhow!("gRPC {}: {}", s.code(), s.message()))?;
+    let mut stream = response.into_inner();
+    let mut ok_count: u64 = 0;
+    let mut fail_count: u64 = 0;
+    while let Some(progress) = stream
+        .message()
+        .await
+        .map_err(|s| anyhow!("gRPC stream {}: {}", s.code(), s.message()))?
+    {
+        if progress.succeeded {
+            ok_count += 1;
+            let calls = progress
+                .tool_calls_indexed
+                .map_or_else(String::new, |n| format!(" ({n} tool calls)"));
+            eprintln!(
+                "[{}/{}] {} indexed{calls}",
+                progress.completed, progress.total, progress.session_id,
+            );
+        } else {
+            fail_count += 1;
+            eprintln!(
+                "[{}/{}] {} FAILED: {}",
+                progress.completed,
+                progress.total,
+                progress.session_id,
+                progress.error.as_deref().unwrap_or("<no error message>"),
+            );
+        }
+    }
+    eprintln!("Done: {ok_count} indexed, {fail_count} failed.");
+    Ok(())
 }
 
 async fn export(
@@ -176,10 +248,7 @@ fn parse_time_range(s: &str) -> anyhow::Result<TimeRangeNs> {
     let end_ns = if end.is_empty() {
         None
     } else {
-        Some(
-            end.parse::<u64>()
-                .with_context(|| format!("invalid end_ns `{end}`"))?,
-        )
+        Some(end.parse::<u64>().with_context(|| format!("invalid end_ns `{end}`"))?)
     };
     Ok(TimeRangeNs { start_ns, end_ns })
 }
