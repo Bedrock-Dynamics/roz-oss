@@ -369,6 +369,13 @@ pub(crate) async fn spawn_session_telemetry_ingest(
             maybe_msg = sub.next() => {
                 let Some(msg) = maybe_msg else { break };
 
+                // Phase 26.3 D-06: extract W3C trace context on the first line so
+                // the rest of this arm runs under the sender's trace. Matches
+                // the pattern Plan 05 landed at `crates/roz-worker/src/main.rs:423`.
+                if let Some(ref headers) = msg.headers {
+                    roz_nats::trace::extract_and_link_parent(headers);
+                }
+
                 // (a) FS-04 verification via shared helper — identical path
                 //     to nats_handlers::spawn_telemetry_state_handler.
                 if let Err(reason) = crate::nats_handlers::verify_telemetry_inbound(
