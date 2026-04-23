@@ -64,6 +64,22 @@ pub struct WorkerConfig {
     /// Camera subsystem configuration.
     #[serde(default)]
     pub camera: CameraConfig,
+    /// Phase 26.5 SC6 — camera MCAP recording controls.
+    ///
+    /// TOML example:
+    ///
+    ///     [observability.camera]
+    ///     record = "keyframes"            # "keyframes" | "full" | "off"
+    ///     keyframe_interval_secs = 2.0
+    ///
+    /// Env var path (figment double-underscore separator per research Q6):
+    ///
+    ///     ROZ_OBSERVABILITY__CAMERA__RECORD=full
+    ///     ROZ_OBSERVABILITY__CAMERA__KEYFRAME_INTERVAL_SECS=5.0
+    ///
+    /// Absent = default (keyframes record, 2.0 s keyframe hint).
+    #[serde(default)]
+    pub observability: crate::observability_config::ObservabilityConfig,
     /// MAVLink backend configuration (Phase 25 D-03).
     /// Absent `[mavlink]` section → worker runs without a MAVLink backend
     /// (existing Gazebo-SITL / joint-arm embodiments unaffected).
@@ -565,6 +581,38 @@ mod tests {
             Some(std::path::Path::new("/tmp/zenoh.json5"))
         );
         assert_eq!(config.device_signing_key.as_deref(), Some("base64:AAAA"));
+    }
+
+    #[test]
+    fn config_observability_defaults_when_unset() {
+        let figment = Figment::new().merge(Serialized::defaults(base_config()));
+        let config = WorkerConfig::from_figment(&figment).unwrap();
+        assert_eq!(
+            config.observability.camera.record,
+            crate::observability_config::RecordMode::Keyframes
+        );
+        assert!(
+            (config.observability.camera.keyframe_interval_secs - 2.0).abs() < f32::EPSILON,
+            "keyframe_interval_secs default = 2.0"
+        );
+    }
+
+    #[test]
+    fn config_observability_loads_nested_overrides() {
+        let mut vals = base_config();
+        vals["observability"] = serde_json::json!({
+            "camera": {
+                "record": "full",
+                "keyframe_interval_secs": 5.0,
+            }
+        });
+        let figment = Figment::new().merge(Serialized::defaults(vals));
+        let config = WorkerConfig::from_figment(&figment).unwrap();
+        assert_eq!(
+            config.observability.camera.record,
+            crate::observability_config::RecordMode::Full
+        );
+        assert!((config.observability.camera.keyframe_interval_secs - 5.0).abs() < f32::EPSILON);
     }
 
     #[test]
