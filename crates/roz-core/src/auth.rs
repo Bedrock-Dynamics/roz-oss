@@ -366,4 +366,75 @@ mod tests {
         assert!(perms.can_write_memory);
         assert!(perms.can_manage_mcp_servers);
     }
+
+    // -----------------------------------------------------------------------
+    // AuthIdentity::is_admin() — Phase 26.4 Plan 03
+    //
+    // Must match `crates/roz-server/src/auth/mod.rs::permissions_for_identity`
+    // detection logic EXACTLY so admin-gated endpoints reuse one source of
+    // truth for admin authority.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_admin_api_key_with_admin_scope_returns_true() {
+        let identity = AuthIdentity::ApiKey {
+            key_id: Uuid::nil(),
+            tenant_id: sample_tenant(),
+            scopes: vec![ApiKeyScope::Admin],
+        };
+        assert!(identity.is_admin());
+    }
+
+    #[test]
+    fn is_admin_api_key_without_admin_scope_returns_false() {
+        let identity = AuthIdentity::ApiKey {
+            key_id: Uuid::nil(),
+            tenant_id: sample_tenant(),
+            scopes: vec![ApiKeyScope::ReadTasks, ApiKeyScope::WriteTasks],
+        };
+        assert!(!identity.is_admin());
+    }
+
+    #[test]
+    fn is_admin_user_admin_role_returns_true() {
+        let identity = AuthIdentity::User {
+            user_id: "user-admin".into(),
+            org_id: Some("org-bedrock".into()),
+            tenant_id: sample_tenant(),
+            role: Role::Admin,
+        };
+        assert!(identity.is_admin());
+    }
+
+    #[test]
+    fn is_admin_user_owner_role_returns_true() {
+        let identity = AuthIdentity::User {
+            user_id: "user-owner".into(),
+            org_id: Some("org-bedrock".into()),
+            tenant_id: sample_tenant(),
+            role: Role::Owner,
+        };
+        assert!(identity.is_admin());
+    }
+
+    #[test]
+    fn is_admin_user_developer_role_returns_false() {
+        let identity = AuthIdentity::User {
+            user_id: "user-dev".into(),
+            org_id: Some("org-bedrock".into()),
+            tenant_id: sample_tenant(),
+            role: Role::Developer,
+        };
+        assert!(!identity.is_admin());
+    }
+
+    #[test]
+    fn is_admin_worker_always_returns_false() {
+        let identity = AuthIdentity::Worker {
+            worker_id: "wrk-admin-attempt".into(),
+            tenant_id: sample_tenant(),
+            host_id: "host-alpha".into(),
+        };
+        assert!(!identity.is_admin());
+    }
 }
