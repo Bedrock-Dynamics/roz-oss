@@ -15,6 +15,7 @@
 
 pub mod channels;
 pub mod export;
+pub mod foxglove_types;
 pub mod idle_monitor;
 pub mod ingest_cloud;
 pub mod ingest_edge;
@@ -40,6 +41,14 @@ pub const CHANNEL_SESSION_EVENTS: &str = "/roz/session/events";
 pub const CHANNEL_TASK_LIFECYCLE: &str = "/roz/task/lifecycle";
 pub const CHANNEL_TOOL_CALLS: &str = "/roz/tool/calls";
 
+// Phase 26.5 SC3: future Phase 29+ perception channels. Schemas are
+// registered + channels pre-declared so Foxglove Studio surfaces empty
+// timelines now; producer code wires to these channels in a later phase.
+// NOT added to `ChannelKey` variants this phase (D-08).
+pub const CHANNEL_POINTCLOUD: &str = "/roz/perception/pointcloud";
+pub const CHANNEL_SCENE_UPDATE: &str = "/roz/perception/scene_update";
+pub const CHANNEL_ANNOTATIONS: &str = "/roz/perception/annotations";
+
 // ---------------------------------------------------------------------------
 // Schema name constants — `mcap::Writer::add_schema` `name` parameter.
 // Must match FQN in the vendored/roz .proto files.
@@ -51,6 +60,16 @@ pub const SCHEMA_LOG: &str = "foxglove.Log";
 pub const SCHEMA_SESSION_EVENT: &str = "roz.v1.SessionEventEnvelope";
 pub const SCHEMA_TASK_LIFECYCLE: &str = "roz.v1.TaskLifecycleEvent";
 pub const SCHEMA_TOOL_CALL: &str = "roz.v1.ToolCallEvent";
+
+// Phase 26.5 SC3: multimedia schema constants. R-01: CompressedVideo is the
+// H.264 target; CompressedImage is vendored alongside for future JPEG/PNG/
+// WEBP/AVIF paths but has NO producer this phase.
+pub const SCHEMA_COMPRESSED_VIDEO: &str = "foxglove.CompressedVideo";
+pub const SCHEMA_COMPRESSED_IMAGE: &str = "foxglove.CompressedImage";
+pub const SCHEMA_RAW_IMAGE: &str = "foxglove.RawImage";
+pub const SCHEMA_POINT_CLOUD: &str = "foxglove.PointCloud";
+pub const SCHEMA_SCENE_UPDATE: &str = "foxglove.SceneUpdate";
+pub const SCHEMA_IMAGE_ANNOTATIONS: &str = "foxglove.ImageAnnotations";
 
 pub const SCHEMA_ENCODING_PROTOBUF: &str = "protobuf";
 
