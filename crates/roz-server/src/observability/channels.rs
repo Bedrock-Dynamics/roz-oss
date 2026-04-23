@@ -48,20 +48,11 @@ pub struct ChannelIds {
     // be unfulfilled, triggering `unfulfilled_lint_expectations` which
     // `-D warnings` promotes to an error. The allow form below sidesteps this
     // and matches the repo's 30+ existing precedents in production code.
-    #[allow(
-        dead_code,
-        reason = "Phase 29+ producer wiring lands later; channel pre-registered so MCAP schema contract is stable"
-    )]
+    #[allow(dead_code, reason = "Phase 29+ producer; see D-10 comment above")]
     pub pointcloud: u16,
-    #[allow(
-        dead_code,
-        reason = "Phase 29+ producer wiring lands later; channel pre-registered so MCAP schema contract is stable"
-    )]
+    #[allow(dead_code, reason = "Phase 29+ producer; see D-10 comment above")]
     pub scene_update: u16,
-    #[allow(
-        dead_code,
-        reason = "Phase 29+ producer wiring lands later; channel pre-registered so MCAP schema contract is stable"
-    )]
+    #[allow(dead_code, reason = "Phase 29+ producer; see D-10 comment above")]
     pub annotations: u16,
 }
 
