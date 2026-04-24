@@ -138,3 +138,89 @@ service ObservabilityService {
   // and emits one ReindexProgress per session attempted.
   rpc ReindexAll (ReindexAllRequest) returns (stream ReindexProgress);
 }
+
+// =========================================================================
+// Phase 26.7 SC2: ArtifactService — generic per-session sidecar archival.
+//
+// UploadArtifact: client-streaming; first frame MUST be Metadata, subsequent
+//   frames carry Chunks of up to 1 MiB (UPLOAD_CHUNK_SIZE in artifacts.rs).
+// DownloadArtifact: server-streaming; chunks + trailing digest on final frame.
+// ListSessionArtifacts: unary + repeated (CONTEXT.md D-26 Claude's Discretion
+// recommended unary+repeated over server-streaming — counts are bounded).
+//
+// D-03: 'mcap' is reserved in the enum for forward compat; this phase does
+// NOT emit 'mcap' rows — MCAPs live in roz_session_mcap_archives.
+// =========================================================================
+
+message UploadArtifactRequest {
+  oneof payload {
+    UploadArtifactMetadata metadata = 1;
+    UploadArtifactChunk    chunk    = 2;
+  }
+}
+
+message UploadArtifactMetadata {
+  string session_id     = 1;
+  // 'copper' | 'ulog' | 'video' | 'bundle' — 'mcap' is reserved but rejected
+  // by the server this phase (D-03).
+  string artifact_type  = 2;
+  // Storage path relative to ROZ_ARTIFACT_DIR. Server canonicalizes the
+  // computed target path and verifies starts_with(artifact_dir).
+  string path           = 3;
+  uint64 size_bytes     = 4;
+  // 32 bytes — client-declared, server re-computes and verifies on stream close.
+  bytes  digest_sha256  = 5;
+  string content_type   = 6;
+}
+
+message UploadArtifactChunk {
+  bytes data = 1;
+}
+
+message UploadArtifactResponse {
+  // Server-assigned UUID string for the roz_session_artifacts.artifact_id column.
+  string artifact_id = 1;
+  // Server-observed byte count — MUST equal metadata.size_bytes when returned.
+  uint64 size_bytes  = 2;
+}
+
+message DownloadArtifactRequest {
+  string artifact_id = 1;
+}
+
+message DownloadArtifactChunk {
+  bytes data = 1;
+  // Populated on the final frame only (recomputed from disk or DB-stored).
+  optional bytes digest_sha256 = 2;
+}
+
+message ListSessionArtifactsRequest {
+  string session_id = 1;
+}
+
+message ListSessionArtifactsResponse {
+  repeated ArtifactSummary artifacts = 1;
+}
+
+message ArtifactSummary {
+  string artifact_id   = 1;
+  string artifact_type = 2;
+  string path          = 3;
+  bytes  digest_sha256 = 4;
+  uint64 size_bytes    = 5;
+  string content_type  = 6;
+}
+
+service ArtifactService {
+  // Worker → server. First message is UploadArtifactMetadata; subsequent
+  // messages are UploadArtifactChunk. On close server verifies digest + size,
+  // then inserts roz_session_artifacts row and returns the assigned UUID.
+  rpc UploadArtifact (stream UploadArtifactRequest) returns (UploadArtifactResponse);
+
+  // CLI → server. Streams 1 MiB chunks; the final frame carries digest_sha256.
+  rpc DownloadArtifact (DownloadArtifactRequest) returns (stream DownloadArtifactChunk);
+
+  // CLI → server. Bounded list; no pagination this phase (D-26).
+  rpc ListSessionArtifacts (ListSessionArtifactsRequest)
+      returns (ListSessionArtifactsResponse);
+}
