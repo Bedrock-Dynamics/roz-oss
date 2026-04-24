@@ -29,12 +29,16 @@
 //! contract shared across all artifact types.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use sha2::{Digest as _, Sha256};
+use tokio_stream::wrappers::ReceiverStream;
 
+use crate::copper_archive::UPLOAD_CHUNK_SIZE_WORKER;
 use crate::roz_v1::artifact_service_client::ArtifactServiceClient;
+use crate::roz_v1::{UploadArtifactChunk, UploadArtifactMetadata, UploadArtifactRequest, upload_artifact_request};
 use crate::ulog_config::UlogConfig;
-use roz_mavlink::{AutopilotKind, MavlinkBackend};
+use roz_mavlink::{AutopilotKind, LogDownloader, MavlinkBackend, UlogError};
 
 /// D-05 canonical MIME for PX4 ULog logs. Matches PX4 Flight Review's
 /// upload accept list and the server-side artifact_type="ulog" mapping.
@@ -97,16 +101,137 @@ pub async fn finalize_ulog_archive(
         return Ok(None);
     }
 
-    // TODO(Task 2): drive LogDownloader + upload_ulog_bytes.
-    let _ = client; // silence unused warning until Task 2 wiring lands.
-    Ok(None)
+    let start = std::time::Instant::now();
+
+    // Phase 26.8 SC1: drive the MAVLink LOG_* protocol via LogDownloader.
+    // The LogDownloader's Drop impl best-effort issues LOG_REQUEST_END on
+    // every exit path (success, error, early return, panic) — see
+    // log_download.rs RESEARCH pitfall 1.
+    let mut downloader = LogDownloader::new(backend.outbound(), backend.subscribe_log_data());
+    let timeout = Duration::from_secs(config.download_timeout_secs);
+    let (log_id, bytes) = match downloader.fetch_newest(timeout).await {
+        Ok(v) => v,
+        Err(e) => {
+            // D-09 structured warn-log; map UlogError variant → failure_mode string.
+            let failure_mode = match e {
+                UlogError::NoLogsAvailable => "no_logs_available",
+                UlogError::LogListTimeout { .. } => "log_list_timeout",
+                UlogError::LogDataTimeout { .. } => "log_data_timeout",
+                UlogError::ReassemblyGapsExhausted { .. } => "reassembly_gaps_exhausted",
+                UlogError::LogOversized { .. } => "log_oversized",
+                UlogError::OutboundClosed => "fc_unreachable",
+            };
+            tracing::warn!(
+                session_id,
+                failure_mode,
+                duration_ms = start.elapsed().as_millis() as u64,
+                error = %e,
+                "ulog download failed (soft-fail)"
+            );
+            return Ok(None);
+        }
+    };
+
+    // Upload via the 26.7 ArtifactService client-stream path.
+    match upload_ulog_bytes(bytes, session_id, client).await {
+        Ok(Some(artifact_id)) => {
+            tracing::info!(
+                session_id,
+                log_id,
+                artifact_id = %artifact_id,
+                duration_ms = start.elapsed().as_millis() as u64,
+                "ulog archive uploaded"
+            );
+            Ok(Some(artifact_id))
+        }
+        Ok(None) => Ok(None),
+        Err(e) => {
+            tracing::warn!(
+                session_id,
+                failure_mode = "upload_failed",
+                log_id,
+                duration_ms = start.elapsed().as_millis() as u64,
+                error = %e,
+                "ulog upload failed (soft-fail)"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Stream-upload an in-memory ULG byte buffer to the server via
+/// `ArtifactService.UploadArtifact`.
+///
+/// Mirrors `crate::copper_archive::upload_single_segment` verbatim,
+/// substituting a `Vec<u8>` producer for the `File` streaming producer.
+/// Returns the server-issued artifact_id on success so Plan 07's LOG_ERASE
+/// gate can key on `Some(id)` vs `None`.
+///
+/// # Errors
+///
+/// Returns `Err` for any failure in the mpsc producer, the gRPC call,
+/// or the post-upload size-echo check. The caller (`finalize_ulog_archive`)
+/// converts these to `Ok(None)` + `failure_mode="upload_failed"` warn-log.
+async fn upload_ulog_bytes(
+    bytes: Vec<u8>,
+    session_id: &str,
+    mut client: ArtifactServiceClient<tonic::transport::Channel>,
+) -> anyhow::Result<Option<String>> {
+    let digest = sha256_of_bytes(&bytes);
+    let size_bytes = bytes.len() as u64;
+    let path_in_row = format!("ulog/{session_id}.ulg"); // D-05
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<UploadArtifactRequest>(4);
+
+    let producer_session_id = session_id.to_string();
+    let producer_digest = digest.to_vec();
+    let producer_path = path_in_row;
+    tokio::spawn(async move {
+        let metadata_frame = UploadArtifactRequest {
+            payload: Some(upload_artifact_request::Payload::Metadata(UploadArtifactMetadata {
+                session_id: producer_session_id,
+                artifact_type: "ulog".to_string(),
+                path: producer_path,
+                size_bytes,
+                digest_sha256: producer_digest,
+                content_type: ULOG_CONTENT_TYPE.to_string(),
+            })),
+        };
+        if tx.send(metadata_frame).await.is_err() {
+            return;
+        }
+        for chunk in bytes.chunks(UPLOAD_CHUNK_SIZE_WORKER) {
+            let frame = UploadArtifactRequest {
+                payload: Some(upload_artifact_request::Payload::Chunk(UploadArtifactChunk {
+                    data: chunk.to_vec(),
+                })),
+            };
+            if tx.send(frame).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    let response = client
+        .upload_artifact(tonic::Request::new(ReceiverStream::new(rx)))
+        .await?
+        .into_inner();
+
+    // Mirror copper_archive:193-198 size-echo check (T-26.8.04-04).
+    if response.size_bytes != size_bytes {
+        return Err(anyhow::anyhow!(
+            "server-observed size {} != declared size {size_bytes}",
+            response.size_bytes
+        ));
+    }
+
+    Ok(Some(response.artifact_id))
 }
 
 /// SHA-256 digest of an in-memory buffer. Mirrors
 /// `copper_archive::sha256_of_file` but skips the streaming read — the
 /// ulog path owns the `Vec<u8>` after `LogDownloader::fetch_newest` so
 /// there is no file to stream from.
-#[cfg_attr(not(test), allow(dead_code))] // used by upload_ulog_bytes in Task 2; only by tests now
 fn sha256_of_bytes(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -129,5 +254,21 @@ mod tests {
     #[test]
     fn ulog_content_type_matches_d05() {
         assert_eq!(ULOG_CONTENT_TYPE, "application/vnd.px4.ulg");
+    }
+
+    #[test]
+    fn sha256_of_bytes_empty() {
+        // Empty digest is well-known: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.
+        let d = sha256_of_bytes(b"");
+        let hex = d.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        assert_eq!(hex, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+    }
+
+    #[test]
+    fn ulog_path_format_matches_d05() {
+        // D-05: path = "ulog/{session_id}.ulg"
+        let session_id = "abc-123";
+        let path = format!("ulog/{session_id}.ulg");
+        assert_eq!(path, "ulog/abc-123.ulg");
     }
 }
