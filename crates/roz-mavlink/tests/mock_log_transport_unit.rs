@@ -13,8 +13,7 @@ mod common;
 
 use common::mock_log_transport::{AutopilotFamily, MockLogTransport};
 use mavlink::common::{
-    LOG_DATA_DATA, LOG_ENTRY_DATA, LOG_REQUEST_DATA_DATA, LOG_REQUEST_END_DATA,
-    LOG_REQUEST_LIST_DATA, MavMessage,
+    LOG_DATA_DATA, LOG_ENTRY_DATA, LOG_REQUEST_DATA_DATA, LOG_REQUEST_END_DATA, LOG_REQUEST_LIST_DATA, MavMessage,
 };
 
 const FCU_SYS: u8 = 1;
@@ -189,12 +188,13 @@ fn drive_once_on_log_request_data_returns_chunked_frames() {
     let frames = log_data_frames(&out);
 
     // Chunk layout per MAVLink common.xml LOG_DATA spec: data[90], count<=90.
+    //
+    // Either branch of the EOF encoding yields `full + 1` total frames:
+    //   - fixture_len % 90 != 0  →  `full` full-90 frames + 1 short final frame (count < 90)
+    //   - fixture_len % 90 == 0  →  `full` full-90 frames + 1 trailing zero-byte frame (count == 0)
     let chunk = u32::try_from(MockLogTransport::LOG_DATA_CHUNK_BYTES).expect("90 fits");
     let full = fixture_len / chunk;
-    let remainder = fixture_len % chunk;
-    let expected_frames = usize::try_from(full + if remainder == 0 { 1 } else { 1 })
-        .expect("fits in usize");
-    // Either: ceil(len/90) regular frames, or (len/90 full frames) + one count=0 EOF frame when len%90==0.
+    let expected_frames = usize::try_from(full + 1).expect("fits in usize");
     assert_eq!(
         frames.len(),
         expected_frames,
