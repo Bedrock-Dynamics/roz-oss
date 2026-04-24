@@ -706,9 +706,6 @@ async fn handle_edge_session(
     // handoff point — the unused-param silence below is intentional.
     mavlink_backend: Option<std::sync::Arc<roz_mavlink::MavlinkBackend>>,
 ) -> anyhow::Result<()> {
-    // Phase 26.8 Plan 05: handoff point reached. Plan 06 replaces this silence
-    // with the actual finalize peer spawn block.
-    let _ = mavlink_backend;
     let response_subject = Subjects::session_response(worker_id, session_id)?;
     let bootstrap = parse_runtime_bootstrap(session_id, &start_msg)?;
     let session_mode = parse_edge_session_mode(&start_msg, bootstrap.cognition_mode(), config.max_velocity.is_some());
@@ -1306,6 +1303,39 @@ async fn handle_edge_session(
                 Err(_) => tracing::warn!(
                     session_id = %session_id_owned,
                     "copper archive upload timed out after 60s"
+                ),
+            }
+        });
+    }
+
+    // Phase 26.8 D-04, D-08, D-11: finalize ulog archive on session end. Soft-fail
+    // per D-09 (never blocks session finalize). Gates silently on absence of
+    // either artifact_client or mavlink_backend (non-FC deployments are the
+    // common case — absence of mavlink_backend is normal, not a warn condition).
+    // The `Option<String>` artifact_id returned by `finalize_ulog_archive` is
+    // consumed internally (Plan 07 LOG_ERASE gate lives inside that function),
+    // so this outer spawn discards the value.
+    if let (Some(client), Some(backend)) = (&artifact_client, &mavlink_backend) {
+        let session_id_owned = session_id.to_string();
+        let ulog_cfg = config.ulog.clone();
+        let client = client.clone();
+        let backend = std::sync::Arc::clone(backend);
+        tokio::spawn(async move {
+            match tokio::time::timeout(
+                Duration::from_secs(60),
+                crate::ulog_archive::finalize_ulog_archive(backend, &session_id_owned, &ulog_cfg, client),
+            )
+            .await
+            {
+                Ok(Ok(_artifact_id)) => {}
+                Ok(Err(e)) => tracing::warn!(
+                    error = %e,
+                    session_id = %session_id_owned,
+                    "ulog archive upload failed"
+                ),
+                Err(_) => tracing::warn!(
+                    session_id = %session_id_owned,
+                    "ulog archive upload timed out after 60s"
                 ),
             }
         });
