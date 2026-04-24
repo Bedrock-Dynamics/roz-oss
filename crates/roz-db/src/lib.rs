@@ -16,6 +16,7 @@ pub mod provenance;
 pub mod safety_audit;
 pub mod safety_policies;
 pub mod scheduled_tasks;
+pub mod session_artifacts;
 pub mod session_turns;
 pub mod skills;
 pub mod streams;
