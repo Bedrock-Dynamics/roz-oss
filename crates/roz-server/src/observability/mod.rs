@@ -83,12 +83,16 @@ pub const ENV_MCAP_TTL_SECS: &str = "ROZ_MCAP_TTL_SECS";
 pub const ENV_MCAP_MAX_FILE_BYTES: &str = "ROZ_MCAP_MAX_FILE_BYTES";
 pub const ENV_MCAP_IDLE_TIMEOUT_SECS: &str = "ROZ_MCAP_IDLE_TIMEOUT_SECS";
 
+// Phase 26.7 D-15: artifact root directory (sibling of ROZ_MCAP_DIR).
+pub const ENV_ARTIFACT_DIR: &str = "ROZ_ARTIFACT_DIR";
+
 // Defaults per D-01/D-02/D-03/D-05.
 pub const DEFAULT_MCAP_DIR: &str = "/var/lib/roz/mcap";
 pub const DEFAULT_MCAP_MAX_BYTES: u64 = 10_000_000_000; // 10 GB
 pub const DEFAULT_MCAP_TTL_SECS: u64 = 604_800; // 7 days
 pub const DEFAULT_MCAP_MAX_FILE_BYTES: u64 = 1_000_000_000; // 1 GB
 pub const DEFAULT_MCAP_IDLE_TIMEOUT_SECS: u64 = 600; // 10 min
+pub const DEFAULT_ARTIFACT_DIR: &str = "/var/lib/roz/artifacts"; // Phase 26.7 D-15
 
 // ---------------------------------------------------------------------------
 // Library-level error type.
