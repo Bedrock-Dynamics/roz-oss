@@ -43,6 +43,8 @@ async fn start_server() -> (String, String, uuid::Uuid, sqlx::PgPool) {
 
     let mcap_dir = std::env::temp_dir().join(format!("roz-mcap-test-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&mcap_dir).expect("create test mcap dir");
+    let artifact_dir = std::env::temp_dir().join(format!("roz-artifact-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&artifact_dir).expect("create test artifact dir");
 
     let state = roz_server::state::AppState {
         pool: pool.clone(),
@@ -80,6 +82,7 @@ async fn start_server() -> (String, String, uuid::Uuid, sqlx::PgPool) {
         schema_descriptors: roz_server::observability::schema_registry::SchemaDescriptors::load()
             .expect("schema descriptors must load in tests"),
         mcap_dir,
+        artifact_dir,
     };
 
     let app = roz_server::build_router(state);

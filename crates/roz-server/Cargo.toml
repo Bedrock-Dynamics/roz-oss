@@ -185,3 +185,13 @@ required-features = ["test-helpers"]
 name = "mcap_camera_roundtrip"
 path = "tests/mcap_camera_roundtrip.rs"
 required-features = ["test-helpers"]
+
+# Phase 26.7 SC6 — artifact_copper_roundtrip. Drives ArtifactService
+# UploadArtifact + DownloadArtifact end-to-end over a real tonic channel
+# with axum-injected AuthIdentity + testcontainer Postgres + canonical
+# tempdir artifact root. Covers the happy-path digest round-trip plus
+# D-34 tampered-digest rejection (partial file cleanup verification).
+[[test]]
+name = "artifact_copper_roundtrip"
+path = "tests/artifact_copper_roundtrip.rs"
+required-features = ["test-helpers"]

@@ -139,6 +139,11 @@ fn build_test_app_state(
             std::fs::create_dir_all(&d).expect("create test mcap dir");
             d
         },
+        artifact_dir: {
+            let d = std::env::temp_dir().join(format!("roz-artifact-test-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&d).expect("create test artifact dir");
+            d
+        },
     }
 }
 

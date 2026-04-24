@@ -696,6 +696,8 @@ mod integration_tests {
 
         let mcap_dir = std::env::temp_dir().join(format!("roz-mcap-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&mcap_dir).expect("create test mcap dir");
+        let artifact_dir = std::env::temp_dir().join(format!("roz-artifact-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&artifact_dir).expect("create test artifact dir");
 
         let state = AppState {
             pool: pool.clone(),
@@ -736,6 +738,7 @@ mod integration_tests {
             schema_descriptors: crate::observability::schema_registry::SchemaDescriptors::load()
                 .expect("schema descriptors must load in tests"),
             mcap_dir,
+            artifact_dir,
         };
 
         let app = crate::build_router(state.clone());
