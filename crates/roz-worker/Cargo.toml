@@ -100,6 +100,11 @@ noxious-client = "1.0.4"
 # Phase 26.5 SC6 (plan 07): `observability_config::tests` parses TOML fixtures
 # to verify the nested `[observability.camera]` section deserializes.
 toml = { workspace = true }
+# Phase 26.7 SC4 (plan 04): `config::tests::config_observability_loads_nested_copper_overrides`
+# uses `figment::Jail` for env-var isolation. `Jail` is gated behind the
+# `test` feature upstream; enable it only for dev-deps so runtime builds
+# stay minimal.
+figment = { workspace = true, features = ["env", "toml", "test"] }
 
 [lints]
 workspace = true

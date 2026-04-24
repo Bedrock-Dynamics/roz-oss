@@ -291,7 +291,16 @@ impl WorkerConfig {
     pub fn load() -> Result<Self, Box<figment::Error>> {
         Figment::new()
             .merge(Toml::file("roz-worker.toml"))
-            .merge(Env::prefixed("ROZ_"))
+            // `.split("__")` wires the documented nested env-var convention
+            // (Phase 26.5 SC6 module-level docs on `observability_config`,
+            // Phase 26.7 SC4 D-23/D-24): `ROZ_OBSERVABILITY__CAMERA__RECORD`
+            // and `ROZ_OBSERVABILITY__COPPER__PREALLOCATED_MB` map onto the
+            // nested struct paths `observability.camera.record` and
+            // `observability.copper.preallocated_mb`. Single-underscore keys
+            // (e.g. `ROZ_API_URL`, `ROZ_MAX_CONCURRENT_TASKS`) are unaffected
+            // — figment only splits on the literal separator, which no
+            // existing flat field name contains.
+            .merge(Env::prefixed("ROZ_").split("__"))
             .merge(
                 Env::raw()
                     .only(&["ROZ_ZENOH_CONFIG"])
@@ -613,6 +622,33 @@ mod tests {
             crate::observability_config::RecordMode::Full
         );
         assert!((config.observability.camera.keyframe_interval_secs - 5.0).abs() < f32::EPSILON);
+    }
+
+    /// Phase 26.7 SC4: proves `ROZ_OBSERVABILITY__COPPER__*` double-underscore
+    /// env vars flow through figment's `Env::prefixed("ROZ_")` layer into the
+    /// nested `observability.copper` struct. Uses `figment::Jail` for env-var
+    /// isolation (no leakage between tests).
+    #[test]
+    fn config_observability_loads_nested_copper_overrides() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("ROZ_API_URL", "http://localhost:3000");
+            jail.set_env("ROZ_NATS_URL", "nats://localhost:4222");
+            jail.set_env("ROZ_RESTATE_URL", "http://localhost:8080");
+            jail.set_env("ROZ_API_KEY", "test-key");
+            jail.set_env("ROZ_GATEWAY_API_KEY", "test-gateway-key");
+            jail.set_env("ROZ_OBSERVABILITY__COPPER__PREALLOCATED_MB", "64");
+            jail.set_env("ROZ_OBSERVABILITY__COPPER__KEEP_LOCAL_AFTER_UPLOAD", "true");
+
+            let cfg = super::WorkerConfig::load().expect("load");
+            assert_eq!(cfg.observability.copper.preallocated_mb, 64);
+            assert!(cfg.observability.copper.keep_local_after_upload);
+            // Camera should still default.
+            assert_eq!(
+                cfg.observability.camera.record,
+                crate::observability_config::RecordMode::Keyframes
+            );
+            Ok(())
+        });
     }
 
     #[test]
