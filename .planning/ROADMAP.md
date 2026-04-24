@@ -313,30 +313,30 @@ Success Criteria (what must be TRUE):
   5. No video in v1 (defers to a future phase once multimedia channels from 26.5 are populated with camera data).
 **Plans**: TBD
 
-### Phase 26.7: Session artifact service — generic sidecar archival (copper logs first)
+### Phase 26.7: Session artifact service — generic sidecar archival (copper logs first) ✓
 
 **Goal:** Introduce a generic `roz_session_artifacts` table and gRPC `ArtifactService` so any per-session sidecar file (copper `.copper` log, ULOG `.ulg`, future video bundles) can be streamed from worker to server, stored, and retrieved. First artifact type wired is copper's unified log — dev-loop replay for controller-tick debugging — with no decoding or projection into MCAP.
 **Requirements:** none (artifact plumbing)
 **Depends on:** Phase 26 (session archive lifecycle)
-**Plans:** 0/9 plans (planned 2026-04-23)
+**Plans:** 9/9 plans complete
 
 Success Criteria (what must be TRUE):
-  1. Migration `migrations/027_session_artifacts.sql` creates `roz_session_artifacts` (artifact_id UUID, session_id UUID FK, tenant_id UUID, artifact_type ∈ {'mcap','copper','ulog','video','bundle'}, path TEXT, digest_sha256 BYTEA, size_bytes BIGINT, content_type TEXT, uploaded_at TIMESTAMPTZ; UNIQUE(session_id, artifact_type, path)).
+  1. Migration `migrations/20260423039_session_artifacts.sql` creates `roz_session_artifacts` (artifact_id UUID, session_id UUID FK, tenant_id UUID, artifact_type ∈ {'mcap','copper','ulog','video','bundle'}, path TEXT, digest_sha256 BYTEA, size_bytes BIGINT, content_type TEXT, uploaded_at TIMESTAMPTZ; UNIQUE(session_id, artifact_type, path)).
   2. `proto/roz/v1/observability.proto` extends with `ArtifactService` (`UploadArtifact` client-stream, `DownloadArtifact` server-stream); `crates/roz-server/src/grpc/artifacts.rs` implements both with chunked transfer and digest verification.
   3. `crates/roz-copper/src/app.rs::build_temp_logger` is parameterized to `build_session_logger(session_dir)`; worker writes copper logs to `{ROZ_WORKER_DATA_DIR}/sessions/{session_id}/session.copper` (persistent, not tmpdir) for the session's duration.
   4. `crates/roz-worker/src/copper_archive.rs` finalize hook: on `SessionCompleted`, compute sha256, stream-upload to server via `ArtifactService.UploadArtifact`, record the artifact row.
   5. `roz session export <id> --bundle` streams a tarball containing the session MCAP plus all sibling `roz_session_artifacts` rows for that session; contents verify via digest.
   6. Integration test: simulated session end produces a `roz_session_artifacts` row with `artifact_type='copper'`; downloading via `ArtifactService.DownloadArtifact` returns bytes matching the worker-local digest.
 Plans:
-- [ ] 26.7-01-PLAN.md — migration 20260423039_session_artifacts.sql + roz_db::session_artifacts CRUD + ROADMAP SC1 amendment
-- [ ] 26.7-02-PLAN.md — observability.proto ArtifactService extension + roz-worker build.rs build_client(true)
-- [ ] 26.7-03-PLAN.md — server ArtifactServiceImpl + ROZ_ARTIFACT_DIR boot canonicalisation + AppState wiring + service registration
-- [ ] 26.7-04-PLAN.md — worker ObservabilityCopperConfig (preallocated_mb=256, keep_local_after_upload=false) + figment nested env-var test
-- [ ] 26.7-05-PLAN.md — crates/roz-copper/src/app.rs build_temp_logger → build_session_logger refactor + cu29 filename-format empirical test
-- [ ] 26.7-06-PLAN.md — crates/roz-worker/src/copper_archive.rs finalize_copper_archive + session_relay.rs hook (drop-ordering invariant enforced)
-- [ ] 26.7-07-PLAN.md — roz session export --bundle CLI flag + manifest.json + parallel ExportSession / ListSessionArtifacts / DownloadArtifact path
-- [ ] 26.7-08-PLAN.md — crates/roz-server/src/observability/retention.rs second pass over roz_session_artifacts (reuse ROZ_MCAP_TTL_SECS / ROZ_MCAP_MAX_BYTES)
-- [ ] 26.7-09-PLAN.md — crates/roz-server/tests/artifact_copper_roundtrip.rs (template: observability_export_grpc.rs — SC6 + D-34 tampered digest)
+- [x] 26.7-01-PLAN.md — migration 20260423039_session_artifacts.sql + roz_db::session_artifacts CRUD + ROADMAP SC1 amendment
+- [x] 26.7-02-PLAN.md — observability.proto ArtifactService extension + roz-worker build.rs build_client(true)
+- [x] 26.7-03-PLAN.md — server ArtifactServiceImpl + ROZ_ARTIFACT_DIR boot canonicalisation + AppState wiring + service registration
+- [x] 26.7-04-PLAN.md — worker ObservabilityCopperConfig (preallocated_mb=256, keep_local_after_upload=false) + figment nested env-var test
+- [x] 26.7-05-PLAN.md — crates/roz-copper/src/app.rs build_temp_logger → build_session_logger refactor + cu29 filename-format empirical test
+- [x] 26.7-06-PLAN.md — crates/roz-worker/src/copper_archive.rs finalize_copper_archive + session_relay.rs hook (drop-ordering invariant enforced)
+- [x] 26.7-07-PLAN.md — roz session export --bundle CLI flag + manifest.json + parallel ExportSession / ListSessionArtifacts / DownloadArtifact path
+- [x] 26.7-08-PLAN.md — crates/roz-server/src/observability/retention.rs second pass over roz_session_artifacts (reuse ROZ_MCAP_TTL_SECS / ROZ_MCAP_MAX_BYTES)
+- [x] 26.7-09-PLAN.md — crates/roz-server/tests/artifact_copper_roundtrip.rs (template: observability_export_grpc.rs — SC6 + D-34 tampered digest)
 
 ### Phase 26.8: ULOG auto-download via MAVLink on session finalize
 
@@ -429,7 +429,7 @@ v3.0 Production Robotics milestone is in the planning stage. Phase 22 is planned
 | 26.4. Session metadata index (fleet query plane) | v3.0 | 0/0 | Not started | — |
 | 26.5. MCAP multimedia channels | v3.0 | 0/0 | Not started | — |
 | 26.6. LeRobotDataset v3 exporter (deferred) | v3.0 | 0/0 | Deferred until user demand | — |
-| 26.7. Session artifact service (copper sidecar) | v3.0 | 0/0 | Not started | — |
+| 26.7. Session artifact service (copper sidecar) | v3.0 | 9/9 | Complete    | 2026-04-24 |
 | 26.8. ULOG auto-download via MAVLink | v3.0 | 0/0 | Not started (gated on 26.7 + 27) | — |
 | 26.9. RRD format export for substrate | v3.0 | 0/0 | Not started | — |
 | 27. Nightly PX4 SITL CI | v3.0 | 0/0 | Not started | — |
