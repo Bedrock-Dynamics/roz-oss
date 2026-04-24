@@ -85,6 +85,21 @@ tonic-build = "0.13"
 [dev-dependencies]
 tempfile = "3"
 roz-test = { path = "../roz-test" }
+# Phase 26.8-08: enables `MavlinkBackend::new_for_tests` for the
+# `ulog_session_finalize_integration` test harness. Dev-only — production
+# builds consume roz-mavlink via the `[dependencies]` entry above without
+# this feature.
+roz-mavlink = { path = "../roz-mavlink", features = ["test-helpers"] }
+# Phase 26.8-08: `MockLogTransport` + the integration test construct MavLink
+# LOG_* frames directly; we need the upstream `MavMessage` variants. Feature
+# set mirrors `crates/roz-mavlink/Cargo.toml` to keep the wire types
+# byte-compatible.
+mavlink = { version = "0.17.1", default-features = false, features = [
+    "std",
+    "serde",
+    "tokio-1",
+    "common",
+] }
 # Phase 26-12 OBS-01: integration test `tests/telemetry_proto_reaches_mcap.rs`
 # drives the worker → NATS → ingest_cloud → MCAP chain end-to-end. `test-helpers`
 # exposes `spawn_session_telemetry_ingest_for_tests` as a public wrapper around
