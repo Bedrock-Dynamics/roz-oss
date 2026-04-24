@@ -85,6 +85,17 @@ pub struct WorkerConfig {
     /// (existing Gazebo-SITL / joint-arm embodiments unaffected).
     #[serde(default)]
     pub mavlink: MavlinkConfig,
+    /// Phase 26.8 D-07 — ulog auto-download controls.
+    ///
+    /// TOML: `[ulog]` section with `enabled`, `download_timeout_secs`,
+    /// `keep_fc_copy`. Env vars: `ROZ_ULOG__*` (figment `__` nesting).
+    /// Absent = defaults (enabled = true, 60s timeout, keep_fc_copy = false).
+    ///
+    /// Placement note: top-level on `WorkerConfig` (NOT nested under
+    /// `observability`) — ulog is a distinct subsystem from MCAP/copper
+    /// observability per D-07.
+    #[serde(default)]
+    pub ulog: crate::ulog_config::UlogConfig,
     /// Trusted signing keys for `.cwasm` modules. Set via `ROZ_WASM_PUBKEYS`.
     ///
     /// Format: `"<key_id>:<base64 Ed25519 pubkey>,..."`. Empty/unset yields
@@ -660,5 +671,48 @@ mod tests {
         let err = config.trusted_keys().expect_err("should fail");
         let msg = err.to_string();
         assert!(msg.contains("no-colon-at-all") || msg.contains("missing"), "got: {msg}");
+    }
+
+    /// Phase 26.8 SC2 D-07: proves `ROZ_ULOG__*` double-underscore env vars
+    /// flow through figment's `Env::prefixed("ROZ_")` layer into the
+    /// top-level `ulog` struct on `WorkerConfig`. Uses `figment::Jail` for
+    /// env-var isolation (no leakage between tests).
+    #[test]
+    fn config_loads_nested_ulog_overrides_from_env() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("ROZ_API_URL", "http://localhost:3000");
+            jail.set_env("ROZ_NATS_URL", "nats://localhost:4222");
+            jail.set_env("ROZ_RESTATE_URL", "http://localhost:8080");
+            jail.set_env("ROZ_API_KEY", "test-key");
+            jail.set_env("ROZ_GATEWAY_API_KEY", "test-gateway-key");
+            jail.set_env("ROZ_ULOG__ENABLED", "false");
+            jail.set_env("ROZ_ULOG__DOWNLOAD_TIMEOUT_SECS", "120");
+            jail.set_env("ROZ_ULOG__KEEP_FC_COPY", "true");
+
+            let cfg = super::WorkerConfig::load().expect("load");
+            assert!(!cfg.ulog.enabled);
+            assert_eq!(cfg.ulog.download_timeout_secs, 120);
+            assert!(cfg.ulog.keep_fc_copy);
+            Ok(())
+        });
+    }
+
+    /// Phase 26.8 SC2 D-07: proves absent `[ulog]` section yields the
+    /// documented defaults (enabled=true, 60s timeout, keep_fc_copy=false).
+    #[test]
+    fn config_ulog_defaults_when_section_missing() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("ROZ_API_URL", "http://localhost:3000");
+            jail.set_env("ROZ_NATS_URL", "nats://localhost:4222");
+            jail.set_env("ROZ_RESTATE_URL", "http://localhost:8080");
+            jail.set_env("ROZ_API_KEY", "test-key");
+            jail.set_env("ROZ_GATEWAY_API_KEY", "test-gateway-key");
+
+            let cfg = super::WorkerConfig::load().expect("load");
+            assert!(cfg.ulog.enabled);
+            assert_eq!(cfg.ulog.download_timeout_secs, 60);
+            assert!(!cfg.ulog.keep_fc_copy);
+            Ok(())
+        });
     }
 }

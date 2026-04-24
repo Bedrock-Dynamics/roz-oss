@@ -57,6 +57,7 @@ pub mod telemetry_replay;
 pub mod transport_nats;
 pub mod trust;
 pub mod turn_flush;
+pub mod ulog_config;
 pub mod wal;
 #[cfg(feature = "aot")]
 pub mod wasm_trust;
