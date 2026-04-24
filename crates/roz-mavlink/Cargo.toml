@@ -58,5 +58,12 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 # Phase 26.8-03: fixture-digest pinning test (T-26.8.03-01 tampering mitigation).
 sha2  = { workspace = true }
 
+[features]
+# Phase 26.8-08: exposes `MavlinkBackend::new_for_tests` for cross-crate test
+# harnesses (specifically `roz-worker`'s `ulog_session_finalize_integration`
+# test). Opt-in — production builds never declare this feature, so the
+# test-only constructor is excluded from release artifacts.
+test-helpers = []
+
 [lints]
 workspace = true
