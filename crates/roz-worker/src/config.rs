@@ -661,4 +661,47 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("no-colon-at-all") || msg.contains("missing"), "got: {msg}");
     }
+
+    /// Phase 26.8 SC2 D-07: proves `ROZ_ULOG__*` double-underscore env vars
+    /// flow through figment's `Env::prefixed("ROZ_")` layer into the
+    /// top-level `ulog` struct on `WorkerConfig`. Uses `figment::Jail` for
+    /// env-var isolation (no leakage between tests).
+    #[test]
+    fn config_loads_nested_ulog_overrides_from_env() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("ROZ_API_URL", "http://localhost:3000");
+            jail.set_env("ROZ_NATS_URL", "nats://localhost:4222");
+            jail.set_env("ROZ_RESTATE_URL", "http://localhost:8080");
+            jail.set_env("ROZ_API_KEY", "test-key");
+            jail.set_env("ROZ_GATEWAY_API_KEY", "test-gateway-key");
+            jail.set_env("ROZ_ULOG__ENABLED", "false");
+            jail.set_env("ROZ_ULOG__DOWNLOAD_TIMEOUT_SECS", "120");
+            jail.set_env("ROZ_ULOG__KEEP_FC_COPY", "true");
+
+            let cfg = super::WorkerConfig::load().expect("load");
+            assert!(!cfg.ulog.enabled);
+            assert_eq!(cfg.ulog.download_timeout_secs, 120);
+            assert!(cfg.ulog.keep_fc_copy);
+            Ok(())
+        });
+    }
+
+    /// Phase 26.8 SC2 D-07: proves absent `[ulog]` section yields the
+    /// documented defaults (enabled=true, 60s timeout, keep_fc_copy=false).
+    #[test]
+    fn config_ulog_defaults_when_section_missing() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("ROZ_API_URL", "http://localhost:3000");
+            jail.set_env("ROZ_NATS_URL", "nats://localhost:4222");
+            jail.set_env("ROZ_RESTATE_URL", "http://localhost:8080");
+            jail.set_env("ROZ_API_KEY", "test-key");
+            jail.set_env("ROZ_GATEWAY_API_KEY", "test-gateway-key");
+
+            let cfg = super::WorkerConfig::load().expect("load");
+            assert!(cfg.ulog.enabled);
+            assert_eq!(cfg.ulog.download_timeout_secs, 60);
+            assert!(!cfg.ulog.keep_fc_copy);
+            Ok(())
+        });
+    }
 }
