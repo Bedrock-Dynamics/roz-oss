@@ -19,6 +19,7 @@ pub mod safety_audit;
 pub mod safety_policies;
 pub mod scheduled_tasks;
 pub mod server_signing_state;
+pub mod session_artifacts;
 pub mod session_metadata;
 pub mod session_turns;
 pub mod skills;
