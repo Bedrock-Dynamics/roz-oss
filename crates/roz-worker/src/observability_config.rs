@@ -10,6 +10,8 @@
 //! Nested figment env vars use the double-underscore separator:
 //!   * `ROZ_OBSERVABILITY__CAMERA__RECORD`              = `"keyframes"` | `"full"` | `"off"`
 //!   * `ROZ_OBSERVABILITY__CAMERA__KEYFRAME_INTERVAL_SECS` = f32 seconds (default 2.0)
+//!   * `ROZ_OBSERVABILITY__COPPER__PREALLOCATED_MB` = usize MiB (default 256)
+//!   * `ROZ_OBSERVABILITY__COPPER__KEEP_LOCAL_AFTER_UPLOAD` = bool (default false)
 //!
 //! Single underscores will NOT parse — this is a figment quirk, not a
 //! roz decision. Unit tests in `crates/roz-worker/src/config.rs` assert
@@ -71,12 +73,51 @@ impl Default for ObservabilityCameraConfig {
     }
 }
 
+/// Phase 26.7 SC4 per-worker copper-log recording config.
+///
+/// TOML example:
+///
+/// ```toml
+/// [observability.copper]
+/// preallocated_mb = 256
+/// keep_local_after_upload = false
+/// ```
+///
+/// See the module-level docs for the figment env-var naming.
+///
+/// # Fields
+/// - `preallocated_mb`: cu29-unifiedlog preallocated mmap region size in MiB.
+///   cu29-unifiedlog 0.14 rotates to the next numbered segment
+///   (`session_N.copper` — see Phase 26.7 RESEARCH.md Discrepancy 1) when
+///   this region fills.
+/// - `keep_local_after_upload`: when `false` (default), the worker removes
+///   the per-session directory `{data_dir}/sessions/{session_id}/` after all
+///   segments upload successfully. When `true`, files are retained.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ObservabilityCopperConfig {
+    #[serde(default = "default_preallocated_mb")]
+    pub preallocated_mb: usize,
+    #[serde(default)]
+    pub keep_local_after_upload: bool,
+}
+
+impl Default for ObservabilityCopperConfig {
+    fn default() -> Self {
+        Self {
+            preallocated_mb: default_preallocated_mb(),
+            keep_local_after_upload: false,
+        }
+    }
+}
+
 /// Top-level observability config bag. Extends additively in future phases
 /// (e.g. metrics exporter settings, log sink overrides).
 #[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 pub struct ObservabilityConfig {
     #[serde(default)]
     pub camera: ObservabilityCameraConfig,
+    #[serde(default)]
+    pub copper: ObservabilityCopperConfig,
 }
 
 const fn default_record_mode() -> RecordMode {
@@ -85,6 +126,10 @@ const fn default_record_mode() -> RecordMode {
 
 const fn default_keyframe_interval_secs() -> f32 {
     2.0
+}
+
+const fn default_preallocated_mb() -> usize {
+    256
 }
 
 #[cfg(test)]
