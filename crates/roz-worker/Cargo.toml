@@ -51,6 +51,7 @@ mcap.workspace = true
 prost = "0.13"
 prost-types = "0.13"
 tonic = "0.13"
+tokio-stream = "0.1"
 sha2.workspace = true
 hex.workspace = true
 crc32fast.workspace = true

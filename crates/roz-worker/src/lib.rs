@@ -29,6 +29,7 @@ pub mod checkpoint_writer;
 pub mod clear_failsafe;
 pub mod command_watchdog;
 pub mod config;
+pub mod copper_archive;
 pub mod copper_handle;
 pub mod degradation;
 pub mod dispatch;

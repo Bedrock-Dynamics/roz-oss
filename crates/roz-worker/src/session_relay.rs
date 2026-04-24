@@ -606,6 +606,7 @@ pub async fn spawn_session_relay(
     camera_manager: Option<Arc<CameraManager>>,
     event_transport: Option<Arc<dyn roz_core::transport::SessionTransport>>,
     signing_ctx: Option<WorkerSigningContext>,
+    artifact_client: Option<crate::roz_v1::artifact_service_client::ArtifactServiceClient<tonic::transport::Channel>>,
 ) -> anyhow::Result<()> {
     let subject = format!("session.{worker_id}.*.request");
     let mut sub = nats.subscribe(subject.clone()).await?;
@@ -647,6 +648,7 @@ pub async fn spawn_session_relay(
             let cam_mgr_clone = camera_manager.clone();
             let transport_clone = event_transport.clone();
             let signing_clone = signing_ctx.clone();
+            let artifact_client_clone = artifact_client.clone();
 
             let handle = tokio::spawn(async move {
                 if let Err(e) = handle_edge_session(
@@ -659,6 +661,7 @@ pub async fn spawn_session_relay(
                     cam_mgr_clone,
                     transport_clone,
                     signing_clone,
+                    artifact_client_clone,
                 )
                 .await
                 {
@@ -689,6 +692,7 @@ async fn handle_edge_session(
     camera_manager: Option<Arc<CameraManager>>,
     event_transport: Option<Arc<dyn roz_core::transport::SessionTransport>>,
     signing_ctx: Option<WorkerSigningContext>,
+    artifact_client: Option<crate::roz_v1::artifact_service_client::ArtifactServiceClient<tonic::transport::Channel>>,
 ) -> anyhow::Result<()> {
     let response_subject = Subjects::session_response(worker_id, session_id)?;
     let bootstrap = parse_runtime_bootstrap(session_id, &start_msg)?;
@@ -1256,6 +1260,40 @@ async fn handle_edge_session(
             Ok(_) => tracing::debug!(session_id, "mcap_relay drained cleanly"),
             Err(_) => tracing::warn!(session_id, "mcap_relay did not drain within 2s; letting it detach"),
         }
+    }
+
+    // Phase 26.7 D-16: finalize copper archive on session end. Soft-fail
+    // per D-16 (never blocks session finalize). DROP-ORDERING INVARIANT
+    // (RESEARCH.md Q1): cu29-unifiedlog 0.14 only syncs segments on Drop.
+    // Every `Arc<Mutex<UnifiedLoggerWrite>>` for this session MUST be
+    // dropped by this point — today the worker does not wire a
+    // per-edge-session CopperHandle (it lives inside `execute_task`
+    // dispatch), so `finalize_copper_archive` typically finds an empty
+    // session dir and returns Ok(()) without uploading.
+    if let Some(ref client) = artifact_client {
+        let data_dir = std::path::PathBuf::from(config.data_dir.clone());
+        let session_id_owned = session_id.to_string();
+        let copper_cfg = config.observability.copper.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(
+                Duration::from_secs(60),
+                crate::copper_archive::finalize_copper_archive(&data_dir, &session_id_owned, &copper_cfg, client),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(
+                    error = %e,
+                    session_id = %session_id_owned,
+                    "copper archive upload failed"
+                ),
+                Err(_) => tracing::warn!(
+                    session_id = %session_id_owned,
+                    "copper archive upload timed out after 60s"
+                ),
+            }
+        });
     }
 
     tracing::info!(session_id, "edge session ended");

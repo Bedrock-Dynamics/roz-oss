@@ -2460,6 +2460,25 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "zenoh"))]
     let event_transport: Option<std::sync::Arc<dyn roz_core::transport::SessionTransport>> =
         Some(std::sync::Arc::new(nats_event_transport));
+    // Phase 26.7 D-16: optional ArtifactServiceClient for copper finalize.
+    // connect_lazy avoids blocking boot on server reachability; soft-fail
+    // per D-16 means a missing or never-connected client just produces a
+    // finalize_copper_archive warn-log, never a session-end block.
+    let artifact_client: Option<
+        roz_worker::roz_v1::artifact_service_client::ArtifactServiceClient<tonic::transport::Channel>,
+    > = match tonic::transport::Channel::from_shared(config.api_url.clone()) {
+        Ok(endpoint) => Some(roz_worker::roz_v1::artifact_service_client::ArtifactServiceClient::new(
+            endpoint.connect_lazy(),
+        )),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                api_url = %config.api_url,
+                "failed to build artifact gRPC channel; copper archival will skip uploads"
+            );
+            None
+        }
+    };
     tokio::spawn(async move {
         if let Err(e) = roz_worker::session_relay::spawn_session_relay(
             relay_nats,
@@ -2469,6 +2488,7 @@ async fn main() -> Result<()> {
             relay_camera_mgr,
             event_transport,
             relay_signing_ctx,
+            artifact_client,
         )
         .await
         {
