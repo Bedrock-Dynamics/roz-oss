@@ -1,24 +1,24 @@
 ---
 gsd_state_version: 1.0
-milestone: v2.2
-milestone_name: Runtime Event Contracts and Completeness
-status: completed
-last_updated: "2026-04-24T14:51:41.613Z"
+milestone: v3.0
+milestone_name: Production Robotics
+status: active
+last_updated: "2026-04-24T22:00:00.000Z"
 last_activity: 2026-04-24
 progress:
-  total_phases: 1
-  completed_phases: 0
-  total_plans: 0
-  completed_plans: 3
+  total_phases: 16
+  completed_phases: 12
+  total_plans: 109
+  completed_plans: 102
 ---
 
 # State
 
 ## Current Position
 
-Phase: 26.7
-Plan: Not started
-Status: Milestone complete
+Phase: 26.8 (just completed — UAT 9/10 + verification 7/7 + security 32/32)
+Plan: All complete
+Status: Active — ready to advance to next phase (26.9 / 27 / 28 unstarted)
 Last activity: 2026-04-24
 
 ## Project Reference
@@ -94,8 +94,11 @@ See: `.planning/PROJECT.md` (updated 2026-04-16)
 - ✅ v1.1 Embodiment Streaming, CLI, and Extensions (2026-04-10)
 - ✅ v1.0 Roz Embodiment Protos (2026-04-08)
 
-**Planned Phase:** 26.7 (session-artifact-service-generic-sidecar-archival-copper-log) — 9 plans — 2026-04-24T02:10:03.900Z
+**Completed Phase:** 26.8 (ulog-auto-download-via-mavlink-on-session-finalize) — 8/8 plans, UAT 9/10 (SC4 deferred to human Flight Review check), verification 7/7 SC pass, security 32/32 closed — commits `f573e55` (security) + `447f3af` (UAT) + `5093842` (verification) — 2026-04-24
 
-**Completed Phase:** 26.1 plan 01 (schema_registry dedup) — commits `8df8cfb` (fix) + `2a7ee15` (test) — Phase 26 SC4 structurally unblocked — 2026-04-22T02:03:22Z
+**Completed Phase (prior):** 26.7 (session-artifact-service-generic-sidecar-archival-copper-log) — 9/9 plans — 2026-04-24
 
-**Completed Plan:** 26.2-03 (deterministic mock model provider `MockProviderV1`) — commit `9082398` — crates/roz-agent/src/model/mock_provider.rs gated behind new `test-helpers` feature; BOTH complete() and stream() return D-06 canned response; 3 unit tests pass; roz-test untouched (no cycle) — 2026-04-22T12:04:41Z
+**Next Phase Candidates (unstarted):**
+- 26.9 RRD format export — Rerun recording files for substrate ingestion
+- 27 Nightly PX4 SITL CI + induced NATS outage + live-FCU task-layer wiring
+- 28 HITL docs + Pixhawk single-binary deployment quickstart
