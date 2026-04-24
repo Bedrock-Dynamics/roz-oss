@@ -403,6 +403,46 @@ impl MavlinkBackend {
             .map_err(|e| anyhow::anyhow!("LOG_ERASE outbound send failed: {e}"))
     }
 
+    /// Phase 26.8-08 test-only constructor. Builds a [`MavlinkBackend`]
+    /// wired to caller-supplied `outbound` + `log_broadcast` channels with
+    /// NO router loop, NO transport keepalive, and NO signing-state watcher.
+    ///
+    /// The returned handle is sufficient for cross-crate test harnesses that
+    /// need to drive `finalize_ulog_archive` against a mock MAVLink
+    /// transport without booting a real UDP/serial link. The caller owns the
+    /// `outbound` receiver side and is responsible for replaying FC → client
+    /// frames onto the `log_broadcast` sender.
+    ///
+    /// # Production safety
+    ///
+    /// This constructor is gated behind the `test-helpers` feature flag so
+    /// it never appears in production builds. CI does NOT enable
+    /// `test-helpers` on release workflows — the feature only activates
+    /// under the `[dev-dependencies]` of downstream test crates.
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[must_use]
+    pub fn new_for_tests(
+        outbound: mpsc::Sender<MavMessage>,
+        log_broadcast: broadcast::Sender<MavMessage>,
+        autopilot_hint: AutopilotHint,
+    ) -> Arc<Self> {
+        let readiness = Arc::new(Mutex::new(ReadinessBuilder::new()));
+        let last_error = Arc::new(AtomicBool::new(false));
+        let signing_state = Arc::new(AtomicU8::new(SigningState::Off as u8));
+        let (ack_broadcast, _) = broadcast::channel::<COMMAND_ACK_DATA>(ACK_BROADCAST_CAPACITY);
+        Arc::new(Self {
+            outbound,
+            readiness,
+            last_error,
+            signing_state,
+            ack_broadcast,
+            log_broadcast,
+            autopilot_hint,
+            _transport_keepalive: Arc::new(Mutex::new(None)),
+            _router_handle: Arc::new(Mutex::new(None)),
+        })
+    }
+
     /// Translate a copper [`CommandFrame`] into a
     /// `SET_POSITION_TARGET_LOCAL_NED` MAVLink message.
     ///
