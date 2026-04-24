@@ -55,6 +55,11 @@ use crate::transport::{
 /// each ACK to every live subscriber.
 const ACK_BROADCAST_CAPACITY: usize = 64;
 
+/// Phase 26.8 SC1: capacity for LOG_ENTRY + LOG_DATA inbound fan-out.
+/// LOG_DATA frames stream at FC-chosen rate; 256 × ~100 B/frame ≈ 25 KiB
+/// buffer for short-burst tolerance without starving subscribers.
+const LOG_BROADCAST_CAPACITY: usize = 256;
+
 /// `SET_POSITION_TARGET_LOCAL_NED` `type_mask` — velocity + yaw_rate, ignore
 /// position + acceleration + yaw. Literal-bit form: bits {0,1,2,6,7,8,10}
 /// (= 0x05C7 = 1479).
@@ -101,6 +106,9 @@ pub struct MavlinkBackend {
     last_error: Arc<AtomicBool>,
     signing_state: Arc<AtomicU8>,
     ack_broadcast: broadcast::Sender<COMMAND_ACK_DATA>,
+    /// Phase 26.8 SC1: fans LOG_ENTRY + LOG_DATA inbound frames to
+    /// [`crate::log_download::LogDownloader`] subscribers.
+    log_broadcast: broadcast::Sender<MavMessage>,
     autopilot_hint: AutopilotHint,
     _transport_keepalive: Arc<Mutex<Option<TransportHandle>>>,
     _router_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -183,6 +191,8 @@ impl MavlinkBackend {
         };
         let signing_state = Arc::new(AtomicU8::new(signing_state_initial as u8));
         let (ack_tx, _) = broadcast::channel::<COMMAND_ACK_DATA>(ACK_BROADCAST_CAPACITY);
+        // Phase 26.8 SC1: LOG_ENTRY + LOG_DATA fan-out for LogDownloader.
+        let (log_tx, _) = broadcast::channel::<MavMessage>(LOG_BROADCAST_CAPACITY);
 
         // Extract the inbound receiver from the TransportHandle. Replace it
         // with a closed dummy so the handle stays owned (reader/writer tasks
@@ -198,8 +208,9 @@ impl MavlinkBackend {
 
         let readiness_writer = Arc::clone(&readiness);
         let ack_tx_router = ack_tx.clone();
+        let log_tx_router = log_tx.clone();
         let router = tokio::spawn(async move {
-            Self::router_loop(inbound, readiness_writer, ack_tx_router).await;
+            Self::router_loop(inbound, readiness_writer, ack_tx_router, log_tx_router).await;
         });
 
         let transport_keepalive = Arc::new(Mutex::new(Some(transport_mut)));
@@ -211,6 +222,7 @@ impl MavlinkBackend {
             last_error,
             signing_state,
             ack_broadcast: ack_tx,
+            log_broadcast: log_tx,
             autopilot_hint,
             _transport_keepalive: transport_keepalive,
             _router_handle: router_handle,
@@ -279,6 +291,7 @@ impl MavlinkBackend {
         mut inbound: mpsc::Receiver<MavMessage>,
         readiness: Arc<Mutex<ReadinessBuilder>>,
         ack_tx: broadcast::Sender<COMMAND_ACK_DATA>,
+        log_tx: broadcast::Sender<MavMessage>,
     ) {
         while let Some(msg) = inbound.recv().await {
             match msg {
@@ -287,6 +300,12 @@ impl MavlinkBackend {
                 MavMessage::ESTIMATOR_STATUS(ekf) => readiness.lock().apply_estimator_status(&ekf),
                 MavMessage::COMMAND_ACK(ack) => {
                     let _ = ack_tx.send(ack);
+                }
+                MavMessage::LOG_ENTRY(_) | MavMessage::LOG_DATA(_) => {
+                    // Phase 26.8 SC1: fan LOG_* frames to LogDownloader
+                    // subscribers. Send-failure (no subscribers) is fine --
+                    // frames drop silently.
+                    let _ = log_tx.send(msg);
                 }
                 _ => {
                     tracing::trace!("dropping uninteresting MAVLink message");
@@ -316,6 +335,24 @@ impl MavlinkBackend {
             3 => SigningState::Pending,
             _ => SigningState::Off,
         }
+    }
+
+    /// Phase 26.8 SC1: subscribe to the FC's LOG_ENTRY + LOG_DATA stream.
+    ///
+    /// Consumer: [`crate::log_download::LogDownloader`]. Broadcast-based
+    /// fan-out drops frames silently when there are no subscribers, which
+    /// is the common case (no active download).
+    #[must_use]
+    pub fn subscribe_log_data(&self) -> broadcast::Receiver<MavMessage> {
+        self.log_broadcast.subscribe()
+    }
+
+    /// Phase 26.8 SC1: clone of the outbound MAVLink sender for the
+    /// [`crate::log_download::LogDownloader`] writer-side
+    /// (LOG_REQUEST_LIST, LOG_REQUEST_DATA, LOG_REQUEST_END).
+    #[must_use]
+    pub fn outbound(&self) -> mpsc::Sender<MavMessage> {
+        self.outbound.clone()
     }
 
     /// Translate a copper [`CommandFrame`] into a
