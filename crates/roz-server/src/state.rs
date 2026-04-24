@@ -151,6 +151,11 @@ pub struct AppState {
     /// path-traversal defence-in-depth check in `WriterActor::open`
     /// (T-26-40). Created at boot if missing.
     pub mcap_dir: std::path::PathBuf,
+    /// Phase 26.7 D-15: canonical `ROZ_ARTIFACT_DIR` root (created at boot).
+    ///
+    /// Absolute, canonicalized path enforced as the root for
+    /// `ArtifactServiceImpl::download_artifact`'s path-traversal guard.
+    pub artifact_dir: std::path::PathBuf,
 }
 
 impl FromRef<AppState> for PgPool {

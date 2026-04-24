@@ -187,6 +187,12 @@ fn grpc_router(state: &AppState) -> Router {
     let observability_svc =
         roz_server::grpc::observability::ObservabilityServiceImpl::new(state.pool.clone(), state.mcap_dir.clone());
 
+    // Phase 26.7 SC2: ArtifactService for generic session-sidecar archival.
+    // Canonicalized artifact_dir drives the path-traversal guard in
+    // ArtifactServiceImpl::download_artifact.
+    let artifact_svc =
+        roz_server::grpc::artifacts::ArtifactServiceImpl::new(state.pool.clone(), state.artifact_dir.clone());
+
     let grpc_auth_state = roz_server::middleware::grpc_auth::GrpcAuthState {
         auth: state.auth.clone(),
         pool: state.pool.clone(),
@@ -213,6 +219,8 @@ fn grpc_router(state: &AppState) -> Router {
     .add_service(
         roz_server::grpc::roz_v1::observability_service_server::ObservabilityServiceServer::new(observability_svc),
     )
+    // Phase 26.7 SC2: ArtifactService (UploadArtifact + DownloadArtifact + ListSessionArtifacts).
+    .add_service(roz_server::grpc::roz_v1::artifact_service_server::ArtifactServiceServer::new(artifact_svc))
     .add_service(
         tonic_reflection::server::Builder::configure()
             .register_encoded_file_descriptor_set(roz_server::grpc::roz_v1::FILE_DESCRIPTOR_SET)
@@ -498,6 +506,22 @@ async fn main() {
         })
     };
 
+    // Phase 26.7 D-15: resolve artifact root (ROZ_ARTIFACT_DIR or
+    // /var/lib/roz/artifacts), create if missing, canonicalize for the
+    // path-traversal guard in ArtifactServiceImpl::download_artifact.
+    let artifact_dir = {
+        let raw = std::env::var(roz_server::observability::ENV_ARTIFACT_DIR)
+            .unwrap_or_else(|_| roz_server::observability::DEFAULT_ARTIFACT_DIR.to_string());
+        let path = std::path::PathBuf::from(&raw);
+        if let Err(e) = std::fs::create_dir_all(&path) {
+            tracing::warn!(error = %e, artifact_dir = %path.display(), "failed to create artifact directory (may already exist)");
+        }
+        path.canonicalize().unwrap_or_else(|e| {
+            tracing::warn!(error = %e, artifact_dir = %path.display(), "failed to canonicalize artifact directory; using raw path");
+            path
+        })
+    };
+
     // Phase 26 OBS-02: decode Foxglove + roz.v1 descriptor subsets once.
     let schema_descriptors = roz_server::observability::schema_registry::SchemaDescriptors::load()
         .expect("schema descriptors must load at server boot");
@@ -529,6 +553,7 @@ async fn main() {
         task_lifecycle_sink,
         schema_descriptors,
         mcap_dir,
+        artifact_dir,
     };
 
     // Phase 26 OBS-01 D-04: startup recovery for partial MCAP archives.
@@ -753,6 +778,8 @@ mod tests {
     fn test_state_with_operator(pool: sqlx::PgPool, operator_seed: Option<String>) -> AppState {
         let mcap_dir = std::env::temp_dir().join(format!("roz-mcap-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&mcap_dir).expect("create test mcap dir");
+        let artifact_dir = std::env::temp_dir().join(format!("roz-artifact-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&artifact_dir).expect("create test artifact dir");
         AppState {
             pool,
             rate_limiter: middleware::rate_limit::create_rate_limiter(&middleware::rate_limit::RateLimitConfig {
@@ -792,6 +819,7 @@ mod tests {
             schema_descriptors: roz_server::observability::schema_registry::SchemaDescriptors::load()
                 .expect("schema descriptors must load in tests"),
             mcap_dir,
+            artifact_dir,
         }
     }
 
@@ -2483,6 +2511,8 @@ mod tests {
     fn test_state_with_nats(pool: sqlx::PgPool, nats_client: async_nats::Client) -> AppState {
         let mcap_dir = std::env::temp_dir().join(format!("roz-mcap-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&mcap_dir).expect("create test mcap dir");
+        let artifact_dir = std::env::temp_dir().join(format!("roz-artifact-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&artifact_dir).expect("create test artifact dir");
         AppState {
             pool,
             rate_limiter: middleware::rate_limit::create_rate_limiter(&middleware::rate_limit::RateLimitConfig {
@@ -2522,6 +2552,7 @@ mod tests {
             schema_descriptors: roz_server::observability::schema_registry::SchemaDescriptors::load()
                 .expect("schema descriptors must load in tests"),
             mcap_dir,
+            artifact_dir,
         }
     }
 
