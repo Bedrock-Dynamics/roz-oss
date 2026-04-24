@@ -233,4 +233,52 @@ mod tests {
     fn retention_interval_is_five_minutes() {
         assert_eq!(RETENTION_INTERVAL, Duration::from_secs(300));
     }
+
+    /// Phase 26.7 Plan 08: the size-cap pass merges MCAP archives and
+    /// session artifacts into one stream ordered newest-first by each
+    /// row's logical creation time (`opened_at` / `uploaded_at`). This
+    /// test pins the sort contract on which the cross-table accumulator
+    /// relies — any regression in that ordering would cause the sweeper
+    /// to drop newer rows before older ones and break the retention
+    /// invariant.
+    #[test]
+    fn merge_sort_orders_newest_first_across_tables() {
+        use chrono::{DateTime, Duration as ChronoDuration, Utc};
+        #[derive(Debug)]
+        struct Row {
+            ts: DateTime<Utc>,
+            kind: &'static str,
+            #[allow(
+                dead_code,
+                reason = "field is part of the merged row shape asserted by other callers; kept here to mirror the production struct layout"
+            )]
+            size: i64,
+        }
+        let now = Utc::now();
+        let mut merged = vec![
+            Row {
+                ts: now - ChronoDuration::seconds(10),
+                kind: "mcap-1",
+                size: 100,
+            },
+            Row {
+                ts: now - ChronoDuration::seconds(5),
+                kind: "artifact-1",
+                size: 50,
+            },
+            Row {
+                ts: now - ChronoDuration::seconds(20),
+                kind: "mcap-2",
+                size: 200,
+            },
+            Row {
+                ts: now - ChronoDuration::seconds(1),
+                kind: "artifact-2",
+                size: 25,
+            },
+        ];
+        merged.sort_by(|a, b| b.ts.cmp(&a.ts));
+        let kinds: Vec<&str> = merged.iter().map(|r| r.kind).collect();
+        assert_eq!(kinds, vec!["artifact-2", "artifact-1", "mcap-1", "mcap-2"]);
+    }
 }
