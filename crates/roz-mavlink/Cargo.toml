@@ -55,6 +55,8 @@ rand  = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+# Phase 26.8-03: fixture-digest pinning test (T-26.8.03-01 tampering mitigation).
+sha2  = { workspace = true }
 
 [lints]
 workspace = true
