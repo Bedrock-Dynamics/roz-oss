@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use mavlink::common::{
-    COMMAND_ACK_DATA, MavCmd, MavFrame as UpstreamMavFrame, MavMessage, PositionTargetTypemask,
+    COMMAND_ACK_DATA, LOG_ERASE_DATA, MavCmd, MavFrame as UpstreamMavFrame, MavMessage, PositionTargetTypemask,
     SET_POSITION_TARGET_LOCAL_NED_DATA,
 };
 use parking_lot::Mutex;
@@ -39,6 +39,7 @@ use roz_copper::io::{
 use roz_core::command::CommandFrame;
 use tokio::sync::{broadcast, mpsc};
 
+use crate::AutopilotKind;
 use crate::flight_command::{AutopilotHint, CommandAckWatcher, FlightCommandDispatcher};
 use crate::readiness::ReadinessBuilder;
 use crate::signing::{
@@ -353,6 +354,53 @@ impl MavlinkBackend {
     #[must_use]
     pub fn outbound(&self) -> mpsc::Sender<MavMessage> {
         self.outbound.clone()
+    }
+
+    /// Phase 26.8 D-11: coarse autopilot family derived from the
+    /// [`AutopilotHint`] supplied at construction time.
+    ///
+    /// This is NOT read from a live HEARTBEAT — at session-end time the
+    /// HEARTBEAT stream may not have arrived yet (D-08 lift rationale).
+    /// The construction-time `AutopilotHint` is the authoritative source;
+    /// Plan 02 also provides [`AutopilotKind::from_mavlink_autopilot`] for
+    /// callers that DO have a live HEARTBEAT byte.
+    ///
+    /// Returns the Plan 02 crate-root [`crate::AutopilotKind`] taxonomy
+    /// (imported via `use crate::AutopilotKind`).
+    #[must_use]
+    pub fn autopilot_kind(&self) -> AutopilotKind {
+        match self.autopilot_hint {
+            AutopilotHint::Px4 => AutopilotKind::Px4,
+            AutopilotHint::ArduCopter | AutopilotHint::ArduPlane => AutopilotKind::ArduPilot,
+            AutopilotHint::Unknown => AutopilotKind::Unknown,
+        }
+    }
+
+    /// Phase 26.8 SC3/SC6: fire-and-forget `LOG_ERASE` (msgid 121). Erases
+    /// ALL logs on the FC (MAVLink spec does not support per-log erase).
+    ///
+    /// No ACK is defined in the common MAVLink dialect for `LOG_ERASE` —
+    /// success means the outbound channel accepted the send, NOT that the
+    /// FC has finished erasing (RESEARCH pitfall 6). Callers that need to
+    /// gate on erase completion must rely on independent readiness signals
+    /// or a follow-up `LOG_REQUEST_LIST` returning `num_logs = 0`.
+    ///
+    /// Plan 05 only EXPOSES this accessor; Plan 07 adds the D-06 gate
+    /// (only called after verified upload succeeds).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the outbound mpsc channel is closed (backend has
+    /// been torn down).
+    pub async fn send_log_erase(&self) -> anyhow::Result<()> {
+        let msg = MavMessage::LOG_ERASE(LOG_ERASE_DATA {
+            target_system: MAV_FCU_SYSTEM_ID,
+            target_component: MAV_FCU_COMPONENT_ID,
+        });
+        self.outbound
+            .send(msg)
+            .await
+            .map_err(|e| anyhow::anyhow!("LOG_ERASE outbound send failed: {e}"))
     }
 
     /// Translate a copper [`CommandFrame`] into a
