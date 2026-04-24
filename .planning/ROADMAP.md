@@ -343,17 +343,26 @@ Plans:
 **Goal:** After any session backed by a MAVLink FC (PX4 or ArduPilot), automatically pull the newest onboard `.ulg` log via `LOG_REQUEST_LIST` / `LOG_REQUEST_DATA`, store as a session artifact (reusing the 26.7 `ArtifactService`), so substrate and PX4 Flight Review can both ingest it. Opt-out per worker config; soft-fail on FC unreachable (never blocks session completion).
 **Requirements:** none (FC forensics archival)
 **Depends on:** Phase 26.7 (artifact service), Phase 25 (MAVLink backbone — shipped), Phase 27 (SITL infra — for integration-test fixtures)
-**Plans:** 8/8 plans complete
+**Plans:** 0/8 plans complete
 
 Success Criteria (what must be TRUE):
   1. New `crates/roz-mavlink/src/log_download.rs` implements the MAVLink log protocol state machine: `LOG_REQUEST_LIST` → collect `LOG_ENTRY` responses → select newest by `time_utc` → chunked `LOG_REQUEST_DATA` → reassemble `LOG_DATA` → `LOG_REQUEST_END` to release FC resources.
   2. `roz-worker.toml` gains `[ulog]` section with `enabled = true` (default), `download_timeout_secs = 60`, `keep_fc_copy = false`.
-  3. `crates/roz-worker/src/ulog_archive.rs` finalize hook: if `ulog.enabled && mavlink_backend_active`, download the log, write to session artifacts dir, reuse 26.7's artifact-upload path to persist as `artifact_type='ulog'`.
+  3. `crates/roz-worker/src/ulog_archive.rs` finalize hook: if `ulog.enabled && mavlink_backend_active`, download the log, write to session artifacts dir, reuse 26.7's artifact-upload path to persist as `artifact_type='ulog'` (PX4-only per D-11; ArduPilot deferred).
   4. Downloaded `.ulg` opens in PX4 Flight Review (flightreview.px4.io) without errors — validated manually at least once.
   5. Opt-out: setting `[ulog] enabled = false` skips cleanly with no session-end stall.
   6. Soft-fail: FC-unreachable produces a warn log and the session finalizes normally; no `artifact_type='ulog'` row is written.
   7. Integration test exercises the protocol against a PX4 SITL fixture (piggy-backs on Phase 27 infra); stubbable via a file-backed mock MAVLink transport until Phase 27 lands.
-**Plans**: TBD
+
+Plans:
+- [ ] 26.8-01-PLAN.md — UlogConfig struct + env-var wiring (ROZ_ULOG__*) (SC2)
+- [ ] 26.8-02-PLAN.md — log_download.rs protocol state machine + Drop-guard LOG_REQUEST_END + backend router-loop LOG_* fan-out (SC1)
+- [ ] 26.8-03-PLAN.md — PX4 ULG test fixture + MockLogTransport replay harness (SC7)
+- [ ] 26.8-04-PLAN.md — ulog_archive.rs finalize hook: download via LogDownloader, upload via ArtifactService (SC3)
+- [ ] 26.8-05-PLAN.md — AutopilotKind + send_log_erase accessors; lift MavlinkBackend to worker-boot scope; thread into spawn_session_relay (SC3, SC6)
+- [ ] 26.8-06-PLAN.md — session_relay.rs peer finalize_ulog_archive spawn block alongside finalize_copper_archive (SC3, SC5, SC6)
+- [ ] 26.8-07-PLAN.md — D-06 LOG_ERASE gate (strict artifact_id.is_some() && !keep_fc_copy) + full D-09 failure_mode field coverage (SC6)
+- [ ] 26.8-08-PLAN.md — integration tests: LogDownloader roundtrip + finalize_ulog_archive end-to-end with mock ArtifactService (SC7)
 
 ### Phase 26.9: RRD format export — static Rerun recording files for substrate ingestion
 
