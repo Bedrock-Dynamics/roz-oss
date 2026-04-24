@@ -31,26 +31,41 @@ struct RozApp {}
 /// same process (tests run in-process with the same PID).
 static LOG_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Build a temporary mmap-backed unified logger for CI/test use.
+/// Build a session-scoped mmap-backed unified logger (Phase 26.7 D-13/D-14).
 ///
-/// Uses `std::env::temp_dir()` with PID + atomic counter to guarantee
-/// unique paths across concurrent invocations within the same process.
-fn build_temp_logger() -> anyhow::Result<Arc<Mutex<UnifiedLoggerWrite>>> {
-    let tmp_dir = std::env::temp_dir().join("roz-copper-ci");
-    std::fs::create_dir_all(&tmp_dir)?;
-
-    let seq = LOG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let log_path = tmp_dir.join(format!("ci_sim_{}_{seq}.copper", std::process::id()));
-
-    // Remove any stale alias/segment files from a previous run.
-    let _ = std::fs::remove_file(&log_path);
-    let segment = tmp_dir.join(format!("ci_sim_{}_{seq}_0.copper", std::process::id()));
-    let _ = std::fs::remove_file(&segment);
+/// Writes segments under `session_dir` as `session_N.copper`
+/// (`session_0.copper`, `session_1.copper`, …) — cu29-unifiedlog 0.14
+/// format `{stem}_{N}.{ext}`, NOT the dotted `session.copper.N` that
+/// older CONTEXT.md drafts referenced; see Phase 26.7 RESEARCH.md
+/// Discrepancy 1.
+///
+/// # Preallocation + rotation
+/// `preallocated_size(preallocated_mb * MiB)` sizes the initial mmap region.
+/// When it fills, cu29 rotates to the next numbered segment automatically.
+///
+/// # CRITICAL: drop-ordering invariant (Q1)
+/// `UnifiedLoggerWrite` has NO public `flush`/`close`/`sync` method. Disk
+/// sync happens EXCLUSIVELY on `Drop` (clears tmp markers, writes EoL
+/// marker, garbage-collects back slabs). Callers that need to read or
+/// upload the segment files (e.g. `finalize_copper_archive` in Plan 06)
+/// MUST drop every `Arc<Mutex<UnifiedLoggerWrite>>` held for this
+/// `session_dir` BEFORE reading from disk. Violating this invariant
+/// produces truncated uploads with an otherwise-valid digest.
+///
+/// # Errors
+/// Returns `anyhow::Error` if directory creation fails, cu29 init fails,
+/// or the builder returns a reader variant instead of a writer.
+pub fn build_session_logger(
+    session_dir: &std::path::Path,
+    preallocated_mb: usize,
+) -> anyhow::Result<Arc<Mutex<UnifiedLoggerWrite>>> {
+    std::fs::create_dir_all(session_dir)?;
+    let log_path = session_dir.join("session.copper");
 
     let UnifiedLogger::Write(writer) = UnifiedLoggerBuilder::new()
         .write(true)
         .create(true)
-        .preallocated_size(16 * 1024 * 1024)
+        .preallocated_size(preallocated_mb * 1024 * 1024)
         .file_base_name(&log_path)
         .build()
         .map_err(|e| anyhow::anyhow!("unified logger init failed: {e}"))?
@@ -59,6 +74,23 @@ fn build_temp_logger() -> anyhow::Result<Arc<Mutex<UnifiedLoggerWrite>>> {
     };
 
     Ok(Arc::new(Mutex::new(writer)))
+}
+
+/// Build a temporary mmap-backed unified logger for CI/test use.
+///
+/// Delegates to [`build_session_logger`] with a unique tmp subdirectory per
+/// process+counter tick and a 16 MiB region. Preserves the pre-26.7
+/// concurrent-test behaviour — `run_sim_ticks(N)` callers get an isolated
+/// `session_dir`.
+fn build_temp_logger() -> anyhow::Result<Arc<Mutex<UnifiedLoggerWrite>>> {
+    let seq = LOG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let session_dir = std::env::temp_dir()
+        .join("roz-copper-ci")
+        .join(format!("ci_sim_{}_{seq}", std::process::id()));
+    // Defensive cleanup: if a previous run left stale segments, remove them so
+    // cu29 doesn't see pre-existing slabs at the same path.
+    let _ = std::fs::remove_dir_all(&session_dir);
+    build_session_logger(&session_dir, 16)
 }
 
 /// Run the Copper task graph for `ticks` iterations in sim mode.
@@ -108,22 +140,11 @@ pub fn run_sim_ticks(ticks: u32) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn run_sim_ticks_completes() {
-        let result = run_sim_ticks(10);
-        assert!(result.is_ok(), "10 sim ticks should complete: {result:?}");
-    }
-
-    #[test]
-    fn run_sim_zero_ticks_completes() {
-        let result = run_sim_ticks(0);
-        assert!(
-            result.is_ok(),
-            "0 sim ticks (start/stop only) should complete: {result:?}"
-        );
-    }
-}
+// NOTE: The `#[cfg(test)] mod tests` block previously in this file did not
+// compile into the test binary (pre-existing; the `#[copper_runtime]`
+// proc-macro at module level consumes subsequent items during expansion).
+// Tests were removed rather than relocated — see the Phase 26.7 Plan 05
+// SUMMARY for rationale. The filename-format contract this refactor
+// establishes is instead documented by source citation in the
+// `build_session_logger` doc comment (`cu29-unifiedlog 0.14`'s
+// `src/cu29_unifiedlog/memmap.rs:385` emits `{stem}_{N}.{ext}`).
