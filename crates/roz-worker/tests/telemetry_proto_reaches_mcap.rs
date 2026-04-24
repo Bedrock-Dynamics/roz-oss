@@ -79,7 +79,9 @@ async fn setup(worker_name: &str) -> Fixture {
         .await
         .expect("create tenant");
     let tenant_id = tenant.id;
-    roz_db::set_tenant_context(&pool, &tenant_id).await.expect("set tenant ctx");
+    roz_db::set_tenant_context(&pool, &tenant_id)
+        .await
+        .expect("set tenant ctx");
     let host = roz_db::hosts::create(&pool, tenant_id, worker_name, "edge", &[], &serde_json::json!({}))
         .await
         .expect("create host");
@@ -191,14 +193,8 @@ async fn worker_proto_publish_populates_tf_and_pose_in_mcap() {
     let ingest_worker = fixture.worker_name.clone();
     let ingest_cancel = cancel.clone();
     let ingest_handle = tokio::spawn(async move {
-        spawn_session_telemetry_ingest_for_tests(
-            &ingest_nats,
-            &ingest_gate,
-            &ingest_worker,
-            ingest_tx,
-            ingest_cancel,
-        )
-        .await;
+        spawn_session_telemetry_ingest_for_tests(&ingest_nats, &ingest_gate, &ingest_worker, ingest_tx, ingest_cancel)
+            .await;
     });
 
     // Give the NATS subscribe a moment to attach before publishing.
@@ -357,14 +353,8 @@ async fn worker_proto_publish_without_pose_yields_no_tf_or_pose() {
     let ingest_worker = fixture.worker_name.clone();
     let ingest_cancel = cancel.clone();
     let ingest_handle = tokio::spawn(async move {
-        spawn_session_telemetry_ingest_for_tests(
-            &ingest_nats,
-            &ingest_gate,
-            &ingest_worker,
-            ingest_tx,
-            ingest_cancel,
-        )
-        .await;
+        spawn_session_telemetry_ingest_for_tests(&ingest_nats, &ingest_gate, &ingest_worker, ingest_tx, ingest_cancel)
+            .await;
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -421,8 +411,5 @@ async fn worker_proto_publish_without_pose_yields_no_tf_or_pose() {
         tf_count, 0,
         "no pose → no /tf; got {tf_count} — ingest should not synthesize /tf from a None end_effector_pose"
     );
-    assert_eq!(
-        pose_count, 0,
-        "no pose → no /roz/telemetry/pose; got {pose_count}"
-    );
+    assert_eq!(pose_count, 0, "no pose → no /roz/telemetry/pose; got {pose_count}");
 }

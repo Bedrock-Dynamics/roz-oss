@@ -38,8 +38,8 @@ use crate::grpc::roz_v1::{
     ExportSessionChunk, ExportSessionRequest, ReindexAllRequest, ReindexProgress, ReindexSessionRequest,
     ReindexSessionResponse,
 };
-use crate::observability::export::{filter_by_time_range, stream_file_raw, EXPORT_CHUNK_BYTES};
-use crate::observability::metadata_index::{index_session, MetadataIndexError};
+use crate::observability::export::{EXPORT_CHUNK_BYTES, filter_by_time_range, stream_file_raw};
+use crate::observability::metadata_index::{MetadataIndexError, index_session};
 
 /// gRPC implementation of `ObservabilityService`.
 ///
@@ -311,8 +311,7 @@ impl ObservabilityService for ObservabilityServiceImpl {
                     // archive_status / rollover_index.
                     let (raw_tx, mut raw_rx) = mpsc::channel(8);
                     let path_clone = path.clone();
-                    let raw_handle =
-                        tokio::spawn(async move { stream_file_raw(&path_clone, &raw_tx).await });
+                    let raw_handle = tokio::spawn(async move { stream_file_raw(&path_clone, &raw_tx).await });
                     while let Some(item) = raw_rx.recv().await {
                         match item {
                             Ok(bytes_chunk) => {

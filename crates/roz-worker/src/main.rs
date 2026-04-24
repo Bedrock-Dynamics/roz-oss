@@ -1764,9 +1764,7 @@ async fn main() -> Result<()> {
                     )
                     .await
                 }
-                (None, _) => {
-                    roz_worker::telemetry::publish_state_proto(&telem_nats, &telem_worker_id, &payload).await
-                }
+                (None, _) => roz_worker::telemetry::publish_state_proto(&telem_nats, &telem_worker_id, &payload).await,
             };
             if let Err(e) = publish_result {
                 tracing::trace!(error = %e, "telemetry publish failed");

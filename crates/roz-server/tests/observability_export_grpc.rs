@@ -32,9 +32,9 @@ use std::time::Duration;
 use roz_core::auth::{AuthIdentity, Role, TenantId};
 use roz_db::{create_pool, mcap_archives, run_migrations, set_tenant_context};
 use roz_server::grpc::observability::ObservabilityServiceImpl;
+use roz_server::grpc::roz_v1::ExportSessionRequest;
 use roz_server::grpc::roz_v1::observability_service_client::ObservabilityServiceClient;
 use roz_server::grpc::roz_v1::observability_service_server::ObservabilityServiceServer;
-use roz_server::grpc::roz_v1::ExportSessionRequest;
 use sqlx::PgPool;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -119,13 +119,14 @@ async fn setup_harness_for(tenant_id: Uuid) -> Harness {
         role: Role::Admin,
     };
     let inject_state = InjectState { identity };
-    let router = tonic::service::Routes::new(server)
-        .prepare()
-        .into_axum_router()
-        .layer(axum::middleware::from_fn_with_state(
-            inject_state,
-            inject_extensions_middleware,
-        ));
+    let router =
+        tonic::service::Routes::new(server)
+            .prepare()
+            .into_axum_router()
+            .layer(axum::middleware::from_fn_with_state(
+                inject_state,
+                inject_extensions_middleware,
+            ));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind grpc");
     let addr = listener.local_addr().expect("addr");
@@ -244,13 +245,14 @@ async fn cross_tenant_request_returns_not_found_without_existence_leak() {
         role: Role::Admin,
     };
     let inject_state = InjectState { identity };
-    let router = tonic::service::Routes::new(server)
-        .prepare()
-        .into_axum_router()
-        .layer(axum::middleware::from_fn_with_state(
-            inject_state,
-            inject_extensions_middleware,
-        ));
+    let router =
+        tonic::service::Routes::new(server)
+            .prepare()
+            .into_axum_router()
+            .layer(axum::middleware::from_fn_with_state(
+                inject_state,
+                inject_extensions_middleware,
+            ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind grpc");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
@@ -337,22 +339,8 @@ async fn export_streams_rollovers_in_order_with_archive_status_on_first_chunk() 
     std::fs::write(&path_0, &bytes_0).expect("write 0");
     std::fs::write(&path_1, &bytes_1).expect("write 1");
 
-    let _ = insert_archive(
-        &h.pool,
-        h.tenant_id,
-        session_id,
-        path_0.to_str().unwrap(),
-        0,
-    )
-    .await;
-    let _ = insert_archive(
-        &h.pool,
-        h.tenant_id,
-        session_id,
-        path_1.to_str().unwrap(),
-        1,
-    )
-    .await;
+    let _ = insert_archive(&h.pool, h.tenant_id, session_id, path_0.to_str().unwrap(), 0).await;
+    let _ = insert_archive(&h.pool, h.tenant_id, session_id, path_1.to_str().unwrap(), 1).await;
 
     let mut client = h.client().await;
     let mut stream = client
@@ -436,14 +424,7 @@ async fn path_outside_mcap_root_returns_internal() {
     write_empty_mcap(&outside_path);
     let canonical_outside = std::fs::canonicalize(&outside_path).expect("canonicalize outside");
 
-    let _ = insert_archive(
-        &h.pool,
-        h.tenant_id,
-        session_id,
-        canonical_outside.to_str().unwrap(),
-        0,
-    )
-    .await;
+    let _ = insert_archive(&h.pool, h.tenant_id, session_id, canonical_outside.to_str().unwrap(), 0).await;
 
     let mut client = h.client().await;
     let resp = client

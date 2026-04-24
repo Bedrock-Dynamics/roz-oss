@@ -513,10 +513,7 @@ mod tests {
         let header = ctx.sign_outbound_worker(correlation, &payload).unwrap();
         let env = SignatureEnvelope::decode_header(&header).unwrap();
         assert_eq!(env.fields.correlation_id, correlation);
-        assert_eq!(
-            env.fields.payload_hash,
-            roz_core::signing::payload_sha256_hex(&payload)
-        );
+        assert_eq!(env.fields.payload_hash, roz_core::signing::payload_sha256_hex(&payload));
         assert_eq!(
             Subjects::telemetry_state(worker_id).unwrap(),
             format!("telemetry.{worker_id}.state")

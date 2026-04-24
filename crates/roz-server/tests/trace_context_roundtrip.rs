@@ -279,8 +279,7 @@ async fn trace_context_roundtrip_stamps_pinned_trace_id_on_every_event() {
             ToolCategory::Pure,
         );
 
-        let event_hook: Arc<dyn AgentEventHook> =
-            Arc::new(SessionRuntimeEventHook::new(runtime.event_emitter()));
+        let event_hook: Arc<dyn AgentEventHook> = Arc::new(SessionRuntimeEventHook::new(runtime.event_emitter()));
         let agent_loop = roz_agent::agent_loop::AgentLoop::new(
             mock_provider_v1(),
             dispatcher,
@@ -364,8 +363,7 @@ async fn trace_context_roundtrip_stamps_pinned_trace_id_on_every_event() {
         for msg in MessageStream::new(&data).expect("valid mcap") {
             let msg = msg.expect("valid message");
             if msg.channel.topic.as_str() == "/roz/session/events" {
-                let env = roz_v1::SessionEventEnvelope::decode(msg.data.as_ref())
-                    .expect("decode SessionEventEnvelope");
+                let env = roz_v1::SessionEventEnvelope::decode(msg.data.as_ref()).expect("decode SessionEventEnvelope");
                 session_envelopes.push(env);
             }
         }

@@ -2,12 +2,12 @@
 gsd_state_version: 1.0
 milestone: v2.2
 milestone_name: Runtime Event Contracts and Completeness
-status: milestone_complete
-last_updated: "2026-04-22T13:33:27.864Z"
-last_activity: 2026-04-22
+status: executing
+last_updated: "2026-04-24T02:10:03.906Z"
+last_activity: 2026-04-23 -- Phase 26.5 execution started
 progress:
   total_phases: 1
-  completed_phases: 1
+  completed_phases: 0
   total_plans: 0
   completed_plans: 3
 ---
@@ -16,17 +16,17 @@ progress:
 
 ## Current Position
 
-Phase: 26.2
-Plan: Not started
-Status: Milestone complete
-Last activity: 2026-04-22
+Phase: 26.5 (MCAP multimedia channels — camera frames, point clouds, scene updates) — EXECUTING
+Plan: 1 of 8
+Status: Executing Phase 26.5
+Last activity: 2026-04-23 -- Phase 26.5 execution started
 
 ## Project Reference
 
 See: `.planning/PROJECT.md` (updated 2026-04-16)
 
 **Core value:** A reliable, secure, and well-tested platform that operators trust for physical robot deployments.
-**Current focus:** Phase 26.2 — agent-layer-mcap-emit-audit-and-wiring-openclaw-for-robotics
+**Current focus:** Phase 26.5 — MCAP multimedia channels — camera frames, point clouds, scene updates
 
 ## Accumulated Context
 
@@ -94,7 +94,7 @@ See: `.planning/PROJECT.md` (updated 2026-04-16)
 - ✅ v1.1 Embodiment Streaming, CLI, and Extensions (2026-04-10)
 - ✅ v1.0 Roz Embodiment Protos (2026-04-08)
 
-**Planned Phase:** 26.2 (Agent-layer MCAP emit audit and wiring (openclaw-for-robotics observability substrate)) — 6 plans — 2026-04-22T11:13:41.819Z
+**Planned Phase:** 26.7 (session-artifact-service-generic-sidecar-archival-copper-log) — 9 plans — 2026-04-24T02:10:03.900Z
 
 **Completed Phase:** 26.1 plan 01 (schema_registry dedup) — commits `8df8cfb` (fix) + `2a7ee15` (test) — Phase 26 SC4 structurally unblocked — 2026-04-22T02:03:22Z
 

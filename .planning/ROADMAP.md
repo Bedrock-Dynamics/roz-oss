@@ -224,23 +224,33 @@ Plans:
 **Goal:** Thread W3C trace context from `logfire`/OpenTelemetry spans into `SessionEventEnvelope` (+ `ToolCallEvent`, `TaskLifecycleEvent`) proto, propagate across NATS envelopes via `traceparent`/`tracestate` headers, and wrap LLM API calls in spans using OTel GenAI semantic conventions. Result: scrubbing an MCAP to any agent turn exposes a `trace_id` that substrate can use to jump into the corresponding logfire trace, and spans connect cleanly across cloud ↔ edge worker boundaries.
 **Requirements:** none (observability plumbing)
 **Depends on:** Phase 26.2
-**Plans:** TBD
+**Plans:** 9/9 plans complete
 
 Success Criteria (what must be TRUE):
   1. `SessionEventEnvelope` proto (agent.proto) has `bytes trace_id = 100;` (16 bytes, W3C) and `bytes span_id = 101;` (8 bytes) fields; `ToolCallEvent` and `TaskLifecycleEvent` (observability.proto) have the same two fields; existing field numbers are preserved (no renumbering).
   2. `crates/roz-core/src/session/event.rs::EventEnvelope` carries `trace_id: Option<[u8; 16]>` and `span_id: Option<[u8; 8]>`; populated in `emit_session_event` from `tracing::Span::current()` via `tracing_opentelemetry::OpenTelemetrySpanExt::context()`; `None` when no active span.
   3. Every NATS publish (in `crates/roz-nats/`) injects `traceparent` + `tracestate` headers; every subscribe extracts them and sets the parent span via `tracing::Span::set_parent`.
   4. Every LLM API call in `crates/roz-agent/src/model/{anthropic,openai}.rs` is wrapped in a span named `gen_ai.{provider}.chat` with attributes `gen_ai.system`, `gen_ai.request.model`, `gen_ai.response.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.response.finish_reasons` per OTel 1.27+ GenAI semantic conventions.
-  5. New integration test `crates/roz-server/tests/trace_context_roundtrip.rs` spans a turn with a known root `trace_id`, runs it end-to-end, decodes the MCAP, and asserts every `/roz/session/events` and `/roz/tool/calls` message in that turn carries identical `trace_id` bytes.
+  5. New integration test `crates/roz-server/tests/trace_context_roundtrip.rs` spans a turn with a known root `trace_id`, runs it end-to-end, finalizes the MCAP, and asserts every `/roz/session/events` message in that turn carries the same `trace_id` byte-for-byte. (Phase 26.3 scope-narrowing — see Plan 04: no production `ToolCallEvent` construction sites exist today; user-visible tool-call events flow through `SessionEvent` variants which are already covered. `/roz/tool/calls` coverage is deferred to a future phase that wires the proto-wrapper emit path.)
   6. logfire (or any OTLP-compatible backend) receives cross-process spans stitched by the propagated `traceparent` (verified by running a 2-process test and observing the trace tree).
-**Plans**: TBD
 
-### Phase 26.4: Session metadata index — turn-level + tool-call-level fleet query plane
+Plans:
+- [x] 26.3-01-PLAN.md — Wave 1: OTel workspace dep promotion (D-01/D-02/D-03) + `crates/roz-nats/src/trace.rs` helpers (`inject_trace_headers` + `extract_and_link_parent`) per D-04
+- [x] 26.3-02-PLAN.md — Wave 1: SC1 proto additions — `bytes trace_id = 100` + `bytes span_id = 101` on `SessionEventEnvelope` (agent.proto), `ToolCallEvent`, `TaskLifecycleEvent` (observability.proto) + compile-keeper placeholders at 8 existing struct-literal sites
+- [x] 26.3-03-PLAN.md — Wave 2 (depends 01+02): SC2 part 1 — `EventEnvelope` + `CanonicalSessionEventEnvelope` Option<[u8;N]> fields (D-10/D-11) + `stamp_trace_context` one-touch funnel in `emit_session_event` (D-12) + `event_mapper` bytes copy (D-15)
+- [x] 26.3-04-PLAN.md — Wave 3 (depends 03): SC2 part 2 — `TaskLifecycleEvent` populate in `sink_to_emit` (D-14) + shared `trace_bytes_from_current_span` helper + reserved access for future `ToolCallEvent` sites (D-13)
+- [x] 26.3-05-PLAN.md — Wave 2 (depends 01): SC3 NATS propagation — internal `inject_trace_headers` in `publish_signed` + `publish_team_event` (D-05) + 3 worker subscribe extract-and-link sites at main.rs:1423/1496/1821 (D-06) + header-wins migration at :2558 (D-07/D-08/D-09)
+- [x] 26.3-06-PLAN.md — Wave 2 (depends 01): SC4 GenAI spans — `#[tracing::instrument(name = gen_ai.{provider}.chat)]` on complete+stream across anthropic/openai/gemini/fallback/mock_provider (D-16..D-20); skip(self,req) + OTel 1.27 field set + prompt/completion/api_key exclusion
+- [x] 26.3-07-PLAN.md — Wave 4 (depends 02/03/04/06): SC5 integration test `crates/roz-server/tests/trace_context_roundtrip.rs` — pin `trace_id = [0xFF;16]` via `make_pinned_span_context` helper; drive one mock_provider_v1 turn; assert every /roz/session/events message carries pinned bytes (D-21/D-23); also fixed a production ingest_cloud detached-span bug caught by the byte-for-byte assertion
+- [x] 26.3-08-PLAN.md — Wave 5 (depends 01/05/07): SC6 cross-process test `crates/roz-server/tests/cross_process_trace_stitch.rs` — testcontainer `otel/opentelemetry-collector-contrib:0.120.0` + fixture `otelcol-config.yaml` + `otel_collector_container` helper; in-process rig (audit chose over subprocess); assert shared trace_id + worker.parent_span_id == server.span_id (D-22/D-23)
+- [x] 26.3-09-PLAN.md — Wave 6 (gap closure, depends: none — all predecessors merged): SC3 completion — wired `extract_and_link_parent` into 18 remaining in-scope production consumer loops across roz-worker/{estop,session_relay,clear_failsafe} and roz-server/{nats_handlers,observability/ingest_cloud,observability/ingest_edge,grpc/agent,grpc/embodiment,grpc/tasks}; closed VERIFICATION.md SC3 `FAIL (partial)` gap — re-verified 6/6
+
+### Phase 26.4: Session metadata index — turn-level + tool-call-level fleet query plane ✓
 
 **Goal:** Build the fleet-queryable plane that complements session MCAP archives. One Postgres row per session summarizes turn/tool/approval/intervention counts, distinct model_ids and policy_ids, first_trace_id, and outcome; one row per tool call gives drill-down detail with a pointer back into the MCAP byte range. Populated at session finalize by reading the MCAP once; re-indexable via CLI for backfill. Enables substrate fleet views (e.g. "all sessions where tool X fired > 10 times and intervention_count > 0 in the last 7 days") without scanning MCAPs.
 **Requirements:** none (observability plumbing)
 **Depends on:** Phase 26.3
-**Plans:** TBD
+**Plans:** 10/10 plans complete
 
 Success Criteria (what must be TRUE):
   1. Migration `migrations/026_session_metadata.sql` creates `roz_session_metadata` (one row per session; columns: session_id, tenant_id, started_at, ended_at, duration_ms, turn_count, tool_call_count, approval_count, intervention_count, violation_count, model_ids[], policy_ids[], controller_artifact_ids[], first_trace_id bytea, outcome, error_summary, indexed_at) and `roz_session_tool_calls` (one row per tool call; columns: call_id, session_id, tenant_id, tool_name, category, requested_at, finished_at, latency_ms, had_approval, outcome, trace_id bytea, mcap_offset bigint); both tables have GIN indexes on array columns and btree indexes on (tenant_id, started_at DESC / requested_at DESC).
@@ -250,14 +260,25 @@ Success Criteria (what must be TRUE):
   5. New CLI subcommand `roz session reindex <session_id|--all>` reads existing archives and repopulates metadata — idempotent (running twice produces no row-count change).
   6. After an SC5 fixture run, `roz_session_metadata` row exists with `turn_count ≥ 1`, `tool_call_count = 60`, `approval_count = 10`, `intervention_count = 0`; `roz_session_tool_calls` has 60 rows each with `latency_ms IS NOT NULL`.
   7. Fleet query `SELECT session_id FROM roz_session_metadata WHERE tool_call_count > 50 AND intervention_count > 0` returns the correct set over a multi-session dataset.
-**Plans**: TBD
 
-### Phase 26.5: MCAP multimedia channels — camera frames, point clouds, scene updates
+Plans:
+- [x] 26.4-01-PLAN.md — Wave 1: SC1 migration 20260423038_session_metadata.sql (both tables + RLS + GIN/btree indexes + CHECK outcomes + rollover_index D-04)
+- [x] 26.4-02-PLAN.md — Wave 1: SC2 crates/roz-db/src/session_metadata.rs — SessionMetadataRow + ToolCallRow structs + upsert_metadata + upsert_tool_calls_batch (UNNEST) + fetch_metadata; 5 testcontainer tests prove idempotency (D-32)
+- [x] 26.4-03-PLAN.md — Wave 1: AuthIdentity::is_admin() helper in roz-core/src/auth.rs + list_all_tenants() helper in roz-db/src/tenant.rs (both required by Plan 07 ReindexAll handler)
+- [x] 26.4-04-PLAN.md — Wave 2: SC3 crates/roz-server/src/observability/metadata_index.rs — index_session + MetadataIndexError + IndexSummary + chunk-offset binary search (BLOCKER 1 Option A) + HashMap<call_id, PartialToolCall> state machine + turn-window ToolUnavailable pairing + outcome derivation + single-transaction upsert
+- [x] 26.4-05-PLAN.md — Wave 3 (depends 04): SC4 WriterActor::finalize_file D-07 detached tokio::spawn of index_session; gated by !matches!(reason, FinalizeReason::Rollover); failure warn! only
+- [x] 26.4-06-PLAN.md — Wave 3: D-14 proto/roz/v1/observability.proto — ReindexSession (unary) + ReindexAll (server-stream) RPCs + ReindexProgress with optional tool_calls_indexed field
+- [x] 26.4-07-PLAN.md — Wave 4 (depends 03,04,06): D-15 ObservabilityServiceImpl reindex_session (RLS-scoped) + reindex_all (admin-gated, per-tenant iteration, ReceiverStream)
+- [x] 26.4-08-PLAN.md — Wave 4 (depends 06,07): SC5 roz-cli Reindex variant + reindex_one/reindex_all dispatch over existing session_channel
+- [x] 26.4-09-PLAN.md — Wave 5 (depends 01,02,04,05): SC6 BLOCKER 2 resolution — replace export_roundtrip.rs:219-234 log_line stubs with 60 real SessionEvent::ToolCall{Requested,Started,Finished} triplets; tool_name LIKE 'mock_tool_%' predicate assertions for exact 60-row equality
+- [x] 26.4-10-PLAN.md — Wave 5 (depends 01,02,04,05): SC7 new session_metadata_fleet_query.rs — 5 sessions with varying (tool_calls, interventions) tuples; canonical fleet query asserts {A,B,C} match and {D,E} do not; D-32 idempotency re-index sub-assertion
+
+### Phase 26.5: MCAP multimedia channels — camera frames, point clouds, scene updates ✓
 
 **Goal:** Extend the session MCAP channel set with Foxglove's published multimedia schemas (`CompressedImage`, `RawImage`, `PointCloud`, `SceneUpdate`, `ImageAnnotations`) so substrate can render visual overlays (camera feeds, LiDAR, bounding boxes, agent reasoning visualizations) beyond transform lines. Tap roz-worker's existing camera pipeline to write H.264 keyframes to the MCAP alongside the WebRTC live stream. Point cloud and annotation channels are plumbed and schema-registered now so substrate can consume them the day downstream sensor fusion ships (Phase 29+).
 **Requirements:** none (extends OBS-01/02)
 **Depends on:** Phase 26.1 (dedup fix — the descriptor set expands additively here and must stay dedup-safe)
-**Plans:** TBD
+**Plans:** 10/10 plans complete
 
 Success Criteria (what must be TRUE):
   1. Foxglove proto schemas vendored under `proto/foxglove/`: `CompressedImage.proto`, `RawImage.proto`, `PointCloud.proto`, `SceneUpdate.proto`, `ImageAnnotations.proto` (alongside the existing `FrameTransform.proto` / `PoseInFrame.proto` / `Log.proto`).
@@ -267,7 +288,15 @@ Success Criteria (what must be TRUE):
   5. New `crates/roz-worker/src/camera/writer_bridge.rs` taps the existing camera manager keyframe path, forwards compressed bytes + timestamp to the MCAP `WriterActor` via the session-relay channel as `WriteCommand::Event { channel: ChannelKey::Camera, ... }`.
   6. New `[observability.camera]` config section in `roz-worker.toml` with `record = "keyframes" | "full" | "off"` (default `"keyframes"`); keyframe interval configurable.
   7. Integration test runs a SITL-camera fixture, produces an MCAP containing a `/roz/camera/{name}` channel with `CompressedImage` messages; opens cleanly via `mcap::MessageStream` and decodes as Foxglove `CompressedImage`.
-**Plans**: TBD
+**Plans**:
+- [x] 26.5-01-PLAN.md — Wave 1: Foundation (vendor 24 Foxglove protos + build.rs extension + SCHEMA_*/CHANNEL_* constants + foxglove_types prost module). R-01 honored — CompressedVideo targeted for H.264.
+- [x] 26.5-02-PLAN.md — Wave 2 (depends 01): SchemaDescriptors targets list extension to 12 schemas + 26.1 dedup regression test extended + D-26 `all_schemas_load_without_error` safeguard.
+- [x] 26.5-03-PLAN.md — Wave 2 (depends 01): `register_all_channels` adds 6 new schemas + 3 future-producer channels (pointcloud/scene_update/annotations) + ChannelIds gains 3 `#[expect(dead_code)]` fields + `register_camera_video_schema` helper for Plan 04.
+- [x] 26.5-04-PLAN.md — Wave 3 (depends 02,03): WriterActor gains ChannelKey::Camera(CameraId) variant + WriteCommand::RegisterCamera + `camera_channels: HashMap<CameraId,u16>` + dynamic register_camera_channel method + rollover re-registers cameras + warn-and-drop on unknown id (D-13). R-02 architecture — no session-start camera list arg.
+- [x] 26.5-05-PLAN.md — Wave 4 (depends 04): New `crates/roz-worker/src/camera/mcap_relay.rs` — per-camera NATS relay with hand-vendored CompressedVideo prost struct, record-mode filter, 1MB size guard, `publish_signed` via FS-04 + 26.3 trace injection; new `Subjects::camera_session` + `camera_session_wildcard` helpers; RecordMode enum scaffolded in `observability_config.rs`.
+- [x] 26.5-06-PLAN.md — Wave 4 (depends 04): `ingest_edge.rs` gains 4th task — subscribe to `camera.{worker}.{session}.*`, verify signature, parse camera_id from subject, first-sighting RegisterCamera + forward raw CompressedVideo bytes as WriteCommand::Event.
+- [x] 26.5-07-PLAN.md — Wave 5 (depends 05,06): ObservabilityConfig + ObservabilityCameraConfig in `observability_config.rs`; WorkerConfig gains `pub observability` field; `handle_edge_session` spawns mcap_relay with session-scoped CancellationToken + 2s drain on exit; CameraManager gains `hub_arc()`.
+- [x] 26.5-08-PLAN.md — Wave 5 (depends 04,06): SC7 integration test `crates/roz-server/tests/mcap_camera_roundtrip.rs` — synthetic CompressedVideo frames through WriterActor, re-decode via prost, assert schema name `foxglove.CompressedVideo` (R-01) + topic `/roz/camera/test_cam` + `format="h264"` + D-13 unknown-camera drop verification. Gated `required-features=["test-helpers"]`.
 
 ### Phase 26.6: LeRobotDataset v3 exporter (optional, on ML-user demand)
 
@@ -289,7 +318,7 @@ Success Criteria (what must be TRUE):
 **Goal:** Introduce a generic `roz_session_artifacts` table and gRPC `ArtifactService` so any per-session sidecar file (copper `.copper` log, ULOG `.ulg`, future video bundles) can be streamed from worker to server, stored, and retrieved. First artifact type wired is copper's unified log — dev-loop replay for controller-tick debugging — with no decoding or projection into MCAP.
 **Requirements:** none (artifact plumbing)
 **Depends on:** Phase 26 (session archive lifecycle)
-**Plans:** TBD
+**Plans:** 0/9 plans (planned 2026-04-23)
 
 Success Criteria (what must be TRUE):
   1. Migration `migrations/027_session_artifacts.sql` creates `roz_session_artifacts` (artifact_id UUID, session_id UUID FK, tenant_id UUID, artifact_type ∈ {'mcap','copper','ulog','video','bundle'}, path TEXT, digest_sha256 BYTEA, size_bytes BIGINT, content_type TEXT, uploaded_at TIMESTAMPTZ; UNIQUE(session_id, artifact_type, path)).
@@ -298,14 +327,23 @@ Success Criteria (what must be TRUE):
   4. `crates/roz-worker/src/copper_archive.rs` finalize hook: on `SessionCompleted`, compute sha256, stream-upload to server via `ArtifactService.UploadArtifact`, record the artifact row.
   5. `roz session export <id> --bundle` streams a tarball containing the session MCAP plus all sibling `roz_session_artifacts` rows for that session; contents verify via digest.
   6. Integration test: simulated session end produces a `roz_session_artifacts` row with `artifact_type='copper'`; downloading via `ArtifactService.DownloadArtifact` returns bytes matching the worker-local digest.
-**Plans**: TBD
+Plans:
+- [ ] 26.7-01-PLAN.md — migration 20260423039_session_artifacts.sql + roz_db::session_artifacts CRUD + ROADMAP SC1 amendment
+- [ ] 26.7-02-PLAN.md — observability.proto ArtifactService extension + roz-worker build.rs build_client(true)
+- [ ] 26.7-03-PLAN.md — server ArtifactServiceImpl + ROZ_ARTIFACT_DIR boot canonicalisation + AppState wiring + service registration
+- [ ] 26.7-04-PLAN.md — worker ObservabilityCopperConfig (preallocated_mb=256, keep_local_after_upload=false) + figment nested env-var test
+- [ ] 26.7-05-PLAN.md — crates/roz-copper/src/app.rs build_temp_logger → build_session_logger refactor + cu29 filename-format empirical test
+- [ ] 26.7-06-PLAN.md — crates/roz-worker/src/copper_archive.rs finalize_copper_archive + session_relay.rs hook (drop-ordering invariant enforced)
+- [ ] 26.7-07-PLAN.md — roz session export --bundle CLI flag + manifest.json + parallel ExportSession / ListSessionArtifacts / DownloadArtifact path
+- [ ] 26.7-08-PLAN.md — crates/roz-server/src/observability/retention.rs second pass over roz_session_artifacts (reuse ROZ_MCAP_TTL_SECS / ROZ_MCAP_MAX_BYTES)
+- [ ] 26.7-09-PLAN.md — crates/roz-server/tests/artifact_copper_roundtrip.rs (template: observability_export_grpc.rs — SC6 + D-34 tampered digest)
 
 ### Phase 26.8: ULOG auto-download via MAVLink on session finalize
 
 **Goal:** After any session backed by a MAVLink FC (PX4 or ArduPilot), automatically pull the newest onboard `.ulg` log via `LOG_REQUEST_LIST` / `LOG_REQUEST_DATA`, store as a session artifact (reusing the 26.7 `ArtifactService`), so substrate and PX4 Flight Review can both ingest it. Opt-out per worker config; soft-fail on FC unreachable (never blocks session completion).
 **Requirements:** none (FC forensics archival)
 **Depends on:** Phase 26.7 (artifact service), Phase 25 (MAVLink backbone — shipped), Phase 27 (SITL infra — for integration-test fixtures)
-**Plans:** TBD
+**Plans:** 8/8 plans complete
 
 Success Criteria (what must be TRUE):
   1. New `crates/roz-mavlink/src/log_download.rs` implements the MAVLink log protocol state machine: `LOG_REQUEST_LIST` → collect `LOG_ENTRY` responses → select newest by `time_utc` → chunked `LOG_REQUEST_DATA` → reassemble `LOG_DATA` → `LOG_REQUEST_END` to release FC resources.
@@ -322,7 +360,7 @@ Success Criteria (what must be TRUE):
 **Goal:** Produce Rerun `.rrd` recording files from session MCAPs for substrate ingestion. Pure format export — writes to disk via `rerun::RecordingStreamBuilder::new(...).save(<path>)`, never spawns or connects to a viewer. Substrate opens the `.rrd` with its embedded Rerun rendering.
 **Requirements:** none (format export)
 **Depends on:** Phase 26.1 (MCAP reads cleanly); benefits from 26.5 multimedia channels if substrate wants camera overlays in RRD
-**Plans:** TBD
+**Plans:** 8/8 plans complete
 
 Success Criteria (what must be TRUE):
   1. New CLI subcommand `roz mcap to-rrd <session.mcap> --output <path.rrd>` produces a valid Rerun recording file; also supports `--bulk "*.mcap" --output-dir <dir>`.
@@ -387,7 +425,7 @@ v3.0 Production Robotics milestone is in the planning stage. Phase 22 is planned
 | 26. Unified MCAP observability | v3.0 | 12/12 | Complete | 2026-04-21 |
 | 26.1. MCAP schema descriptor dedup (Foxglove) | v3.0 | 1/1 | Complete (human UAT deferred) | 2026-04-21 |
 | 26.2. Agent-layer MCAP emit audit + wire | v3.0 | 6/6 | Complete    | 2026-04-22 |
-| 26.3. W3C trace context propagation | v3.0 | 0/0 | Not started | — |
+| 26.3. W3C trace context propagation | v3.0 | 9/9 | Complete — 6/6 must-haves verified | — |
 | 26.4. Session metadata index (fleet query plane) | v3.0 | 0/0 | Not started | — |
 | 26.5. MCAP multimedia channels | v3.0 | 0/0 | Not started | — |
 | 26.6. LeRobotDataset v3 exporter (deferred) | v3.0 | 0/0 | Deferred until user demand | — |

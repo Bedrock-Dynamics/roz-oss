@@ -14,8 +14,8 @@ use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::Path;
 
-use mcap::records::MessageHeader;
 use mcap::Writer;
+use mcap::records::MessageHeader;
 use tokio::io::AsyncReadExt as _;
 use tokio::sync::mpsc;
 

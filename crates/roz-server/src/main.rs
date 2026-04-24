@@ -210,9 +210,9 @@ fn grpc_router(state: &AppState) -> Router {
     .add_service(skills_svc.into_server())
     .add_service(mcp_svc.into_server())
     // Phase 26 OBS-03: ObservabilityService (ExportSession streaming).
-    .add_service(roz_server::grpc::roz_v1::observability_service_server::ObservabilityServiceServer::new(
-        observability_svc,
-    ))
+    .add_service(
+        roz_server::grpc::roz_v1::observability_service_server::ObservabilityServiceServer::new(observability_svc),
+    )
     .add_service(
         tonic_reflection::server::Builder::configure()
             .register_encoded_file_descriptor_set(roz_server::grpc::roz_v1::FILE_DESCRIPTOR_SET)
