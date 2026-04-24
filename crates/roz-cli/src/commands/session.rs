@@ -52,6 +52,16 @@ pub enum SessionCommands {
         /// Output file path. When omitted, bytes are written to stdout.
         #[arg(long, short)]
         output: Option<PathBuf>,
+        /// Phase 26.7 SC5 — produce a self-verifying tarball with MCAP + artifacts.
+        ///
+        /// When set, the command fetches the session's MCAP via `ExportSession`
+        /// plus every sidecar artifact registered in `roz_session_artifacts`
+        /// (copper logs today; ULOG/video/bundle reserved), and emits an
+        /// uncompressed `.tar` whose first entry is `manifest.json` with a
+        /// per-file `digest_sha256`. `--bundle` is mutually exclusive with
+        /// `--time-range` (bundle is all-or-nothing).
+        #[arg(long, conflicts_with = "time_range")]
+        bundle: bool,
     },
     /// Reindex session metadata + tool-call rows from the session's MCAP
     /// archive(s). Idempotent — running twice produces the same rows.
@@ -83,12 +93,19 @@ pub async fn execute(cmd: &SessionCommands, config: &CliConfig) -> anyhow::Resul
             format,
             time_range,
             output,
+            bundle,
         } => {
             // `format` is currently a one-variant enum; reserved for future
             // formats. Explicit match so adding a new variant forces the
             // maintainer to revisit dispatch.
             match format {
                 ExportFormat::Mcap => {}
+            }
+            // Phase 26.7 SC5: bundle short-circuit — MCAP + artifacts + manifest
+            // into an uncompressed tar. `--bundle` conflicts with `--time-range`
+            // at clap parse time (see the `Export` variant declaration above).
+            if *bundle {
+                return export_bundle(config, session_id, output.as_deref()).await;
             }
             export(config, session_id, time_range.as_deref(), output.as_deref()).await
         }
@@ -223,6 +240,14 @@ fn build_client(channel: Channel, bearer: Bearer) -> AuthedClient {
             Ok(req)
         });
     ObservabilityServiceClient::with_interceptor(channel, interceptor)
+}
+
+// -------------------------------------------------------------------------
+// Phase 26.7 SC5: bundle export. Full implementation lands in Task 2; this
+// stub exists only so Task 1's clap dispatch compiles.
+// -------------------------------------------------------------------------
+async fn export_bundle(_config: &CliConfig, _session_id: &str, _out: Option<&Path>) -> anyhow::Result<()> {
+    anyhow::bail!("--bundle implementation not yet landed (Phase 26.7 Plan 07 Task 2)")
 }
 
 /// Parse a `<start_ns>:<end_ns>` time range; either side may be empty.
