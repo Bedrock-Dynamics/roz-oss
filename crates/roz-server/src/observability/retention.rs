@@ -95,34 +95,100 @@ pub async fn sweep_once(pool: &PgPool) -> Result<(), McapArchiveError> {
     let ttl = i64::try_from(ttl_secs_from_env()).unwrap_or(i64::MAX);
     let max_bytes = max_bytes_from_env();
 
-    // Pass 1: TTL. list_retention_candidates returns `status <> 'open'`
-    // rows with opened_at < now() - ttl, sorted oldest-first. Unlink
-    // every one before moving on to size-cap.
-    let candidates = roz_db::mcap_archives::list_retention_candidates(pool, ttl).await?;
-    let ttl_count = candidates.len();
-    for row in &candidates {
-        unlink_and_delete(pool, row.id, Path::new(&row.path)).await;
+    // Pass 1a: TTL over roz_session_mcap_archives. Per-table error is
+    // logged and the other table's TTL still runs (D-31 "errors in one
+    // table do not abort the other").
+    let mut mcap_ttl_count: usize = 0;
+    match roz_db::mcap_archives::list_retention_candidates(pool, ttl).await {
+        Ok(rows) => {
+            mcap_ttl_count = rows.len();
+            for row in &rows {
+                unlink_and_delete(pool, row.id, Path::new(&row.path)).await;
+            }
+        }
+        Err(error) => warn!(%error, "retention: mcap TTL query failed"),
     }
 
-    // Pass 2: Size cap. list_finalized_ordered returns ALL non-open rows
-    // newest-first. Walk the list accumulating bytes; once the running
-    // total exceeds max_bytes every subsequent (older) row is dropped
-    // FIFO-style. The newest row is always kept.
-    let ordered = roz_db::mcap_archives::list_finalized_ordered(pool).await?;
+    // Pass 1b: TTL over roz_session_artifacts (Phase 26.7 D-31).
+    let mut artifact_ttl_count: usize = 0;
+    match roz_db::session_artifacts::list_retention_candidates(pool, ttl).await {
+        Ok(rows) => {
+            artifact_ttl_count = rows.len();
+            for row in &rows {
+                unlink_and_delete_artifact(pool, row.artifact_id, Path::new(&row.path)).await;
+            }
+        }
+        Err(error) => warn!(%error, "retention: artifact TTL query failed"),
+    }
+
+    // Pass 2: size-cap across BOTH tables, merged newest-first in Rust
+    // (RESEARCH Q5 option (a)). Walk the merged stream accumulating
+    // bytes; once the running total exceeds max_bytes every subsequent
+    // (older) row is dropped FIFO-style. The newest row is always kept.
+    let mcap_rows = match roz_db::mcap_archives::list_finalized_ordered(pool).await {
+        Ok(v) => v,
+        Err(error) => {
+            warn!(%error, "retention: mcap size-pass query failed; skipping size cap");
+            return Ok(());
+        }
+    };
+    let artifact_rows = match roz_db::session_artifacts::list_finalized_ordered_desc(pool).await {
+        Ok(v) => v,
+        Err(error) => {
+            warn!(%error, "retention: artifact size-pass query failed; skipping size cap");
+            return Ok(());
+        }
+    };
+
+    enum Kind {
+        Mcap(uuid::Uuid),
+        Artifact(uuid::Uuid),
+    }
+    struct Merged {
+        ts: chrono::DateTime<chrono::Utc>,
+        size_bytes: i64,
+        kind: Kind,
+        path: String,
+    }
+    let mut merged: Vec<Merged> = Vec::with_capacity(mcap_rows.len() + artifact_rows.len());
+    for r in mcap_rows {
+        merged.push(Merged {
+            ts: r.opened_at,
+            size_bytes: r.size_bytes,
+            kind: Kind::Mcap(r.id),
+            path: r.path,
+        });
+    }
+    for r in artifact_rows {
+        merged.push(Merged {
+            ts: r.uploaded_at,
+            size_bytes: r.size_bytes,
+            kind: Kind::Artifact(r.artifact_id),
+            path: r.path,
+        });
+    }
+    merged.sort_by(|a, b| b.ts.cmp(&a.ts));
+
     let mut running: u64 = 0;
     let mut size_count: usize = 0;
-    for row in ordered {
+    for row in merged {
         let sz = u64::try_from(row.size_bytes.max(0)).unwrap_or(u64::MAX);
         running = running.saturating_add(sz);
         if running > max_bytes {
-            unlink_and_delete(pool, row.id, Path::new(&row.path)).await;
+            let path = Path::new(&row.path);
+            match row.kind {
+                Kind::Mcap(id) => unlink_and_delete(pool, id, path).await,
+                Kind::Artifact(id) => unlink_and_delete_artifact(pool, id, path).await,
+            }
             size_count = size_count.saturating_add(1);
         }
     }
 
+    let ttl_count = mcap_ttl_count.saturating_add(artifact_ttl_count);
     if ttl_count > 0 || size_count > 0 {
         info!(
-            ttl_dropped = ttl_count,
+            mcap_ttl_dropped = mcap_ttl_count,
+            artifact_ttl_dropped = artifact_ttl_count,
             size_dropped = size_count,
             max_bytes,
             ttl_secs = ttl,
@@ -166,6 +232,33 @@ async fn unlink_and_delete(pool: &PgPool, id: uuid::Uuid, path: &Path) {
             "retention: dropped archive"
         ),
         Err(error) => warn!(%error, %id, "retention: DB delete failed"),
+    }
+}
+
+/// Phase 26.7 Plan 08: mirror of [`unlink_and_delete`] for
+/// `roz_session_artifacts`. File-unlink first, row-delete second; ENOENT
+/// on unlink is tolerated so the DB row still clears and the size-cap
+/// running total stays accurate.
+async fn unlink_and_delete_artifact(pool: &PgPool, artifact_id: uuid::Uuid, path: &Path) {
+    if let Err(error) = tokio::fs::remove_file(path).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            %error,
+            path = %path.display(),
+            %artifact_id,
+            "retention: unlink failed; keeping artifact row for retry"
+        );
+        return;
+    }
+    match roz_db::session_artifacts::delete_by_id(pool, artifact_id).await {
+        Ok(0) => warn!(%artifact_id, "retention: artifact DB delete matched 0 rows"),
+        Ok(_) => info!(
+            %artifact_id,
+            path = %path.display(),
+            "retention: dropped session artifact"
+        ),
+        Err(error) => warn!(%error, %artifact_id, "retention: artifact DB delete failed"),
     }
 }
 
