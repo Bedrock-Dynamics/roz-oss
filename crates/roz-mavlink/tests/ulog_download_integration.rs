@@ -263,11 +263,7 @@ async fn gap_retry_recovers_dropped_frame() {
     drop(in_tx);
     replay.abort();
 
-    assert_eq!(
-        bytes.len(),
-        expected_bytes.len(),
-        "recovered length must match fixture"
-    );
+    assert_eq!(bytes.len(), expected_bytes.len(), "recovered length must match fixture");
     assert_eq!(bytes, expected_bytes, "recovered bytes must match fixture");
 }
 
