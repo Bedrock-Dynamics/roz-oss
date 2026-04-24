@@ -89,7 +89,7 @@ const fn default_keyframe_interval_secs() -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ObservabilityCameraConfig, ObservabilityConfig, RecordMode};
+    use super::{ObservabilityCameraConfig, ObservabilityConfig, ObservabilityCopperConfig, RecordMode};
 
     #[test]
     fn record_mode_serde_lowercase_roundtrip() {
@@ -155,5 +155,41 @@ mod tests {
         let cfg: ObservabilityConfig = toml::from_str(toml_src).expect("parse");
         assert_eq!(cfg.camera.record, RecordMode::Off);
         assert!((cfg.camera.keyframe_interval_secs - 10.0).abs() < f32::EPSILON);
+    }
+
+    // Phase 26.7 SC4 additions below:
+
+    #[test]
+    fn observability_copper_config_defaults() {
+        let cfg = ObservabilityCopperConfig::default();
+        assert_eq!(cfg.preallocated_mb, 256);
+        assert!(!cfg.keep_local_after_upload);
+    }
+
+    #[test]
+    fn observability_config_copper_toml_parses_nested() {
+        let toml_src = r#"
+            [copper]
+            preallocated_mb = 64
+            keep_local_after_upload = true
+        "#;
+        let cfg: ObservabilityConfig = toml::from_str(toml_src).expect("parse");
+        assert_eq!(cfg.copper.preallocated_mb, 64);
+        assert!(cfg.copper.keep_local_after_upload);
+        // Camera subfield should still get its defaults.
+        assert_eq!(cfg.camera.record, RecordMode::Keyframes);
+    }
+
+    #[test]
+    fn observability_config_copper_defaults_when_omitted() {
+        // Document with only [camera] section — copper must default.
+        let toml_src = r#"
+            [camera]
+            record = "off"
+        "#;
+        let cfg: ObservabilityConfig = toml::from_str(toml_src).expect("parse");
+        assert_eq!(cfg.copper.preallocated_mb, 256);
+        assert!(!cfg.copper.keep_local_after_upload);
+        assert_eq!(cfg.camera.record, RecordMode::Off);
     }
 }
