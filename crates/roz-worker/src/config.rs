@@ -85,6 +85,17 @@ pub struct WorkerConfig {
     /// (existing Gazebo-SITL / joint-arm embodiments unaffected).
     #[serde(default)]
     pub mavlink: MavlinkConfig,
+    /// Phase 26.8 D-07 — ulog auto-download controls.
+    ///
+    /// TOML: `[ulog]` section with `enabled`, `download_timeout_secs`,
+    /// `keep_fc_copy`. Env vars: `ROZ_ULOG__*` (figment `__` nesting).
+    /// Absent = defaults (enabled = true, 60s timeout, keep_fc_copy = false).
+    ///
+    /// Placement note: top-level on `WorkerConfig` (NOT nested under
+    /// `observability`) — ulog is a distinct subsystem from MCAP/copper
+    /// observability per D-07.
+    #[serde(default)]
+    pub ulog: crate::ulog_config::UlogConfig,
     /// Trusted signing keys for `.cwasm` modules. Set via `ROZ_WASM_PUBKEYS`.
     ///
     /// Format: `"<key_id>:<base64 Ed25519 pubkey>,..."`. Empty/unset yields
