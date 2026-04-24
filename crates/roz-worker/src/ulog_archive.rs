@@ -180,6 +180,44 @@ pub async fn finalize_ulog_archive(
         }
     };
 
+    // D-06 LOG_ERASE gate (Plan 07).
+    //
+    // STRICT GATING MATRIX:
+    //   * upload failed  + keep_fc_copy=false → NO erase (prevents permanent
+    //     data loss; `artifact_id` is None here because the upload_failed
+    //     branch returned early above; this code is only reachable when
+    //     `artifact_id` is `Some` OR when the server returned a zero-value
+    //     `Ok(None)` — in which case the gate also refuses to erase)
+    //   * upload failed  + keep_fc_copy=true  → NO erase (trivial)
+    //   * upload succeed + keep_fc_copy=true  → NO erase (operator opt-in
+    //     retention; debug-log only)
+    //   * upload succeed + keep_fc_copy=false → ERASE (the single path
+    //     that issues LOG_ERASE)
+    //
+    // MAVLink LOG_ERASE has no ACK per spec (RESEARCH pitfall 6); erase
+    // failure soft-fails with `failure_mode="erase_failed"` but does NOT
+    // tear down the overall finalize success — the upload already succeeded.
+    if artifact_id.is_some() && !config.keep_fc_copy {
+        match backend.send_log_erase().await {
+            Ok(()) => tracing::info!(
+                session_id,
+                log_id,
+                "issued LOG_ERASE after verified upload (D-06; fire-and-forget per MAVLink spec)"
+            ),
+            Err(e) => tracing::warn!(
+                session_id,
+                failure_mode = "erase_failed",
+                attempted_log_id,
+                bytes_received,
+                duration_ms = start.elapsed().as_millis() as u64,
+                error = %e,
+                "LOG_ERASE send failed (soft-fail; FC-side copy retained)"
+            ),
+        }
+    } else if artifact_id.is_some() && config.keep_fc_copy {
+        tracing::debug!(session_id, log_id, "keep_fc_copy=true — skipping LOG_ERASE");
+    }
+
     Ok(artifact_id)
 }
 
