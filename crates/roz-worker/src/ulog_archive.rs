@@ -103,6 +103,12 @@ pub async fn finalize_ulog_archive(
 
     let start = std::time::Instant::now();
 
+    // Plan 07 D-09 structured warn-log fields: carried through every
+    // failure branch so downstream consumers get a consistent shape. Both
+    // default to 0 (pre-download state); updated as the protocol advances.
+    let mut attempted_log_id: u16 = 0;
+    let mut bytes_received: usize = 0;
+
     // Phase 26.8 SC1: drive the MAVLink LOG_* protocol via LogDownloader.
     // The LogDownloader's Drop impl best-effort issues LOG_REQUEST_END on
     // every exit path (success, error, early return, panic) — see
@@ -113,17 +119,27 @@ pub async fn finalize_ulog_archive(
         Ok(v) => v,
         Err(e) => {
             // D-09 structured warn-log; map UlogError variant → failure_mode string.
-            let failure_mode = match e {
+            // Extract bytes_received from the variants that carry it so the
+            // warn-log surfaces partial-progress telemetry (Plan 07).
+            let failure_mode = match &e {
                 UlogError::NoLogsAvailable => "no_logs_available",
                 UlogError::LogListTimeout { .. } => "log_list_timeout",
-                UlogError::LogDataTimeout { .. } => "log_data_timeout",
-                UlogError::ReassemblyGapsExhausted { .. } => "reassembly_gaps_exhausted",
+                UlogError::LogDataTimeout { bytes_received: br } => {
+                    bytes_received = *br;
+                    "log_data_timeout"
+                }
+                UlogError::ReassemblyGapsExhausted { bytes_received: br, .. } => {
+                    bytes_received = *br;
+                    "reassembly_gaps_exhausted"
+                }
                 UlogError::LogOversized { .. } => "log_oversized",
                 UlogError::OutboundClosed => "fc_unreachable",
             };
             tracing::warn!(
                 session_id,
                 failure_mode,
+                attempted_log_id,
+                bytes_received,
                 duration_ms = start.elapsed().as_millis() as u64,
                 error = %e,
                 "ulog download failed (soft-fail)"
@@ -131,32 +147,40 @@ pub async fn finalize_ulog_archive(
             return Ok(None);
         }
     };
+    // Successful download → update structured fields for the upload-stage
+    // warn-log (and the D-06 erase gate below).
+    attempted_log_id = log_id;
+    bytes_received = bytes.len();
 
     // Upload via the 26.7 ArtifactService client-stream path.
-    match upload_ulog_bytes(bytes, session_id, client).await {
+    let artifact_id = match upload_ulog_bytes(bytes, session_id, client).await {
         Ok(Some(artifact_id)) => {
             tracing::info!(
                 session_id,
                 log_id,
                 artifact_id = %artifact_id,
+                bytes_received,
                 duration_ms = start.elapsed().as_millis() as u64,
                 "ulog archive uploaded"
             );
-            Ok(Some(artifact_id))
+            Some(artifact_id)
         }
-        Ok(None) => Ok(None),
+        Ok(None) => None,
         Err(e) => {
             tracing::warn!(
                 session_id,
                 failure_mode = "upload_failed",
-                log_id,
+                attempted_log_id,
+                bytes_received,
                 duration_ms = start.elapsed().as_millis() as u64,
                 error = %e,
                 "ulog upload failed (soft-fail)"
             );
-            Ok(None)
+            return Ok(None);
         }
-    }
+    };
+
+    Ok(artifact_id)
 }
 
 /// Stream-upload an in-memory ULG byte buffer to the server via
