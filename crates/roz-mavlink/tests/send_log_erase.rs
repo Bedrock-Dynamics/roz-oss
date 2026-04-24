@@ -52,8 +52,7 @@ async fn send_log_erase_emits_log_erase_message() {
     // for the LOG_ERASE we are about to trigger from the test body.
     let shim_handle = tokio::task::spawn_blocking(move || -> Result<MavMessage, String> {
         let shim_url = format!("udpout:127.0.0.1:{port}");
-        let mut shim_conn =
-            mavlink::connect::<MavMessage>(&shim_url).map_err(|e| format!("shim connect: {e}"))?;
+        let mut shim_conn = mavlink::connect::<MavMessage>(&shim_url).map_err(|e| format!("shim connect: {e}"))?;
         shim_conn.set_protocol_version(MavlinkVersion::V2);
         let header = MavHeader {
             system_id: SHIM_SYSTEM_ID,

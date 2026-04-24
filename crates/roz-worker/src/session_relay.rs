@@ -607,6 +607,12 @@ pub async fn spawn_session_relay(
     event_transport: Option<Arc<dyn roz_core::transport::SessionTransport>>,
     signing_ctx: Option<WorkerSigningContext>,
     artifact_client: Option<crate::roz_v1::artifact_service_client::ArtifactServiceClient<tonic::transport::Channel>>,
+    // Phase 26.8 D-08: worker-boot-scoped MavlinkBackend handle. Plan 06 will
+    // consume this in the per-session peer spawn block to drive the ulog
+    // finalize hook; Plan 05 only threads it end-to-end. `None` = no MAVLink
+    // transport configured on this worker (common for non-FC deployments);
+    // ulog finalize becomes a silent no-op.
+    mavlink_backend: Option<std::sync::Arc<roz_mavlink::MavlinkBackend>>,
 ) -> anyhow::Result<()> {
     let subject = format!("session.{worker_id}.*.request");
     let mut sub = nats.subscribe(subject.clone()).await?;
@@ -649,6 +655,7 @@ pub async fn spawn_session_relay(
             let transport_clone = event_transport.clone();
             let signing_clone = signing_ctx.clone();
             let artifact_client_clone = artifact_client.clone();
+            let mavlink_backend_clone = mavlink_backend.clone();
 
             let handle = tokio::spawn(async move {
                 if let Err(e) = handle_edge_session(
@@ -662,6 +669,7 @@ pub async fn spawn_session_relay(
                     transport_clone,
                     signing_clone,
                     artifact_client_clone,
+                    mavlink_backend_clone,
                 )
                 .await
                 {
@@ -693,7 +701,14 @@ async fn handle_edge_session(
     event_transport: Option<Arc<dyn roz_core::transport::SessionTransport>>,
     signing_ctx: Option<WorkerSigningContext>,
     artifact_client: Option<crate::roz_v1::artifact_service_client::ArtifactServiceClient<tonic::transport::Channel>>,
+    // Phase 26.8 D-08: worker-boot-scoped MavlinkBackend. Consumed by Plan 06's
+    // per-session peer finalize spawn block. Plan 05 establishes only the
+    // handoff point — the unused-param silence below is intentional.
+    mavlink_backend: Option<std::sync::Arc<roz_mavlink::MavlinkBackend>>,
 ) -> anyhow::Result<()> {
+    // Phase 26.8 Plan 05: handoff point reached. Plan 06 replaces this silence
+    // with the actual finalize peer spawn block.
+    let _ = mavlink_backend;
     let response_subject = Subjects::session_response(worker_id, session_id)?;
     let bootstrap = parse_runtime_bootstrap(session_id, &start_msg)?;
     let session_mode = parse_edge_session_mode(&start_msg, bootstrap.cognition_mode(), config.max_velocity.is_some());

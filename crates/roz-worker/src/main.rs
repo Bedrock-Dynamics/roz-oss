@@ -710,12 +710,12 @@ async fn execute_task(
         roz_nats::dispatch::ExecutionMode::React => None,
     };
 
-    // Phase 25 D-11 / D-12: construct optional MAVLink backend for Pixhawk-class
-    // embodiments. See `construct_mavlink_backend` doc — the backend is held
-    // as `Option<Arc<MavlinkBackend>>` on worker task-local state; Phase 27
-    // SC5 wires it into the agent-loop tool-dispatch layer (FlightCommand).
-    let _mavlink_backend: Option<Arc<roz_mavlink::MavlinkBackend>> =
-        construct_mavlink_backend(&task_config.mavlink, invocation.host_id).await;
+    // Phase 26.8 D-08 lift: MavlinkBackend is now constructed once at
+    // worker-boot scope (see main() below, search for `let mavlink_backend:`)
+    // and threaded into `spawn_session_relay` so `handle_edge_session` can
+    // drive the ulog finalize hook. The former per-task `_mavlink_backend`
+    // binding here was unused (Phase 27 D-19 integration deferred to a
+    // later plan), so removal is safe.
 
     let spatial: Arc<dyn WorldStateProvider> = if let Some(ref handle) = copper_handle {
         Arc::new(roz_worker::spatial_bridge::CopperSpatialProvider::new(Arc::clone(
@@ -1519,6 +1519,12 @@ async fn main() -> Result<()> {
     let mut worker_wal: Option<std::sync::Arc<roz_worker::wal::WalStore>> = None;
     let mut worker_tenant: Option<Uuid> = None;
     let mut signing_ctx_shared: Option<std::sync::Arc<WorkerSigningContext>> = None;
+    // Phase 26.8 D-08 lift: hoist host_id up here so the boot-scope
+    // `construct_mavlink_backend` call below (before `spawn_session_relay`)
+    // has the registered host UUID. Populated by the Ok arm of `register_host`
+    // below; stays `None` when registration is skipped (empty API key) or
+    // fails — matching `worker_tenant` hoisting semantics.
+    let mut worker_host_id: Option<Uuid> = None;
 
     // Register with server and bootstrap Phase 23 device signing key.
     //
@@ -1542,6 +1548,10 @@ async fn main() -> Result<()> {
                     tenant_id = %identity.tenant_id,
                     "registered with server"
                 );
+                // Phase 26.8 D-08 lift: capture the resolved host UUID so the
+                // boot-scope `construct_mavlink_backend` call below (before
+                // `spawn_session_relay`) has the sysid-derivation input.
+                worker_host_id = Some(identity.host_id);
                 // Upload embodiment runtime if available (D-04: log-and-continue; runtime now passed per STRM-02)
                 if let Some(ref rt) = embodiment_runtime {
                     match roz_worker::registration::upload_embodiment(
@@ -2479,6 +2489,28 @@ async fn main() -> Result<()> {
             None
         }
     };
+    // Phase 26.8 D-08: lift MavlinkBackend to worker-boot scope so session-relay
+    // can thread a handle into handle_edge_session (which runs under
+    // spawn_session_relay, NOT per-task). Absence = None = ulog finalize is a
+    // silent no-op (the common case for non-FC deployments).
+    //
+    // BREAKING CHANGE from Phase 25 per-task scope: one UDP bind / serial open
+    // per worker lifetime. Phase 25 regression tests (mavlink_backend_null_key,
+    // qgc_coexistence, log_fanout) remain green — no observable regression.
+    //
+    // Construction is gated on `worker_host_id` being resolved by
+    // `register_host` above. Without a host UUID, `construct_mavlink_backend`
+    // cannot derive the MAVLink sysid deterministically (main.rs:97-101), so
+    // we skip construction with a debug-log rather than burning a random UUID.
+    let mavlink_backend: Option<std::sync::Arc<roz_mavlink::MavlinkBackend>> = if let Some(hid) = worker_host_id {
+        construct_mavlink_backend(&config.mavlink, hid).await
+    } else {
+        tracing::debug!(
+            "worker_host_id unresolved (no API registration) — skipping boot-scope MavlinkBackend construction"
+        );
+        None
+    };
+    let mavlink_backend_for_relay = mavlink_backend.clone();
     tokio::spawn(async move {
         if let Err(e) = roz_worker::session_relay::spawn_session_relay(
             relay_nats,
@@ -2489,12 +2521,17 @@ async fn main() -> Result<()> {
             event_transport,
             relay_signing_ctx,
             artifact_client,
+            mavlink_backend_for_relay,
         )
         .await
         {
             tracing::error!(error = %e, "session relay exited");
         }
     });
+    // The non-cloned `mavlink_backend` remains available in the main() scope
+    // in case any later boot step wants it. Suppress unused-variable noise
+    // without taking a Drop path — this Arc is a weak keepalive.
+    let _ = &mavlink_backend;
 
     // Subscribe to task invocations
     let worker_id = &config.worker_id;
