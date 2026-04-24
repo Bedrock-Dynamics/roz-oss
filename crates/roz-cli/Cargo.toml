@@ -36,6 +36,7 @@ owo-colors.workspace = true
 indicatif.workspace = true
 tokio-tungstenite.workspace = true
 futures = "0.3"
+hex = { workspace = true }
 keyring.workspace = true
 directories.workspace = true
 webbrowser.workspace = true
