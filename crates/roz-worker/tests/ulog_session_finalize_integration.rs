@@ -316,13 +316,15 @@ async fn finalize_happy_path_uploads_ulog_and_erases_fc() {
         "must return server-issued artifact_id"
     );
 
-    // Drop the backend so the backend's outbound sender closes → replay task exits cleanly.
+    // Drop the backend so the backend's outbound sender closes. The
+    // LogDownloader inside finalize_ulog_archive has already dropped its
+    // cloned sender, so once we drop the backend the mpsc receiver in the
+    // replay task observes EOF and the task exits naturally after draining
+    // the buffered frames. Await the handle rather than aborting — this
+    // guarantees LOG_ERASE has been forwarded to the observer channel
+    // before we read it below (no race window, no sleep heuristic).
     drop(harness.backend);
-    // Give the replay task a moment to drain remaining frames (LOG_ERASE
-    // was sent via `backend.send_log_erase()` which completed before we
-    // dropped the backend; the frame is in the channel).
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    replay_handle.abort();
+    replay_handle.await.expect("replay task must exit cleanly");
 
     // --- Assert upload metadata ---
     let md = harness
@@ -406,8 +408,7 @@ async fn finalize_keep_fc_copy_true_skips_erase() {
     assert_eq!(result.as_deref(), Some("artifact-keep-fc"));
 
     drop(harness.backend);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    replay_handle.abort();
+    replay_handle.await.expect("replay task must exit cleanly");
 
     let mut saw_log_erase = false;
     let mut saw_log_request_end = false;
@@ -456,8 +457,7 @@ async fn finalize_autopilot_not_px4_skips_entirely() {
     assert_eq!(result, None, "ArduPilot backend must return Ok(None)");
 
     drop(harness.backend);
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    replay_handle.abort();
+    replay_handle.await.expect("replay task must exit cleanly");
 
     let mut saw_any = false;
     while observed_rx.try_recv().is_ok() {
@@ -502,8 +502,7 @@ async fn finalize_disabled_returns_ok_none_silently() {
     assert_eq!(result, None, "enabled=false must return Ok(None)");
 
     drop(harness.backend);
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    replay_handle.abort();
+    replay_handle.await.expect("replay task must exit cleanly");
 
     let mut saw_any = false;
     while observed_rx.try_recv().is_ok() {
@@ -543,8 +542,7 @@ async fn finalize_upload_fails_does_not_erase() {
     assert_eq!(result, None, "upload failure must surface as Ok(None) (soft-fail)");
 
     drop(harness.backend);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    replay_handle.abort();
+    replay_handle.await.expect("replay task must exit cleanly");
 
     let mut saw_log_erase = false;
     let mut saw_log_request_end = false;
@@ -602,8 +600,7 @@ async fn finalize_no_logs_available_warns_without_upload() {
     assert_eq!(result, None, "no logs on FC must surface as Ok(None)");
 
     drop(harness.backend);
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    replay_handle.abort();
+    replay_handle.await.expect("replay task must exit cleanly");
 
     let md = harness.received_metadata.lock().expect("lock").clone();
     assert!(md.is_none(), "no upload must have started when FC reports num_logs=0");
