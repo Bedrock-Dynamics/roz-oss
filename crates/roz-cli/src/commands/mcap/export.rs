@@ -65,6 +65,16 @@ pub enum ChannelKind {
 /// - counters for per-file summary line (D-05).
 #[derive(Debug, Default)]
 pub struct ConversionState {
+    /// Set of camera names for which `VideoStream` archetype has been
+    /// logged once. Plan 07 (`camera::emit_camera`) consumes this to
+    /// dedupe the once-per-entity `VideoStream` log call (CONTEXT D-11).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Plan 03 establishes the field; Plan 07 reads it via &mut state in emit_camera. Test profile reads it via `conversion_state_default_is_empty` so the expect is non-test only."
+        )
+    )]
     pub seen_camera_videostream_logged: HashSet<String>,
     pub unknown_channels_warned: HashSet<String>,
     pub messages_seen: u64,
@@ -87,10 +97,11 @@ pub fn classify_channel(topic: &str, schema_name: &str) -> ChannelKind {
         _ => {}
     }
     // Camera channels: prefix match on topic + exact schema.
-    if let Some(name) = topic.strip_prefix(TOPIC_CAMERA_PREFIX) {
-        if schema_name == SCHEMA_COMPRESSED_VIDEO && !name.is_empty() {
-            return ChannelKind::Camera(name.to_string());
-        }
+    if let Some(name) = topic.strip_prefix(TOPIC_CAMERA_PREFIX)
+        && schema_name == SCHEMA_COMPRESSED_VIDEO
+        && !name.is_empty()
+    {
+        return ChannelKind::Camera(name.to_string());
     }
     ChannelKind::Unknown
 }
@@ -128,12 +139,11 @@ pub fn classify_or_warn(msg: &mcap::Message<'_>, state: &mut ConversionState) ->
 /// or any per-channel emit handler returns an error.
 pub fn export_one(input: &Path, output: &Path) -> Result<ConversionStats> {
     let bytes = std::fs::read(input).with_context(|| format!("read mcap: {}", input.display()))?;
-    let stream =
-        mcap::MessageStream::new(&bytes).with_context(|| format!("open mcap stream: {}", input.display()))?;
+    let stream = mcap::MessageStream::new(&bytes).with_context(|| format!("open mcap stream: {}", input.display()))?;
 
     // Plan 04 provides the RecordingStream builder.
-    let rec = super::recording::open_rrd_writer(output)
-        .with_context(|| format!("open rrd writer: {}", output.display()))?;
+    let rec =
+        super::recording::open_rrd_writer(output).with_context(|| format!("open rrd writer: {}", output.display()))?;
 
     let mut state = ConversionState::default();
 
@@ -161,8 +171,21 @@ pub fn export_one(input: &Path, output: &Path) -> Result<ConversionStats> {
 /// Per-file conversion accounting (used by `export_bulk` for summary lines).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ConversionStats {
+    /// Total messages observed in the input MCAP. Returned for callers
+    /// (downstream tooling, future smoke tests in Plan 08) that want
+    /// observability beyond the bulk-mode summary line.
+    #[expect(
+        dead_code,
+        reason = "Part of the public ConversionStats contract; Plan 08 smoke test + downstream substrate-side tooling read this field"
+    )]
     pub messages_seen: u64,
     pub messages_emitted: u64,
+    /// Count of distinct unknown channels that triggered warn-once. Same
+    /// rationale as `messages_seen` — exposed for downstream callers.
+    #[expect(
+        dead_code,
+        reason = "Part of the public ConversionStats contract; Plan 08 smoke test + downstream substrate-side tooling read this field"
+    )]
     pub unknown_channel_count: u64,
     pub rrd_bytes: u64,
 }
@@ -280,10 +303,7 @@ mod tests {
 
     #[test]
     fn classify_tf() {
-        assert_eq!(
-            classify_channel("/tf", "foxglove.FrameTransform"),
-            ChannelKind::Tf
-        );
+        assert_eq!(classify_channel("/tf", "foxglove.FrameTransform"), ChannelKind::Tf);
     }
 
     #[test]
