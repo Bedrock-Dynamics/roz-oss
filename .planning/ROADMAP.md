@@ -387,7 +387,7 @@ Success Criteria (what must be TRUE):
   6. Smoke test on `phase26-sc5-fixture.mcap` round-trips cleanly and renders the expected 1500 transforms + agent events.
 **Plans**:
 - [x] 26.9-01-PLAN.md — workspace + roz-cli Cargo deps (rerun=0.31.3 exact, glob, export-rrd feature) + build.rs foxglove .protos
-- [ ] 26.9-02-PLAN.md — CLI surface (`roz mcap to-rrd`) + module directory skeleton with submodule stubs + feature-gated friendly error (D-17)
+- [x] 26.9-02-PLAN.md — CLI surface (`roz mcap to-rrd`) + module directory skeleton with submodule stubs + feature-gated friendly error (D-17)
 - [ ] 26.9-03-PLAN.md — MCAP reader + `ChannelKind` classifier + warn-once state + `export_one`/`export_bulk` dispatchers (D-04/D-05/D-13/D-14/D-19/D-20)
 - [ ] 26.9-04-PLAN.md — `RecordingStream` builder + dual-timeline helper with B-2 method-name correction (`set_timestamp_secs_since_epoch`)
 - [ ] 26.9-05-PLAN.md — `/tf` + `/roz/telemetry/pose` → `Transform3D` emit (D-10 rows 1-2)
