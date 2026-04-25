@@ -141,6 +141,35 @@ async fn count_tasks(pool: &PgPool, tenant_id: Uuid) -> i64 {
     row.0
 }
 
+/// Phase 26.10 FW-01: build a minimal `EmbodimentRuntime` JSON blob suitable
+/// for storing in `roz_hosts.embodiment_runtime` and round-tripping through
+/// the dispatch resolver. Mirrors the posture of `simple_model()` at
+/// `crates/roz-core/src/embodiment/embodiment_runtime.rs:2599`.
+fn minimal_embodiment_runtime_json() -> serde_json::Value {
+    use roz_core::embodiment::frame_tree::{FrameSource, FrameTree};
+    use roz_core::embodiment::{EmbodimentModel, EmbodimentRuntime};
+    let mut tree = FrameTree::new();
+    tree.set_root("world", FrameSource::Static);
+    let mut model = EmbodimentModel {
+        model_id: "fw01-test-v1".into(),
+        model_digest: String::new(),
+        embodiment_family: None,
+        links: vec![],
+        joints: vec![],
+        frame_tree: tree,
+        collision_bodies: vec![],
+        allowed_collision_pairs: vec![],
+        tcps: vec![],
+        sensor_mounts: vec![],
+        workspace_zones: vec![],
+        watched_frames: vec!["world".into()],
+        channel_bindings: vec![],
+    };
+    model.stamp_digest();
+    let runtime = EmbodimentRuntime::compile(model, None, None);
+    serde_json::to_value(runtime).expect("serialize EmbodimentRuntime")
+}
+
 fn control_interface_manifest() -> roz_core::embodiment::binding::ControlInterfaceManifest {
     serde_json::from_value(serde_json::json!({
         "version": 3,
@@ -259,6 +288,20 @@ async fn dispatch_starts_workflow_before_publish_and_preserves_request_shape() {
     let (tenant_id, host_id, host_name) = seed_tenant_and_host(&pool, "trusted").await;
     let environment_id = seed_environment(&pool, tenant_id).await;
     insert_device_trust_row(&pool, tenant_id, host_id, "trusted", Some(trusted_firmware_json())).await;
+
+    // Phase 26.10 FW-01: OodaReAct dispatches now require an authoritative
+    // embodiment_runtime resolved at dispatch time. Seed a minimal runtime
+    // JSON so this test (which uses OodaReAct phases) continues to exercise
+    // the post-resolution code path.
+    let runtime_json = minimal_embodiment_runtime_json();
+    roz_db::embodiments::upsert(
+        &pool,
+        host_id,
+        &serde_json::json!({"model_id": "fixture", "model_digest": "fixture"}),
+        Some(&runtime_json),
+    )
+    .await
+    .expect("seed embodiment_runtime");
 
     let parent_task = roz_db::tasks::create(
         &pool,

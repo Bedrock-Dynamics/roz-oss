@@ -135,6 +135,66 @@ pub async fn dispatch_task(
         .filter(|row| row.tenant_id == request.tenant_id)
         .ok_or_else(|| TaskDispatchError::NotFound(format!("host {host_id_str} not found")))?;
 
+    // Phase 26.10 FW-01: resolve authoritative `EmbodimentRuntime` by host_id
+    // for OodaReAct dispatches. Runs BEFORE `roz_db::tasks::create` AND BEFORE
+    // the Restate workflow start so a missing or invalid runtime fails closed
+    // with no side effects. Codex review H1 — original plan placed this at
+    // line 225 (the TaskInvocation literal) which is AFTER tasks::create
+    // (:157) AND AFTER the Restate POST (:186), leaking task rows + workflows
+    // on resolver failure.
+    let resolved_embodiment_runtime: Option<roz_core::embodiment::EmbodimentRuntime> =
+        if matches!(
+            mode_from_phases(&request.phases),
+            roz_nats::dispatch::ExecutionMode::OodaReAct
+        ) {
+            match roz_db::embodiments::get_by_host_id(&mut *conn, host_uuid).await {
+                Ok(Some(row)) => {
+                    // FW-01 H1 — explicit tenant assertion on EmbodimentRow.
+                    // The host's tenant filter at :135 does NOT transitively
+                    // cover the embodiment row (separate authority record).
+                    if row.tenant_id != request.tenant_id {
+                        tracing::error!(
+                            request_tenant = %request.tenant_id,
+                            embodiment_tenant = %row.tenant_id,
+                            host_uuid = %host_uuid,
+                            "task dispatch rejected: cross-tenant embodiment row (FW-01)"
+                        );
+                        return Err(TaskDispatchError::BadRequest(format!(
+                            "host {host_uuid} embodiment record belongs to a different tenant (FW-01)"
+                        )));
+                    }
+                    match row.embodiment_runtime {
+                        Some(json) => Some(
+                            serde_json::from_value::<roz_core::embodiment::EmbodimentRuntime>(json).map_err(
+                                |error| {
+                                    TaskDispatchError::Internal(format!(
+                                        "embodiment_runtime JSON malformed for host {host_uuid}: {error}"
+                                    ))
+                                },
+                            )?,
+                        ),
+                        None => {
+                            return Err(TaskDispatchError::BadRequest(format!(
+                                "host {host_uuid} has no authoritative embodiment runtime (FW-01)"
+                            )));
+                        }
+                    }
+                }
+                Ok(None) => {
+                    return Err(TaskDispatchError::BadRequest(format!(
+                        "host {host_uuid} has no embodiment record (FW-01)"
+                    )));
+                }
+                Err(error) => {
+                    return Err(TaskDispatchError::Internal(format!(
+                        "embodiment lookup failed for host {host_uuid}: {error}"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
     if let Err(rejection) =
         crate::trust::check_host_trust(services.pool, request.tenant_id, host_uuid, services.trust_policy).await
     {
@@ -225,10 +285,10 @@ pub async fn dispatch_task(
     // Plan 24-12: declared velocity bounds are not yet surfaced on the
     // REST create-task payload — worker pre-dispatch gate falls through
     // to trivial-allow on None. Follow-up plan threads them in.
-    // Phase 26.10 FW-01: `embodiment_runtime` defaults to None via the
-    // constructor; Plan 26.10-01 Task 2 attaches the resolved runtime
-    // after construction (`invocation.embodiment_runtime = ...`).
-    let invocation = roz_nats::dispatch::TaskInvocation::new(
+    // Phase 26.10 FW-01: attach the runtime resolved above (before any side
+    // effect) for OodaReAct dispatches. React-only dispatches always carry
+    // None — controller promotion is not part of those flows.
+    let mut invocation = roz_nats::dispatch::TaskInvocation::new(
         task.id,
         request.tenant_id.to_string(),
         task.prompt.clone(),
@@ -248,6 +308,21 @@ pub async fn dispatch_task(
         None,
         None,
     );
+    invocation.embodiment_runtime = resolved_embodiment_runtime;
+
+    // T-26.10-01-03: warn (do not fail) when the serialised dispatch envelope
+    // approaches the 1 MB NATS default — `embodiment_runtime` is the only
+    // field with unbounded size. 512 KiB leaves headroom for the signing
+    // wrapper and is non-fatal so dispatch keeps working; ops can react.
+    if let Ok(bytes) = serde_json::to_vec(&invocation)
+        && bytes.len() > 512 * 1024
+    {
+        tracing::warn!(
+            envelope_bytes = bytes.len(),
+            host_id = %host_uuid,
+            "dispatch envelope > 512 KiB — embodiment_runtime may exceed NATS limits"
+        );
+    }
     let subject = roz_nats::subjects::Subjects::invoke(&host.name, &task.id.to_string())
         .map_err(|error| TaskDispatchError::BadRequest(format!("invalid NATS subject: {error}")))?;
     let payload = serde_json::to_vec(&invocation)
