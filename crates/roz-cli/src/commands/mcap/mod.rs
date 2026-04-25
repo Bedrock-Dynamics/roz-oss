@@ -29,7 +29,8 @@ use crate::config::CliConfig;
     clippy::pedantic,
     clippy::nursery,
     unused_qualifications,
-    reason = "generated prost code — upstream Foxglove proto shapes, no hand-editing"
+    dead_code,
+    reason = "generated prost code — upstream Foxglove proto shapes, no hand-editing; types consumed by Plans 05/06"
 )]
 pub(crate) mod foxglove {
     tonic::include_proto!("foxglove");
@@ -64,28 +65,19 @@ pub enum McapCommands {
 /// Two mutually exclusive modes:
 ///
 /// - **Single:** `<INPUT_MCAP> --output <OUTPUT_RRD>` — fail-fast (D-04).
-/// - **Bulk:**   `--bulk <GLOB> --output-dir <DIR>` — continue-on-error (D-05);
-///               output filename = `<input_basename>.rrd`.
+/// - **Bulk:** `--bulk <GLOB> --output-dir <DIR>` — continue-on-error (D-05);
+///   output filename = `<input_basename>.rrd`.
 ///
 /// The `conflicts_with` / `required_unless_present` combination enforces
 /// mode exclusivity at clap parse time.
 #[derive(Debug, Args)]
 pub struct ToRrdArgs {
     /// Single-mode: input MCAP file. Conflicts with `--bulk`.
-    #[arg(
-        value_name = "INPUT_MCAP",
-        conflicts_with = "bulk",
-        required_unless_present = "bulk"
-    )]
+    #[arg(value_name = "INPUT_MCAP", conflicts_with = "bulk", required_unless_present = "bulk")]
     pub input: Option<PathBuf>,
 
     /// Single-mode: output .rrd path. Conflicts with `--output-dir`.
-    #[arg(
-        short,
-        long,
-        conflicts_with = "output_dir",
-        required_unless_present = "bulk"
-    )]
+    #[arg(short, long, conflicts_with = "output_dir", required_unless_present = "bulk")]
     pub output: Option<PathBuf>,
 
     /// Bulk-mode: glob pattern (expanded by the binary, not the shell).
@@ -107,6 +99,10 @@ pub async fn execute(cmd: &McapCommands, _config: &CliConfig) -> anyhow::Result<
 }
 
 #[cfg(not(feature = "export-rrd"))]
+#[expect(
+    clippy::unused_async,
+    reason = "Plan 02 skeleton: signature mirrors the feature-on path so Plans 03-07 can land async I/O without re-shaping the dispatcher"
+)]
 async fn to_rrd(_args: &ToRrdArgs) -> anyhow::Result<()> {
     // D-17 — friendly error when the binary was built without the feature.
     anyhow::bail!(
@@ -116,6 +112,10 @@ async fn to_rrd(_args: &ToRrdArgs) -> anyhow::Result<()> {
 }
 
 #[cfg(feature = "export-rrd")]
+#[expect(
+    clippy::unused_async,
+    reason = "Plan 02 skeleton placeholder; Plans 03/04/05/06/07 add async RecordingStream + tokio file I/O"
+)]
 async fn to_rrd(_args: &ToRrdArgs) -> anyhow::Result<()> {
     // Plan 02 skeleton only — Plans 03/04/05/06/07 wire the real exporter.
     anyhow::bail!(
@@ -132,14 +132,7 @@ mod tests {
 
     #[test]
     fn parse_mcap_to_rrd_single() {
-        let cli = Cli::parse_from([
-            "roz",
-            "mcap",
-            "to-rrd",
-            "/tmp/in.mcap",
-            "--output",
-            "/tmp/out.rrd",
-        ]);
+        let cli = Cli::parse_from(["roz", "mcap", "to-rrd", "/tmp/in.mcap", "--output", "/tmp/out.rrd"]);
         let Some(Commands::Mcap(args)) = cli.command else {
             panic!("expected Mcap command");
         };
@@ -183,15 +176,8 @@ mod tests {
     #[test]
     fn parse_mcap_to_rrd_rejects_mixed_modes() {
         // Positional + --bulk is invalid per D-03.
-        let err = Cli::try_parse_from([
-            "roz",
-            "mcap",
-            "to-rrd",
-            "/tmp/in.mcap",
-            "--bulk",
-            "x/*.mcap",
-        ])
-        .expect_err("mixed single + bulk modes must fail");
+        let err = Cli::try_parse_from(["roz", "mcap", "to-rrd", "/tmp/in.mcap", "--bulk", "x/*.mcap"])
+            .expect_err("mixed single + bulk modes must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("cannot be used with") || msg.contains("conflicts_with"),
@@ -205,8 +191,7 @@ mod tests {
         let err = Cli::try_parse_from(["roz", "mcap", "to-rrd", "/tmp/in.mcap"])
             .expect_err("missing --output must fail in single mode");
         assert!(
-            err.to_string().contains("--output")
-                || err.to_string().contains("required"),
+            err.to_string().contains("--output") || err.to_string().contains("required"),
             "expected required-arg error, got: {err}"
         );
     }

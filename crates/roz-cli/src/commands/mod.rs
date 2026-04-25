@@ -7,6 +7,7 @@ pub mod env;
 pub mod estop;
 pub mod host;
 pub mod interactive;
+pub mod mcap;
 pub mod media;
 pub mod non_interactive;
 pub mod recording;
