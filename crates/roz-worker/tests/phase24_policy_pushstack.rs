@@ -128,24 +128,24 @@ fn build_policy_row(policy_id: Uuid, tenant_id: Uuid) -> SafetyPolicyRow {
 }
 
 fn sample_invocation_with_policy(policy_id: Uuid) -> TaskInvocation {
-    TaskInvocation {
-        task_id: Uuid::nil(),
-        tenant_id: "t1".into(),
-        prompt: "move".into(),
-        environment_id: Uuid::nil(),
-        safety_policy_id: Some(policy_id),
-        host_id: Uuid::nil(),
-        timeout_secs: 60,
-        mode: ExecutionMode::React,
-        parent_task_id: None,
-        restate_url: String::new(),
-        traceparent: None,
-        phases: vec![],
-        control_interface_manifest: None,
-        delegation_scope: None,
-        declared_max_linear_m_per_s: None,
-        declared_max_angular_rad_per_s: None,
-    }
+    TaskInvocation::new(
+        Uuid::nil(),
+        "t1".into(),
+        "move".into(),
+        Uuid::nil(),
+        Some(policy_id),
+        Uuid::nil(),
+        60,
+        ExecutionMode::React,
+        None,
+        String::new(),
+        None,
+        vec![],
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
 /// Forge a `roz-sig-v1` ServerToWorker envelope over `payload` using the

@@ -2733,7 +2733,11 @@ async fn main() -> Result<()> {
         tokio::spawn(
             async move {
                 let _task_permit = task_permit;
-                execute_task(
+                // Phase 26.10 FW-01: `TaskInvocation` now carries an
+                // `EmbodimentRuntime` which inflates `execute_task`'s future
+                // past clippy's `large_futures` threshold (16 KiB). Box::pin
+                // moves it to the heap so the spawned future stays small.
+                Box::pin(execute_task(
                     invocation,
                     task_id,
                     task_config,
@@ -2751,7 +2755,7 @@ async fn main() -> Result<()> {
                     task_worker_wal,
                     task_session_event_tx,
                     task_shared_copper_state,
-                )
+                ))
                 .await;
             }
             .instrument(span),
@@ -2768,24 +2772,24 @@ mod tests {
     use roz_core::team::TeamEvent as CoreTeamEvent;
 
     fn sample_invocation(mode: roz_nats::dispatch::ExecutionMode) -> TaskInvocation {
-        TaskInvocation {
-            task_id: Uuid::new_v4(),
-            tenant_id: "tenant".into(),
-            prompt: "test".into(),
-            environment_id: Uuid::new_v4(),
-            safety_policy_id: None,
-            host_id: Uuid::new_v4(),
-            timeout_secs: 30,
+        TaskInvocation::new(
+            Uuid::new_v4(),
+            "tenant".into(),
+            "test".into(),
+            Uuid::new_v4(),
+            None,
+            Uuid::new_v4(),
+            30,
             mode,
-            parent_task_id: None,
-            restate_url: "http://localhost:8080".into(),
-            traceparent: None,
-            phases: vec![],
-            control_interface_manifest: None,
-            delegation_scope: None,
-            declared_max_linear_m_per_s: None,
-            declared_max_angular_rad_per_s: None,
-        }
+            None,
+            "http://localhost:8080".into(),
+            None,
+            vec![],
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     #[test]

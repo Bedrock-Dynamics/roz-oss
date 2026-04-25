@@ -133,6 +133,58 @@ pub struct TaskInvocation {
     /// See `declared_max_linear_m_per_s` — same semantics, angular axis.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub declared_max_angular_rad_per_s: Option<f64>,
+    /// Phase 26.10 FW-01: authoritative embodiment runtime resolved by the
+    /// server at dispatch time. Required for OodaReAct controller promotion;
+    /// `controller.rs:553` rejects load without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embodiment_runtime: Option<roz_core::embodiment::EmbodimentRuntime>,
+}
+
+impl TaskInvocation {
+    /// FW-01: canonical constructor. Use this everywhere a `TaskInvocation` is built.
+    /// Defaults `embodiment_runtime: None`; callers that need to attach a runtime
+    /// (only the server dispatch path for OodaReAct mode) must set it AFTER
+    /// construction via the public field.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        task_id: Uuid,
+        tenant_id: String,
+        prompt: String,
+        environment_id: Uuid,
+        safety_policy_id: Option<Uuid>,
+        host_id: Uuid,
+        timeout_secs: u32,
+        mode: ExecutionMode,
+        parent_task_id: Option<Uuid>,
+        restate_url: String,
+        traceparent: Option<String>,
+        phases: Vec<roz_core::phases::PhaseSpec>,
+        control_interface_manifest: Option<roz_core::embodiment::binding::ControlInterfaceManifest>,
+        delegation_scope: Option<roz_core::tasks::DelegationScope>,
+        declared_max_linear_m_per_s: Option<f64>,
+        declared_max_angular_rad_per_s: Option<f64>,
+    ) -> Self {
+        Self {
+            task_id,
+            tenant_id,
+            prompt,
+            environment_id,
+            safety_policy_id,
+            host_id,
+            timeout_secs,
+            mode,
+            parent_task_id,
+            restate_url,
+            traceparent,
+            phases,
+            control_interface_manifest,
+            delegation_scope,
+            declared_max_linear_m_per_s,
+            declared_max_angular_rad_per_s,
+            embodiment_runtime: None,
+        }
+    }
 }
 
 /// Token counts for a completed task.
@@ -263,24 +315,24 @@ mod tests {
 
     #[test]
     fn task_invocation_roundtrip() {
-        let invocation = TaskInvocation {
-            task_id: Uuid::new_v4(),
-            tenant_id: "tenant-abc".to_string(),
-            prompt: "Pick up the red block".to_string(),
-            environment_id: Uuid::new_v4(),
-            safety_policy_id: Some(Uuid::new_v4()),
-            host_id: Uuid::new_v4(),
-            timeout_secs: 300,
-            mode: ExecutionMode::OodaReAct,
-            parent_task_id: None,
-            restate_url: "http://localhost:8080".to_string(),
-            traceparent: None,
-            phases: vec![],
-            control_interface_manifest: None,
-            delegation_scope: None,
-            declared_max_linear_m_per_s: None,
-            declared_max_angular_rad_per_s: None,
-        };
+        let invocation = TaskInvocation::new(
+            Uuid::new_v4(),
+            "tenant-abc".to_string(),
+            "Pick up the red block".to_string(),
+            Uuid::new_v4(),
+            Some(Uuid::new_v4()),
+            Uuid::new_v4(),
+            300,
+            ExecutionMode::OodaReAct,
+            None,
+            "http://localhost:8080".to_string(),
+            None,
+            vec![],
+            None,
+            None,
+            None,
+            None,
+        );
 
         let bytes = serde_json::to_vec(&invocation).expect("serialize");
         let deserialized: TaskInvocation = serde_json::from_slice(&bytes).expect("deserialize");
@@ -442,19 +494,19 @@ mod tests {
     #[test]
     fn task_invocation_phases_serde_roundtrip() {
         use roz_core::phases::{PhaseMode, PhaseSpec, PhaseTrigger, ToolSetFilter};
-        let inv = TaskInvocation {
-            task_id: Uuid::nil(),
-            tenant_id: "t".into(),
-            prompt: "test".into(),
-            environment_id: Uuid::nil(),
-            safety_policy_id: None,
-            host_id: Uuid::nil(),
-            timeout_secs: 60,
-            mode: ExecutionMode::React,
-            parent_task_id: None,
-            restate_url: "http://localhost:8080".into(),
-            traceparent: None,
-            phases: vec![
+        let inv = TaskInvocation::new(
+            Uuid::nil(),
+            "t".into(),
+            "test".into(),
+            Uuid::nil(),
+            None,
+            Uuid::nil(),
+            60,
+            ExecutionMode::React,
+            None,
+            "http://localhost:8080".into(),
+            None,
+            vec![
                 PhaseSpec {
                     mode: PhaseMode::React,
                     tools: ToolSetFilter::All,
@@ -466,44 +518,42 @@ mod tests {
                     trigger: PhaseTrigger::OnToolSignal,
                 },
             ],
-            control_interface_manifest: None,
-            delegation_scope: None,
-            declared_max_linear_m_per_s: None,
-            declared_max_angular_rad_per_s: None,
-        };
+            None,
+            None,
+            None,
+            None,
+        );
         let json = serde_json::to_string(&inv).unwrap();
         let back: TaskInvocation = serde_json::from_str(&json).unwrap();
         assert_eq!(back.phases.len(), 2);
         assert_eq!(back.phases[1].trigger, PhaseTrigger::OnToolSignal);
         // Also verify empty phases omitted from JSON (skip_serializing_if)
-        let inv_no_phases = TaskInvocation {
-            phases: vec![],
-            ..inv.clone()
-        };
+        let mut inv_no_phases = inv.clone();
+        inv_no_phases.phases = vec![];
         let json2 = serde_json::to_string(&inv_no_phases).unwrap();
         assert!(!json2.contains("phases"));
     }
 
     #[test]
     fn task_invocation_optional_fields() {
-        let invocation = TaskInvocation {
-            task_id: Uuid::new_v4(),
-            tenant_id: "tenant-xyz".to_string(),
-            prompt: "Navigate to waypoint".to_string(),
-            environment_id: Uuid::new_v4(),
-            safety_policy_id: None,
-            host_id: Uuid::new_v4(),
-            timeout_secs: 60,
-            mode: ExecutionMode::React,
-            parent_task_id: None,
-            restate_url: "http://localhost:9070".to_string(),
-            traceparent: None,
-            phases: vec![],
-            control_interface_manifest: None,
-            delegation_scope: None,
-            declared_max_linear_m_per_s: None,
-            declared_max_angular_rad_per_s: None,
-        };
+        let invocation = TaskInvocation::new(
+            Uuid::new_v4(),
+            "tenant-xyz".to_string(),
+            "Navigate to waypoint".to_string(),
+            Uuid::new_v4(),
+            None,
+            Uuid::new_v4(),
+            60,
+            ExecutionMode::React,
+            None,
+            "http://localhost:9070".to_string(),
+            None,
+            vec![],
+            None,
+            None,
+            None,
+            None,
+        );
 
         // Verify optional fields serialize as null in the wire format.
         let json = serde_json::to_value(&invocation).expect("serialize");
@@ -568,24 +618,24 @@ mod tests {
 
     #[test]
     fn task_invocation_serializes_declared_velocities_when_set() {
-        let invocation = TaskInvocation {
-            task_id: Uuid::new_v4(),
-            tenant_id: "t".into(),
-            prompt: "p".into(),
-            environment_id: Uuid::new_v4(),
-            safety_policy_id: None,
-            host_id: Uuid::new_v4(),
-            timeout_secs: 60,
-            mode: ExecutionMode::React,
-            parent_task_id: None,
-            restate_url: "http://localhost:8080".into(),
-            traceparent: None,
-            phases: vec![],
-            control_interface_manifest: None,
-            delegation_scope: None,
-            declared_max_linear_m_per_s: Some(1.5),
-            declared_max_angular_rad_per_s: Some(0.75),
-        };
+        let invocation = TaskInvocation::new(
+            Uuid::new_v4(),
+            "t".into(),
+            "p".into(),
+            Uuid::new_v4(),
+            None,
+            Uuid::new_v4(),
+            60,
+            ExecutionMode::React,
+            None,
+            "http://localhost:8080".into(),
+            None,
+            vec![],
+            None,
+            None,
+            Some(1.5),
+            Some(0.75),
+        );
         let json = serde_json::to_value(&invocation).expect("serialize");
         assert_eq!(json["declared_max_linear_m_per_s"], 1.5);
         assert_eq!(json["declared_max_angular_rad_per_s"], 0.75);
@@ -597,26 +647,141 @@ mod tests {
 
     #[test]
     fn task_invocation_skips_declared_velocities_when_none() {
-        let invocation = TaskInvocation {
-            task_id: Uuid::new_v4(),
-            tenant_id: "t".into(),
-            prompt: "p".into(),
-            environment_id: Uuid::new_v4(),
-            safety_policy_id: None,
-            host_id: Uuid::new_v4(),
-            timeout_secs: 60,
-            mode: ExecutionMode::React,
-            parent_task_id: None,
-            restate_url: "http://localhost:8080".into(),
-            traceparent: None,
-            phases: vec![],
-            control_interface_manifest: None,
-            delegation_scope: None,
-            declared_max_linear_m_per_s: None,
-            declared_max_angular_rad_per_s: None,
-        };
+        let invocation = TaskInvocation::new(
+            Uuid::new_v4(),
+            "t".into(),
+            "p".into(),
+            Uuid::new_v4(),
+            None,
+            Uuid::new_v4(),
+            60,
+            ExecutionMode::React,
+            None,
+            "http://localhost:8080".into(),
+            None,
+            vec![],
+            None,
+            None,
+            None,
+            None,
+        );
         let json = serde_json::to_string(&invocation).expect("serialize");
         assert!(!json.contains("declared_max_linear_m_per_s"));
         assert!(!json.contains("declared_max_angular_rad_per_s"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 26.10 Plan 01 Task 1: FW-01 embodiment_runtime field tests
+    // -----------------------------------------------------------------------
+
+    /// FW-01: building a minimal `EmbodimentRuntime` for round-trip tests.
+    /// Mirrors the posture of `simple_model()` at
+    /// `crates/roz-core/src/embodiment/embodiment_runtime.rs:2599` but kept
+    /// minimal — empty vecs are valid for compile().
+    fn minimal_runtime() -> roz_core::embodiment::EmbodimentRuntime {
+        use roz_core::embodiment::frame_tree::{FrameSource, FrameTree};
+        use roz_core::embodiment::EmbodimentModel;
+        let mut tree = FrameTree::new();
+        tree.set_root("world", FrameSource::Static);
+        let mut model = EmbodimentModel {
+            model_id: "fw01-test-v1".into(),
+            model_digest: String::new(),
+            embodiment_family: None,
+            links: vec![],
+            joints: vec![],
+            frame_tree: tree,
+            collision_bodies: vec![],
+            allowed_collision_pairs: vec![],
+            tcps: vec![],
+            sensor_mounts: vec![],
+            workspace_zones: vec![],
+            watched_frames: vec!["world".into()],
+            channel_bindings: vec![],
+        };
+        model.stamp_digest();
+        roz_core::embodiment::EmbodimentRuntime::compile(model, None, None)
+    }
+
+    #[test]
+    fn task_invocation_new_defaults_runtime_to_none() {
+        let inv = TaskInvocation::new(
+            Uuid::new_v4(),
+            "t".into(),
+            "p".into(),
+            Uuid::new_v4(),
+            None,
+            Uuid::new_v4(),
+            60,
+            ExecutionMode::React,
+            None,
+            "http://localhost:8080".into(),
+            None,
+            vec![],
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(inv.embodiment_runtime.is_none());
+    }
+
+    #[test]
+    fn task_invocation_omits_runtime_when_none() {
+        let inv = TaskInvocation::new(
+            Uuid::new_v4(),
+            "t".into(),
+            "p".into(),
+            Uuid::new_v4(),
+            None,
+            Uuid::new_v4(),
+            60,
+            ExecutionMode::OodaReAct,
+            None,
+            "http://localhost:8080".into(),
+            None,
+            vec![],
+            None,
+            None,
+            None,
+            None,
+        );
+        let value = serde_json::to_value(&inv).expect("serialize");
+        assert!(
+            value.get("embodiment_runtime").is_none() || value["embodiment_runtime"].is_null(),
+            "embodiment_runtime must be skipped when None, got: {value}"
+        );
+    }
+
+    #[test]
+    fn task_invocation_roundtrip_with_runtime() {
+        let runtime = minimal_runtime();
+        let mut inv = TaskInvocation::new(
+            Uuid::new_v4(),
+            "t".into(),
+            "p".into(),
+            Uuid::new_v4(),
+            None,
+            Uuid::new_v4(),
+            60,
+            ExecutionMode::OodaReAct,
+            None,
+            "http://localhost:8080".into(),
+            None,
+            vec![],
+            None,
+            None,
+            None,
+            None,
+        );
+        inv.embodiment_runtime = Some(runtime);
+        let bytes = serde_json::to_vec(&inv).expect("serialize");
+        let back: TaskInvocation = serde_json::from_slice(&bytes).expect("deserialize");
+        assert_eq!(inv, back);
+        assert!(back.embodiment_runtime.is_some());
+        // Confirm the runtime survives byte-for-byte round-trip.
+        assert_eq!(
+            inv.embodiment_runtime.as_ref().unwrap().combined_digest,
+            back.embodiment_runtime.as_ref().unwrap().combined_digest
+        );
     }
 }

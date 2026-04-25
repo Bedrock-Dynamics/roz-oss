@@ -193,24 +193,24 @@ async fn task_chain_end_to_end() {
     );
 
     // 8. Publish TaskInvocation to NATS (simulating REST handler's NATS publish)
-    let invocation = roz_nats::dispatch::TaskInvocation {
-        task_id: task.id,
-        tenant_id: tenant.id.to_string(),
-        prompt: task.prompt.clone(),
-        environment_id: task.environment_id,
-        safety_policy_id: None,
-        host_id: uuid::Uuid::nil(),
-        timeout_secs: 300,
-        mode: roz_nats::dispatch::ExecutionMode::React,
-        parent_task_id: None,
-        restate_url: restate.url().to_string(),
-        traceparent: None,
-        phases: vec![],
-        control_interface_manifest: None,
-        delegation_scope: None,
-        declared_max_linear_m_per_s: None,
-        declared_max_angular_rad_per_s: None,
-    };
+    let invocation = roz_nats::dispatch::TaskInvocation::new(
+        task.id,
+        tenant.id.to_string(),
+        task.prompt.clone(),
+        task.environment_id,
+        None,
+        uuid::Uuid::nil(),
+        300,
+        roz_nats::dispatch::ExecutionMode::React,
+        None,
+        restate.url().to_string(),
+        None,
+        vec![],
+        None,
+        None,
+        None,
+        None,
+    );
 
     let subject = format!("invoke.{worker_id}.{}", task.id);
     let payload = serde_json::to_vec(&invocation).expect("serialize invocation");

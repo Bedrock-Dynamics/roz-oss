@@ -15,24 +15,24 @@ async fn worker_receives_task_invocation_via_nats() {
 
     // Build and publish a task invocation (as server would after UUID→name resolution)
     let task_id = uuid::Uuid::new_v4();
-    let invocation = roz_nats::dispatch::TaskInvocation {
+    let invocation = roz_nats::dispatch::TaskInvocation::new(
         task_id,
-        tenant_id: uuid::Uuid::new_v4().to_string(),
-        prompt: "pick up the red block".to_string(),
-        environment_id: uuid::Uuid::new_v4(),
-        safety_policy_id: None,
-        host_id: uuid::Uuid::new_v4(),
-        timeout_secs: 60,
-        mode: roz_nats::dispatch::ExecutionMode::React,
-        parent_task_id: None,
-        restate_url: "http://localhost:9080".to_string(),
-        traceparent: None,
-        phases: vec![],
-        control_interface_manifest: None,
-        delegation_scope: None,
-        declared_max_linear_m_per_s: None,
-        declared_max_angular_rad_per_s: None,
-    };
+        uuid::Uuid::new_v4().to_string(),
+        "pick up the red block".to_string(),
+        uuid::Uuid::new_v4(),
+        None,
+        uuid::Uuid::new_v4(),
+        60,
+        roz_nats::dispatch::ExecutionMode::React,
+        None,
+        "http://localhost:9080".to_string(),
+        None,
+        vec![],
+        None,
+        None,
+        None,
+        None,
+    );
 
     let subject = format!("invoke.test-robot.{task_id}");
     let payload = serde_json::to_vec(&invocation).unwrap();

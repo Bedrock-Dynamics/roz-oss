@@ -68,24 +68,24 @@ mod tests {
         let bridge = NatsCopperBridge::new("nats://localhost:4222", "worker-test");
 
         let task_id = Uuid::new_v4();
-        let invocation = TaskInvocation {
+        let invocation = TaskInvocation::new(
             task_id,
-            tenant_id: "tenant-abc".to_owned(),
-            prompt: "Pick up the red block".to_owned(),
-            environment_id: Uuid::new_v4(),
-            safety_policy_id: None,
-            host_id: Uuid::new_v4(),
-            timeout_secs: 300,
-            mode: ExecutionMode::OodaReAct,
-            parent_task_id: None,
-            restate_url: "http://localhost:8080".to_owned(),
-            traceparent: None,
-            phases: vec![],
-            control_interface_manifest: None,
-            delegation_scope: None,
-            declared_max_linear_m_per_s: None,
-            declared_max_angular_rad_per_s: None,
-        };
+            "tenant-abc".to_owned(),
+            "Pick up the red block".to_owned(),
+            Uuid::new_v4(),
+            None,
+            Uuid::new_v4(),
+            300,
+            ExecutionMode::OodaReAct,
+            None,
+            "http://localhost:8080".to_owned(),
+            None,
+            vec![],
+            None,
+            None,
+            None,
+            None,
+        );
 
         let result = bridge.execute_task(&invocation);
 

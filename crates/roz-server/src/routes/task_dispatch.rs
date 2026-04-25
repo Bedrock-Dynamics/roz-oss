@@ -222,29 +222,32 @@ pub async fn dispatch_task(
         }
     }
 
-    let invocation = roz_nats::dispatch::TaskInvocation {
-        task_id: task.id,
-        tenant_id: request.tenant_id.to_string(),
-        prompt: task.prompt.clone(),
-        environment_id: task.environment_id,
-        safety_policy_id: None,
-        host_id: host_uuid,
-        timeout_secs: request
+    // Plan 24-12: declared velocity bounds are not yet surfaced on the
+    // REST create-task payload — worker pre-dispatch gate falls through
+    // to trivial-allow on None. Follow-up plan threads them in.
+    // Phase 26.10 FW-01: `embodiment_runtime` defaults to None via the
+    // constructor; Plan 26.10-01 Task 2 attaches the resolved runtime
+    // after construction (`invocation.embodiment_runtime = ...`).
+    let invocation = roz_nats::dispatch::TaskInvocation::new(
+        task.id,
+        request.tenant_id.to_string(),
+        task.prompt.clone(),
+        task.environment_id,
+        None,
+        host_uuid,
+        request
             .timeout_secs
             .map_or(300, |timeout| u32::try_from(timeout).unwrap_or(300)),
-        mode: mode_from_phases(&request.phases),
-        parent_task_id: request.parent_task_id,
-        restate_url: services.restate_ingress_url.to_string(),
-        traceparent: roz_nats::dispatch::current_traceparent(),
-        phases: request.phases,
-        control_interface_manifest: request.control_interface_manifest,
-        delegation_scope: request.delegation_scope,
-        // Plan 24-12: declared velocity bounds are not yet surfaced on the
-        // REST create-task payload — worker pre-dispatch gate falls through
-        // to trivial-allow on None. Follow-up plan threads them in.
-        declared_max_linear_m_per_s: None,
-        declared_max_angular_rad_per_s: None,
-    };
+        mode_from_phases(&request.phases),
+        request.parent_task_id,
+        services.restate_ingress_url.to_string(),
+        roz_nats::dispatch::current_traceparent(),
+        request.phases,
+        request.control_interface_manifest,
+        request.delegation_scope,
+        None,
+        None,
+    );
     let subject = roz_nats::subjects::Subjects::invoke(&host.name, &task.id.to_string())
         .map_err(|error| TaskDispatchError::BadRequest(format!("invalid NATS subject: {error}")))?;
     let payload = serde_json::to_vec(&invocation)

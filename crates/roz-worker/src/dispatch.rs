@@ -612,24 +612,24 @@ mod tests {
     use roz_core::tools::ToolResult;
 
     fn sample_invocation(mode: ExecutionMode) -> TaskInvocation {
-        TaskInvocation {
-            task_id: Uuid::nil(),
-            tenant_id: "t1".into(),
-            prompt: "do something".into(),
-            environment_id: Uuid::nil(),
-            safety_policy_id: None,
-            host_id: Uuid::nil(),
-            timeout_secs: 300,
+        TaskInvocation::new(
+            Uuid::nil(),
+            "t1".into(),
+            "do something".into(),
+            Uuid::nil(),
+            None,
+            Uuid::nil(),
+            300,
             mode,
-            parent_task_id: None,
-            restate_url: String::new(),
-            traceparent: None,
-            phases: vec![],
-            control_interface_manifest: None,
-            delegation_scope: None,
-            declared_max_linear_m_per_s: None,
-            declared_max_angular_rad_per_s: None,
-        }
+            None,
+            String::new(),
+            None,
+            vec![],
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     // --- Plan 24-05 Task 2: pre-dispatch gate tests ------------------------

@@ -311,27 +311,30 @@ async fn spawn_task_handler(
         };
 
         // Publish NATS invocation for worker dispatch.
-        let invocation = roz_nats::dispatch::TaskInvocation {
-            task_id: task.id,
-            tenant_id: req.tenant_id.to_string(),
-            prompt: task.prompt.clone(),
-            environment_id: task.environment_id,
-            safety_policy_id: None,
-            host_id: host_uuid,
-            timeout_secs: 300,
-            mode: mode_from_phases(&req.phases),
-            parent_task_id: Some(req.parent_task_id),
-            restate_url: restate_ingress_url.clone(),
-            traceparent: roz_nats::dispatch::current_traceparent(),
-            phases: req.phases.clone(),
-            control_interface_manifest: req.control_interface_manifest.clone(),
-            delegation_scope: req.delegation_scope.clone(),
-            // Plan 24-12: child-task declared velocity bounds — server does
-            // not (yet) project from parent policy, worker falls back to
-            // `HotPolicy` trivial-allow on None.
-            declared_max_linear_m_per_s: None,
-            declared_max_angular_rad_per_s: None,
-        };
+        // Plan 24-12: child-task declared velocity bounds — server does
+        // not (yet) project from parent policy, worker falls back to
+        // `HotPolicy` trivial-allow on None.
+        // Phase 26.10 FW-01: child tasks dispatched via the internal spawn
+        // path do not currently resolve the embodiment runtime — the parent
+        // task's runtime context applies. Defaults to None via constructor.
+        let invocation = roz_nats::dispatch::TaskInvocation::new(
+            task.id,
+            req.tenant_id.to_string(),
+            task.prompt.clone(),
+            task.environment_id,
+            None,
+            host_uuid,
+            300,
+            mode_from_phases(&req.phases),
+            Some(req.parent_task_id),
+            restate_ingress_url.clone(),
+            roz_nats::dispatch::current_traceparent(),
+            req.phases.clone(),
+            req.control_interface_manifest.clone(),
+            req.delegation_scope.clone(),
+            None,
+            None,
+        );
         // Phase 23 Plan 23-10 (FS-04): sign the invoke publish when a
         // signing gate is wired (production). The SpawnReply below uses a
         // different subject — `reply_subject` is the ephemeral NATS inbox of
