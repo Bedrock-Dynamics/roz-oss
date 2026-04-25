@@ -123,6 +123,23 @@ mcap = "0.24"
 # dep, surfaced here for direct use in crates/roz-server/src/observability/recovery.rs.
 enumset = "1"
 
+# Phase 26.9 — Rerun .rrd export (D-15). Pinned EXACT to match substrate-ide's
+# bundled Rerun viewer version; the RRD format has no cross-minor stability
+# guarantee per RESEARCH §Topic 1. CI MUST `cargo update -p rerun --precise 0.31.3`
+# to reproduce.
+#
+# B-1 LOCKSTEP CONTRACT: Substrate-ide has not yet published which Rerun crate
+# version it bundles. `=0.31.3` is a provisional pin (latest stable on
+# 2026-04-24). If substrate-ide ships a different version, this pin MUST be
+# upgraded in lockstep BEFORE any integration — produced `.rrd` files are not
+# guaranteed to load across Rerun minor versions. See
+# .planning/phases/26.9-.../26.9-RESEARCH.md §Research Blockers (B-1).
+rerun = { version = "=0.31.3", default-features = false }
+
+# Phase 26.9 D-02 — bulk-mode glob expansion for `roz mcap to-rrd --bulk <GLOB>`.
+# Expanded inside the binary (not the shell) for OS-uniform behavior.
+glob = "0.3"
+
 # Phase 4a additions
 reqwest-eventsource = "0.6"
 futures = "0.3"
