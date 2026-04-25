@@ -408,7 +408,17 @@ Success Criteria (what must be TRUE):
   5. Worker `execute_task` path dispatches `DiscreteCommandSink<FlightCommand>::send_command` end-to-end for drone embodiments: a flight-command task (or tool-call) produced by the agent is routed to `Box<dyn DiscreteCommandSink<FlightCommand>>` extracted from `roz_agent::dispatch::Extensions`, the call returns `FlightCommandResponse`, and the response propagates back to the agent loop for reasoning. Integration test exercises this via a scripted task that issues ARM + TAKEOFF via the DiscreteCommandSink path (not direct gRPC shim).
   6. Live `TelemetryFrame.readiness` propagation: `roz-mavlink` `SensorSource::try_recv` feeds `SensorFrame.frame_snapshot_input` that carries `ReadinessState` derived from SITL HEARTBEAT + GPS_RAW_INT + ESTIMATOR_STATUS; copper telemetry publisher attaches that readiness to the outbound `TelemetryFrame.readiness` field (populated with autopilot=PX4); a subscriber asserts the readiness round-trip against the scripted scenario's expected state at TAKEOFF and LAND checkpoints.
   7. Full-boot QGC coexistence: a QGC-shim peer on `MAV_COMP_ID_MISSIONPLANNER (190)` link_id 3 connects to the same SITL instance while copper is flying the scripted scenario; both peers send + receive without command or heartbeat conflicts; QGC-shim can observe TELEMETRY_RADIO and READY-level heartbeats from copper without interleaving-induced drops. This closes the SC5 live-FCU gap scoped out of Phase 25.
-**Plans**: TBD
+**Plans**: 10 plans
+  - [ ] 27-01-PLAN.md — Wave 1: add v1 `ReadinessState` + `optional readiness=6` on `TelemetryUpdate` (proto change for D-11 amendment) [MAV-03]
+  - [ ] 27-02-PLAN.md — Wave 1: `Px4SitlGuard` testcontainers wrapper + roz-test re-export [RD-01]
+  - [ ] 27-03-PLAN.md — Wave 2: `QgcShimHandle` + `spawn_qgc_shim` reusable peer (extracted from qgc_coexistence.rs) [RD-01]
+  - [ ] 27-04-PLAN.md — Wave 1: single `flight_command` tool in roz-agent dispatch (D-05) [RD-01]
+  - [ ] 27-05-PLAN.md — Wave 2: worker `execute_task` install `Arc<MavlinkBackend>` extension + `FlightCommandTool` registration + telemetry-loop readiness populate (single same-file plan) [RD-01, MAV-03]
+  - [ ] 27-06-PLAN.md — Wave 3: `px4_sitl_full_scenario` integration test — ARM→TAKEOFF→HOVER→RTL→LAND + NATS outage + WAL row growth + MCAP dedup + readiness exact-equality [RD-01, MAV-03]
+  - [ ] 27-07-PLAN.md — Wave 4: inline `.tlog` capture (10 PX4 fixtures) with verify-only diff (D-16) + bootstrap-mode write [MAV-01, MAV-03]
+  - [ ] 27-08-PLAN.md — Wave 5: `crates/roz-mavlink/tests/{compliance,readiness_replay,common/tlog}.rs` — 7 PX4 compliance + 3 PX4 readiness replay tests [MAV-01, MAV-03]
+  - [ ] 27-09-PLAN.md — Wave 5: `qgc_coexistence_during_takeoff` test fn (separate process via std::process::exit(0) per Phase 25 known limitation #5) [RD-01]
+  - [ ] 27-10-PLAN.md — Wave 6: `.github/workflows/integration-px4-sitl.yml` (cron 0 8 * * *, two separate `cargo nextest` invocations, JUnit + MCAP + .tlog artifacts, peter-evans failure issue) [RD-01]
 
 ### Phase 28: HITL documentation, companion setup, and Pixhawk single-binary deployment quickstart
 
