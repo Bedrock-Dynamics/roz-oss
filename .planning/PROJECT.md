@@ -142,4 +142,4 @@ Security posture: tenant isolation remains enforced with RLS across the new pers
 This document evolves at phase transitions and milestone boundaries.
 
 ---
-*Last updated: 2026-04-16 after completing carryover Phase 21.1*
+*Last updated: 2026-04-25 after completing Phase 26.9 (RRD format export for substrate)*
