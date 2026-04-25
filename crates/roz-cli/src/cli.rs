@@ -142,6 +142,8 @@ pub enum Commands {
     Media(commands::media::MediaArgs),
     /// Recording and sim-to-real comparison.
     Recording(commands::recording::RecordingArgs),
+    /// MCAP utilities — convert session MCAP to Rerun .rrd (Phase 26.9).
+    Mcap(commands::mcap::McapArgs),
     /// Simulation environment management.
     Sim(commands::sim::SimArgs),
     /// Device trust management.

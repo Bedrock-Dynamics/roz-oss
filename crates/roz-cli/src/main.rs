@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
             cli::Commands::Stream(args) => commands::stream::execute(&args.command, &config).await,
             cli::Commands::Media(args) => commands::media::execute(&args.command, &config).await,
             cli::Commands::Recording(args) => commands::recording::execute(&args.command, &config).await,
+            cli::Commands::Mcap(args) => commands::mcap::execute(&args.command, &config).await,
             cli::Commands::Sim(args) => commands::sim::execute(&args.action).await,
             cli::Commands::Trust(args) => commands::trust::execute(&args.command, &config).await,
             cli::Commands::Device(args) => commands::device::execute(&args.command).await,
