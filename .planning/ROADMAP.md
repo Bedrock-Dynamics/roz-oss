@@ -369,7 +369,7 @@ Plans:
 **Goal:** Produce Rerun `.rrd` recording files from session MCAPs for substrate ingestion. Pure format export — writes to disk via `rerun::RecordingStreamBuilder::new(...).save(<path>)`, never spawns or connects to a viewer. Substrate opens the `.rrd` with its embedded Rerun rendering.
 **Requirements:** none (format export)
 **Depends on:** Phase 26.1 (MCAP reads cleanly); benefits from 26.5 multimedia channels if substrate wants camera overlays in RRD
-**Plans:** 8/8 plans complete
+**Plans:** 8 plans
 
 Success Criteria (what must be TRUE):
   1. New CLI subcommand `roz mcap to-rrd <session.mcap> --output <path.rrd>` produces a valid Rerun recording file; also supports `--bulk "*.mcap" --output-dir <dir>`.
@@ -385,7 +385,15 @@ Success Criteria (what must be TRUE):
   4. No viewer launch: the CLI calls `.save()`, never `.spawn()` or `.connect()`; the binary runs and exits without requiring a display.
   5. Produced `.rrd` file is valid and loadable via `rerun` CLI (`rerun view <path.rrd>`) — verified manually once.
   6. Smoke test on `phase26-sc5-fixture.mcap` round-trips cleanly and renders the expected 1500 transforms + agent events.
-**Plans**: TBD
+**Plans**:
+- [x] 26.9-01-PLAN.md — workspace + roz-cli Cargo deps (rerun=0.31.3 exact, glob, export-rrd feature) + build.rs foxglove .protos
+- [ ] 26.9-02-PLAN.md — CLI surface (`roz mcap to-rrd`) + module directory skeleton with submodule stubs + feature-gated friendly error (D-17)
+- [ ] 26.9-03-PLAN.md — MCAP reader + `ChannelKind` classifier + warn-once state + `export_one`/`export_bulk` dispatchers (D-04/D-05/D-13/D-14/D-19/D-20)
+- [ ] 26.9-04-PLAN.md — `RecordingStream` builder + dual-timeline helper with B-2 method-name correction (`set_timestamp_secs_since_epoch`)
+- [ ] 26.9-05-PLAN.md — `/tf` + `/roz/telemetry/pose` → `Transform3D` emit (D-10 rows 1-2)
+- [ ] 26.9-06-PLAN.md — `/roz/log` + `/roz/session/events` + `/roz/task/lifecycle` + `/roz/tool/calls` → `TextLog` emit (D-10 rows 3-6; AnyValues demoted to JSON body per RESEARCH §Topic 5)
+- [ ] 26.9-07-PLAN.md — `/roz/camera/{name}` → H.264 pass-through via `VideoStream` once + `VideoSample` per frame (D-10 row 7, D-11, D-12)
+- [ ] 26.9-08-PLAN.md — smoke test (D-21 ignore-gated fixture) + bulk-mode continue-on-error integration test (D-05)
 
 ### Phase 27: Nightly PX4 SITL integration CI with induced NATS outage + live-FCU task-layer wiring
 

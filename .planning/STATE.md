@@ -1,32 +1,32 @@
 ---
 gsd_state_version: 1.0
-milestone: v3.0
-milestone_name: Production Robotics
-status: active
-last_updated: "2026-04-24T22:00:00.000Z"
-last_activity: 2026-04-24
+milestone: v2.2
+milestone_name: Runtime Event Contracts and Completeness
+status: executing
+last_updated: "2026-04-25T02:54:22.557Z"
+last_activity: 2026-04-25 -- Phase --phase execution started
 progress:
-  total_phases: 16
-  completed_phases: 12
-  total_plans: 109
-  completed_plans: 102
+  total_phases: 1
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 3
 ---
 
 # State
 
 ## Current Position
 
-Phase: 26.8 (just completed — UAT 9/10 + verification 7/7 + security 32/32)
-Plan: All complete
-Status: Active — ready to advance to next phase (26.9 / 27 / 28 unstarted)
-Last activity: 2026-04-24
+Phase: --phase (26.9) — EXECUTING
+Plan: 1 of --name
+Status: Executing Phase --phase
+Last activity: 2026-04-25 -- Phase --phase execution started
 
 ## Project Reference
 
 See: `.planning/PROJECT.md` (updated 2026-04-16)
 
 **Core value:** A reliable, secure, and well-tested platform that operators trust for physical robot deployments.
-**Current focus:** Phase 26.5 — MCAP multimedia channels — camera frames, point clouds, scene updates
+**Current focus:** Phase --phase — 26.9
 
 ## Accumulated Context
 
@@ -99,6 +99,9 @@ See: `.planning/PROJECT.md` (updated 2026-04-16)
 **Completed Phase (prior):** 26.7 (session-artifact-service-generic-sidecar-archival-copper-log) — 9/9 plans — 2026-04-24
 
 **Next Phase Candidates (unstarted):**
+
 - 26.9 RRD format export — Rerun recording files for substrate ingestion
 - 27 Nightly PX4 SITL CI + induced NATS outage + live-FCU task-layer wiring
 - 28 HITL docs + Pixhawk single-binary deployment quickstart
+
+**Planned Phase:** 26.9 (RRD format export — static Rerun recording files for substrate ingestion) — 8 plans — 2026-04-25T02:48:02.617Z
