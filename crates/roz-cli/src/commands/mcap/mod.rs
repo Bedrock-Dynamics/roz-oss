@@ -114,14 +114,27 @@ async fn to_rrd(_args: &ToRrdArgs) -> anyhow::Result<()> {
 #[cfg(feature = "export-rrd")]
 #[expect(
     clippy::unused_async,
-    reason = "Plan 02 skeleton placeholder; Plans 03/04/05/06/07 add async RecordingStream + tokio file I/O"
+    reason = "Plan 03: dispatcher routes to sync export entry points; Plans 04/07 may introduce real `.await` (e.g. tokio file I/O for camera frames) and remove this expect"
 )]
-async fn to_rrd(_args: &ToRrdArgs) -> anyhow::Result<()> {
-    // Plan 02 skeleton only — Plans 03/04/05/06/07 wire the real exporter.
-    anyhow::bail!(
-        "Phase 26.9 Plan 02 skeleton: to-rrd dispatch wired but export \
-         pipeline implementations land in Plans 03-07"
-    )
+async fn to_rrd(args: &ToRrdArgs) -> anyhow::Result<()> {
+    if args.input.is_some() {
+        // Single mode (D-04 fail-fast).
+        let input = args.input.as_ref().expect("clap enforces presence");
+        let output = args
+            .output
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("--output is required in single-file mode"))?;
+        export::export_one(input, output)?;
+        Ok(())
+    } else {
+        // Bulk mode (D-05 continue-on-error).
+        let pattern = args.bulk.as_ref().expect("clap enforces presence");
+        let out_dir = args
+            .output_dir
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("--output-dir is required in bulk mode"))?;
+        export::export_bulk(pattern, out_dir)
+    }
 }
 
 #[cfg(test)]
