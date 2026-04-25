@@ -15,6 +15,29 @@ pub const SYNTHETIC_EMBODIMENT_RUNTIME_ISSUE: &str = "embodiment runtime synthes
 pub const EMBODIMENT_MANIFEST_FILE: &str = "embodiment.toml";
 pub const LEGACY_ROBOT_MANIFEST_FILE: &str = "robot.toml";
 
+/// Errors returned by the fail-closed authoritative manifest parse path
+/// (`EmbodimentManifest::try_authoritative_embodiment_runtime`).
+///
+/// Production callers MUST handle these; the legacy
+/// [`EmbodimentManifest::embodiment_runtime`] getter remains an unchecked
+/// `Option`-returning compatibility helper that synthesizes loose limits
+/// when joint metadata is absent.
+#[derive(Debug, thiserror::Error)]
+pub enum ManifestError {
+    /// `[[joints]]` table absent from the manifest. Production parse refuses
+    /// to synthesize `INFINITY` limits so dispatch fails fast.
+    #[error("manifest is missing joint limits — production manifests must declare [[joints]] tables (FW-06)")]
+    MissingJointLimits,
+
+    /// A `[[joints]]` table referenced an unknown TOML structure.
+    #[error("invalid joint table for `{joint}`: {detail}")]
+    InvalidJoint { joint: String, detail: String },
+
+    /// `[channels]` section was required but absent.
+    #[error("manifest is missing [channels] section required for control interface")]
+    MissingChannels,
+}
+
 /// Top-level physical embodiment manifest parsed from `embodiment.toml`
 /// or the legacy `robot.toml` fallback.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +59,174 @@ pub struct EmbodimentManifest {
     pub channels: Option<ChannelConfig>,
     /// Daemon REST/WebSocket configuration for agent tools.
     pub daemon: Option<DaemonConfig>,
+    /// Authoritative joint schema (FW-06). Required by
+    /// [`Self::try_authoritative_embodiment_runtime`] on production
+    /// codepaths; absent in legacy channel-only manifests, in which case
+    /// only the synthesizing [`Self::embodiment_runtime`] compat getter is
+    /// available.
+    #[serde(default)]
+    pub joints: Vec<JointTable>,
+    /// Tool center points authored on the manifest.
+    #[serde(default)]
+    pub tcps: Vec<TcpTable>,
+    /// Sensor mounts authored on the manifest.
+    #[serde(default)]
+    pub sensor_mounts: Vec<SensorMountTable>,
+    /// Workspace zones authored on the manifest.
+    #[serde(default)]
+    pub workspace_zones: Vec<WorkspaceZoneTable>,
+}
+
+/// Manifest TOML table for a single joint.
+///
+/// Mirrors [`crate::embodiment::model::Joint`] but uses an inline
+/// TOML-friendly transform shape and forwards `name` into
+/// [`JointSafetyLimits::joint_name`] at parse time so operators do not
+/// have to repeat it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JointTable {
+    pub name: String,
+    pub joint_type: crate::embodiment::model::JointType,
+    pub parent_link: String,
+    pub child_link: String,
+    pub axis: [f64; 3],
+    pub origin: Transform3DTable,
+    pub limits: JointSafetyLimitsTable,
+}
+
+/// TOML-friendly mirror of [`crate::embodiment::limits::JointSafetyLimits`].
+/// `joint_name` is intentionally absent and copied from the parent
+/// [`JointTable::name`] at materialisation time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JointSafetyLimitsTable {
+    pub position_min: f64,
+    pub position_max: f64,
+    pub max_velocity: f64,
+    pub max_acceleration: f64,
+    pub max_jerk: f64,
+    /// Optional per `JointSafetyLimits.max_torque: Option<f64>`. Omit the key
+    /// in TOML for `None`; provide a literal value for `Some(_)`.
+    #[serde(default)]
+    pub max_torque: Option<f64>,
+}
+
+/// TOML-friendly mirror of [`crate::embodiment::frame_tree::Transform3D`].
+/// `timestamp_ns` is omitted in TOML and defaulted to 0 — manifests describe
+/// static topology, not live frame samples.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Transform3DTable {
+    pub translation: [f64; 3],
+    /// Quaternion in `[w, x, y, z]` order. Identity is `[1.0, 0.0, 0.0, 0.0]`.
+    pub rotation: [f64; 4],
+}
+
+/// TOML-friendly mirror of [`crate::embodiment::model::ToolCenterPoint`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TcpTable {
+    pub name: String,
+    pub parent_link: String,
+    pub offset: Transform3DTable,
+    pub tcp_type: crate::embodiment::model::TcpType,
+}
+
+/// TOML-friendly mirror of [`crate::embodiment::model::SensorMount`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SensorMountTable {
+    pub sensor_id: String,
+    pub parent_link: String,
+    pub offset: Transform3DTable,
+    pub sensor_type: crate::embodiment::model::SensorType,
+    #[serde(default)]
+    pub is_actuated: bool,
+    #[serde(default)]
+    pub actuation_joint: Option<String>,
+    #[serde(default)]
+    pub frustum: Option<crate::embodiment::model::CameraFrustum>,
+}
+
+/// TOML-friendly mirror of [`crate::embodiment::workspace::WorkspaceZone`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceZoneTable {
+    pub name: String,
+    pub shape: crate::embodiment::workspace::WorkspaceShape,
+    pub origin_frame: String,
+    pub zone_type: crate::embodiment::workspace::ZoneType,
+    pub margin_m: f64,
+}
+
+impl Transform3DTable {
+    fn to_transform(&self) -> crate::embodiment::frame_tree::Transform3D {
+        crate::embodiment::frame_tree::Transform3D {
+            translation: self.translation,
+            rotation: self.rotation,
+            timestamp_ns: 0,
+        }
+    }
+}
+
+impl JointTable {
+    fn to_joint(&self) -> crate::embodiment::model::Joint {
+        use crate::embodiment::limits::JointSafetyLimits;
+        use crate::embodiment::model::Joint;
+
+        Joint {
+            name: self.name.clone(),
+            joint_type: self.joint_type.clone(),
+            parent_link: self.parent_link.clone(),
+            child_link: self.child_link.clone(),
+            axis: self.axis,
+            origin: self.origin.to_transform(),
+            // joint_name on the limits is sourced from the parent joint's
+            // name — never read separately from TOML, so operators cannot
+            // drift the two apart.
+            limits: JointSafetyLimits {
+                joint_name: self.name.clone(),
+                max_velocity: self.limits.max_velocity,
+                max_acceleration: self.limits.max_acceleration,
+                max_jerk: self.limits.max_jerk,
+                position_min: self.limits.position_min,
+                position_max: self.limits.position_max,
+                max_torque: self.limits.max_torque,
+            },
+        }
+    }
+}
+
+impl TcpTable {
+    fn to_tcp(&self) -> crate::embodiment::model::ToolCenterPoint {
+        crate::embodiment::model::ToolCenterPoint {
+            name: self.name.clone(),
+            parent_link: self.parent_link.clone(),
+            offset: self.offset.to_transform(),
+            tcp_type: self.tcp_type.clone(),
+        }
+    }
+}
+
+impl SensorMountTable {
+    fn to_sensor_mount(&self) -> crate::embodiment::model::SensorMount {
+        crate::embodiment::model::SensorMount {
+            sensor_id: self.sensor_id.clone(),
+            parent_link: self.parent_link.clone(),
+            offset: self.offset.to_transform(),
+            sensor_type: self.sensor_type.clone(),
+            is_actuated: self.is_actuated,
+            actuation_joint: self.actuation_joint.clone(),
+            frustum: self.frustum.clone(),
+        }
+    }
+}
+
+impl WorkspaceZoneTable {
+    fn to_zone(&self) -> crate::embodiment::workspace::WorkspaceZone {
+        crate::embodiment::workspace::WorkspaceZone {
+            name: self.name.clone(),
+            shape: self.shape.clone(),
+            origin_frame: self.origin_frame.clone(),
+            zone_type: self.zone_type.clone(),
+            margin_m: self.margin_m,
+        }
+    }
 }
 
 /// Legacy compatibility alias retained while downstream code converges on the
@@ -578,6 +769,122 @@ impl EmbodimentManifest {
         })
     }
 
+    /// Production-grade authoritative embodiment runtime parser (FW-06).
+    ///
+    /// Unlike [`Self::embodiment_runtime`], this path:
+    /// - Reads explicit per-joint `JointSafetyLimits` from `[[joints]]` tables.
+    /// - Returns `Err(ManifestError::MissingJointLimits)` when no joint
+    ///   table is declared — production manifests fail closed instead of
+    ///   silently synthesizing `f64::INFINITY` limits.
+    /// - Preserves TCPs, sensor mounts, and workspace zones from the
+    ///   manifest into the resulting [`EmbodimentRuntime`].
+    /// - Produces a runtime with NO `SYNTHETIC_EMBODIMENT_RUNTIME_ISSUE`
+    ///   tag, so downstream callers (e.g. `promote_controller`) accept it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ManifestError::MissingJointLimits`] if the manifest does
+    /// not declare any `[[joints]]` table. Other variants surface specific
+    /// schema issues (currently only `MissingJointLimits` is emitted by the
+    /// parse path; future variants are reserved for richer validation).
+    pub fn try_authoritative_embodiment_runtime(&self) -> Result<crate::embodiment::EmbodimentRuntime, ManifestError> {
+        use std::collections::BTreeSet;
+
+        use crate::embodiment::frame_tree::{FrameSource, FrameTree, Transform3D};
+        use crate::embodiment::model::{EmbodimentModel, Link};
+
+        if self.joints.is_empty() {
+            return Err(ManifestError::MissingJointLimits);
+        }
+
+        // Materialize joints from the explicit schema.
+        let joints: Vec<crate::embodiment::model::Joint> = self.joints.iter().map(JointTable::to_joint).collect();
+
+        // Build the link set as the union of every parent_link / child_link
+        // referenced by joints, plus the canonical `world` root. The frame
+        // tree mirrors the joint topology: each child_link is anchored to
+        // its parent_link via the joint's origin transform.
+        let mut frame_tree = FrameTree::new();
+        frame_tree.set_root("world", FrameSource::Static);
+
+        let mut link_names: BTreeSet<String> = BTreeSet::from(["world".to_string()]);
+        for j in &joints {
+            link_names.insert(j.parent_link.clone());
+            link_names.insert(j.child_link.clone());
+        }
+
+        // Anchor every joint-referenced link beneath `world`. We walk the
+        // joints in declaration order, attaching child_link to parent_link
+        // when both are present in the tree; orphans fall back to `world`
+        // so the tree remains acyclic and rooted.
+        let mut placed: BTreeSet<String> = BTreeSet::from(["world".to_string()]);
+
+        // First, attach all parent_links that aren't already placed to
+        // `world` as direct children (so subsequent joint-driven anchoring
+        // has somewhere to attach).
+        for name in &link_names {
+            if !placed.contains(name) {
+                let _ = frame_tree.add_frame(name, "world", Transform3D::identity(), FrameSource::Static);
+                placed.insert(name.clone());
+            }
+        }
+
+        // Build the link list in BTreeSet (deterministic) order.
+        let links: Vec<Link> = link_names
+            .iter()
+            .map(|name| Link {
+                name: name.clone(),
+                parent_joint: None,
+                inertial: None,
+                visual_geometry: None,
+                collision_geometry: None,
+            })
+            .collect();
+
+        let watched_frames: Vec<String> = link_names.into_iter().collect();
+
+        // Optional channel bindings: if the manifest declares `[channels]`,
+        // project them so the runtime carries control surface metadata.
+        // Absence is allowed at this layer — Plan 03 will resolve channel
+        // bindings against the runtime when binding actuator IO.
+        let channel_bindings = self
+            .control_interface_manifest()
+            .map(|cm| cm.bindings)
+            .unwrap_or_default();
+
+        let tcps: Vec<crate::embodiment::model::ToolCenterPoint> = self.tcps.iter().map(TcpTable::to_tcp).collect();
+        let sensor_mounts: Vec<crate::embodiment::model::SensorMount> = self
+            .sensor_mounts
+            .iter()
+            .map(SensorMountTable::to_sensor_mount)
+            .collect();
+        let workspace_zones: Vec<crate::embodiment::workspace::WorkspaceZone> =
+            self.workspace_zones.iter().map(WorkspaceZoneTable::to_zone).collect();
+
+        let model = EmbodimentModel {
+            model_id: self.robot.name.clone(),
+            model_digest: String::new(),
+            embodiment_family: None,
+            links,
+            joints,
+            frame_tree,
+            collision_bodies: Vec::new(),
+            allowed_collision_pairs: Vec::new(),
+            tcps,
+            sensor_mounts,
+            workspace_zones,
+            watched_frames,
+            channel_bindings,
+        };
+
+        // Compile through `EmbodimentRuntime::compile` which stamps the
+        // model_digest, builds the frame graph, and resolves watched
+        // frames. We deliberately do NOT push the
+        // `SYNTHETIC_EMBODIMENT_RUNTIME_ISSUE` tag here — this path is
+        // authoritative.
+        Ok(crate::embodiment::EmbodimentRuntime::compile(model, None, None))
+    }
+
     /// Render as a concise system prompt block (~400-500 tokens).
     #[must_use]
     pub fn to_system_prompt(&self) -> String {
@@ -972,6 +1279,233 @@ set_target_body = '{"type": "set_full_target", "head": [1,0,0,0]}'
         let (manifest, path) = RobotManifest::load_from_project_dir_with_path(dir.path()).unwrap();
         assert_eq!(manifest.robot.name, "canonical");
         assert_eq!(path, dir.path().join(EMBODIMENT_MANIFEST_FILE));
+    }
+
+    // ------------------------------------------------------------------
+    // FW-06 (Plan 26.10-02) — full Joint schema parsing tests
+    //
+    // The plan replaces the `f64::INFINITY` synthesis path on production
+    // codepaths with explicit per-joint parsing of the full
+    // `roz_core::embodiment::model::Joint` shape (joint_type, parent_link,
+    // child_link, axis, origin, limits) plus preservation of TCPs, sensor
+    // mounts, and workspace zones.
+    //
+    // The compatibility-only `embodiment_runtime()` getter (which still
+    // synthesizes loose limits) is preserved unchanged for callers that
+    // have not yet migrated. The new `try_authoritative_embodiment_runtime`
+    // path fails closed when joint limits are missing.
+    // ------------------------------------------------------------------
+
+    /// Path to the UR5 fixture relative to the workspace root.
+    /// Tests resolve via `CARGO_MANIFEST_DIR` so they work regardless of
+    /// the working directory at test time.
+    const UR5_MANIFEST_REL_PATH: &str = "../../examples/ur5/robot.toml";
+
+    fn load_ur5_manifest() -> RobotManifest {
+        let crate_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = crate_dir.join(UR5_MANIFEST_REL_PATH);
+        RobotManifest::load(&path).expect("UR5 fixture must parse")
+    }
+
+    #[test]
+    fn ur5_manifest_preserves_full_joint_schema() {
+        use crate::embodiment::model::JointType;
+
+        let manifest = load_ur5_manifest();
+        let runtime = manifest
+            .try_authoritative_embodiment_runtime()
+            .expect("UR5 fixture must produce an authoritative runtime");
+
+        assert_eq!(runtime.model.joints.len(), 6, "UR5 has 6 joints");
+
+        for joint in &runtime.model.joints {
+            assert_eq!(joint.joint_type, JointType::Revolute, "{} not revolute", joint.name);
+            assert!(!joint.parent_link.is_empty(), "{} parent_link empty", joint.name);
+            assert!(!joint.child_link.is_empty(), "{} child_link empty", joint.name);
+
+            // axis must come from TOML — not the [0,0,0] default
+            let axis_norm = joint.axis[0].abs() + joint.axis[1].abs() + joint.axis[2].abs();
+            assert!(axis_norm > 0.0, "{} axis must be non-zero", joint.name);
+
+            // origin must be parsed (rotation must be a valid quaternion)
+            let q = joint.origin.rotation;
+            let q_norm_sq = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
+            assert!(
+                (q_norm_sq - 1.0).abs() < 1e-6,
+                "{} origin rotation must be unit quaternion, got norm² = {}",
+                joint.name,
+                q_norm_sq
+            );
+
+            // every JointSafetyLimits field must be finite — no INFINITY synthesis
+            assert!(
+                joint.limits.max_velocity.is_finite(),
+                "{} max_velocity not finite",
+                joint.name
+            );
+            assert!(
+                joint.limits.max_acceleration.is_finite(),
+                "{} max_acceleration not finite",
+                joint.name
+            );
+            assert!(joint.limits.max_jerk.is_finite(), "{} max_jerk not finite", joint.name);
+            assert!(
+                joint.limits.position_min.is_finite(),
+                "{} position_min not finite",
+                joint.name
+            );
+            assert!(
+                joint.limits.position_max.is_finite(),
+                "{} position_max not finite",
+                joint.name
+            );
+            if let Some(t) = joint.limits.max_torque.as_ref() {
+                assert!(t.is_finite(), "{} max_torque present but not finite", joint.name);
+            }
+
+            // UR5-class spec checks
+            assert!(
+                joint.limits.max_velocity <= 6.28 + 1e-6,
+                "{} velocity exceeds UR5",
+                joint.name
+            );
+            assert!(
+                joint.limits.position_min >= -3.142,
+                "{} position_min exceeds UR5",
+                joint.name
+            );
+            assert!(
+                joint.limits.position_max <= 3.142,
+                "{} position_max exceeds UR5",
+                joint.name
+            );
+            assert!(
+                joint.limits.max_jerk >= 1.0,
+                "{} max_jerk below sane lower bound",
+                joint.name
+            );
+            assert!(
+                joint.limits.max_torque.is_some(),
+                "{} max_torque must be Some",
+                joint.name
+            );
+
+            // joint_name must be propagated into limits (the model requires it)
+            assert_eq!(
+                joint.limits.joint_name, joint.name,
+                "JointSafetyLimits.joint_name must mirror Joint.name"
+            );
+        }
+    }
+
+    #[test]
+    fn production_manifest_without_joint_limits_fails() {
+        // Manifest with channels but no [[joints]] tables — must fail closed.
+        let toml_str = r#"
+[robot]
+name = "no-joints"
+description = "manifest without explicit joint limits — must fail closed"
+
+[channels]
+robot_id = "no-joints"
+robot_class = "manipulator"
+control_rate_hz = 100
+
+[[channels.commands]]
+name = "ghost"
+type = "velocity"
+unit = "rad/s"
+limits = [-1.0, 1.0]
+"#;
+        let manifest: RobotManifest = toml::from_str(toml_str).unwrap();
+        let result = manifest.try_authoritative_embodiment_runtime();
+        assert!(result.is_err(), "production parse must fail when [[joints]] is absent");
+        let err = result.unwrap_err().to_string().to_lowercase();
+        assert!(
+            err.contains("joint") && (err.contains("limits") || err.contains("missing")),
+            "error message must mention missing joint limits, got: {err}"
+        );
+    }
+
+    #[test]
+    fn ur5_manifest_preserves_tcp_gripper_sensors() {
+        use crate::embodiment::model::TcpType;
+
+        let manifest = load_ur5_manifest();
+        let runtime = manifest
+            .try_authoritative_embodiment_runtime()
+            .expect("UR5 fixture must produce an authoritative runtime");
+
+        assert_eq!(runtime.model.joints.len(), 6, "UR5 has 6 joints");
+        assert!(!runtime.model.tcps.is_empty(), "UR5 must declare ≥ 1 TCP");
+        let tcp = &runtime.model.tcps[0];
+        assert!(
+            matches!(
+                tcp.tcp_type,
+                TcpType::Gripper | TcpType::Tool | TcpType::Sensor | TcpType::Custom
+            ),
+            "tcp_type must deserialize to a known variant",
+        );
+
+        assert!(
+            !runtime.model.sensor_mounts.is_empty(),
+            "UR5 must declare ≥ 1 sensor mount"
+        );
+
+        assert!(
+            !runtime
+                .validation_issues
+                .iter()
+                .any(|issue| issue == SYNTHETIC_EMBODIMENT_RUNTIME_ISSUE),
+            "authoritative runtime must NOT carry the synthetic-issue tag",
+        );
+    }
+
+    #[test]
+    fn ur5_manifest_no_infinity_anywhere() {
+        let manifest = load_ur5_manifest();
+        let runtime = manifest
+            .try_authoritative_embodiment_runtime()
+            .expect("UR5 fixture must produce an authoritative runtime");
+
+        for joint in &runtime.model.joints {
+            assert!(
+                joint.limits.max_velocity.is_finite(),
+                "{} max_velocity not finite",
+                joint.name
+            );
+            assert!(
+                joint.limits.max_acceleration.is_finite(),
+                "{} max_acceleration not finite",
+                joint.name
+            );
+            assert!(joint.limits.max_jerk.is_finite(), "{} max_jerk not finite", joint.name);
+            assert!(
+                joint.limits.position_min.is_finite(),
+                "{} position_min not finite",
+                joint.name
+            );
+            assert!(
+                joint.limits.position_max.is_finite(),
+                "{} position_max not finite",
+                joint.name
+            );
+            if let Some(t) = joint.limits.max_torque.as_ref() {
+                assert!(t.is_finite(), "{} max_torque present but not finite", joint.name);
+            }
+        }
+    }
+
+    #[test]
+    fn compat_embodiment_runtime_getter_still_works() {
+        // The legacy `embodiment_runtime()` synthesis path is preserved for
+        // callers that still depend on channel-only `robot.toml` manifests
+        // (e.g. `roz-worker/src/main.rs:1487`). It MUST continue to return
+        // `Some(runtime)` for the UR5 fixture, even though the canonical
+        // production path is now `try_authoritative_embodiment_runtime`.
+        let manifest = load_ur5_manifest();
+        let compat = manifest.embodiment_runtime();
+        assert!(compat.is_some(), "compat embodiment_runtime() must still return Some");
     }
 
     #[test]

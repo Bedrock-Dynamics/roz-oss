@@ -7,6 +7,172 @@ e_stop_behavior = "hold_position"
 watchdog_timeout_ms = 500
 max_contact_force_n = 150.0
 
+# ----------------------------------------------------------------------------
+# Authoritative joint schema (FW-06 — Plan 26.10-02)
+#
+# Each joint declares the FULL `roz_core::embodiment::model::Joint` shape:
+#   joint_type, parent_link, child_link, axis, origin (Transform3D), limits.
+#
+# Limits MUST carry every `JointSafetyLimits` field — no INFINITY synthesis on
+# the production parse path. `max_torque` is `Option<f64>`; omit the key for
+# `None`, present a literal value for `Some(_)`.
+#
+# UR5 joint topology (canonical):
+#   shoulder_pan   : base_link    → shoulder_link    (axis [0,0,1])
+#   shoulder_lift  : shoulder_link → upper_arm_link  (axis [0,1,0])
+#   elbow          : upper_arm_link → forearm_link   (axis [0,1,0])
+#   wrist_1        : forearm_link → wrist_1_link     (axis [0,1,0])
+#   wrist_2        : wrist_1_link → wrist_2_link     (axis [0,0,1])
+#   wrist_3        : wrist_2_link → wrist_3_link     (axis [0,1,0])
+#
+# Transform3D rotation is `[w, x, y, z]`; identity is [1, 0, 0, 0].
+# `timestamp_ns` is omitted in TOML and defaulted to 0 by the parser.
+# ----------------------------------------------------------------------------
+
+[[joints]]
+name = "shoulder_pan"
+joint_type = "revolute"
+parent_link = "base_link"
+child_link = "shoulder_link"
+axis = [0.0, 0.0, 1.0]
+
+[joints.origin]
+translation = [0.0, 0.0, 0.089159]
+rotation = [1.0, 0.0, 0.0, 0.0]
+
+[joints.limits]
+position_min = -3.14159
+position_max = 3.14159
+max_velocity = 3.14
+max_acceleration = 5.0
+max_jerk = 50.0
+max_torque = 150.0
+
+[[joints]]
+name = "shoulder_lift"
+joint_type = "revolute"
+parent_link = "shoulder_link"
+child_link = "upper_arm_link"
+axis = [0.0, 1.0, 0.0]
+
+[joints.origin]
+translation = [0.0, 0.13585, 0.0]
+rotation = [1.0, 0.0, 0.0, 0.0]
+
+[joints.limits]
+position_min = -3.14159
+position_max = 3.14159
+max_velocity = 3.14
+max_acceleration = 5.0
+max_jerk = 50.0
+max_torque = 150.0
+
+[[joints]]
+name = "elbow"
+joint_type = "revolute"
+parent_link = "upper_arm_link"
+child_link = "forearm_link"
+axis = [0.0, 1.0, 0.0]
+
+[joints.origin]
+translation = [0.0, -0.1197, 0.425]
+rotation = [1.0, 0.0, 0.0, 0.0]
+
+[joints.limits]
+position_min = -3.14159
+position_max = 3.14159
+max_velocity = 3.14
+max_acceleration = 5.0
+max_jerk = 50.0
+max_torque = 150.0
+
+[[joints]]
+name = "wrist_1"
+joint_type = "revolute"
+parent_link = "forearm_link"
+child_link = "wrist_1_link"
+axis = [0.0, 1.0, 0.0]
+
+[joints.origin]
+translation = [0.0, 0.0, 0.39225]
+rotation = [1.0, 0.0, 0.0, 0.0]
+
+[joints.limits]
+position_min = -3.14159
+position_max = 3.14159
+max_velocity = 6.28
+max_acceleration = 5.0
+max_jerk = 50.0
+max_torque = 28.0
+
+[[joints]]
+name = "wrist_2"
+joint_type = "revolute"
+parent_link = "wrist_1_link"
+child_link = "wrist_2_link"
+axis = [0.0, 0.0, 1.0]
+
+[joints.origin]
+translation = [0.0, 0.093, 0.0]
+rotation = [1.0, 0.0, 0.0, 0.0]
+
+[joints.limits]
+position_min = -3.14159
+position_max = 3.14159
+max_velocity = 6.28
+max_acceleration = 5.0
+max_jerk = 50.0
+max_torque = 28.0
+
+[[joints]]
+name = "wrist_3"
+joint_type = "revolute"
+parent_link = "wrist_2_link"
+child_link = "wrist_3_link"
+axis = [0.0, 1.0, 0.0]
+
+[joints.origin]
+translation = [0.0, 0.0, 0.09465]
+rotation = [1.0, 0.0, 0.0, 0.0]
+
+[joints.limits]
+position_min = -3.14159
+position_max = 3.14159
+max_velocity = 6.28
+max_acceleration = 5.0
+max_jerk = 50.0
+max_torque = 28.0
+
+# ----------------------------------------------------------------------------
+# Tool center points
+# ----------------------------------------------------------------------------
+
+[[tcps]]
+name = "wrist_tool_center"
+parent_link = "wrist_3_link"
+tcp_type = "tool"
+
+[tcps.offset]
+translation = [0.0, 0.0, 0.0823]
+rotation = [1.0, 0.0, 0.0, 0.0]
+
+# ----------------------------------------------------------------------------
+# Sensor mounts
+# ----------------------------------------------------------------------------
+
+[[sensor_mounts]]
+sensor_id = "wrist_camera"
+parent_link = "wrist_3_link"
+sensor_type = "camera"
+
+[sensor_mounts.offset]
+translation = [0.05, 0.0, 0.0]
+rotation = [1.0, 0.0, 0.0, 0.0]
+
+# ----------------------------------------------------------------------------
+# Channel manifest (legacy — preserved for control surface)
+# ----------------------------------------------------------------------------
+
 [channels]
 robot_id = "ur5"
 robot_class = "manipulator"
