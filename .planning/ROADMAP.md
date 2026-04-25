@@ -369,7 +369,7 @@ Plans:
 **Goal:** Produce Rerun `.rrd` recording files from session MCAPs for substrate ingestion. Pure format export — writes to disk via `rerun::RecordingStreamBuilder::new(...).save(<path>)`, never spawns or connects to a viewer. Substrate opens the `.rrd` with its embedded Rerun rendering.
 **Requirements:** none (format export)
 **Depends on:** Phase 26.1 (MCAP reads cleanly); benefits from 26.5 multimedia channels if substrate wants camera overlays in RRD
-**Plans:** 8 plans
+**Plans:** 8/8 plans complete
 
 Success Criteria (what must be TRUE):
   1. New CLI subcommand `roz mcap to-rrd <session.mcap> --output <path.rrd>` produces a valid Rerun recording file; also supports `--bulk "*.mcap" --output-dir <dir>`.
@@ -448,6 +448,6 @@ v3.0 Production Robotics milestone is in the planning stage. Phase 22 is planned
 | 26.6. LeRobotDataset v3 exporter (deferred) | v3.0 | 0/0 | Deferred until user demand | — |
 | 26.7. Session artifact service (copper sidecar) | v3.0 | 9/9 | Complete    | 2026-04-24 |
 | 26.8. ULOG auto-download via MAVLink | v3.0 | 0/0 | Not started (gated on 26.7 + 27) | — |
-| 26.9. RRD format export for substrate | v3.0 | 0/0 | Not started | — |
+| 26.9. RRD format export for substrate | v3.0 | 8/8 | Complete    | 2026-04-25 |
 | 27. Nightly PX4 SITL CI | v3.0 | 0/0 | Not started | — |
 | 28. HITL docs + Pixhawk quickstart | v3.0 | 0/0 | Not started | — |
