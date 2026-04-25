@@ -659,11 +659,13 @@ jobs:
 | A5 | A "drone embodiment" check is equivalent to `mavlink_backend.is_some()` at execute_task install time | Pattern 2 + Anti-Patterns | If the user wants a more granular embodiment-tag check (e.g., differentiate quadcopter vs fixed-wing), need an additional predicate from `embodiment_runtime` at line 1483-1497 of `main.rs` |
 | A6 | `Extensions::get<Arc<MavlinkBackend>>` is the right insertion type (not `Box<dyn DiscreteCommandSink<FlightCommand>>`) per Pitfall 10 | Pattern 2 | If wrong, dispatch fails at runtime — easy to detect with a smoke test before the full nightly |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-> **CRITICAL.** These three contract gaps cannot be silently resolved by the planner. They need an amendment to CONTEXT.md (or explicit confirmation from the user) before a plan is durable.
+> All four open questions have been resolved. Q1 + Q2 via CONTEXT.md amendments before planning. Q3 + Q4 via planner discretion in the locked PLAN.md set. Marked with inline `RESOLVED` notes below.
 
-### Open Q1: D-11 references `TelemetryFrame.readiness` on NATS, but production NATS path uses `roz.v1.TelemetryUpdate` (no `readiness` field)
+### Open Q1 [RESOLVED → CONTEXT D-11 amendment, path (a)]: D-11 references `TelemetryFrame.readiness` on NATS, but production NATS path uses `roz.v1.TelemetryUpdate` (no `readiness` field)
+
+**RESOLVED:** CONTEXT D-11 amended to "add `optional ReadinessState readiness = 6;` to `roz.v1.TelemetryUpdate`" (path a). Implemented by Plan 27-01 (proto change), Plan 27-05 (worker populates field), Plan 27-06 (subscriber asserts).
 **What we know:**
 - `TelemetryFrame.readiness = 20` exists in **`crates/roz-copper/proto/substrate/sim/bridge.proto:389`** — this is the **bridge.proto** wire (copper↔substrate-sim-bridge gRPC).
 - The actual **NATS** wire format on the production telemetry path is **`roz.v1.TelemetryUpdate`** (verified at `crates/roz-worker/src/main.rs:1670-1671, 1742-1748`).
@@ -678,20 +680,17 @@ jobs:
 
 **Recommendation:** Path (a) — adding a single optional proto field is wire-compatible (per Phase 25 D-05' precedent on `MavAutopilot autopilot = 11`) and gives D-12's "exact-equality on full ReadinessState struct" assertion a clean implementation. Path (b) is viable but creates a second telemetry topology to maintain.
 
-### Open Q2: D-13 says `roz.telemetry.{worker_id}`; production is `telemetry.{worker_id}.state`
-**What we know:** Verified at `crates/roz-worker/src/main.rs:1670-1671`: `// Same NATS subject (telemetry.{worker_id}.state)`.
-**What's unclear:** Is D-13 a typo (the real intent is to subscribe to the production subject) or is Phase 27 introducing a new subject?
-**Recommendation:** Treat D-13 as a typo and subscribe to **`telemetry.{worker_id}.state`** unless the user amends. (This question is mostly cosmetic if Open Q1 resolves to path (a) — same subject either way.)
+### Open Q2 [RESOLVED → CONTEXT D-13 amendment]: D-13 says `roz.telemetry.{worker_id}`; production is `telemetry.{worker_id}.state`
 
-### Open Q3: Phase 25 known limitation #5 (qgc_coexistence force-exits the test process) blocks SC7 full-boot composition
-**What we know:** `crates/roz-mavlink/tests/qgc_coexistence.rs:191,197` calls `std::process::exit(0)` after the assertion. Reason: upstream `mavlink::connect("udpin:...")` holds an uncancellable blocking `recv` (Phase 25 known limitation #5, `docs/mavlink-coexistence.md:144`). Doc explicitly says: "Clean shutdown is a Phase 27 follow-up."
-**What's unclear:** Does Phase 27 (a) fix the upstream blocking-recv issue (touches `crates/roz-mavlink/src/transport/`), or (b) accept the per-test-name CI-matrix split (run SC7 as a separate `cargo test --test px4_sitl_e2e <test_name>` invocation)?
-**Recommendation:** Path (b). Path (a) is unbounded scope (upstream mavlink crate change). The CI matrix split is already the documented pattern for the existing two qgc_coexistence tests.
+**RESOLVED:** CONTEXT D-13 amended to use the production subject `telemetry.{worker_id}.state` (verified at `crates/roz-worker/src/main.rs:1670-1671`). The earlier subject was a typo. Implemented by Plan 27-05 (worker publishes here) and Plan 27-06 (test subscribes here).
 
-### Open Q4 (smaller): Worker + Server binaries inside a roz-test integration test
-**What we know:** The zenoh-chaos suite pre-builds `roz-worker` (`.github/workflows/nightly.yml:223`) and spawns it as a subprocess. The pattern exists.
-**What's unclear:** Does Phase 27 spawn separate `roz-worker` + `roz-server` binaries, or embed them in-process via library calls?
-**Recommendation:** Subprocess for production fidelity. The `tokio::process::Command::new(env!("CARGO_BIN_EXE_roz-worker"))` pattern is already used by zenoh chaos tests. Embedding would be faster but loses signal on process-startup behavior (config loading, env-var precedence, etc.).
+### Open Q3 [RESOLVED → planner discretion, path (b)]: Phase 25 known limitation #5 (qgc_coexistence force-exits the test process) blocks SC7 full-boot composition
+
+**RESOLVED:** Plan 27-09 implements SC7 as a separate `#[tokio::test]` invocation in the same test binary, run via a distinct `cargo nextest` filter (path b). Path (a) — fixing the upstream `mavlink` blocking-recv issue — was rejected as unbounded scope.
+
+### Open Q4 [RESOLVED → planner discretion, subprocess]: Worker + Server binaries inside a roz-test integration test
+
+**RESOLVED:** Plan 27-06 spawns `roz-worker` as a subprocess via `tokio::process::Command::new(env!("CARGO_BIN_EXE_roz-worker"))` (matches zenoh-chaos precedent at `.github/workflows/nightly.yml:223`). Production-fidelity path chosen over in-process embedding.
 
 ## Environment Availability
 
