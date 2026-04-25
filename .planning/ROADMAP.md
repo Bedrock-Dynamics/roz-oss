@@ -393,7 +393,7 @@ Success Criteria (what must be TRUE):
 - [x] 26.9-05-PLAN.md — `/tf` + `/roz/telemetry/pose` → `Transform3D` emit (D-10 rows 1-2)
 - [x] 26.9-06-PLAN.md — `/roz/log` + `/roz/session/events` + `/roz/task/lifecycle` + `/roz/tool/calls` → `TextLog` emit (D-10 rows 3-6; AnyValues demoted to JSON body per RESEARCH §Topic 5)
 - [x] 26.9-07-PLAN.md — `/roz/camera/{name}` → H.264 pass-through via `VideoStream` once + `VideoSample` per frame (D-10 row 7, D-11, D-12)
-- [ ] 26.9-08-PLAN.md — smoke test (D-21 ignore-gated fixture) + bulk-mode continue-on-error integration test (D-05)
+- [x] 26.9-08-PLAN.md — smoke test (D-21 ignore-gated fixture) + bulk-mode continue-on-error integration test (D-05)
 
 ### Phase 27: Nightly PX4 SITL integration CI with induced NATS outage + live-FCU task-layer wiring
 
