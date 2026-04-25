@@ -35,6 +35,7 @@ pub mod gazebo_cmd;
 pub mod gazebo_sensor;
 pub mod handle;
 pub mod io;
+pub mod io_factory;
 pub mod io_grpc;
 pub mod io_log;
 pub mod io_ws;
