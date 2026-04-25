@@ -2580,7 +2580,41 @@ async fn handle_start(
         .filter_map(|m| roz_agent::model::types::Message::try_from(m).ok())
         .collect();
 
-    let is_edge = resolve_placement(start.agent_placement.unwrap_or(0), start.host_id.is_some());
+    // FW-04 / Codex M2 (Option B): derive `controller_capable_worker` from the
+    // host's persisted capability advertisement. This is a stable property of
+    // the host (independent of session-start tool registration ordering) — it
+    // closes the timing gap where server-owned MCP tools register at :2624,
+    // AFTER the placement decision below.
+    //
+    // Capability source (26.10 baseline): the `roz_hosts.capabilities`
+    // operator-curated tag list (`Vec<String>`) is the only persisted capability
+    // signal on the server today. A non-empty capability list is the
+    // controller-capable proxy for 26.10. **Plan 09 establishes typed
+    // descriptors** (`RobotCapabilities` joints/TCP/workspace persisted via
+    // `embodiment_runtime`) — when that lands, replace this proxy with a
+    // joints-non-empty check per the FW-04 plan's stated signal.
+    //
+    // Known gap: a host registered with `capabilities = ["gpu"]` but no
+    // controller capability would route AUTO→edge incorrectly. This is
+    // documented in 26.10-05-SUMMARY (Deferred Issues) and resolved by Plan 09.
+    let controller_capable_worker = if let Some(host_id_str) = start.host_id.as_ref() {
+        match uuid::Uuid::parse_str(host_id_str) {
+            Ok(host_uuid) => roz_db::hosts::get_by_id(pool, host_uuid)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|h| !h.capabilities.is_empty()),
+            Err(_) => false, // unparseable host_id → cloud-default
+        }
+    } else {
+        false
+    };
+
+    let is_edge = resolve_placement(
+        start.agent_placement.unwrap_or(0),
+        start.host_id.is_some(),
+        controller_capable_worker,
+    );
     let server_owned_mcp = Arc::new(Mutex::new(ServerOwnedMcpSurface::default()));
 
     // Resolve host_id to worker_name once at session start to avoid per-message DB lookups.
