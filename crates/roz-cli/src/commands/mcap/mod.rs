@@ -150,12 +150,9 @@ mod tests {
             panic!("expected Mcap command");
         };
         let super::McapCommands::ToRrd(to_rrd_args) = args.command;
+        assert_eq!(to_rrd_args.input.as_deref(), Some(std::path::Path::new("/tmp/in.mcap")));
         assert_eq!(
-            to_rrd_args.input.as_ref().map(|p| p.as_path()),
-            Some(std::path::Path::new("/tmp/in.mcap"))
-        );
-        assert_eq!(
-            to_rrd_args.output.as_ref().map(|p| p.as_path()),
+            to_rrd_args.output.as_deref(),
             Some(std::path::Path::new("/tmp/out.rrd"))
         );
         assert!(to_rrd_args.bulk.is_none());
@@ -181,7 +178,7 @@ mod tests {
         assert!(to_rrd_args.output.is_none());
         assert_eq!(to_rrd_args.bulk.as_deref(), Some("sessions/*.mcap"));
         assert_eq!(
-            to_rrd_args.output_dir.as_ref().map(|p| p.as_path()),
+            to_rrd_args.output_dir.as_deref(),
             Some(std::path::Path::new("/tmp/out"))
         );
     }
