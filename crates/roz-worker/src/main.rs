@@ -681,23 +681,87 @@ async fn execute_task(
 
     // Spawn Copper controller for OodaReAct mode.
     //
-    // Worker task invocations currently carry the canonical control contract
-    // but not a compiled EmbodimentRuntime or runtime-owned rollout policy, so
-    // the worker must stay on the execution boundary only.
-    //
-    // Plan 24-12 Task 3: `spawn_with_policy` replaces `spawn_execution_only`
-    // so the chassis-level `HotCopperPolicy` (updated by the policy push
-    // subscriber) and the shared `TelemetryBackpressure` atom (written by
-    // the WAL-aware telemetry publisher) reach the running task graph.
+    // Phase 26.10 Plan 03 (FW-02 + FW-01): OodaReAct dispatch must carry an
+    // authoritative `EmbodimentRuntime` (Plan 01) and Copper must bind real
+    // IO via the worker-side `io_backends` registry (Codex H2: factory
+    // dispatch lives in roz-worker, NOT roz-copper, to avoid the cargo cycle
+    // since `roz-mavlink` already depends on `roz-copper`). Plan 24-12 Task 3
+    // continues to wire the chassis-level `HotCopperPolicy` and shared
+    // `TelemetryBackpressure` atom into the running task graph.
+    let copper_spawn_failure = |reason: String| async {
+        tracing::error!(error = %reason, "copper spawn aborted before controller start");
+        publish_task_status(
+            &task_nats,
+            signing_ctx.as_ref(),
+            &TaskStatusEvent {
+                task_id,
+                status: "failed".into(),
+                detail: Some(reason.clone()),
+                host_id: Some(invocation.host_id),
+            },
+        )
+        .await;
+        let result = roz_worker::dispatch::build_task_result(
+            task_id,
+            TaskTerminalStatus::Failed,
+            Err(roz_agent::error::AgentError::Safety(reason)),
+        );
+        if let Err(sig_err) =
+            roz_worker::dispatch::signal_result(&task_http, &restate_url, &task_id.to_string(), &result).await
+        {
+            tracing::error!(error = %sig_err, "failed to signal copper-spawn failure to Restate");
+        }
+    };
     let mut copper_handle = match invocation.mode {
         roz_nats::dispatch::ExecutionMode::OodaReAct => {
+            let Some(runtime) = invocation.embodiment_runtime.as_ref() else {
+                copper_spawn_failure(
+                    anyhow::anyhow!("OodaReAct dispatch missing embodiment_runtime (FW-01)").to_string(),
+                )
+                .await;
+                return;
+            };
+            let Some(control_manifest) = invocation.control_interface_manifest.as_ref() else {
+                copper_spawn_failure("OodaReAct dispatch missing control_interface_manifest".to_string())
+                    .await;
+                return;
+            };
+
+            // Codex H2: factory_for lives in roz-worker (this crate), NOT roz-copper.
+            let family_id = runtime
+                .model
+                .embodiment_family
+                .as_ref()
+                .map(|f| f.family_id.as_str());
+            let Some(factory) = roz_worker::io_backends::factory_for(family_id) else {
+                copper_spawn_failure(format!(
+                    "no IoFactory registered for embodiment_family={:?}",
+                    runtime.model.embodiment_family,
+                ))
+                .await;
+                return;
+            };
+
+            let (actuator, sensor) = match factory.build(runtime, control_manifest) {
+                Ok(io) => io,
+                Err(err) => {
+                    copper_spawn_failure(format!("IoFactory build failed: {err}")).await;
+                    return;
+                }
+            };
+
             let max_velocity = task_config.max_velocity.unwrap_or(1.5);
-            let handle = roz_worker::copper_handle::CopperHandle::spawn_with_policy(
+            let handle = roz_worker::copper_handle::CopperHandle::spawn_with_policy_and_io(
                 max_velocity,
+                actuator,
+                Some(sensor),
                 copper_hot_policy.clone(),
                 telemetry_backpressure.shared(),
             );
-            tracing::info!("copper controller spawned for OodaReAct task with hot policy + shared backpressure");
+            tracing::info!(
+                factory = factory.name(),
+                "copper controller spawned for OodaReAct task with real IO + hot policy + shared backpressure"
+            );
             // Phase 26-12 OBS-01: install a clone of the controller state
             // pointer so the worker-wide 10 Hz telemetry loop (main()) can
             // observe `ControllerState.entities` and publish

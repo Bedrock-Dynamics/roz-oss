@@ -261,6 +261,29 @@ impl CopperHandle {
         )
     }
 
+    /// FW-02: spawn Copper with both pluggable IO backends and chassis-level
+    /// safety/policy wiring. Replaces the no-IO `spawn_with_policy` call site
+    /// in `roz-worker/src/main.rs:692` once worker-side `factory_for` returns
+    /// real `ActuatorSink` / `SensorSource` impls keyed on the embodiment
+    /// family. The actuator is `Arc<dyn ...>` (shared across worker + copper);
+    /// the sensor is `Box<dyn ...>` (moved into the controller thread).
+    pub fn spawn_with_policy_and_io(
+        max_velocity: f64,
+        actuator: Arc<dyn crate::io::ActuatorSink>,
+        sensor: Option<Box<dyn crate::io::SensorSource>>,
+        hot_policy: crate::policy::HotCopperPolicy,
+        shared_backpressure: Arc<AtomicU8>,
+    ) -> Self {
+        Self::spawn_with_io_and_deployment_manager_and_wiring(
+            max_velocity,
+            Some(actuator),
+            sensor,
+            EXECUTION_ONLY_DEPLOYMENT_MANAGER,
+            Some(hot_policy),
+            Some(shared_backpressure),
+        )
+    }
+
     #[doc(hidden)]
     /// Spawn the full Copper pipeline with pluggable IO backends.
     ///
@@ -684,6 +707,45 @@ mod tests {
         let guard = hot_policy.load();
         assert_eq!(guard.enforcement_mode, CopperEnforcementMode::Halt);
         assert!((guard.max_linear_m_per_s - 0.1).abs() < f64::EPSILON);
+
+        handle.shutdown().await;
+    }
+
+    /// FW-02: `spawn_with_policy_and_io` must accept both an `ActuatorSink`
+    /// (`Arc<dyn ...>`) and an optional `SensorSource` (`Box<dyn ...>`)
+    /// alongside the same `HotCopperPolicy` + shared backpressure surface as
+    /// `spawn_with_policy`, and the resulting handle must be a fully-spawned
+    /// controller (state ticking + backpressure pointer-shared with caller).
+    #[tokio::test]
+    async fn spawn_with_policy_and_io_accepts_actuator_and_sensor() {
+        use crate::io_log::{LogActuatorSink, MockSensorSource};
+        use crate::policy::new_hot_policy;
+
+        let hot_policy = new_hot_policy();
+        let backpressure = Arc::new(AtomicU8::new(0));
+        let actuator: Arc<dyn crate::io::ActuatorSink> = Arc::new(LogActuatorSink::new());
+        let sensor: Box<dyn crate::io::SensorSource> = Box::new(MockSensorSource::empty());
+
+        let handle = CopperHandle::spawn_with_policy_and_io(
+            1.5,
+            Arc::clone(&actuator),
+            Some(sensor),
+            hot_policy.clone(),
+            Arc::clone(&backpressure),
+        );
+
+        // Backpressure pointer must be the caller-supplied Arc, not a fresh local.
+        assert!(
+            Arc::ptr_eq(handle.telemetry_backpressure(), &backpressure),
+            "spawn_with_policy_and_io must reuse the caller-supplied backpressure Arc"
+        );
+
+        // Wait for the controller thread to start ticking.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            handle.state().load().last_tick > 0,
+            "controller thread must be ticking after spawn_with_policy_and_io"
+        );
 
         handle.shutdown().await;
     }
