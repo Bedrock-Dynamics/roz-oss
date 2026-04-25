@@ -64,6 +64,25 @@ tokio-stream.workspace = true
 tar.workspace = true
 flate2.workspace = true
 walkdir = "2"
+# Phase 26.9 D-19 — MCAP reader for `roz mcap to-rrd`. Production dep (not
+# dev-only) because `commands::mcap::*` consumes `mcap::MessageStream` in
+# shipped code.
+mcap = { workspace = true }
+# Phase 26.9 D-02 — bulk-mode glob expansion for `roz mcap to-rrd --bulk`.
+glob = { workspace = true }
+# Phase 26.9 D-16 — Rerun .rrd writer, gated behind feature `export-rrd`.
+# default-features = false disables viewer/server/web stack (~60% of deps).
+# Feature set per RESEARCH §Topic 2: `sdk` mandatory, `data_loaders` + `log`
+# optional-but-retained for future read-side smoke paths and tracing-log
+# routing.
+rerun = { workspace = true, optional = true, default-features = false, features = ["sdk", "data_loaders", "log"] }
+
+[features]
+# Phase 26.9 D-16 — optional Rerun .rrd export. Off by default — pulls in
+# the rerun SDK (~50 deps with default-features=false). Distributors enable
+# via `cargo install --features export-rrd`. Per D-15 the rerun crate is
+# pinned exact at the workspace level to match substrate's bundled viewer.
+export-rrd = ["dep:rerun"]
 
 [build-dependencies]
 tonic-build.workspace = true
