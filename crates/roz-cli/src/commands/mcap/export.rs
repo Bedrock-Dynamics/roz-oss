@@ -68,13 +68,6 @@ pub struct ConversionState {
     /// Set of camera names for which `VideoStream` archetype has been
     /// logged once. Plan 07 (`camera::emit_camera`) consumes this to
     /// dedupe the once-per-entity `VideoStream` log call (CONTEXT D-11).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Plan 03 establishes the field; Plan 07 reads it via &mut state in emit_camera. Test profile reads it via `conversion_state_default_is_empty` so the expect is non-test only."
-        )
-    )]
     pub seen_camera_videostream_logged: HashSet<String>,
     pub unknown_channels_warned: HashSet<String>,
     pub messages_seen: u64,
