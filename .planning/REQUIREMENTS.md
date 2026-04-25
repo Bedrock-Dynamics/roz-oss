@@ -68,6 +68,25 @@ Prove the full stack end-to-end on sim + real hardware. Single-binary deployment
 
 - [ ] **RD-03**: `docs/deployments/pixhawk.md` quickstart under 2000 words walking a Linux-comfortable operator (no prior MAVLink or roz experience assumed) from `git clone roz-oss` to tethered-bench-flight readiness. Sections: hardware BOM + wiring (Pixhawk TELEM2 → RPi UART) → Ubuntu 22.04 flash to RPi 5 → roz-worker install + systemd enable → MAVLink device config in `roz.toml` (serial port, baud, signing posture) → device enrollment (exercises FS-04) → safety policy bind (exercises FS-01) → first tethered flight with pre-flight checklist → MCAP export + Foxglove replay (exercises OBS-03). **Single-binary deployment: no companion-bridge process to install or manage.** Quickstart validated end-to-end on at least one RPi 5 + Pixhawk 6C system; screenshot or video of Foxglove MCAP playback is the acceptance signal.
 
+## Framework Fidelity (FW)
+
+Close the production-wiring gaps surfaced by the codex review (2026-04-25) so live WASM controller deployment works through the normal agent/task path on Roz — paralleling Phase 27's drone-class validation with manipulator-class fidelity. Roz is inspired by **OpenClaw, NemoClaw, and Hermes** as reference architectures; these requirements validate Roz's framework claim that it can support manipulator-class hardware, not a separate vendor integration. See `26.10-CODEX-REVIEW.md` and `26.10-RESEARCH.md`.
+
+- [x] **FW-01
+**: Authoritative `EmbodimentRuntime` rides on every task dispatch envelope. Server resolves `EmbodimentRuntime` by `host_id`/`embodiment_id` at dispatch time (deserialised from `roz_hosts.embodiment_runtime` JSONB column from migration 022) and attaches it to `TaskInvocation` (additive proto field). Worker passes the runtime to controller promotion. Controller load at `crates/roz-copper/src/controller.rs:553` rejects promotion when the runtime descriptor is missing or fails authority checks. Signed envelope reuses Phase 23 Ed25519 path (no new signing primitives). Envelope-size guard warns when serialised invocation > 512 KiB.
+
+- [ ] **FW-02**: `IoFactory` trait surface in `roz-copper` binds real `ActuatorSink` + `SensorSource` from the resolved `EmbodimentRuntime`. `spawn_with_policy_and_io` is a one-page extension of existing `spawn_with_io_and_deployment_manager_and_wiring`. Adding a new robot family is `impl IoFactory for X` + registration, not a worker code change. MAVLink branch returns `Err("MAVLink IoFactory deferred — see Phase 27 SC5/SC6/SC7 live-FCU work")` for 26.10; manipulator branch is the framework-fidelity surface.
+
+- [ ] **FW-03**: Worker registers `promote_controller`, `stop_controller`, `controller_status` tools. Local runtime registers live promotion alongside replay (replay stays as a separately-named tool). All three tools are categorised `ToolCategory::Physical` so the OodaReAct loop applies physical-execution approval and safety policies. Worker and local share contract through `roz-core` tool schemas.
+
+- [ ] **FW-04**: Edge `AUTO` placement resolves to **edge** when the session contains any tool with `ToolCategory::Physical` (session-start scan in `crates/roz-server/src/grpc/agent.rs:2583`, reusing the already-extracted `tool_categories: HashMap<String, ToolCategory>`). Cloud is permitted only for sessions with no physical-execution tools. Decision is per-tool-category, not per-task — a single agent turn correctly mixes edge control with cloud reasoning.
+
+- [ ] **FW-05**: Safety hardening before hardware. Three concrete sub-requirements: (a) timer-driven stale-heartbeat scan in `crates/roz-safety/src/main.rs:38-51` fires e-stop after `T_stale` regardless of whether another heartbeat ever arrives — no more silent detection; (b) bounded WASM host output in `crates/roz-copper/src/wit_host.rs:343-361` validates output length **before** allocation, mirroring the existing `get_input` guard at `:325-330`; (c) latched e-stop state machine `Run → Latched → AwaitingAck → ZeroVerified → Run` per IEC 60204-1 Stop Category 0 and EN ISO 13849-1:2023 Manual Reset Function, with WAL persistence so worker restart returns to `Latched` (fail-safe). The `Latched ↛ Run` and `Latched ↛ ZeroVerified` transitions are forbidden. All-default outputs do not bypass force-e-stop.
+
+- [ ] **FW-06**: Manifest parsing in `crates/roz-core/src/manifest.rs:528` preserves joints, TCPs, grippers, sensors, and workspaces as structured runtime data — no flattening into generic channels at parse time, no `f64::INFINITY` synthesised limits. `crates/roz-core/src/embodiment/model.rs:54` is the single source of truth for the runtime view controllers see. Capability publishing in `crates/roz-worker/src/main.rs:1394` derives embodiment-specific descriptors losslessly from the runtime — no generic empty capabilities. UR5 fixture (`examples/ur5/robot.toml`) carries ≥1 `[[tcps]]` block (UR datasheet wrist mount) and ≥1 `[[sensor_mounts]]` block as the lossless-projection test target.
+
+- [ ] **FW-07**: Framework-fidelity HIL coverage. Deterministic in-process fake OpenClaw-class backend (`crates/roz-copper/src/fake_openclaw.rs`, gated by `[features] test-fixtures = []` to avoid a `roz-copper ↔ roz-test` Cargo cycle) implements the same triple-trait pattern as `MavlinkBackend` (`SensorSource + ActuatorSink + DiscreteCommandSink`) over `Arc<Mutex<_>>` shared state, simulating joint position/velocity, encoder/current feedback, and gripper TCP. `scripts/run_live_e2e_matrix.sh` adds a manipulator row that runs the fake-backend tests deterministically (same posture as PX4/ArduPilot rows). Real-hardware HIL tests cover tiny bounded motion, encoder/current feedback, channel order/sign/unit checks, and physical e-stop latency, gated behind `#[ignore]` + `ROZ_OPENCLAW_HIL=1` env var (mirror of `ROZ_SKIP_MANIPULATOR_LIVE_TEST` pattern). Serial/Dynamixel/OpenCR fixtures live behind a feature flag and run when their env is present. `hil_physical_estop_latency` runs deterministically against the fake backend today; the other three real-hardware variants are `unimplemented!("Phase X")`.
+
 ## Future Requirements
 
 - Public / commercial `substrate-hardware-bridge` companion process — only if a customer surfaces a need (e.g. non-Rust vendor SDK, multi-vehicle gateway, process isolation for regulatory reasons). Native `roz-mavlink` covers v3.0 Pixhawk scope without it.
@@ -109,3 +128,10 @@ Prove the full stack end-to-end on sim + real hardware. Single-binary deployment
 | RD-01  | DEEP-RD.md  | Phase 27 | Defined |
 | RD-02  | DEEP-RD.md + INTEGRATION-POLICY.md | Phase 28 | Defined |
 | RD-03  | DEEP-RD.md  | Phase 28 | Defined |
+| FW-01  | 26.10-CODEX-REVIEW.md + 26.10-RESEARCH.md | Phase 26.10 | Defined |
+| FW-02  | 26.10-CODEX-REVIEW.md + 26.10-RESEARCH.md | Phase 26.10 | Defined |
+| FW-03  | 26.10-CODEX-REVIEW.md + 26.10-RESEARCH.md | Phase 26.10 | Defined |
+| FW-04  | 26.10-CODEX-REVIEW.md + 26.10-RESEARCH.md | Phase 26.10 | Defined |
+| FW-05  | 26.10-CODEX-REVIEW.md + 26.10-RESEARCH.md | Phase 26.10 | Defined |
+| FW-06  | 26.10-CODEX-REVIEW.md + 26.10-RESEARCH.md | Phase 26.10 | Defined |
+| FW-07  | 26.10-CODEX-REVIEW.md + 26.10-RESEARCH.md | Phase 26.10 | Defined |
