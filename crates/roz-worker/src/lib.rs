@@ -47,6 +47,7 @@ pub mod recording_reader;
 pub mod recovery;
 pub mod registration;
 pub mod safety_guards;
+pub mod safety_subscribers;
 pub mod session_event_forwarder;
 pub mod session_relay;
 pub mod signing_hooks;

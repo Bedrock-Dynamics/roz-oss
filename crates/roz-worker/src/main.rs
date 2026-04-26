@@ -2292,6 +2292,47 @@ async fn main() -> Result<()> {
         }
 
         // -----------------------------------------------------------------
+        // FW-05 / Plan 26.10-10 (gap CR-02a + CR-02b): signed-NATS
+        // subscribers for `safety.estop_ack.{worker_id}` and
+        // `safety.resume.{worker_id}`. Both gate inbound payloads through
+        // Phase 23 `WorkerSigningContext::verify_inbound_worker`, audit
+        // failures via `safety.signature_failure.{host_id}`, and dispatch
+        // the verified command into the live per-task controller via
+        // `shared_cmd_tx`. Logic lives in
+        // `roz_worker::safety_subscribers` so production code and the
+        // integration test in `tests/fw05_estop_ack_subscriber.rs` drive
+        // the same code path.
+        //
+        // host_id is guaranteed `Some` here: the outer guard requires
+        // `signing_ctx_shared = Some(_)`, which is only populated inside
+        // the `Ok(identity)` arm of `register_host` where `worker_host_id`
+        // is also assigned. The `unwrap_or` fallback is defensive only —
+        // an empty string would itself fail the `validate_token` gate
+        // inside `safety_signature_failure_worker`.
+        // -----------------------------------------------------------------
+        {
+            let safety_host_id = worker_host_id
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            roz_worker::safety_subscribers::spawn_estop_ack_subscriber(
+                nats.clone(),
+                (**ctx_shared).clone(),
+                config.worker_id.clone(),
+                safety_host_id.clone(),
+                shared_cmd_tx.clone(),
+                phase24_cancel.clone(),
+            );
+            roz_worker::safety_subscribers::spawn_safety_resume_subscriber(
+                nats.clone(),
+                (**ctx_shared).clone(),
+                config.worker_id.clone(),
+                safety_host_id,
+                shared_cmd_tx.clone(),
+                phase24_cancel.clone(),
+            );
+        }
+
+        // -----------------------------------------------------------------
         // Boot-time checkpoint writer (D-08). The per-task periodic writer
         // lives inside `execute_task` (Plan 24-12 Task 5) with a real
         // `periodic_task_id = task_id.to_string()`. This boot-time writer
