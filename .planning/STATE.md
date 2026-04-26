@@ -1,24 +1,24 @@
 ---
 gsd_state_version: 1.0
-milestone: v2.2
-milestone_name: Runtime Event Contracts and Completeness
+milestone: v3.0
+milestone_name: Production Robotics
 status: milestone_complete
-last_updated: "2026-04-26T13:37:10.368Z"
+last_updated: "2026-04-26T18:47:10.604Z"
 last_activity: 2026-04-26
 progress:
   total_phases: 1
   completed_phases: 1
-  total_plans: 0
-  completed_plans: 3
+  total_plans: 6
+  completed_plans: 6
 ---
 
 # State
 
 ## Current Position
 
-Phase: 26.10
-Plan: Not started
-Status: Milestone complete
+Phase: 26.11
+Plan: Complete
+Status: Phase complete
 Last activity: 2026-04-26
 
 ## Project Reference
@@ -26,7 +26,7 @@ Last activity: 2026-04-26
 See: `.planning/PROJECT.md` (updated 2026-04-16)
 
 **Core value:** A reliable, secure, and well-tested platform that operators trust for physical robot deployments.
-**Current focus:** Phase 26.10 — openclaw-production-wiring-authoritative-embodiment-runtime-
+**Current focus:** Phase 26.11 complete — robotics-test-realism-hardening-ci-runner-coverage-golden-openclaw-px4-vertical-tests-camera-artifact-rrd-semantic-validation-and-anti-tautology-cleanup
 
 ## Accumulated Context
 
@@ -46,7 +46,8 @@ See: `.planning/PROJECT.md` (updated 2026-04-16)
 - Phase 21.1 inserted after Phase 21: Typed skill events, cross-surface correlation coverage, and skill reload contract (URGENT)
 - v3.0 phases 22-28 drafted 2026-04-16.
 - Phase 26.1 inserted after Phase 26: MCAP schema descriptor dedup for Foxglove Studio compatibility (URGENT — Phase 26 UAT surfaced `duplicate name 'Timestamp' in Namespace .google.protobuf` across all 6 channels; root cause in `schema_registry.rs::load` concat of foxglove_descriptor.bin + roz_v1_descriptor.bin without filename dedup)
-- Phase 26.10 inserted after Phase 26: OpenClaw production wiring — authoritative embodiment runtime, worker Copper actuator/sensor IO, safety hardening, and HIL validation (URGENT — codex review 2026-04-25 identified 3 blocking gaps: agent/task path cannot deploy live WASM controller, worker Copper has no actuator/sensor IO, dispatch lacks authoritative `EmbodimentRuntime`; plus 3 high gaps in edge placement, safety, and OpenClaw modeling fidelity. See `26.10-CODEX-REVIEW.md` for file:line evidence.)
+- Phase 26.10 inserted after Phase 26: OpenClaw-inspired manipulator production wiring — authoritative embodiment runtime, worker Copper actuator/sensor IO, safety hardening, and HIL validation (URGENT — codex review 2026-04-25 identified 3 blocking gaps: agent/task path cannot deploy live WASM controller, worker Copper has no actuator/sensor IO, dispatch lacks authoritative `EmbodimentRuntime`; plus 3 high gaps in edge placement, safety, and OpenClaw-inspired manipulator modeling fidelity. See `26.10-CODEX-REVIEW.md` for file:line evidence.)
+- Phase 26.11 inserted after Phase 26: Robotics test realism hardening - CI runner coverage, golden OpenClaw-inspired manipulator/PX4 vertical tests, camera/artifact/RRD semantic validation, and anti-tautology cleanup (URGENT)
 
 ### Research Artifacts
 
@@ -95,14 +96,13 @@ See: `.planning/PROJECT.md` (updated 2026-04-16)
 - ✅ v1.1 Embodiment Streaming, CLI, and Extensions (2026-04-10)
 - ✅ v1.0 Roz Embodiment Protos (2026-04-08)
 
-**Completed Phase:** 26.8 (ulog-auto-download-via-mavlink-on-session-finalize) — 8/8 plans, UAT 9/10 (SC4 deferred to human Flight Review check), verification 7/7 SC pass, security 32/32 closed — commits `f573e55` (security) + `447f3af` (UAT) + `5093842` (verification) — 2026-04-24
+**Completed Phase:** 26.11 (robotics-test-realism-hardening-ci-runner-coverage-golden-openclaw-px4-vertical-tests-camera-artifact-rrd-semantic-validation-and-anti-tautology-cleanup) — 6/6 plans, verification 29/29 must-haves passed — 2026-04-26
 
-**Completed Phase (prior):** 26.7 (session-artifact-service-generic-sidecar-archival-copper-log) — 9/9 plans — 2026-04-24
+**Completed Phase (prior):** 26.10 (OpenClaw-inspired manipulator production wiring — authoritative embodiment runtime, worker Copper actuator/sensor IO, safety hardening, and HIL validation) — 10/10 plans — 2026-04-26
 
 **Next Phase Candidates (unstarted):**
 
-- 26.9 RRD format export — Rerun recording files for substrate ingestion
 - 27 Nightly PX4 SITL CI + induced NATS outage + live-FCU task-layer wiring
 - 28 HITL docs + Pixhawk single-binary deployment quickstart
 
-**Planned Phase:** 26.10 (OpenClaw production wiring — authoritative embodiment runtime, worker Copper actuator/sensor IO, safety hardening, and HIL validation) — 10 plans — 2026-04-26T11:48:34.910Z
+**Planned Phase:** none currently selected after Phase 26.11 completion.

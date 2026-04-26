@@ -186,9 +186,24 @@ Plans:
 - [x] 26-11-PLAN.md — Wave 9: SC5 integration test (30 s fixture round-trip + quaternion decode assertion) + export-roundtrip test + D-10 ROADMAP SC4 + REQUIREMENTS OBS-02 amendments
 - [x] 26-12-PLAN.md — Wave 10: worker telemetry wire-format migration from JSON to prost `roz.v1.TelemetryUpdate` (closes OBS-01 production-data gap for `/tf` + `/roz/telemetry/pose`)
 
-### Phase 26.10: OpenClaw production wiring — authoritative embodiment runtime, worker Copper actuator/sensor IO, safety hardening, and HIL validation (INSERTED)
+### Phase 26.11: Robotics test realism hardening - CI runner coverage, golden OpenClaw-inspired manipulator/PX4 vertical tests, camera/artifact/RRD semantic validation, and anti-tautology cleanup (INSERTED) — COMPLETE 2026-04-26 (6/6 plans; verification 29/29 must-haves passed)
 
-**Goal:** Close the production-wiring gaps that prevent live WASM controller deployment through the normal agent/task path. Authoritative `EmbodimentRuntime` rides inline on every OodaReAct dispatch (Phase 23 signed envelope auto-covers it); worker spawns Copper with real `ActuatorSink`/`SensorSource` via a new `IoFactory` keyed off `embodiment_family`; agent layer registers `promote_controller`/`stop_controller`/`controller_status` with `ToolCategory::Physical`; AUTO placement defaults edge for OodaReAct robot-control sessions; safety hardens with bounded WASM host output, timer-driven stale-heartbeat, and a IEC 60204-1 / ISO 13849-1 latched e-stop state machine that survives worker restart; manifest fidelity preserves joints/TCPs/grippers/sensors/workspaces and capability publish projects losslessly from the runtime; deterministic fake-OpenClaw backend + gated HIL row close manipulator-class validation parity with PX4/ArduPilot rows.
+**Goal:** Harden robotics acceptance evidence so Roz's OpenClaw-inspired manipulator abstraction, safety, camera/artifact, RRD, MAVLink/PX4 readiness, and feature-gated CI coverage are proven by vertical, non-tautological tests through production seams. This phase does not claim upstream OpenClaw hardware/protocol compatibility.
+**Requirements**: TR-01, TR-02, TR-03, TR-04, TR-05, TR-06 (phase-local test-realism requirements derived from 26.11-CONTEXT locked decisions)
+**Depends on:** Phase 26
+**Plans:** 6/6 plans complete
+
+Plans:
+- [x] 26.11-01-PLAN.md — CI/nightly runner coverage and MAVLink process-exit cleanup
+- [x] 26.11-02-PLAN.md — Golden OpenClaw-inspired manipulator vertical and `flight_command` tool-routing tests
+- [x] 26.11-03-PLAN.md — Safety policy physical vertical test with archived/indexed evidence
+- [x] 26.11-04-PLAN.md — Camera relay MCAP vertical and semantic RRD validation
+- [x] 26.11-05-PLAN.md — Copper artifact finalizer and live CLI/server bundle export tests
+- [x] 26.11-06-PLAN.md — PX4 readiness replay and verify-only fixture recording hardening
+
+### Phase 26.10: OpenClaw-inspired manipulator production wiring — authoritative embodiment runtime, worker Copper actuator/sensor IO, safety hardening, and HIL validation (INSERTED)
+
+**Goal:** Close the production-wiring gaps that prevent live WASM controller deployment through the normal agent/task path. Authoritative `EmbodimentRuntime` rides inline on every OodaReAct dispatch (Phase 23 signed envelope auto-covers it); worker spawns Copper with real `ActuatorSink`/`SensorSource` via a new `IoFactory` keyed off `embodiment_family`; agent layer registers `promote_controller`/`stop_controller`/`controller_status` with `ToolCategory::Physical`; AUTO placement defaults edge for OodaReAct robot-control sessions; safety hardens with bounded WASM host output, timer-driven stale-heartbeat, and a IEC 60204-1 / ISO 13849-1 latched e-stop state machine that survives worker restart; manifest fidelity preserves joints/TCPs/grippers/sensors/workspaces and capability publish projects losslessly from the runtime; deterministic fake OpenClaw-class backend + gated manipulator HIL row close manipulator-class validation parity with PX4/ArduPilot rows. This phase validates Roz's OpenClaw-inspired manipulator architecture, not upstream OpenClaw hardware/protocol compatibility.
 **Requirements**: FW-01, FW-02, FW-03, FW-04, FW-05, FW-06, FW-07 (proposed in 26.10-RESEARCH.md — backfill into REQUIREMENTS.md after planning)
 **Depends on:** Phase 26
 **Plans:** 10/10 plans complete
@@ -201,8 +216,8 @@ Plans:
 - [x] 26.10-05-PLAN.md — Wave 2: FW-04 — `resolve_placement(placement, has_host, controller_capable_worker) -> bool` (Codex M2 Option B revision: capability lookup not tool-list); AUTO defaults edge when `has_host && controller_capable_worker`; call site at `grpc/agent.rs:2583` looks up `roz_hosts.capabilities` non-empty as the controller-capable proxy (Plan 09 replaces with typed-descriptor projection)
 - [x] 26.10-06-PLAN.md — Wave 2: FW-05a+b — bounded WASM host output (`MAX_TICK_OUTPUT_BYTES = 64 KiB` guard before `vec!` at `wit_host.rs:343-361` mirroring `get_input` shape) + timer-driven stale-heartbeat scan (`tokio::time::interval(1s)` task alongside existing `safety/main.rs:38-51` watchdog; `Arc<Mutex<HeartbeatTracker>>` shared ownership)
 - [x] 26.10-07-PLAN.md — Wave 3 (depends 06): FW-05c — latched e-stop state machine (`Run → Latched → AwaitingAck → ZeroVerified → Run`) per IEC 60204-1 Stop Cat 0 + ISO 13849-1 manual reset; new `crates/roz-copper/src/latch.rs`; replace `all_default` short-circuit at `controller.rs:1111` with explicit zero emission; signed-NATS gating on `safety.estop_ack.*` + `safety.resume.*`; persist `LatchState` in WAL for fail-safe restart (Open Q5 resolved)
-- [x] 26.10-08-PLAN.md — Wave 3 (depends 03+04): FW-07a — deterministic fake-OpenClaw backend at `crates/roz-copper/src/fake_openclaw.rs` (triple-trait shape mirroring `MavlinkBackend`'s shared-state `Arc<Mutex<>>`; located in roz-copper not roz-test per Codex H2 cycle prevention); `FakeOpenclawFactory` replaces Plan 03's stub under `test-fixtures` feature; production builds reject manipulator family with named error
-- [x] 26.10-09-PLAN.md — Wave 4 (depends 03+04+07+08): FW-06b + FW-07b — `RobotCapabilities` projection at `worker/main.rs:1488` (line shifted from :1394 plan-text after embodiment_runtime hoist) via new `roz_core::embodiment::projection::project_capabilities` helper consuming `EmbodimentRuntime.model.{joints,tcps,sensor_mounts,workspace_zones}` (Pitfall 6 closure, Codex H5); manipulator deterministic row in `scripts/run_live_e2e_matrix.sh::run_deterministic` invokes the H4 production-parity gate (`crates/roz-worker/tests/manipulator_dispatch_path.rs` — relocated from copper-tests for cycle prevention); gated HIL test slots (`#[ignore]` + `ROZ_OPENCLAW_HIL=1` env) for tiny bounded motion + encoder/current feedback + channel order/sign/units + physical e-stop latency; new `examples/openclaw/robot.toml` fixture
+- [x] 26.10-08-PLAN.md — Wave 3 (depends 03+04): FW-07a — deterministic fake OpenClaw-class backend at `crates/roz-copper/src/fake_openclaw.rs` (triple-trait shape mirroring `MavlinkBackend`'s shared-state `Arc<Mutex<>>`; located in roz-copper not roz-test per Codex H2 cycle prevention); `FakeOpenclawFactory` replaces Plan 03's stub under `test-fixtures` feature; production builds reject manipulator family with named error
+- [x] 26.10-09-PLAN.md — Wave 4 (depends 03+04+07+08): FW-06b + FW-07b — `RobotCapabilities` projection at `worker/main.rs:1488` (line shifted from :1394 plan-text after embodiment_runtime hoist) via new `roz_core::embodiment::projection::project_capabilities` helper consuming `EmbodimentRuntime.model.{joints,tcps,sensor_mounts,workspace_zones}` (Pitfall 6 closure, Codex H5); manipulator deterministic row in `scripts/run_live_e2e_matrix.sh::run_deterministic` invokes the H4 production-parity gate (`crates/roz-worker/tests/manipulator_dispatch_path.rs` — relocated from copper-tests for cycle prevention); gated manipulator HIL test slots (`#[ignore]` + `ROZ_OPENCLAW_HIL=1` env) for tiny bounded motion + encoder/current feedback + channel order/sign/units + physical e-stop latency; new `examples/openclaw/robot.toml` OpenClaw-inspired manipulator fixture
 - [x] 26.10-10-PLAN.md — Wave 5 (gap closure; depends 26.10-07): FW-05c production wiring — close VERIFICATION.md gaps CR-01 (WAL persistence path dead — `latch_persist_tx` hardcoded `None` at `controller.rs:2172`) + CR-02 (signed `safety.estop_ack.*` / `safety.resume.*` subscribers absent in `roz-worker/src/main.rs`). Thread `latch_persist_tx: Option<SyncSender<LatchState>>` through `CopperHandle::spawn_with_policy_and_io`, add `WalStore::load_latch_state` boot seed (Err-on-corruption per IEC 60204-1) + `tokio::task::spawn_blocking` drainer for `WalStore::save_latch_state`, and add 2 Phase-23 verified subscribers routing `AckEstop`/`ResumeAfterZeroVerified` through a worker-level `shared_cmd_tx: Arc<ArcSwap<Option<...>>>` slot; default-runnable integration test (no `#[ignore]`)
 
 ### Phase 26.1: MCAP schema descriptor dedup for Foxglove Studio compatibility (INSERTED) — COMPLETE 2026-04-21 (1/1 plan; Foxglove Studio open-and-render UAT deferred to human verification)
@@ -453,7 +468,7 @@ Success Criteria (what must be TRUE):
 
 ## Current Status
 
-v3.0 Production Robotics milestone is in the planning stage. Phase 22 is planned (3 plans, all wave 1) and ready to execute. No plans committed yet for phases 23-28.
+v3.0 Production Robotics milestone is in progress. Phase 26.11 robotics test realism hardening is complete as of 2026-04-26 with 6/6 plans and 29/29 verification must-haves passed. Next substantive work remains Phase 27 nightly PX4 SITL CI or Phase 28 HITL docs/quickstart.
 
 ## Progress
 
@@ -478,5 +493,7 @@ v3.0 Production Robotics milestone is in the planning stage. Phase 22 is planned
 | 26.7. Session artifact service (copper sidecar) | v3.0 | 9/9 | Complete    | 2026-04-24 |
 | 26.8. ULOG auto-download via MAVLink | v3.0 | 0/0 | Not started (gated on 26.7 + 27) | — |
 | 26.9. RRD format export for substrate | v3.0 | 8/8 | Complete    | 2026-04-25 |
+| 26.10. OpenClaw-inspired manipulator production wiring | v3.0 | 10/10 | Complete | 2026-04-26 |
+| 26.11. Robotics test realism hardening | v3.0 | 6/6 | Complete — 29/29 must-haves verified | 2026-04-26 |
 | 27. Nightly PX4 SITL CI | v3.0 | 0/0 | Not started | — |
 | 28. HITL docs + Pixhawk quickstart | v3.0 | 0/0 | Not started | — |
