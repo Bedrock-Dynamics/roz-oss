@@ -40,26 +40,17 @@ use std::sync::atomic::AtomicU8;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use roz_agent::dispatch::{Extensions, ToolContext, ToolDispatcher, TypedToolExecutor};
 use roz_copper::channels::{ControllerCommand, ControllerState};
 use roz_copper::handle::CopperHandle;
 use roz_copper::policy::new_hot_policy;
-use roz_core::controller::artifact::{ControllerArtifact, ControllerClass, ExecutionMode, SourceKind, VerificationKey};
-use roz_core::controller::verification::VerifierVerdict;
 use roz_core::embodiment::EmbodimentRuntime;
 use roz_core::embodiment::binding::{
     BindingType, ChannelBinding, CommandInterfaceType, ControlChannelDef, ControlInterfaceManifest,
 };
 use roz_core::tools::ToolCategory;
-
-const LIVE_WIT_WORLD: &str = "live-controller";
-const LIVE_WIT_WORLD_VERSION: &str = "bedrock:controller@1.0.0";
-const LIVE_COMPILER_VERSION: &str = "wasmtime";
-const LIVE_CHANNEL_MANIFEST_VERSION: u32 = 1;
-const LIVE_HOST_ABI_VERSION: u32 = 2;
 
 /// Minimal `live-controller` WAT — emits a constant zero command vector and
 /// completes the WIT tick contract. Same shape used by
@@ -126,50 +117,6 @@ fn manipulator_control_manifest() -> ControlInterfaceManifest {
     };
     cm.stamp_digest();
     cm
-}
-
-fn build_live_artifact(
-    controller_id: &str,
-    source_bytes: &[u8],
-    control_manifest: &ControlInterfaceManifest,
-    embodiment_runtime: &EmbodimentRuntime,
-) -> (ControllerArtifact, Vec<u8>) {
-    let component_bytes = roz_copper::wasm::CuWasmTask::canonical_live_component_bytes(source_bytes, control_manifest)
-        .expect("componentize manipulator dispatch test controller");
-    let controller_digest = hex::encode(Sha256::digest(&component_bytes));
-    let artifact = ControllerArtifact {
-        controller_id: controller_id.into(),
-        sha256: controller_digest.clone(),
-        source_kind: SourceKind::LlmGenerated,
-        controller_class: ControllerClass::LowRiskCommandGenerator,
-        generator_model: None,
-        generator_provider: None,
-        channel_manifest_version: LIVE_CHANNEL_MANIFEST_VERSION,
-        host_abi_version: LIVE_HOST_ABI_VERSION,
-        evidence_bundle_id: None,
-        created_at: chrono::Utc::now(),
-        promoted_at: None,
-        replaced_controller_id: None,
-        verification_key: VerificationKey {
-            controller_digest,
-            wit_world_version: LIVE_WIT_WORLD_VERSION.into(),
-            model_digest: embodiment_runtime.model_digest.clone(),
-            calibration_digest: embodiment_runtime.calibration_digest.clone(),
-            manifest_digest: control_manifest.manifest_digest.clone(),
-            execution_mode: ExecutionMode::Verify,
-            compiler_version: LIVE_COMPILER_VERSION.into(),
-            embodiment_family: embodiment_runtime
-                .model
-                .embodiment_family
-                .as_ref()
-                .map(|family| format!("{family:?}")),
-        },
-        wit_world: LIVE_WIT_WORLD.into(),
-        verifier_result: Some(VerifierVerdict::Pass {
-            evidence_summary: "manipulator dispatch path test".into(),
-        }),
-    };
-    (artifact, component_bytes)
 }
 
 /// Build a `ToolContext` with all the extensions the worker boot path attaches
@@ -249,23 +196,36 @@ async fn manipulator_dispatch_through_promote_controller_path() {
     let state = Arc::clone(handle.state());
     let ctx = manipulator_tool_context(cmd_tx.clone(), Arc::clone(&state), cm.clone(), runtime.clone());
 
-    // Step 4 — load a controller artifact directly into Copper (the
-    // promote_controller production path componentizes WAT internally; for
-    // this in-test gate we componentize the WAT once via the same canonical
-    // helper PromoteControllerTool uses, drive LoadArtifact via cmd_tx, and
-    // then exercise controller_status + stop_controller through the
-    // dispatcher to validate the live tool surface). The WAT componentize
-    // path + verification verdict path is identical to
-    // `crates/roz-worker/tests/copper_integration.rs::agent_deploys_wasm_to_copper_and_reads_state`.
-    let (artifact, bytes) = build_live_artifact("h4-test-ctrl", MINIMAL_LIVE_CONTROLLER_WAT.as_bytes(), &cm, &runtime);
-    cmd_tx
-        .send(ControllerCommand::load_artifact_with_embodiment_runtime(
-            artifact, bytes, &cm, &runtime,
-        ))
-        .await
-        .expect("Copper cmd_tx accepts LoadArtifact");
-    // Allow the controller thread to prepare + start ticking.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Step 4 — drive the production `promote_controller` tool through its
+    // `TypedToolExecutor::execute()` entry point. This is the load-bearing
+    // H4 contract: the tool's body componentizes WAT, runs verify_wasm
+    // (100 verification ticks under production safety limits), invokes
+    // run_lifecycle (artifact stage progression + verifier verdict), checks
+    // the runtime authority (rejects synthesized embodiment runtimes), then
+    // sends LoadArtifact via the cmd_tx pulled from `ToolContext.extensions`.
+    //
+    // Codex H4 enforcement (T-26.10-09-07 mitigation): we call execute() on
+    // the actual production tool. We do NOT bypass to a hand-built
+    // ControllerArtifact + cmd_tx.send() — that would re-create the original
+    // H4 failure shape (test passing without exercising promote_controller).
+    let promote_tool = roz_worker::tools::promote_controller::PromoteControllerTool::new(&cm);
+    let promote_result = TypedToolExecutor::execute(
+        &promote_tool,
+        roz_worker::tools::promote_controller::PromoteControllerInput {
+            code: MINIMAL_LIVE_CONTROLLER_WAT.to_string(),
+        },
+        &ctx,
+    )
+    .await
+    .expect("promote_controller.execute() must complete (verify_wasm + run_lifecycle + LoadArtifact)");
+    assert!(
+        promote_result.is_success(),
+        "promote_controller must report success against the manipulator fixture; got {:?}",
+        promote_result
+    );
+    // Allow the controller thread to prepare + start ticking after the LoadArtifact
+    // command lands on the cmd_tx pulled from ctx.extensions.
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Step 5 — drive controller_status via the dispatcher; assert the live
     // controller is running. This is the agent-visible surface: substrate-ide /
