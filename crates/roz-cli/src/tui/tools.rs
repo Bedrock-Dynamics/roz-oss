@@ -190,7 +190,7 @@ pub fn build_all_tools_with_copper(project_dir: &Path) -> AllTools {
                 ToolCategory::Physical,
             );
             dispatcher.register_with_category(
-                Box::new(roz_local::tools::controller_status::GetControllerStatusTool),
+                Box::new(roz_local::tools::controller_status::ControllerStatusTool),
                 ToolCategory::Pure,
             );
 
@@ -664,7 +664,7 @@ available_moves = ["wake_up", "goto_sleep"]
         let names: Vec<&str> = all.schemas.iter().map(|(s, _)| s.name.as_str()).collect();
         assert!(!names.contains(&"promote_controller"));
         assert!(!names.contains(&"stop_controller"));
-        assert!(!names.contains(&"get_controller_status"));
+        assert!(!names.contains(&"controller_status"));
     }
 
     #[test]
@@ -730,7 +730,7 @@ path = "/ws/sdk"
         );
         let names: Vec<&str> = all.schemas.iter().map(|(s, _)| s.name.as_str()).collect();
         assert!(!names.contains(&"stop_controller"));
-        assert!(!names.contains(&"get_controller_status"));
+        assert!(!names.contains(&"controller_status"));
         assert!(
             names.contains(&"replay_controller"),
             "control-manifest tooling should still load"
@@ -790,7 +790,7 @@ set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
         let names: Vec<&str> = all.schemas.iter().map(|(s, _)| s.name.as_str()).collect();
         assert!(names.contains(&"replay_controller"));
         assert!(!names.contains(&"stop_controller"));
-        assert!(!names.contains(&"get_controller_status"));
+        assert!(!names.contains(&"controller_status"));
     }
 
     #[test]
@@ -861,8 +861,8 @@ set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
         );
         assert!(names.contains(&"stop_controller"), "missing stop_controller");
         assert!(
-            names.contains(&"get_controller_status"),
-            "missing get_controller_status"
+            names.contains(&"controller_status"),
+            "missing controller_status"
         );
 
         // Extensions populated.
@@ -889,7 +889,7 @@ set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
         let status_cat = all
             .schemas
             .iter()
-            .find(|(s, _)| s.name == "get_controller_status")
+            .find(|(s, _)| s.name == "controller_status")
             .map(|(_, c)| c);
         assert_eq!(status_cat, Some(&ToolCategory::Pure));
 

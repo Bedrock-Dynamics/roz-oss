@@ -1,4 +1,10 @@
-//! `get_controller_status` tool — reads Copper controller state.
+//! `controller_status` tool — reads Copper controller state.
+//!
+//! NOTE (Phase 26.10 Plan 04 / FW-03 Codex review): canonical registered tool
+//! name is `controller_status` (NOT `get_controller_status`). Both this
+//! `roz-local` impl and the worker mirror at
+//! `crates/roz-worker/src/tools/controller_status.rs` MUST advertise the same
+//! schema name string.
 
 use std::sync::Arc;
 
@@ -12,23 +18,23 @@ use roz_copper::channels::ControllerState;
 use roz_copper::evidence_archive::EvidenceArchive;
 use roz_core::tools::ToolResult;
 
-/// Input for the `get_controller_status` tool.
+/// Input for the `controller_status` tool.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
-pub struct GetControllerStatusInput {}
+pub struct ControllerStatusInput {}
 
 /// Reports the current status of the WASM controller.
 ///
 /// Reads the shared [`Arc<ArcSwap<ControllerState>>`] from
 /// [`ToolContext::extensions`] and returns `running`, `last_tick`,
 /// and `estop_reason`.
-pub struct GetControllerStatusTool;
+pub struct ControllerStatusTool;
 
 #[async_trait]
-impl TypedToolExecutor for GetControllerStatusTool {
-    type Input = GetControllerStatusInput;
+impl TypedToolExecutor for ControllerStatusTool {
+    type Input = ControllerStatusInput;
 
     fn name(&self) -> &'static str {
-        "get_controller_status"
+        "controller_status"
     }
 
     fn description(&self) -> &'static str {
@@ -128,8 +134,8 @@ mod tests {
             call_id: String::new(),
             extensions,
         };
-        let tool = GetControllerStatusTool;
-        let result = TypedToolExecutor::execute(&tool, GetControllerStatusInput {}, &ctx)
+        let tool = ControllerStatusTool;
+        let result = TypedToolExecutor::execute(&tool, ControllerStatusInput {}, &ctx)
             .await
             .unwrap();
         assert!(result.is_success());
@@ -187,8 +193,8 @@ mod tests {
             call_id: String::new(),
             extensions,
         };
-        let tool = GetControllerStatusTool;
-        let result = TypedToolExecutor::execute(&tool, GetControllerStatusInput {}, &ctx)
+        let tool = ControllerStatusTool;
+        let result = TypedToolExecutor::execute(&tool, ControllerStatusInput {}, &ctx)
             .await
             .unwrap();
         assert!(result.is_success());
@@ -217,8 +223,8 @@ mod tests {
             call_id: String::new(),
             extensions: Extensions::default(),
         };
-        let tool = GetControllerStatusTool;
-        let result = TypedToolExecutor::execute(&tool, GetControllerStatusInput {}, &ctx).await;
+        let tool = ControllerStatusTool;
+        let result = TypedToolExecutor::execute(&tool, ControllerStatusInput {}, &ctx).await;
         assert!(result.is_err(), "should error without controller state");
     }
 }
