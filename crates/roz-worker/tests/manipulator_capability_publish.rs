@@ -69,6 +69,49 @@ fn capability_publish_falls_back_when_runtime_absent() {
 }
 
 #[test]
+fn openclaw_robot_toml_projects_full_descriptor_set() {
+    // Phase 26.10 Plan 09 (Task 3) — `examples/openclaw/robot.toml` is the
+    // OpenClaw-class manipulator fixture used by the live-matrix manipulator
+    // row. This test asserts the manifest parses through `EmbodimentManifest::load`
+    // and then through `project_capabilities` produces the lossless typed
+    // descriptor set substrate-ide depends on (6 joints, ≥1 TCP, ≥1 sensor
+    // mount, ≥1 workspace zone — matches the plan's acceptance criteria for
+    // the fixture).
+    let workspace_root = std::env::var("CARGO_MANIFEST_DIR")
+        .map(|d| std::path::PathBuf::from(d).join("../..").canonicalize().unwrap())
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let path = workspace_root.join("examples/openclaw/robot.toml");
+    let manifest = roz_core::manifest::EmbodimentManifest::load(&path)
+        .expect("examples/openclaw/robot.toml must parse via EmbodimentManifest::load");
+    // Authoritative path (FW-06 Plan 02 M1) — uses `[[joints]]` block, real
+    // limits, plus `[[tcps]]` / `[[sensor_mounts]]` / `[[workspace_zones]]`.
+    // The legacy `embodiment_runtime()` synthesizing path drops these and is
+    // not the right surface for the H5 lossless contract.
+    let runtime = manifest
+        .try_authoritative_embodiment_runtime()
+        .expect("openclaw fixture has explicit [[joints]] schema → authoritative path must succeed");
+    assert_eq!(runtime.model.joints.len(), 6, "openclaw is a 6-DOF reference manipulator");
+    assert!(
+        !runtime.model.tcps.is_empty(),
+        "fixture must declare at least one TCP (gripper)"
+    );
+    assert!(
+        !runtime.model.sensor_mounts.is_empty(),
+        "fixture must declare at least one sensor mount"
+    );
+    assert!(
+        !runtime.model.workspace_zones.is_empty(),
+        "fixture must declare at least one workspace zone"
+    );
+
+    let caps = project_capabilities(Some(&runtime), 1.5);
+    assert_eq!(caps.joint_descriptors.len(), 6);
+    assert!(!caps.tcp_descriptors.is_empty());
+    assert!(!caps.sensor_mount_descriptors.is_empty());
+    assert!(!caps.workspace_zone_descriptors.is_empty());
+}
+
+#[test]
 fn capability_publish_serde_roundtrip_includes_descriptors_when_populated() {
     // Defensive — when descriptors ARE populated, the JSON wire format must
     // round-trip lossless. This is the wire contract substrate-ide depends on

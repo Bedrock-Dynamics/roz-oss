@@ -128,6 +128,47 @@ run_deterministic() {
     -p 9097:9090 -p 8098:8090 -p 14551:14550/udp \
     bedrockdynamics/substrate-sim:ardupilot-gazebo
   run cargo test -p roz-copper --test ardupilot_wasm_velocity ardupilot_wasm_velocity_through_bridge -- --ignored --nocapture
+
+  # FW-07 / Codex H4 — manipulator deterministic row exercising the FULL
+  # agent/task production path (NOT just Copper spawn + sleep).
+  #
+  # `manipulator_dispatch_through_promote_controller_path` is the H4
+  # production-parity gate: it boots a worker-side `ToolDispatcher` with
+  # `promote_controller` / `controller_status` / `stop_controller`, spawns
+  # CopperHandle against the fake-OpenClaw IO backend, drives a real
+  # `LoadArtifact` → `controller_status` (running == true) → `stop_controller`
+  # sequence. Default-runnable (no `#[ignore]`); the H4 gate cannot be silently
+  # skipped from CI.
+  #
+  # Test file lives at crates/roz-worker/tests/manipulator_dispatch_path.rs
+  # (NOT crates/roz-copper/tests/...) because the lifecycle tools live in
+  # roz-worker and roz-copper cannot dev-dep roz-worker (cycle prevention,
+  # see Plan 09 SUMMARY for context).
+  echo "[live-matrix] manipulator (fake-openclaw deterministic — production path)..."
+  run cargo test -p roz-worker --test manipulator_dispatch_path --features test-fixtures \
+      manipulator_dispatch_through_promote_controller_path -- --nocapture
+
+  # Deterministic IO-substrate gates (position integration + Halt smoke).
+  run cargo test -p roz-copper --test fake_openclaw_tick_loop --features test-fixtures \
+      fake_openclaw_tick_loop_advances_positions fake_openclaw_estop_smoke_via_halt -- --nocapture
+
+  # Capability-publish lossless contract (FW-06 / Codex H5) — exercises the
+  # OpenClaw fixture manifest end-to-end through `project_capabilities`.
+  run cargo test -p roz-worker --test manipulator_capability_publish --features test-fixtures \
+      -- --nocapture
+}
+
+# FW-07 — gated HIL row. Skipped unless ROZ_OPENCLAW_HIL=1.
+# Each test in the suite checks the env var internally and `unimplemented!()`s
+# without it. `--ignored` is required because every HIL test carries `#[ignore]`.
+run_hil_manipulator() {
+  if [ "${ROZ_OPENCLAW_HIL:-0}" != "1" ]; then
+    echo "[live-matrix] manipulator HIL skipped (set ROZ_OPENCLAW_HIL=1 to enable)"
+    return 0
+  fi
+  echo "[live-matrix] manipulator (HIL — real Dynamixel/OpenCR)..."
+  run cargo test -p roz-copper --test fake_openclaw_tick_loop --features test-fixtures \
+      -- --ignored --nocapture
 }
 
 case "$MODE" in
@@ -136,9 +177,11 @@ case "$MODE" in
     ;;
   deterministic)
     run_deterministic
+    run_hil_manipulator
     ;;
   all)
     run_authored
     run_deterministic
+    run_hil_manipulator
     ;;
 esac
