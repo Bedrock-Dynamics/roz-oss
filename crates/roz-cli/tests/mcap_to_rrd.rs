@@ -25,9 +25,14 @@
 #![cfg(feature = "export-rrd")]
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use re_log_encoding::DecoderApp;
+use re_log_types::LogMsg;
+use re_sorbet::ChunkBatch;
 
 /// RESEARCH §Topic 6 strategy A — magic header check.
 const RRF2_MAGIC: &[u8; 4] = b"RRF2";
@@ -67,6 +72,70 @@ fn assert_rrf2_magic(path: &Path) {
         "rrd at {} must start with RRF2 magic (got {:x?})",
         path.display(),
         &bytes[..4.min(bytes.len())]
+    );
+}
+
+#[derive(Debug, Default)]
+struct RrdSemanticManifest {
+    entities: BTreeSet<String>,
+    timelines: BTreeSet<String>,
+    components: BTreeSet<String>,
+}
+
+fn rrd_entities_timelines_components(path: &Path) -> RrdSemanticManifest {
+    let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open rrd at {}: {e}", path.display()));
+    let reader = std::io::BufReader::new(file);
+    let mut manifest = RrdSemanticManifest::default();
+
+    for decoded in DecoderApp::decode_lazy(reader) {
+        let msg = decoded.unwrap_or_else(|e| panic!("decode rrd at {}: {e}", path.display()));
+        let LogMsg::ArrowMsg(_, arrow_msg) = msg else {
+            continue;
+        };
+        let chunk = ChunkBatch::try_from(&arrow_msg.batch)
+            .unwrap_or_else(|e| panic!("decode rerun chunk at {}: {e}", path.display()));
+        manifest.entities.insert(chunk.entity_path().to_string());
+        for index in chunk.chunk_schema().columns.index_columns() {
+            manifest.timelines.insert(index.timeline_name().to_string());
+        }
+        for component in chunk.chunk_schema().columns.component_columns() {
+            manifest.components.insert(component.component.to_string());
+            if let Some(component_type) = component.component_type {
+                manifest.components.insert(component_type.full_name().to_owned());
+            }
+            if let Some(archetype) = component.archetype {
+                manifest.components.insert(archetype.full_name().to_owned());
+            }
+        }
+    }
+
+    manifest
+}
+
+fn assert_rrd_semantics(path: &Path, entity: &str) {
+    let manifest = rrd_entities_timelines_components(path);
+    assert!(
+        manifest.entities.contains(entity),
+        "rrd at {} missing entity {entity}; entities={:?}",
+        path.display(),
+        manifest.entities
+    );
+    assert!(
+        manifest.timelines.contains("publish_time"),
+        "rrd at {} missing publish_time timeline; timelines={:?}",
+        path.display(),
+        manifest.timelines
+    );
+    assert!(
+        manifest.timelines.contains("log_time"),
+        "rrd at {} missing log_time timeline; timelines={:?}",
+        path.display(),
+        manifest.timelines
+    );
+    assert!(
+        !manifest.components.is_empty(),
+        "rrd at {} must contain at least one semantic component",
+        path.display()
     );
 }
 
@@ -142,6 +211,76 @@ fn encode_foxglove_log(level: i32, message: &str) -> Vec<u8> {
     buf
 }
 
+fn push_len_delimited(buf: &mut Vec<u8>, field_number: u8, body: &[u8]) {
+    buf.push((field_number << 3) | 2);
+    push_varint(buf, body.len() as u64);
+    buf.extend_from_slice(body);
+}
+
+fn push_fixed64(buf: &mut Vec<u8>, field_number: u8, value: f64) {
+    buf.push((field_number << 3) | 1);
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
+fn encode_timestamp(seconds: i64, nanos: i32) -> Vec<u8> {
+    let mut buf = Vec::new();
+    // field 1 (seconds), wire type 0.
+    buf.push(1 << 3);
+    push_varint(&mut buf, seconds as u64);
+    // field 2 (nanos), wire type 0.
+    buf.push(2 << 3);
+    push_varint(&mut buf, nanos as u64);
+    buf
+}
+
+fn encode_vec3(x: f64, y: f64, z: f64) -> Vec<u8> {
+    let mut buf = Vec::new();
+    push_fixed64(&mut buf, 1, x);
+    push_fixed64(&mut buf, 2, y);
+    push_fixed64(&mut buf, 3, z);
+    buf
+}
+
+fn encode_quat(x: f64, y: f64, z: f64, w: f64) -> Vec<u8> {
+    let mut buf = Vec::new();
+    push_fixed64(&mut buf, 1, x);
+    push_fixed64(&mut buf, 2, y);
+    push_fixed64(&mut buf, 3, z);
+    push_fixed64(&mut buf, 4, w);
+    buf
+}
+
+fn encode_foxglove_frame_transform(parent: &str, child: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    push_len_delimited(&mut buf, 1, &encode_timestamp(1, 0));
+    push_len_delimited(&mut buf, 2, parent.as_bytes());
+    push_len_delimited(&mut buf, 3, child.as_bytes());
+    push_len_delimited(&mut buf, 4, &encode_vec3(1.0, 2.0, 3.0));
+    push_len_delimited(&mut buf, 5, &encode_quat(0.0, 0.0, 0.0, 1.0));
+    buf
+}
+
+fn encode_foxglove_pose_in_frame(frame_id: &str) -> Vec<u8> {
+    let mut pose = Vec::new();
+    push_len_delimited(&mut pose, 1, &encode_vec3(4.0, 5.0, 6.0));
+    push_len_delimited(&mut pose, 2, &encode_quat(0.0, 0.0, 0.0, 1.0));
+
+    let mut buf = Vec::new();
+    push_len_delimited(&mut buf, 1, &encode_timestamp(1, 500_000_000));
+    push_len_delimited(&mut buf, 2, frame_id.as_bytes());
+    push_len_delimited(&mut buf, 3, &pose);
+    buf
+}
+
+fn encode_foxglove_compressed_video(frame_id: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    push_len_delimited(&mut buf, 1, &encode_timestamp(2, 0));
+    push_len_delimited(&mut buf, 2, frame_id.as_bytes());
+    push_len_delimited(&mut buf, 3, &[0x00, 0x00, 0x00, 0x01, 0x65, b'r', b'o', b'z']);
+    push_len_delimited(&mut buf, 4, b"h264");
+    buf
+}
+
 /// Write a minimal MCAP file containing a single `/roz/log` message
 /// carrying a `foxglove.Log` payload. Uses the workspace `mcap = 0.24`
 /// `Writer::new(BufWriter)` constructor (the same shape used by
@@ -173,6 +312,135 @@ fn write_synthetic_mcap(path: &Path, body: &str) {
         .expect("write message");
 
     writer.finish().expect("finalize mcap");
+}
+
+fn write_semantic_mcap(path: &Path) {
+    let file = std::fs::File::create(path).expect("create semantic mcap");
+    let buf = BufWriter::new(file);
+    let mut writer = mcap::Writer::new(buf).expect("mcap writer");
+
+    let log_schema = writer
+        .add_schema("foxglove.Log", "protobuf", &[])
+        .expect("add log schema");
+    let tf_schema = writer
+        .add_schema("foxglove.FrameTransform", "protobuf", &[])
+        .expect("add tf schema");
+    let pose_schema = writer
+        .add_schema("foxglove.PoseInFrame", "protobuf", &[])
+        .expect("add pose schema");
+    let video_schema = writer
+        .add_schema("foxglove.CompressedVideo", "protobuf", &[])
+        .expect("add video schema");
+
+    let log = writer
+        .add_channel(log_schema, "/roz/log", "protobuf", &BTreeMap::new())
+        .expect("add log channel");
+    let tf = writer
+        .add_channel(tf_schema, "/tf", "protobuf", &BTreeMap::new())
+        .expect("add tf channel");
+    let pose = writer
+        .add_channel(pose_schema, "/roz/telemetry/pose", "protobuf", &BTreeMap::new())
+        .expect("add pose channel");
+    let camera = writer
+        .add_channel(video_schema, "/roz/camera/front", "protobuf", &BTreeMap::new())
+        .expect("add camera channel");
+
+    let records = [
+        (log, 1_000_000_000, encode_foxglove_log(2, "semantic log")),
+        (
+            tf,
+            1_100_000_000,
+            encode_foxglove_frame_transform("world", "robot/base_link"),
+        ),
+        (pose, 1_200_000_000, encode_foxglove_pose_in_frame("world")),
+        (camera, 1_300_000_000, encode_foxglove_compressed_video("front")),
+    ];
+
+    for (sequence, (channel_id, log_time, payload)) in records.into_iter().enumerate() {
+        writer
+            .write_to_known_channel(
+                &mcap::records::MessageHeader {
+                    channel_id,
+                    sequence: u32::try_from(sequence).expect("sequence fits u32"),
+                    log_time,
+                    publish_time: log_time + 10_000_000,
+                },
+                payload.as_slice(),
+            )
+            .expect("write semantic message");
+    }
+
+    writer.finish().expect("finalize semantic mcap");
+}
+
+#[test]
+fn semantic_rrd_contains_entities_timelines_and_components() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mcap_path = tmp.path().join("semantic.mcap");
+    let rrd_path = tmp.path().join("semantic.rrd");
+    write_semantic_mcap(&mcap_path);
+
+    let out = roz()
+        .args([
+            "mcap",
+            "to-rrd",
+            mcap_path.to_str().expect("mcap path utf8"),
+            "--output",
+            rrd_path.to_str().expect("rrd path utf8"),
+        ])
+        .output()
+        .expect("spawn roz mcap to-rrd");
+
+    assert!(
+        out.status.success(),
+        "to-rrd failed (status={:?}): stdout={} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert_rrf2_magic(&rrd_path);
+    let manifest = rrd_entities_timelines_components(&rrd_path);
+    for entity in [
+        "/session/log",
+        "/world/robot/base_link",
+        "/world/robot/pose",
+        "/world/cameras/front",
+    ] {
+        assert!(
+            manifest.entities.contains(entity),
+            "rrd missing entity {entity}; entities={:?}",
+            manifest.entities
+        );
+    }
+    assert!(
+        manifest.timelines.contains("publish_time"),
+        "rrd missing publish_time timeline; timelines={:?}",
+        manifest.timelines
+    );
+    assert!(
+        manifest.timelines.contains("log_time"),
+        "rrd missing log_time timeline; timelines={:?}",
+        manifest.timelines
+    );
+    assert!(
+        manifest.components.iter().any(|c| c.contains("Text")),
+        "rrd missing text/log component; components={:?}",
+        manifest.components
+    );
+    assert!(
+        manifest
+            .components
+            .iter()
+            .any(|c| c.contains("Transform") || c.contains("Translation") || c.contains("Rotation")),
+        "rrd missing transform component; components={:?}",
+        manifest.components
+    );
+    assert!(
+        manifest.components.iter().any(|c| c.contains("Video")),
+        "rrd missing video component; components={:?}",
+        manifest.components
+    );
 }
 
 #[test]
@@ -233,6 +501,8 @@ fn bulk_mode_continue_on_error() {
     // Both good outputs must carry RRF2 magic.
     assert_rrf2_magic(&out_a);
     assert_rrf2_magic(&out_b);
+    assert_rrd_semantics(&out_a, "/session/log");
+    assert_rrd_semantics(&out_b, "/session/log");
 
     // Note: `bad.rrd` may also exist with just a Rerun header, because
     // `export_one` opens the writer (writing the RRF2 magic) BEFORE
