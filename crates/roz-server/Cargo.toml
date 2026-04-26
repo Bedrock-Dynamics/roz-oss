@@ -19,7 +19,7 @@ authors.workspace      = true
 # `roz_agent::model::mock_provider_v1` (relocated from roz-test per Plan 03)
 # is reachable from `tests/mcap_agent_session_live.rs`. Without this
 # propagation the integration test would not see the `pub use` re-export.
-test-helpers = ["roz-agent/test-helpers"]
+test-helpers = ["roz-agent/test-helpers", "roz-worker/test-fixtures"]
 
 [dependencies]
 roz-core = { path = "../roz-core" }
@@ -194,4 +194,13 @@ required-features = ["test-helpers"]
 [[test]]
 name = "artifact_copper_roundtrip"
 path = "tests/artifact_copper_roundtrip.rs"
+required-features = ["test-helpers"]
+
+# Phase 26.11 Plan 03 — safety_policy_physical_vertical drives the live
+# policy CRUD fanout into the worker verify/apply path, then proves the same
+# hot Copper policy affects the fake OpenClaw-class physical runtime and
+# archived session metadata.
+[[test]]
+name = "safety_policy_physical_vertical"
+path = "tests/safety_policy_physical_vertical.rs"
 required-features = ["test-helpers"]
