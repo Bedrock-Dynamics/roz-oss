@@ -55,6 +55,10 @@ pub mod spatial_bridge;
 pub mod telemetry;
 pub mod telemetry_backpressure;
 pub mod telemetry_replay;
+// Phase 26.10 Plan 04 (FW-03): worker-side controller lifecycle tools
+// (promote_controller, stop_controller, controller_status). Mirrors
+// `crates/roz-local/src/tools/`.
+pub mod tools;
 pub mod transport_nats;
 pub mod trust;
 pub mod turn_flush;
