@@ -80,10 +80,14 @@ impl ReadinessBuilder {
     /// Ingest a HEARTBEAT -- updates `heartbeat_alive`, `heartbeat_age_ms`,
     /// `armed`, `system_status`, `autopilot`.
     pub fn apply_heartbeat(&mut self, msg: &HEARTBEAT_DATA) {
+        self.apply_heartbeat_at(msg, Instant::now());
+    }
+
+    fn apply_heartbeat_at(&mut self, msg: &HEARTBEAT_DATA, rx_at: Instant) {
         let safety_armed_bit = MavModeFlag::MAV_MODE_FLAG_SAFETY_ARMED.bits();
         let armed = (msg.base_mode.bits() & safety_armed_bit) != 0;
         self.last_heartbeat = Some(HeartbeatState {
-            rx_at: Instant::now(),
+            rx_at,
             armed,
             system_status: msg.system_status as u32,
             autopilot: upstream_autopilot_to_proto(msg.autopilot),
@@ -107,7 +111,10 @@ impl ReadinessBuilder {
     /// Compute a fresh [`ReadinessState`] snapshot from the current builder state.
     #[must_use]
     pub fn snapshot(&self) -> ReadinessState {
-        let now = Instant::now();
+        self.snapshot_at(Instant::now())
+    }
+
+    fn snapshot_at(&self, now: Instant) -> ReadinessState {
         let (heartbeat_alive, heartbeat_age_ms, armed, system_status, autopilot) =
             self.last_heartbeat
                 .map_or((false, 0, false, 0, ProtoMavAutopilot::Unspecified as i32), |hb| {
@@ -146,6 +153,20 @@ impl ReadinessBuilder {
             fully_operational,
             autopilot,
         }
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl ReadinessBuilder {
+    /// Test-only HEARTBEAT ingestion with deterministic receipt time.
+    pub fn apply_heartbeat_at_for_tests(&mut self, msg: &HEARTBEAT_DATA, rx_at: Instant) {
+        self.apply_heartbeat_at(msg, rx_at);
+    }
+
+    /// Test-only snapshot with deterministic wall-clock time.
+    #[must_use]
+    pub fn snapshot_at_for_tests(&self, now: Instant) -> ReadinessState {
+        self.snapshot_at(now)
     }
 }
 
