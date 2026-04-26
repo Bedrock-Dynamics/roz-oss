@@ -5,8 +5,11 @@
 //! `ActuatorSink`/`SensorSource`, so a copper -> driver edge would cycle.
 //! roz-worker depends on both crates without cycle.
 //!
-//! Plan 08 replaces `ManipulatorStubFactory` with a real `FakeOpenclawFactory`
-//! (gated `test-fixtures` feature). MAVLink wiring lives in Phase 27 SC5/SC6/SC7.
+//! Phase 26.10 Plan 08 (FW-07) replaces the previous `ManipulatorStubFactory`
+//! with `FakeOpenclawFactory`, which under the `test-fixtures` feature wires
+//! `roz_copper::fake_openclaw::fake_openclaw_pair`. Without the feature,
+//! `build()` returns `Err` so production binaries fail closed (T-26.10-08-04).
+//! MAVLink wiring lives in Phase 27 SC5/SC6/SC7.
 
 use std::sync::Arc;
 
@@ -19,31 +22,53 @@ use roz_core::embodiment::binding::ControlInterfaceManifest;
 #[must_use]
 pub fn factory_for(family: Option<&str>) -> Option<Box<dyn IoFactory>> {
     match family {
-        Some("openclaw" | "manipulator") => Some(Box::new(ManipulatorStubFactory)),
+        Some("openclaw" | "manipulator") => Some(Box::new(FakeOpenclawFactory)),
         Some("drone-mavlink") => Some(Box::new(MavlinkFactory)),
         _ => None,
     }
 }
 
-/// Stub for the manipulator family. Plan 08 (FW-07) replaces this with a real
-/// `FakeOpenclawFactory` that wraps the deterministic fake-OpenClaw backend.
-/// The replacement is in this same file (no caller changes — `factory_for`
-/// continues to dispatch through `Some("manipulator") | Some("openclaw")`).
-pub(crate) struct ManipulatorStubFactory;
-impl IoFactory for ManipulatorStubFactory {
+/// Manipulator-family backend. Under the `test-fixtures` feature this wires
+/// the deterministic fake-OpenClaw backend from `roz_copper::fake_openclaw`;
+/// without the feature, `build()` returns `Err` so production binaries cannot
+/// silently spawn a controller against a fake (T-26.10-08-04 mitigation).
+///
+/// Production manipulator backends (Dynamixel, OpenCR, real OpenClaw firmware)
+/// are scope of a future phase; they will replace this `cfg(not(...))` branch
+/// with their own real implementation.
+pub(crate) struct FakeOpenclawFactory;
+
+#[cfg(feature = "test-fixtures")]
+impl IoFactory for FakeOpenclawFactory {
+    fn build(
+        &self,
+        runtime: &EmbodimentRuntime,
+        _control_manifest: &ControlInterfaceManifest,
+    ) -> anyhow::Result<(Arc<dyn ActuatorSink>, Box<dyn SensorSource>)> {
+        let (actuator, sensor) = roz_copper::fake_openclaw::fake_openclaw_pair(runtime);
+        Ok((Arc::new(actuator), Box::new(sensor)))
+    }
+    fn name(&self) -> &'static str {
+        "fake-openclaw"
+    }
+}
+
+#[cfg(not(feature = "test-fixtures"))]
+impl IoFactory for FakeOpenclawFactory {
     fn build(
         &self,
         _runtime: &EmbodimentRuntime,
         _control_manifest: &ControlInterfaceManifest,
     ) -> anyhow::Result<(Arc<dyn ActuatorSink>, Box<dyn SensorSource>)> {
         anyhow::bail!(
-            "manipulator IoFactory stub — Plan 26.10-08 must wire the deterministic \
-             fake-OpenClaw backend (or a real Dynamixel/OpenCR backend) before this path \
-             can spawn a controller"
+            "manipulator IoFactory: test-fixtures feature not enabled — production \
+             manipulator backends (Dynamixel, OpenCR) are scope of a future phase. \
+             Enable `roz-worker/test-fixtures` for the deterministic fake-OpenClaw \
+             backend (CI / live-matrix only)."
         )
     }
     fn name(&self) -> &'static str {
-        "manipulator-stub"
+        "fake-openclaw-stub"
     }
 }
 
@@ -72,10 +97,17 @@ mod tests {
     use super::*;
 
     /// Build a minimal `EmbodimentRuntime` via the canonical compile path.
-    /// Mirrors `crates/roz-nats/src/dispatch.rs:681` `minimal_runtime()`.
-    /// `EmbodimentRuntime` does NOT implement `Default` — `compile()` is the
-    /// only canonical constructor. For the Err-path tests below the runtime
-    /// CONTENTS do not matter; the factory body never reads them.
+    /// Plan 08 (FW-07) provides `roz_core::embodiment::test_fixtures::manipulator_runtime`
+    /// when the `test-fixtures` feature is enabled — under that feature we
+    /// route through the canonical helper. Without the feature, the body of
+    /// the manipulator factory bails before reading the runtime, so a
+    /// hand-built minimal model is sufficient.
+    #[cfg(feature = "test-fixtures")]
+    fn minimal_runtime() -> EmbodimentRuntime {
+        roz_core::embodiment::test_fixtures::manipulator_runtime(2, 1.0, 3.14)
+    }
+
+    #[cfg(not(feature = "test-fixtures"))]
     fn minimal_runtime() -> EmbodimentRuntime {
         use roz_core::embodiment::EmbodimentModel;
         use roz_core::embodiment::frame_tree::{FrameSource, FrameTree};
@@ -122,9 +154,17 @@ mod tests {
     #[test]
     fn factory_for_returns_some_for_manipulator() {
         let f = factory_for(Some("manipulator")).expect("manipulator factory exists");
-        assert_eq!(f.name(), "manipulator-stub");
         let f2 = factory_for(Some("openclaw")).expect("openclaw alias factory exists");
-        assert_eq!(f2.name(), "manipulator-stub");
+        #[cfg(feature = "test-fixtures")]
+        {
+            assert_eq!(f.name(), "fake-openclaw");
+            assert_eq!(f2.name(), "fake-openclaw");
+        }
+        #[cfg(not(feature = "test-fixtures"))]
+        {
+            assert_eq!(f.name(), "fake-openclaw-stub");
+            assert_eq!(f2.name(), "fake-openclaw-stub");
+        }
     }
 
     #[test]
@@ -150,8 +190,12 @@ mod tests {
         );
     }
 
+    /// Without the `test-fixtures` feature, the manipulator factory MUST return
+    /// an Err so production binaries cannot spawn a controller through the fake
+    /// (T-26.10-08-04 mitigation).
+    #[cfg(not(feature = "test-fixtures"))]
     #[test]
-    fn manipulator_factory_build_returns_err_stub() {
+    fn factory_for_manipulator_without_feature_errors() {
         let factory = factory_for(Some("manipulator")).unwrap();
         let runtime = minimal_runtime();
         let manifest = minimal_manifest();
@@ -162,8 +206,39 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("manipulator IoFactory stub"),
-            "expected stub-message, got: {msg}"
+            msg.contains("test-fixtures feature not enabled"),
+            "expected feature-disabled message, got: {msg}"
+        );
+    }
+
+    /// With the `test-fixtures` feature, the manipulator factory MUST return a
+    /// real paired actuator+sensor backed by `fake_openclaw_pair`. Sending a
+    /// command through the actuator must be visible on the next sensor read.
+    #[cfg(feature = "test-fixtures")]
+    #[test]
+    fn fake_openclaw_factory_build_returns_paired_io() {
+        let runtime = minimal_runtime();
+        let manifest = minimal_manifest();
+        let factory = factory_for(Some("manipulator")).unwrap();
+        let (actuator, mut sensor) = factory.build(&runtime, &manifest).unwrap();
+        actuator
+            .send(&roz_core::command::CommandFrame {
+                values: vec![0.5, -0.25],
+            })
+            .unwrap();
+        let frame = sensor.try_recv().expect("sensor frame");
+        // Both joints have max_velocity = 1.0, so values are within saturation;
+        // sensor frame echoes the (clamped) commanded velocities through the
+        // shared-state path.
+        assert!(
+            (frame.joint_velocities[0] - 0.5).abs() < f64::EPSILON,
+            "joint 0 velocity should reflect command: got {}",
+            frame.joint_velocities[0]
+        );
+        assert!(
+            (frame.joint_velocities[1] - -0.25).abs() < f64::EPSILON,
+            "joint 1 velocity should reflect command: got {}",
+            frame.joint_velocities[1]
         );
     }
 }
