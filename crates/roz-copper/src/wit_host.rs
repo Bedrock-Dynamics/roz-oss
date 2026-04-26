@@ -29,6 +29,18 @@ use wasmtime::{Linker, StoreLimits, StoreLimitsBuilder};
 use crate::tick_contract::{TickInput, TickOutput};
 use crate::wit_bindings::live_controller;
 
+/// FW-05(a): Maximum bytes a tick can emit via `tick::set_output`.
+///
+/// Bounds the host-side allocation BEFORE the `vec![0u8; len]` to prevent
+/// OOM-class denial-of-service from a malicious or buggy WASM controller
+/// that supplies an unbounded `len` argument. The wasmtime sandbox protects
+/// WASM linear memory; this guard protects the host process heap.
+///
+/// 64 KiB is generous: `TickOutput` JSON is bounded by
+/// `command_values.len() * ~32 bytes` per command and live controllers have
+/// at most ~50 channels. The cap is the per-call ceiling, not a rate limit.
+pub const MAX_TICK_OUTPUT_BYTES: usize = 64 * 1024;
+
 /// A single command recorded by a host function (retained for observability).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandEntry {
@@ -343,6 +355,10 @@ fn register_tick_functions(linker: &mut Linker<HostContext>) -> anyhow::Result<(
     // tick::set_output(json_ptr: i32, json_len: i32)
     //   The controller calls this to submit its TickOutput. The host reads
     //   the JSON from WASM linear memory and stores it for post-tick processing.
+    //
+    //   FW-05(a): the `len_usize > MAX_TICK_OUTPUT_BYTES` guard runs BEFORE
+    //   `vec![0u8; len_usize]` to prevent host-heap exhaustion DoS by a
+    //   malicious/buggy controller. Mirrors the `get_input` bound at :328.
     #[allow(clippy::cast_sign_loss)]
     linker.func_wrap(
         "tick",
@@ -351,7 +367,17 @@ fn register_tick_functions(linker: &mut Linker<HostContext>) -> anyhow::Result<(
             if len <= 0 {
                 return;
             }
-            let mut buf = vec![0u8; len as usize];
+            let len_usize = len as usize;
+            if len_usize > MAX_TICK_OUTPUT_BYTES {
+                // FW-05(a): bound BEFORE alloc to prevent host-heap exhaustion DoS.
+                tracing::warn!(
+                    len = len_usize,
+                    max = MAX_TICK_OUTPUT_BYTES,
+                    "tick::set_output exceeds bound; dropping"
+                );
+                return;
+            }
+            let mut buf = vec![0u8; len_usize];
             if let Some(memory) = caller.get_export("memory").and_then(wasmtime::Extern::into_memory)
                 && memory.read(&caller, ptr as usize, &mut buf).is_ok()
             {

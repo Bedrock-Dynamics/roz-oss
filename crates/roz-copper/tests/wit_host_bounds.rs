@@ -32,6 +32,7 @@ fn instantiate_with_host(wat: &str, host: HostContext) -> (Engine, Store<HostCon
 /// Test 1: Calling `set_output` with `len = MAX_TICK_OUTPUT_BYTES + 1` MUST NOT
 /// allocate or populate the host-side tick_output_json buffer.
 #[test]
+#[allow(clippy::cast_possible_wrap, reason = "65537 fits trivially in i32; cast is safe by construction")]
 fn wit_host_set_output_bounded_drops_oversize() {
     // The WAT module passes a length GREATER than MAX_TICK_OUTPUT_BYTES.
     // We use 64 KiB + 1 = 65537. WASM memory min is 1 page (64 KiB), so the
