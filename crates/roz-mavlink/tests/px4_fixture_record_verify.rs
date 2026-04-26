@@ -2,7 +2,7 @@
 
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 const ENV_NAME: &str = "ROZ_PX4_FIXTURE_RECORD_VERIFY";
@@ -40,6 +40,35 @@ fn compare_recorded_to_checked_in(output_dir: &Path) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn record_px4_fixtures_to_dir(output_dir: &Path) -> anyhow::Result<()> {
+    if env::var(ENV_NAME).as_deref() != Ok("1") {
+        anyhow::bail!("PX4 SITL recorder lands in Phase 27");
+    }
+
+    let recorder = FakePx4FixtureRecorder;
+    recorder.record_to_dir(output_dir)
+}
+
+trait Px4FixtureRecorder {
+    fn record_to_dir(&self, output_dir: &Path) -> anyhow::Result<()>;
+}
+
+struct FakePx4FixtureRecorder;
+
+impl Px4FixtureRecorder for FakePx4FixtureRecorder {
+    fn record_to_dir(&self, output_dir: &Path) -> anyhow::Result<()> {
+        for relative_path in READINESS_FIXTURES {
+            let source = Path::new(FIXTURE_ROOT).join(relative_path);
+            let destination = output_dir.join(relative_path);
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&source, &destination)?;
+        }
+        Ok(())
+    }
 }
 
 fn fixture_git_status() -> anyhow::Result<String> {
