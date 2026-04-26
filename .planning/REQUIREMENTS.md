@@ -78,7 +78,8 @@ Close the production-wiring gaps surfaced by the codex review (2026-04-25) so li
 - [x] **FW-02
 **: `IoFactory` trait surface in `roz-copper` binds real `ActuatorSink` + `SensorSource` from the resolved `EmbodimentRuntime`. `spawn_with_policy_and_io` is a one-page extension of existing `spawn_with_io_and_deployment_manager_and_wiring`. Adding a new robot family is `impl IoFactory for X` + registration, not a worker code change. MAVLink branch returns `Err("MAVLink IoFactory deferred — see Phase 27 SC5/SC6/SC7 live-FCU work")` for 26.10; manipulator branch is the framework-fidelity surface.
 
-- [ ] **FW-03**: Worker registers `promote_controller`, `stop_controller`, `controller_status` tools. Local runtime registers live promotion alongside replay (replay stays as a separately-named tool). All three tools are categorised `ToolCategory::Physical` so the OodaReAct loop applies physical-execution approval and safety policies. Worker and local share contract through `roz-core` tool schemas.
+- [x] **FW-03
+**: Worker registers `promote_controller`, `stop_controller`, `controller_status` tools. Local runtime registers live promotion alongside replay (replay stays as a separately-named tool). All three tools are categorised `ToolCategory::Physical` so the OodaReAct loop applies physical-execution approval and safety policies. Worker and local share contract through `roz-core` tool schemas.
 
 - [x] **FW-04
 **: Edge `AUTO` placement resolves to **edge** when the session contains any tool with `ToolCategory::Physical` (session-start scan in `crates/roz-server/src/grpc/agent.rs:2583`, reusing the already-extracted `tool_categories: HashMap<String, ToolCategory>`). Cloud is permitted only for sessions with no physical-execution tools. Decision is per-tool-category, not per-task — a single agent turn correctly mixes edge control with cloud reasoning.
