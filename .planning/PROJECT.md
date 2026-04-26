@@ -10,7 +10,7 @@ A reliable, secure, and well-tested platform that operators trust for physical r
 
 ## Current State
 
-**Last shipped:** v2.2 Runtime Event Contracts and Completeness (2026-04-16)
+**Last completed phase:** Phase 26.11 Robotics Test Realism Hardening (2026-04-26)
 
 Platform now has:
 
@@ -22,6 +22,8 @@ Platform now has:
 - Natural-language scheduled invocations backed by canonical cron parsing, durable Restate workflows, and shipped `roz schedule` CLI commands
 - Typed `skill_loaded` / `skill_crystallized` gRPC payloads with cloud, worker-relay, and local cloud-TUI correlation coverage
 - An explicit skill freshness contract: `skills_context` freezes at session start while `skills_list` and `skill_view` remain the live mid-session surfaces
+- v3.0 production-robotics groundwork through Phase 26.11: native MAVLink backend, unified MCAP/RRD observability, session artifact archival, OpenClaw-inspired manipulator runtime wiring, and feature-gated robotics acceptance coverage
+- Robotics test realism hardening: CI/nightly routes, OpenClaw-inspired worker vertical, `flight_command` tool routing, safety-policy physical vertical, camera/artifact/RRD semantic validation, PX4 readiness replay, and verify-only fixture recording
 
 ## Current Milestone: v3.0 Production Robotics
 
@@ -75,6 +77,9 @@ Platform now has:
 
 **v2.2 Runtime Event Contracts and Completeness**
 - ✓ RTEC-01..03: Typed skill-event gRPC payloads, cloud/worker/local correlation coverage, and the explicit frozen-vs-live skill reload contract
+
+**v3.0 Production Robotics (completed slices through Phase 26.11)**
+- ✓ TR-01..06: Robotics test realism hardening — CI/nightly visibility, OpenClaw-inspired manipulator verticals, flight-command routing, safety-policy physical evidence, camera/artifact/RRD semantic validation, and PX4 readiness fixture hygiene
 
 ### Active
 
@@ -142,4 +147,4 @@ Security posture: tenant isolation remains enforced with RLS across the new pers
 This document evolves at phase transitions and milestone boundaries.
 
 ---
-*Last updated: 2026-04-25 after completing Phase 26.9 (RRD format export for substrate)*
+*Last updated: 2026-04-26 after completing Phase 26.11 (robotics test realism hardening)*
