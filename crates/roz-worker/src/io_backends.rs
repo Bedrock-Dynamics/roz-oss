@@ -5,8 +5,8 @@
 //! `ActuatorSink`/`SensorSource`, so a copper -> driver edge would cycle.
 //! roz-worker depends on both crates without cycle.
 //!
-//! Phase 26.10 Plan 08 (FW-07) replaces the previous `ManipulatorStubFactory`
-//! with `FakeOpenclawFactory`, which under the `test-fixtures` feature wires
+//! Phase 26.10 Plan 08 (FW-07) replaces Plan 03's deferred manipulator-stub
+//! factory with `FakeOpenclawFactory`, which under the `test-fixtures` feature wires
 //! `roz_copper::fake_openclaw::fake_openclaw_pair`. Without the feature,
 //! `build()` returns `Err` so production binaries fail closed (T-26.10-08-04).
 //! MAVLink wiring lives in Phase 27 SC5/SC6/SC7.
