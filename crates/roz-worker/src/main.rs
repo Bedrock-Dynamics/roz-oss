@@ -1484,17 +1484,46 @@ async fn main() -> Result<()> {
             None
         };
 
-    // Publish capabilities on startup
-    let mut caps = roz_core::capabilities::RobotCapabilities {
-        robot_type: "generic".to_string(),
-        joints: vec![],
-        control_modes: vec!["position".to_string(), "velocity".to_string()],
-        workspace_bounds: None,
-        sensors: vec![],
-        max_velocity: config.max_velocity.unwrap_or(1.5),
-        cameras: vec![],
-        ..roz_core::capabilities::RobotCapabilities::default()
-    };
+    // FW-06 / Codex H5 (Phase 26.10 Plan 09): load embodiment runtime from
+    // robot.toml BEFORE publishing capabilities so the capability publish at
+    // startup can project lossless typed descriptors (joints/TCPs/sensor
+    // mounts/workspace zones) via `project_capabilities`. Hoisted from its
+    // original position immediately above `register_host` (~line 1576) so the
+    // capability publish has access to the same runtime the host registration
+    // path consumes. `invocation` is NOT in scope at startup — the per-task
+    // re-publication path (when an OodaReAct task arrives carrying
+    // invocation.embodiment_runtime) is owned by execute_task, not main.
+    let embodiment_runtime: Option<roz_core::embodiment::embodiment_runtime::EmbodimentRuntime> =
+        config.robot_toml.as_ref().and_then(|toml_path| {
+            match roz_core::manifest::EmbodimentManifest::load(std::path::Path::new(toml_path)) {
+                Ok(manifest) => {
+                    if let Some(rt) = manifest.embodiment_runtime() {
+                        tracing::info!(path = %toml_path, digest = %rt.model.model_digest, "loaded embodiment runtime from manifest");
+                        Some(rt)
+                    } else {
+                        tracing::info!(path = %toml_path, "manifest has no channels section, skipping embodiment upload");
+                        None
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(path = %toml_path, error = %e, "failed to load embodiment manifest");
+                    None
+                }
+            }
+        });
+
+    // Publish capabilities on startup. Codex H5 fix: project typed descriptors
+    // from `embodiment_runtime` (loaded from robot_toml above) via the pure
+    // `project_capabilities` helper. Then layer the legacy generic fields
+    // (`robot_type`, `control_modes`) and the camera vector that lives outside
+    // EmbodimentRuntime. Wire-format stays compatible — descriptor vectors are
+    // omitted entirely from the JSON output when the manifest is absent.
+    let mut caps = roz_core::embodiment::projection::project_capabilities(
+        embodiment_runtime.as_ref(),
+        config.max_velocity.unwrap_or(1.5),
+    );
+    caps.robot_type = "generic".to_string();
+    caps.control_modes = vec!["position".to_string(), "velocity".to_string()];
 
     if let Some(ref cam_mgr) = camera_manager {
         caps.cameras = cam_mgr
@@ -1573,25 +1602,9 @@ async fn main() -> Result<()> {
     tokio::spawn(async move { wd.run(wd_cancel).await });
     tracing::info!("idle watchdog active (30s deadline, policy-sourced on_expire)");
 
-    // Load embodiment runtime from robot.toml if configured (D-01, D-02)
-    let embodiment_runtime: Option<roz_core::embodiment::embodiment_runtime::EmbodimentRuntime> =
-        config.robot_toml.as_ref().and_then(|toml_path| {
-            match roz_core::manifest::EmbodimentManifest::load(std::path::Path::new(toml_path)) {
-                Ok(manifest) => {
-                    if let Some(rt) = manifest.embodiment_runtime() {
-                        tracing::info!(path = %toml_path, digest = %rt.model.model_digest, "loaded embodiment runtime from manifest");
-                        Some(rt)
-                    } else {
-                        tracing::info!(path = %toml_path, "manifest has no channels section, skipping embodiment upload");
-                        None
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(path = %toml_path, error = %e, "failed to load embodiment manifest");
-                    None
-                }
-            }
-        });
+    // (FW-06 / Codex H5: `embodiment_runtime` is now loaded above the capability
+    // publish so `project_capabilities` can consume it at startup. The variable
+    // remains in scope here for the host-registration upload below.)
 
     // Phase 23 Plan 23-08: signing context, hoisted here so the invoke
     // subscribe loop below can verify inbound server→worker envelopes.

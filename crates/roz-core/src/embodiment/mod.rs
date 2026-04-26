@@ -11,6 +11,11 @@ pub mod limits;
 pub mod model;
 pub mod perception;
 pub mod prediction;
+// FW-06 / Codex H5 sub-task 2 (Phase 26.10 Plan 09) — pure projection helper
+// from EmbodimentRuntime to RobotCapabilities. Unconditional pub mod (production
+// code path; not feature-gated). Worker startup at main.rs:1488 calls into this
+// module to publish lossless capability descriptors.
+pub mod projection;
 pub mod retargeting;
 pub mod safety_overlay;
 // Phase 26.10 Plan 08 (FW-07) — manipulator_runtime helper. Gated `test-fixtures`

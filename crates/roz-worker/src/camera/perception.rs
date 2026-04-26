@@ -331,6 +331,7 @@ mod tests {
                 fps: 30,
                 hw_encoder: false,
             }],
+            ..RobotCapabilities::default()
         };
         let mut ext = Extensions::new();
         ext.insert(caps);
