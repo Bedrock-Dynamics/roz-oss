@@ -13,6 +13,12 @@ pub mod perception;
 pub mod prediction;
 pub mod retargeting;
 pub mod safety_overlay;
+// Phase 26.10 Plan 08 (FW-07) — manipulator_runtime helper. Gated `test-fixtures`
+// so production binaries do not link the helper. Tests within roz-core enable it
+// implicitly via the `cfg(test)` clause; downstream crates (roz-copper, roz-worker)
+// enable it through `roz-core/test-fixtures` feature propagation.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod test_fixtures;
 pub mod workspace;
 
 // Stub modules are exported here for consistent public API; items will be populated by

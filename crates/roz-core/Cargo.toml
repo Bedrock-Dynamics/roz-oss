@@ -6,6 +6,13 @@ rust-version.workspace = true
 license.workspace      = true
 authors.workspace      = true
 
+[features]
+# Phase 26.10 Plan 08 (FW-07) — exposes `embodiment::test_fixtures::manipulator_runtime`
+# helper so other crates (roz-copper, roz-worker) can build minimal `EmbodimentRuntime`
+# instances in their own tests without copying the construction code. Gated `cfg(any(test,
+# feature = "test-fixtures"))` so production binaries never link the helper.
+test-fixtures = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
