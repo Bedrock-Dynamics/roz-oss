@@ -12,8 +12,8 @@
 //!   4. Shim performs a blocking `recv()` (bounded timeout) and asserts the
 //!      inbound frame is a `LOG_ERASE` with the FCU target triplet.
 //!
-//! Teardown uses `std::process::exit(0)` — matches
-//! `log_fanout.rs` / `qgc_coexistence.rs` (25-PATTERNS Variance Note 2).
+//! Teardown calls `MavlinkBackend::shutdown_for_tests()` so the live UDP
+//! transport tasks drain without terminating the whole test process.
 
 use std::time::Duration;
 
@@ -119,9 +119,5 @@ async fn send_log_erase_emits_log_erase_message() {
         Err(msg) => panic!("{msg}"),
     }
 
-    drop(backend);
-    // Force-exit so the blocking UDP reader tasks inside the backend do not
-    // hang the test runtime on drop. Matches the teardown idiom in
-    // `log_fanout.rs` / `qgc_coexistence.rs` (25-PATTERNS Variance Note 2).
-    std::process::exit(0);
+    backend.shutdown_for_tests().await;
 }

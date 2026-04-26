@@ -10,11 +10,8 @@
 //! # Test shape
 //!
 //! Four sequential backend constructions (each on a fresh ephemeral
-//! UDP port) cover `{Px4, ArduCopter, ArduPlane, Unknown}`; the
-//! trailing `std::process::exit(0)` is the same teardown idiom as
-//! `log_fanout.rs` + `qgc_coexistence.rs` — upstream `mavlink::connect`
-//! (`udpin:...`) holds a blocking `UdpSocket::recv` that cannot be
-//! cancelled cleanly at test shutdown (25-PATTERNS Variance Note 2).
+//! UDP port) cover `{Px4, ArduCopter, ArduPlane, Unknown}` and each backend
+//! is explicitly shut down before the next one is opened.
 
 use roz_mavlink::{AutopilotHint, AutopilotKind, MavlinkBackend, MavlinkSigningConfig, SigningPosture};
 
@@ -46,7 +43,7 @@ async fn autopilot_kind_maps_all_variants() {
         AutopilotKind::Px4,
         "AutopilotHint::Px4 must map to AutopilotKind::Px4"
     );
-    drop(backend);
+    backend.shutdown_for_tests().await;
 
     // ArduCopter → ArduPilot
     let backend = build_backend(AutopilotHint::ArduCopter).await;
@@ -55,7 +52,7 @@ async fn autopilot_kind_maps_all_variants() {
         AutopilotKind::ArduPilot,
         "AutopilotHint::ArduCopter must map to AutopilotKind::ArduPilot"
     );
-    drop(backend);
+    backend.shutdown_for_tests().await;
 
     // ArduPlane → ArduPilot
     let backend = build_backend(AutopilotHint::ArduPlane).await;
@@ -64,7 +61,7 @@ async fn autopilot_kind_maps_all_variants() {
         AutopilotKind::ArduPilot,
         "AutopilotHint::ArduPlane must map to AutopilotKind::ArduPilot"
     );
-    drop(backend);
+    backend.shutdown_for_tests().await;
 
     // Unknown → Unknown
     let backend = build_backend(AutopilotHint::Unknown).await;
@@ -73,11 +70,5 @@ async fn autopilot_kind_maps_all_variants() {
         AutopilotKind::Unknown,
         "AutopilotHint::Unknown must map to AutopilotKind::Unknown"
     );
-    drop(backend);
-
-    // Force-exit: upstream `mavlink::connect("udpin:...")` holds blocking
-    // UdpSocket::recv tasks across all 4 backends. Without exit the tokio
-    // runtime hangs on drop. Matches `log_fanout.rs` / `qgc_coexistence.rs`
-    // teardown (25-PATTERNS Variance Note 2).
-    std::process::exit(0);
+    backend.shutdown_for_tests().await;
 }

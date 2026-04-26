@@ -403,6 +403,25 @@ impl MavlinkBackend {
             .map_err(|e| anyhow::anyhow!("LOG_ERASE outbound send failed: {e}"))
     }
 
+    /// Test-facing deterministic teardown for live transport backends.
+    ///
+    /// Integration tests that open `udpin:` transports should call this rather
+    /// than relying on `Drop`. It aborts and awaits the router plus transport
+    /// tasks so the Tokio runtime can drain cleanly.
+    #[doc(hidden)]
+    pub async fn shutdown_for_tests(self) {
+        let transport = { self._transport_keepalive.lock().take() };
+        let router = { self._router_handle.lock().take() };
+
+        if let Some(transport) = transport {
+            transport.shutdown().await;
+        }
+        if let Some(router) = router {
+            router.abort();
+            let _ = router.await;
+        }
+    }
+
     /// Phase 26.8-08 test-only constructor. Builds a [`MavlinkBackend`]
     /// wired to caller-supplied `outbound` + `log_broadcast` channels with
     /// NO router loop, NO transport keepalive, and NO signing-state watcher.

@@ -161,38 +161,22 @@ async fn run_coexistence_scenario(signing_on: bool) {
     );
 
     // 5. Stop the shim and clean up. Drop order matters: stop the shim first
-    //    so its in-flight `send` loop exits, then drop the backend (which in
-    //    turn drops the transport handle + router task).
+    //    so its in-flight `send` loop exits, then shut down the backend
+    //    transport and router tasks.
     shim_stop.store(true, Ordering::Relaxed);
-    // spawn_blocking on drop ensures the shim thread exits before the test
-    // completes — if the shim is mid-sleep when `stop` is set, the next loop
-    // iteration terminates.
-    let _ = tokio::task::spawn_blocking(move || drop(shim_handle)).await;
-    drop(backend);
+    tokio::time::timeout(Duration::from_secs(2), shim_handle)
+        .await
+        .expect("QGC shim should stop within timeout")
+        .expect("QGC shim should not panic");
+    backend.shutdown_for_tests().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn copper_and_qgc_shim_coexist_unsigned() {
     run_coexistence_scenario(false).await;
-    // Force-exit after the assertion so the tokio test runtime does not hang
-    // on drop. Upstream `mavlink::connect("udpin:...")` holds a blocking
-    // `UdpSocket::recv` that cannot be cancelled cleanly — same teardown
-    // pattern as `crates/roz-worker/tests/mavlink_backend_null_key.rs`. Clean
-    // shutdown of long-lived transport tasks is a Phase 27 follow-up
-    // (25-PATTERNS Variance Note 2).
-    //
-    // NOTE: `std::process::exit(0)` terminates the WHOLE test process, which
-    // means only ONE of the two coexistence tests runs per invocation. To run
-    // the signed variant, invoke `cargo test -p roz-mavlink --test
-    // qgc_coexistence copper_and_qgc_shim_coexist_signed` directly. When
-    // either test runs it is the only one in the process. CI matrix must run
-    // both test names separately — documented in
-    // `docs/mavlink-coexistence.md` §Known Limitations.
-    std::process::exit(0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn copper_and_qgc_shim_coexist_signed() {
     run_coexistence_scenario(true).await;
-    std::process::exit(0);
 }

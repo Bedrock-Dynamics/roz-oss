@@ -106,12 +106,5 @@ async fn log_broadcast_fans_out_log_entry_to_subscribers() {
     // Shim cleanup: the blocking task has already returned after the send
     // loop; joining it ensures no lingering UDP socket.
     let _ = shim_handle.await;
-    drop(backend);
-    // Force-exit after the assertion so the tokio test runtime does not hang
-    // on drop. Upstream `mavlink::connect("udpin:...")` holds a blocking
-    // `UdpSocket::recv` that cannot be cancelled cleanly -- same teardown
-    // idiom as `crates/roz-mavlink/tests/qgc_coexistence.rs`. Clean shutdown
-    // of long-lived transport tasks is a Phase 27 follow-up
-    // (25-PATTERNS Variance Note 2).
-    std::process::exit(0);
+    backend.shutdown_for_tests().await;
 }

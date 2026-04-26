@@ -1,32 +1,30 @@
-//! MAVLink transport adapters (serial / UDP) on top of upstream `mavlink::connect`.
+//! MAVLink transport adapters (serial / UDP) on top of upstream
+//! `mavlink::connect_async`.
 //!
-//! Provides a [`TransportHandle`] that owns the long-lived `MavConnection`
-//! plus reader + writer tasks bridging sync upstream I/O into async mpsc
-//! channels per Phase 22 D-03.
+//! Provides a [`TransportHandle`] that owns the long-lived
+//! `AsyncMavConnection` plus reader + writer tasks bridging upstream I/O into
+//! async mpsc channels per Phase 22 D-03.
 //!
 //! Per 25-RESEARCH.md §Anti-Patterns, the writer side is a SINGLE long-lived
 //! `tokio::spawn`-backed task fed by an `mpsc::Sender<MavMessage>` — NOT a
 //! per-send `tokio::spawn`. This keeps `ActuatorSink::send` non-blocking while
-//! preserving the single-owner `MavConnection` invariant.
+//! preserving the single-owner connection invariant.
 //!
 //! # Deviations from 25-06-PLAN
 //!
 //! * **Rule 1 — upstream API drift:** plan uses `Option<SigningData>` for
-//!   `setup_signing`; upstream `mavlink::MavConnection::setup_signing` takes
-//!   `Option<SigningConfig>` in 0.17.1. Signature updated to match upstream.
+//!   `setup_signing`; upstream `mavlink::AsyncMavConnection::setup_signing`
+//!   takes `Option<SigningConfig>` in 0.17.1. Signature updated to match
+//!   upstream.
 //! * **Rule 3 — dependency not yet available:** plan imports
 //!   `crate::signing::TransportKind`, but `signing.rs` is still a stub (plan
 //!   25-05 populates it). A minimal [`TransportKind`] enum is defined here and
 //!   is expected to move into `signing.rs` once 25-05 lands.
-//! * **Rule 1 — concrete vs. boxed connection:** plan sketched
-//!   `Arc::from(conn)` to coerce a `Box<dyn MavConnection>`; upstream
-//!   `connect::<M>(..)` returns the concrete `Connection<M>`. `Arc::new(conn)`
-//!   is used with a trait-object coercion at the binding site.
-//! * **Rule 1 — `clippy::unused_async`:** `open_*` helpers are kept `async`
-//!   (per plan `done` criteria grep for `pub async fn`) but their bodies
-//!   currently contain no `.await` — upstream `mavlink::connect` is sync. The
-//!   `async` keyword is preserved so the surface is stable when we migrate to
-//!   upstream `connect_async` (tokio-1 feature) in a later plan.
+//! * **Phase 26.11 teardown hardening:** the transport now uses upstream
+//!   `connect_async` (tokio-1 feature) so UDP receives are cancellable at test
+//!   shutdown. The previous sync `recv()` + `block_in_place` bridge could leave
+//!   blocking runtime threads alive and forced several tests to call
+//!   `std::process::exit(0)`.
 
 pub mod serial;
 pub mod udp;
@@ -34,7 +32,7 @@ pub mod udp;
 use std::sync::Arc;
 
 use mavlink::common::MavMessage;
-use mavlink::{MavConnection, MavHeader, SigningConfig};
+use mavlink::{AsyncMavConnection, MavHeader, SigningConfig};
 use tokio::sync::mpsc;
 
 /// Copper's MAVLink companion ID per DEEP-MAV §3 + 25-CONTEXT.md D-04.
@@ -98,14 +96,36 @@ pub struct TransportHandle {
     pub inbound: mpsc::Receiver<MavMessage>,
     /// Kind of transport (for posture resolution and logging).
     pub transport_kind: TransportKind,
-    reader: tokio::task::JoinHandle<()>,
-    writer: tokio::task::JoinHandle<()>,
+    reader: Option<tokio::task::JoinHandle<()>>,
+    writer: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl TransportHandle {
+    /// Abort and await the reader/writer tasks.
+    ///
+    /// This is intentionally explicit for tests and orderly shutdown paths.
+    /// Dropping the handle still aborts tasks as a fallback.
+    pub async fn shutdown(mut self) {
+        if let Some(reader) = self.reader.take() {
+            reader.abort();
+            let _ = reader.await;
+        }
+        if let Some(writer) = self.writer.take() {
+            writer.abort();
+            let _ = writer.await;
+        }
+        tracing::debug!("TransportHandle shutdown complete");
+    }
 }
 
 impl Drop for TransportHandle {
     fn drop(&mut self) {
-        self.reader.abort();
-        self.writer.abort();
+        if let Some(reader) = self.reader.take() {
+            reader.abort();
+        }
+        if let Some(writer) = self.writer.take() {
+            writer.abort();
+        }
         tracing::debug!("TransportHandle dropped — reader + writer tasks aborted");
     }
 }
@@ -127,12 +147,8 @@ impl Drop for TransportHandle {
 ///
 /// # Errors
 ///
-/// Returns `Err` if `mavlink::connect` fails (serial port missing, UDP bind
-/// conflict, etc.).
-#[allow(
-    clippy::unused_async,
-    reason = "kept async to mirror future tokio-1 connect_async migration"
-)]
+/// Returns `Err` if `mavlink::connect_async` fails (serial port missing, UDP
+/// bind conflict, etc.).
 pub async fn open_transport(
     url: &str,
     transport_kind: TransportKind,
@@ -146,12 +162,12 @@ pub async fn open_transport(
         signing_on = signing.is_some(),
         "opening MAVLink transport"
     );
-    let mut conn = mavlink::connect::<MavMessage>(url)?;
+    let mut conn = mavlink::connect_async::<MavMessage>(url).await?;
     conn.set_protocol_version(mavlink::MavlinkVersion::V2);
     if let Some(cfg) = signing {
         conn.setup_signing(Some(cfg));
     }
-    let conn: Arc<dyn MavConnection<MavMessage> + Send + Sync> = Arc::new(conn);
+    let conn: Arc<dyn AsyncMavConnection<MavMessage> + Send + Sync> = Arc::from(conn);
 
     let (out_tx, out_rx) = mpsc::channel::<MavMessage>(OUTBOUND_CHANNEL_CAPACITY);
     let (in_tx, in_rx) = mpsc::channel::<MavMessage>(INBOUND_CHANNEL_CAPACITY);
@@ -170,21 +186,18 @@ pub async fn open_transport(
         outbound: out_tx,
         inbound: in_rx,
         transport_kind,
-        reader,
-        writer,
+        reader: Some(reader),
+        writer: Some(writer),
     })
 }
 
 /// Reader task — drains `conn.recv()` into `tx` forever.
 ///
 /// On error, logs and backs off 10 ms before retrying (matches `io_grpc.rs`
-/// stream loop). `tokio::task::block_in_place` is required because upstream
-/// `MavConnection::recv` is synchronous and blocks the calling thread on the
-/// underlying `std::io::Read`; the worker runtime is multi-threaded so
-/// `block_in_place` is legal. See 25-RESEARCH.md §Pattern 1.
-async fn reader_loop(conn: Arc<dyn MavConnection<MavMessage> + Send + Sync>, tx: mpsc::Sender<MavMessage>) {
+/// stream loop).
+async fn reader_loop(conn: Arc<dyn AsyncMavConnection<MavMessage> + Send + Sync>, tx: mpsc::Sender<MavMessage>) {
     loop {
-        match tokio::task::block_in_place(|| conn.recv()) {
+        match conn.recv().await {
             Ok((_header, msg)) => {
                 if tx.send(msg).await.is_err() {
                     tracing::debug!("inbound channel closed; reader exiting");
@@ -206,7 +219,7 @@ async fn reader_loop(conn: Arc<dyn MavConnection<MavMessage> + Send + Sync>, tx:
 /// Per Anti-Pattern guidance, this is a SINGLE long-lived task, not a
 /// per-send spawn.
 async fn writer_loop(
-    conn: Arc<dyn MavConnection<MavMessage> + Send + Sync>,
+    conn: Arc<dyn AsyncMavConnection<MavMessage> + Send + Sync>,
     mut rx: mpsc::Receiver<MavMessage>,
     our_system_id: u8,
     our_component_id: u8,
@@ -219,7 +232,7 @@ async fn writer_loop(
             sequence,
         };
         sequence = sequence.wrapping_add(1);
-        match tokio::task::block_in_place(|| conn.send(&header, &msg)) {
+        match conn.send(&header, &msg).await {
             Ok(_) => {}
             Err(e) => {
                 tracing::warn!(error = %e, "MavConnection send error");
