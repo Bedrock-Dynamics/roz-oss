@@ -11,5 +11,6 @@
 //!   - `controller_status`   (NOT `get_controller_status` — Codex review naming drift fix)
 
 pub mod controller_status;
+pub mod flight_command;
 pub mod promote_controller;
 pub mod stop_controller;
