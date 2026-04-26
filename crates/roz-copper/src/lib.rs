@@ -33,6 +33,11 @@ pub mod evidence_collector;
 pub mod gazebo_cmd;
 #[cfg(feature = "gazebo")]
 pub mod gazebo_sensor;
+// Phase 26.10 Plan 08 (FW-07) — deterministic fake-OpenClaw backend.
+// Gated `test-fixtures` so production binaries cannot link the fake
+// (T-26.10-08-01 mitigation). Lives next to `io` because it impls those traits.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod fake_openclaw;
 pub mod handle;
 pub mod io;
 pub mod io_factory;
