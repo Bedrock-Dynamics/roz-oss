@@ -36,13 +36,14 @@ use roz_core::command::CommandFrame;
 use roz_core::controller::artifact::{ControllerArtifact, ExecutionMode};
 use roz_core::controller::deployment::DeploymentState;
 use roz_core::controller::evidence::ControllerEvidenceBundle;
-use roz_core::embodiment::binding::{CommandInterfaceType, ControlInterfaceManifest};
+use roz_core::embodiment::binding::{BindingType, ChannelBinding, CommandInterfaceType, ControlInterfaceManifest};
 use roz_core::embodiment::limits::{ForceSafetyLimits, JointSafetyLimits};
 #[cfg(test)]
 use roz_core::embodiment::{EmbodimentModel, FrameSource, Joint, Link, Transform3D};
 use roz_core::embodiment::{EmbodimentRuntime, FrameSnapshotInput};
 
 use crate::channels::{ControllerState, EvidenceSummaryState};
+use crate::latch::{LatchState, ZERO_VERIFY_TICK_COUNT};
 use crate::controller_lifecycle::{ControllerLifecycle, LifecycleRetirement, LifecycleTransition, RuntimeDigests};
 use crate::deployment_manager::DeploymentManager;
 use crate::evidence_collector::{EvidenceCollector, EvidenceFinalizeContext};
@@ -798,6 +799,12 @@ fn drain_commands(
     lifecycle_annotation: &mut Option<serde_json::Map<String, serde_json::Value>>,
     deployment_manager: DeploymentManager,
     hot_policy: Option<&crate::policy::HotCopperPolicy>,
+    // FW-05 H3 — system-level latch state lives on ControllerState; drive
+    // transitions in response to AckEstop / ResumeAfterZeroVerified here so
+    // the LatchState mutation and the WAL persist are colocated with the
+    // command consumption.
+    shared_state: &Arc<ArcSwap<ControllerState>>,
+    latch_persist_tx: Option<&std::sync::mpsc::SyncSender<LatchState>>,
 ) -> bool {
     let process = |cmd: crate::channels::CopperRuntimeCommand,
                    active_controller: &mut Option<LoadedController>,
@@ -929,21 +936,58 @@ fn drain_commands(
                     tracing::warn!("UpdateParams ignored — no WASM controller loaded");
                 }
             }
-            crate::channels::CopperRuntimeCommand::AckEstop
-            | crate::channels::CopperRuntimeCommand::ResumeAfterZeroVerified => {
-                // FW-05 H3 — these variants drive the system-level
-                // `LatchState` machine on `ControllerState` (not on
-                // individual loaded controllers). They are handled in the
-                // outer loop where `shared_state` is in scope. The drain
-                // path forwards them via the channel; the loop polls them
-                // from a parallel rendezvous and applies the transition
-                // there. See `apply_pending_latch_commands` in the main loop.
-                //
-                // Kept as a no-op here to preserve the closure signature
-                // and avoid threading shared_state through `drain_commands`.
-                tracing::debug!(
-                    "drain_commands: latch command observed; processed in main loop latch handler"
-                );
+            crate::channels::CopperRuntimeCommand::AckEstop => {
+                // FW-05 H3 — drive the system-level LatchState machine.
+                // The transition is no-op when not in Latched (apply_ack_estop
+                // returns the same state). Persistence to WAL is handled by
+                // the worker via the latch_persist_tx channel.
+                let prior = shared_state.load_full();
+                let new_state = prior.latch_state.apply_ack_estop();
+                if new_state != prior.latch_state {
+                    let mut next = (*prior).clone();
+                    next.latch_state = new_state;
+                    next.zero_motion_tick_count = 0;
+                    shared_state.store(Arc::new(next));
+                    if let Some(tx) = latch_persist_tx {
+                        let _ = tx.try_send(new_state);
+                    }
+                    tracing::info!(
+                        prior = ?prior.latch_state,
+                        new = ?new_state,
+                        "FW-05 latch: AckEstop applied"
+                    );
+                } else {
+                    tracing::warn!(
+                        latch_state = ?prior.latch_state,
+                        "FW-05 latch: AckEstop ignored — no transition from current state"
+                    );
+                }
+            }
+            crate::channels::CopperRuntimeCommand::ResumeAfterZeroVerified => {
+                // FW-05 H3 — IEC 60204-1 manual reset: only valid from
+                // ZeroVerified. From any other state this is a no-op
+                // (apply_resume_after_zero_verified preserves state).
+                let prior = shared_state.load_full();
+                let new_state = prior.latch_state.apply_resume_after_zero_verified();
+                if new_state != prior.latch_state {
+                    let mut next = (*prior).clone();
+                    next.latch_state = new_state;
+                    next.zero_motion_tick_count = 0;
+                    shared_state.store(Arc::new(next));
+                    if let Some(tx) = latch_persist_tx {
+                        let _ = tx.try_send(new_state);
+                    }
+                    tracing::info!(
+                        prior = ?prior.latch_state,
+                        new = ?new_state,
+                        "FW-05 latch: ResumeAfterZeroVerified applied — controller cleared to Run"
+                    );
+                } else {
+                    tracing::warn!(
+                        latch_state = ?prior.latch_state,
+                        "FW-05 latch: ResumeAfterZeroVerified ignored — must be in ZeroVerified state (IEC 60204-1 no-auto-rearm)"
+                    );
+                }
             }
         }
     };
@@ -1259,6 +1303,139 @@ fn runtime_joint_limits_for_channel(
 
 pub fn joint_limits_from_control_manifest(control_manifest: &ControlInterfaceManifest) -> Vec<JointSafetyLimits> {
     control_manifest.channels.iter().map(fallback_joint_limits).collect()
+}
+
+// ---------------------------------------------------------------------------
+// FW-05 H3 — per-channel-kind latched-tick zero policy.
+// ---------------------------------------------------------------------------
+
+/// FW-05 H3 — build the explicit per-channel-kind zero command frame for
+/// the latched-e-stop path. Velocity/torque/force channels emit `0.0`;
+/// position channels HOLD the last commanded value (raw `0.0` would
+/// command "go to position 0" — collision path).
+///
+/// Policy table (see plan):
+/// - `JointVelocity`    -> `0.0` (zero velocity halts motion safely)
+/// - `GripperForce`     -> `0.0` (zero force releases grip)
+/// - `Command` (generic, includes torque) -> `0.0` (conservative default;
+///   torque channels are modelled as `Command` in `BindingType`)
+/// - `JointPosition`    -> last commanded value (hold)
+/// - `GripperPosition`  -> last commanded value (hold)
+/// - sensor-side bindings (ForceTorque, Imu*) -> `0.0` (defensive; they
+///   should not appear on the command channel anyway)
+///
+/// Note: `BindingType` does NOT have a dedicated `JointTorque` variant —
+/// torque channels are bound as `Command` (see crates/roz-core/src/embodiment/binding.rs:6-15).
+/// `CommandInterfaceType::JointTorque` exists at the channel-definition
+/// layer but the per-binding policy table here keys on `BindingType`.
+///
+/// `bindings` and `last_commanded` are zipped against `channel_count` so
+/// the function is robust to short / mismatched inputs (defensive default
+/// is `0.0` for any unbound channel index).
+pub(crate) fn build_per_channel_zero_frame(
+    bindings: &[ChannelBinding],
+    last_commanded: &[f64],
+    channel_count: usize,
+) -> CommandFrame {
+    let mut values = vec![0.0; channel_count];
+    for binding in bindings.iter() {
+        let i = match usize::try_from(binding.channel_index) {
+            Ok(idx) if idx < channel_count => idx,
+            _ => continue,
+        };
+        values[i] = match binding.binding_type {
+            BindingType::JointPosition | BindingType::GripperPosition => {
+                // Hold last commanded — `0.0` here would command "go to position 0" (collision).
+                last_commanded.get(i).copied().unwrap_or(0.0)
+            }
+            BindingType::JointVelocity | BindingType::GripperForce => 0.0,
+            BindingType::Command => 0.0,
+            // Sensor-side bindings should not appear in a command frame; zero is defensive.
+            BindingType::ForceTorque
+            | BindingType::ImuOrientation
+            | BindingType::ImuAngularVelocity
+            | BindingType::ImuLinearAcceleration => 0.0,
+        };
+    }
+    CommandFrame { values }
+}
+
+/// FW-05 H3 — assert the latched e-stop on `ControllerState`. Returns
+/// `true` if the state actually transitioned (caller may persist to WAL).
+/// No-op when already in `Latched` (sticky).
+pub(crate) fn assert_latch_estop(shared_state: &Arc<ArcSwap<ControllerState>>) -> bool {
+    let prior = shared_state.load_full();
+    let new_state = prior.latch_state.assert_estop();
+    if new_state != prior.latch_state {
+        let mut next = (*prior).clone();
+        next.latch_state = new_state;
+        next.zero_motion_tick_count = 0;
+        shared_state.store(Arc::new(next));
+        tracing::warn!(
+            prior = ?prior.latch_state,
+            new = ?new_state,
+            "FW-05 latch: e-stop asserted, latched"
+        );
+        true
+    } else {
+        false
+    }
+}
+
+/// FW-05 H3 — bump the consecutive-zero-motion tick counter when the
+/// loop is in `AwaitingAck` and a sensor frame is present with all
+/// joint velocities below epsilon. Advances to `ZeroVerified` after
+/// `ZERO_VERIFY_TICK_COUNT` consecutive ticks.
+///
+/// Returns `Some(new_state)` if a transition occurred (caller may
+/// persist to WAL).
+pub(crate) fn bump_zero_motion_tick(
+    shared_state: &Arc<ArcSwap<ControllerState>>,
+    sensor_frame_present: bool,
+    sensor_velocities: &[f64],
+) -> Option<LatchState> {
+    let prior = shared_state.load_full();
+    if prior.latch_state != LatchState::AwaitingAck {
+        return None;
+    }
+    if !sensor_frame_present {
+        // Codex H3 explicit requirement: cannot verify zero without sensor evidence.
+        // Reset counter to 0 to be conservative.
+        if prior.zero_motion_tick_count != 0 {
+            let mut next = (*prior).clone();
+            next.zero_motion_tick_count = 0;
+            shared_state.store(Arc::new(next));
+        }
+        return None;
+    }
+    // Check: all velocities below epsilon (no observed motion).
+    let zero_motion = sensor_velocities.iter().all(|v| v.abs() < 1e-6);
+    if !zero_motion {
+        if prior.zero_motion_tick_count != 0 {
+            let mut next = (*prior).clone();
+            next.zero_motion_tick_count = 0;
+            shared_state.store(Arc::new(next));
+        }
+        return None;
+    }
+    let new_count = prior.zero_motion_tick_count + 1;
+    if new_count >= ZERO_VERIFY_TICK_COUNT {
+        let new_state = prior.latch_state.apply_zero_verified();
+        let mut next = (*prior).clone();
+        next.latch_state = new_state;
+        next.zero_motion_tick_count = 0;
+        shared_state.store(Arc::new(next));
+        tracing::info!(
+            ticks = new_count,
+            "FW-05 latch: AwaitingAck -> ZeroVerified after sustained zero motion"
+        );
+        Some(new_state)
+    } else {
+        let mut next = (*prior).clone();
+        next.zero_motion_tick_count = new_count;
+        shared_state.store(Arc::new(next));
+        None
+    }
 }
 
 pub fn joint_limits_from_runtime(
@@ -1989,6 +2166,10 @@ pub fn run_controller_loop_with_policy(
     hot_policy: Option<crate::policy::HotCopperPolicy>,
     telemetry_backpressure: Option<Arc<AtomicU8>>,
 ) {
+    // FW-05 H3: latch persistence channel is None for the legacy entry
+    // point; the worker boot path uses the new `*_with_latch_persist`
+    // entry to wire WAL write-back. Internal calls share one impl.
+    let latch_persist_tx: Option<std::sync::mpsc::SyncSender<LatchState>> = None;
     let mut active_controller: Option<LoadedController> = None;
     let mut candidate_controller: Option<LoadedController> = None;
     let mut rollback_controller: Option<LoadedController> = None;
@@ -2021,6 +2202,13 @@ pub fn run_controller_loop_with_policy(
     let mut sensor_contact: Option<ContactState> = None;
     let mut sensor_frame_snapshot_input = FrameSnapshotInput::default();
 
+    // FW-05 H3 — track the last commanded values per channel so that
+    // position channels can HOLD their last value during a latched
+    // e-stop (raw `0.0` would command "go to position 0" — collision).
+    // Updated each Run-state tick from the actuated command frame; held
+    // (read-only) during latched ticks.
+    let mut last_commanded_values: Vec<f64> = Vec::new();
+
     tracing::info!(max_velocity, ?watchdog_timeout, "copper controller loop started");
     let loop_origin = Instant::now();
 
@@ -2046,12 +2234,15 @@ pub fn run_controller_loop_with_policy(
             &mut lifecycle_annotation,
             deployment_manager,
             hot_policy.as_ref(),
+            shared_state,
+            latch_persist_tx.as_ref(),
         );
         if received {
             last_agent_contact = Instant::now();
         }
 
         // --- Read sensor data (non-blocking) ---
+        let mut sensor_frame_present_this_tick = false;
         if let Some(ref mut src) = sensor
             && let Some(frame) = src.try_recv()
         {
@@ -2062,6 +2253,134 @@ pub fn run_controller_loop_with_policy(
             sensor_wrench = frame.wrench;
             sensor_contact = frame.contact;
             sensor_frame_snapshot_input = frame.frame_snapshot_input;
+            sensor_frame_present_this_tick = true;
+        }
+
+        // --- FW-05 H3 LATCHED E-STOP GATE ---
+        //
+        // Fail-closed: when ControllerState.latch_state.requires_zero_emission(),
+        // emit explicit per-channel-kind zero each tick to the actuator and
+        // SKIP the WASM tick entirely. This replaces the all_default
+        // short-circuit at the per-controller level (which left actuators
+        // running with their last commanded value — drift). IEC 60204-1 Stop
+        // Category 0 + EN ISO 13849-1 manual-reset semantics.
+        //
+        // Position channels HOLD their last commanded value (raw `0.0`
+        // would command "go to position 0" — collision); velocity / torque /
+        // force channels emit `0.0`. Per-channel-kind policy table is
+        // enforced inside `build_per_channel_zero_frame`.
+        let latch_state_snapshot = shared_state.load_full().latch_state;
+        if latch_state_snapshot.requires_zero_emission() {
+            // Build the zero frame. Prefer the active controller's bindings
+            // (which carry the embodiment's per-channel BindingType); fall
+            // back to candidate, then to a defensive empty.
+            let (bindings, channel_count) = if let Some(controller) = active_controller.as_ref() {
+                let bindings = controller.embodiment_runtime.model.channel_bindings.clone();
+                (bindings, controller.command_count)
+            } else if let Some(controller) = candidate_controller.as_ref() {
+                let bindings = controller.embodiment_runtime.model.channel_bindings.clone();
+                (bindings, controller.command_count)
+            } else {
+                // No controller loaded — use last_velocity_count as a
+                // best-effort length and emit raw zeros (no bindings to
+                // honour position-hold; this is the safest fallback).
+                (Vec::new(), last_velocity_count.max(6))
+            };
+
+            let zero_frame = build_per_channel_zero_frame(&bindings, &last_commanded_values, channel_count);
+
+            // Send to actuator — this is the SAFETY-CRITICAL emission.
+            if let Some(sink) = actuator
+                && let Err(error) = sink.send(&zero_frame)
+            {
+                tracing::warn!(error = %error, "FW-05 latched-tick actuator send failed");
+            }
+            last_velocity_count = zero_frame.values.len();
+
+            // Halt any running controllers so they cannot tick during latch.
+            if let Some(controller) = active_controller.as_mut() {
+                controller.running = false;
+            }
+            if let Some(controller) = candidate_controller.as_mut() {
+                controller.running = false;
+            }
+
+            // Annotate the published last_output so observers see we are
+            // latched. Preserve a pre-existing `error` field (e.g. set by
+            // the controller-error path that triggered the latch) so
+            // observers can still see the originating error reason.
+            let preserved_error = last_output
+                .as_ref()
+                .and_then(|o| o.get("error").cloned());
+            let mut latched_obj = serde_json::json!({
+                "latched": true,
+                "latch_state": format!("{:?}", latch_state_snapshot),
+                "latched_zero_frame": zero_frame.values.clone(),
+            });
+            if let Some(err) = preserved_error
+                && let Some(map) = latched_obj.as_object_mut()
+            {
+                map.insert("error".into(), err);
+            }
+            last_output = Some(latched_obj);
+
+            // Record the explicit estop reason for observability if missing.
+            if estop_reason.is_none() {
+                estop_reason = Some(format!("latched: {latch_state_snapshot:?}"));
+            }
+
+            // Bump the zero-motion counter when in AwaitingAck. Sensor-absent
+            // ticks REMAIN in current state (no advancement) per Codex H3.
+            if let Some(new_state) = bump_zero_motion_tick(
+                shared_state,
+                sensor_frame_present_this_tick,
+                &sensor_joint_velocities,
+            ) && let Some(tx) = latch_persist_tx.as_ref()
+            {
+                let _ = tx.try_send(new_state);
+            }
+
+            // Publish state and sleep for the next tick — skip the WASM
+            // tick path entirely.
+            let running = false;
+            let (candidate_stage_ticks_completed, candidate_stage_ticks_required) =
+                candidate_stage_progress(candidate_state, shadow_ticks, canary_ticks, deployment_manager);
+            publish_state(
+                shared_state,
+                tick,
+                running,
+                &mut last_output,
+                &entities,
+                estop_reason.as_deref(),
+                deployment_state_for_publish(&active_controller, candidate_state),
+                active_controller.as_ref().map(|controller| controller.controller_id()),
+                candidate_controller
+                    .as_ref()
+                    .map(|controller| controller.controller_id()),
+                last_known_good_controller_id.as_deref(),
+                promotion_requested,
+                candidate_stage_ticks_completed,
+                candidate_stage_ticks_required,
+                None,
+                None,
+                false,
+                candidate_last_rejection_reason.as_deref(),
+                last_live_evidence.as_ref(),
+                last_live_evidence_bundle.as_ref(),
+                last_candidate_evidence.as_ref(),
+                last_candidate_evidence_bundle.as_ref(),
+            );
+            tick += 1;
+            let tick_period = effective_tick_period(
+                &active_controller,
+                &candidate_controller,
+                telemetry_backpressure.as_ref(),
+            );
+            let elapsed = tick_start.elapsed();
+            if let Some(remaining) = tick_period.checked_sub(elapsed) {
+                std::thread::sleep(remaining);
+            }
+            continue;
         }
 
         let watchdog_fired = check_watchdog(
@@ -2169,7 +2488,22 @@ pub fn run_controller_loop_with_policy(
                         shadow_ticks = 0;
                         canary_ticks = 0;
                         bounded_canary_ticks = 0;
-                        estop_reason = None;
+                        // FW-05 H3 (Codex): rollback must NOT clear
+                        // estop_reason while the latch is active. The
+                        // controller error that triggered the rollback
+                        // also asserted the e-stop; clearing the reason
+                        // would mask the latch in published state and
+                        // could be misread by observers as "back to normal".
+                        // Operator MUST AckEstop -> ZeroVerified ->
+                        // ResumeAfterZeroVerified to clear the latch first.
+                        if shared_state.load_full().latch_state == LatchState::Run {
+                            estop_reason = None;
+                        } else {
+                            tracing::debug!(
+                                latch_state = ?shared_state.load_full().latch_state,
+                                "FW-05 latch: rollback path skipped estop_reason clear — latch active"
+                            );
+                        }
                         if let Some(sink) = actuator {
                             let _ = sink.send(&CommandFrame::zero(last_velocity_count.max(6)));
                         }
@@ -2191,6 +2525,14 @@ pub fn run_controller_loop_with_policy(
                     Err(restore_error) => {
                         let _ = estop_tx.try_send(reason.clone());
                         estop_reason = Some(reason);
+                        // FW-05 H3 — also assert the system-level latch
+                        // when rollback is unavailable. Persist the
+                        // transition so worker restart resumes latched.
+                        if assert_latch_estop(shared_state)
+                            && let Some(tx) = latch_persist_tx.as_ref()
+                        {
+                            let _ = tx.try_send(LatchState::Latched);
+                        }
                         if let Some(sink) = actuator {
                             let _ = sink.send(&CommandFrame::zero(last_velocity_count.max(6)));
                         }
@@ -2300,6 +2642,14 @@ pub fn run_controller_loop_with_policy(
             } else {
                 let _ = estop_tx.try_send(reason.to_string());
                 estop_reason = Some(reason.to_string());
+                // FW-05 H3 — assert latched e-stop on candidate failure
+                // when no active fallback is available. Persist the
+                // transition so worker restart resumes latched.
+                if assert_latch_estop(shared_state)
+                    && let Some(tx) = latch_persist_tx.as_ref()
+                {
+                    let _ = tx.try_send(LatchState::Latched);
+                }
                 reject_candidate(
                     &mut candidate_controller,
                     &mut candidate_state,
@@ -2382,6 +2732,13 @@ pub fn run_controller_loop_with_policy(
                 } else {
                     let _ = estop_tx.try_send(reason.clone());
                     estop_reason = Some(reason.clone());
+                    // FW-05 H3 — assert latched e-stop on bounded-canary
+                    // overrun with no fallback. Persist the transition.
+                    if assert_latch_estop(shared_state)
+                        && let Some(tx) = latch_persist_tx.as_ref()
+                    {
+                        let _ = tx.try_send(LatchState::Latched);
+                    }
                     reject_candidate(
                         &mut candidate_controller,
                         &mut candidate_state,
@@ -2417,6 +2774,11 @@ pub fn run_controller_loop_with_policy(
 
         if let Some(clamped) = actuated_command {
             last_velocity_count = clamped.values.len();
+            // FW-05 H3 — track the last actuated command per channel so a
+            // subsequent latched-tick can HOLD position channels at their
+            // most recent commanded value (raw `0.0` would command "go to
+            // position 0" — collision).
+            last_commanded_values = clamped.values.clone();
             if let Some(sink) = actuator
                 && let Err(error) = sink.send(clamped)
             {
@@ -2529,6 +2891,8 @@ pub fn run_controller_loop_with_policy(
         &mut lifecycle_annotation,
         deployment_manager,
         hot_policy.as_ref(),
+        shared_state,
+        latch_persist_tx.as_ref(),
     );
     finalize_controller_slot(
         &mut active_controller,
@@ -4391,5 +4755,378 @@ mod tests {
         );
 
         handle.shutdown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 26.10 Plan 07 (FW-05c) — latched e-stop loop-level behaviour.
+    //
+    // Inline because they reach `pub(crate)` helpers
+    // (build_per_channel_zero_frame / assert_latch_estop / bump_zero_motion_tick)
+    // and the in-file fixtures (test_control_manifest, prepared_test_controller).
+    // -----------------------------------------------------------------------
+
+    /// FW-05 H3 — per-channel-kind zero policy: velocity channels emit 0.0;
+    /// position channels HOLD the last commanded value (raw 0.0 would
+    /// command "go to position 0" — collision).
+    #[test]
+    fn position_channel_zero_policy_emits_last_commanded() {
+        // Build a manifest with one velocity channel + one position channel.
+        let mut manifest = ControlInterfaceManifest {
+            version: 1,
+            manifest_digest: String::new(),
+            channels: vec![
+                ControlChannelDef {
+                    name: "joint0/velocity".into(),
+                    interface_type: CommandInterfaceType::JointVelocity,
+                    units: "rad/s".into(),
+                    frame_id: "joint0_link".into(),
+                },
+                ControlChannelDef {
+                    name: "joint1/position".into(),
+                    interface_type: CommandInterfaceType::JointPosition,
+                    units: "rad".into(),
+                    frame_id: "joint1_link".into(),
+                },
+            ],
+            bindings: vec![
+                ChannelBinding {
+                    physical_name: "joint0".into(),
+                    channel_index: 0,
+                    binding_type: BindingType::JointVelocity,
+                    frame_id: "joint0_link".into(),
+                    units: "rad/s".into(),
+                    semantic_role: None,
+                },
+                ChannelBinding {
+                    physical_name: "joint1".into(),
+                    channel_index: 1,
+                    binding_type: BindingType::JointPosition,
+                    frame_id: "joint1_link".into(),
+                    units: "rad".into(),
+                    semantic_role: None,
+                },
+            ],
+        };
+        manifest.stamp_digest();
+
+        // Last commanded values: velocity at 0.7, position at 0.5.
+        let last_commanded = vec![0.7, 0.5];
+        let frame = build_per_channel_zero_frame(&manifest.bindings, &last_commanded, 2);
+
+        assert_eq!(frame.values.len(), 2);
+        assert!(
+            (frame.values[0] - 0.0).abs() < f64::EPSILON,
+            "velocity channel must emit 0.0 (got {})",
+            frame.values[0]
+        );
+        assert!(
+            (frame.values[1] - 0.5).abs() < f64::EPSILON,
+            "position channel must HOLD last commanded 0.5 (got {} — would collide if 0.0)",
+            frame.values[1]
+        );
+    }
+
+    #[test]
+    fn build_per_channel_zero_frame_handles_empty_bindings() {
+        // Defensive: no bindings -> all zeros at the requested length.
+        let frame = build_per_channel_zero_frame(&[], &[], 4);
+        assert_eq!(frame.values, vec![0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn build_per_channel_zero_frame_velocity_torque_force_emit_zero() {
+        // Build manifest with velocity + gripper-force bindings; both must emit 0.0.
+        let bindings = vec![
+            ChannelBinding {
+                physical_name: "j0".into(),
+                channel_index: 0,
+                binding_type: BindingType::JointVelocity,
+                frame_id: "j0".into(),
+                units: "rad/s".into(),
+                semantic_role: None,
+            },
+            ChannelBinding {
+                physical_name: "g0".into(),
+                channel_index: 1,
+                binding_type: BindingType::GripperForce,
+                frame_id: "g0".into(),
+                units: "N".into(),
+                semantic_role: None,
+            },
+        ];
+        let last_commanded = vec![0.9, 5.0];
+        let frame = build_per_channel_zero_frame(&bindings, &last_commanded, 2);
+        assert_eq!(frame.values, vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn build_per_channel_zero_frame_gripper_position_holds() {
+        let bindings = vec![ChannelBinding {
+            physical_name: "g0".into(),
+            channel_index: 0,
+            binding_type: BindingType::GripperPosition,
+            frame_id: "g0".into(),
+            units: "m".into(),
+            semantic_role: None,
+        }];
+        let last_commanded = vec![0.05]; // 5 cm grip
+        let frame = build_per_channel_zero_frame(&bindings, &last_commanded, 1);
+        assert!((frame.values[0] - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn assert_latch_estop_transitions_run_to_latched_and_persists() {
+        let state = Arc::new(ArcSwap::from_pointee(ControllerState::default()));
+        assert_eq!(state.load().latch_state, LatchState::Run);
+        let changed = assert_latch_estop(&state);
+        assert!(changed, "Run -> Latched is a real transition");
+        assert_eq!(state.load().latch_state, LatchState::Latched);
+        // Sticky: a second assertion is a no-op.
+        let changed = assert_latch_estop(&state);
+        assert!(!changed, "Latched -> Latched is a no-op");
+    }
+
+    #[test]
+    fn bump_zero_motion_tick_advances_to_zero_verified_after_n() {
+        let state = Arc::new(ArcSwap::from_pointee(ControllerState {
+            latch_state: LatchState::AwaitingAck,
+            ..ControllerState::default()
+        }));
+        // Sensor present, velocities all zero.
+        let zeros = vec![0.0, 0.0];
+        for tick in 1..crate::latch::ZERO_VERIFY_TICK_COUNT {
+            let transition = bump_zero_motion_tick(&state, true, &zeros);
+            assert!(
+                transition.is_none(),
+                "tick {tick}: should NOT advance to ZeroVerified yet"
+            );
+            assert_eq!(state.load().zero_motion_tick_count, tick);
+        }
+        // The Nth tick triggers the transition.
+        let transition = bump_zero_motion_tick(&state, true, &zeros);
+        assert_eq!(transition, Some(LatchState::ZeroVerified));
+        assert_eq!(state.load().latch_state, LatchState::ZeroVerified);
+        // Counter resets to 0 after transition.
+        assert_eq!(state.load().zero_motion_tick_count, 0);
+    }
+
+    #[test]
+    fn bump_zero_motion_tick_remains_without_sensor_frame() {
+        // FW-05 H3 explicit: AwaitingAck without sensor frame must NOT
+        // advance the counter — cannot verify zero motion without sensor evidence.
+        let state = Arc::new(ArcSwap::from_pointee(ControllerState {
+            latch_state: LatchState::AwaitingAck,
+            zero_motion_tick_count: 5, // pre-existing partial progress
+            ..ControllerState::default()
+        }));
+        let transition = bump_zero_motion_tick(&state, false, &[]);
+        assert!(transition.is_none());
+        assert_eq!(state.load().latch_state, LatchState::AwaitingAck);
+        // Counter resets to 0 (conservative — Codex H3).
+        assert_eq!(state.load().zero_motion_tick_count, 0);
+    }
+
+    #[test]
+    fn bump_zero_motion_tick_resets_on_motion() {
+        let state = Arc::new(ArcSwap::from_pointee(ControllerState {
+            latch_state: LatchState::AwaitingAck,
+            zero_motion_tick_count: 7,
+            ..ControllerState::default()
+        }));
+        // Non-zero velocity observed.
+        let moving = vec![0.0, 0.5];
+        let transition = bump_zero_motion_tick(&state, true, &moving);
+        assert!(transition.is_none());
+        assert_eq!(state.load().zero_motion_tick_count, 0, "motion must reset counter");
+        assert_eq!(state.load().latch_state, LatchState::AwaitingAck);
+    }
+
+    #[test]
+    fn bump_zero_motion_tick_noop_when_not_awaiting_ack() {
+        // Run state -> bump must do nothing.
+        let state = Arc::new(ArcSwap::from_pointee(ControllerState::default()));
+        let transition = bump_zero_motion_tick(&state, true, &[0.0]);
+        assert!(transition.is_none());
+        assert_eq!(state.load().latch_state, LatchState::Run);
+    }
+
+    /// FW-05 H3 — boot the controller loop with a pre-set
+    /// `LatchState::Latched` on shared_state. The loop must emit explicit
+    /// zero command frames to the actuator each tick AND remain in Latched
+    /// state (no auto-rearm). This exercises the latched-tick gate at the
+    /// loop level.
+    #[test]
+    fn latched_estop_emits_zero_each_tick_and_no_auto_rearm() {
+        use crate::io_log::LogActuatorSink;
+
+        let manifest = test_control_manifest(2); // 2 velocity channels
+        let prepared = prepared_test_controller("ctrl-latch-1", constant_output_wat(0.4).as_bytes(), manifest);
+        let sink = Arc::new(LogActuatorSink::new());
+        let sink_ref: Arc<LogActuatorSink> = Arc::clone(&sink);
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        // Pre-set LatchState::Latched on shared_state — this is the
+        // "WAL-authoritative boot" simulation: as if a previous run had
+        // crashed while latched and the WAL re-set it on restart.
+        let state = Arc::new(ArcSwap::from_pointee(ControllerState {
+            latch_state: LatchState::Latched,
+            ..ControllerState::default()
+        }));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (estop_tx, _estop_rx) = tokio::sync::mpsc::channel(4);
+        let s = Arc::clone(&state);
+        let sd = Arc::clone(&shutdown);
+
+        let handle = std::thread::spawn(move || {
+            run_controller_loop_with_policy(
+                &rx,
+                &s,
+                1.5,
+                &sd,
+                Some(&*sink_ref),
+                None, // no sensor — counter cannot advance from AwaitingAck
+                Duration::from_secs(60),
+                None,
+                &estop_tx,
+                DeploymentManager::execution_only(),
+                None,
+                None,
+            );
+        });
+
+        // Load the controller while Latched. The latched-tick gate must
+        // still fire — the controller never actually ticks (gate runs
+        // BEFORE the WASM tick).
+        tx.send(crate::channels::CopperRuntimeCommand::PreparedArtifact(prepared))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Send the existing Resume — must be a no-op for the latch.
+        tx.send(crate::channels::CopperRuntimeCommand::Resume).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Send ResumeAfterZeroVerified — also a no-op from Latched (IEC 60204-1).
+        tx.send(crate::channels::CopperRuntimeCommand::ResumeAfterZeroVerified).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Verify state.
+        let current = state.load();
+        assert_eq!(
+            current.latch_state,
+            LatchState::Latched,
+            "Resume / ResumeAfterZeroVerified from Latched must be no-ops (IEC 60204-1 no-auto-rearm); got {:?}",
+            current.latch_state
+        );
+
+        // Verify actuator received explicit zero frames each tick.
+        let cmds = sink.commands();
+        assert!(
+            cmds.len() >= 5,
+            "expected ≥5 zero frames during ~250 ms of latched ticks at 100 Hz, got {}",
+            cmds.len()
+        );
+        for (i, frame) in cmds.iter().enumerate() {
+            assert_eq!(frame.values.len(), 2, "frame {i} channel count");
+            for (j, v) in frame.values.iter().enumerate() {
+                assert!(
+                    v.abs() < f64::EPSILON,
+                    "frame {i} channel {j}: latched-tick MUST emit explicit 0.0 for velocity channels (got {v})"
+                );
+            }
+        }
+
+        stop(&shutdown, handle);
+    }
+
+    /// Test-only sensor that returns the same `SensorFrame` on every
+    /// `try_recv` call. Mirrors `MockSensorSource` but does not exhaust
+    /// after one tick — needed for the full-cycle latched test where the
+    /// loop must observe N consecutive zero-motion frames.
+    struct AlwaysReadyZeroSensor {
+        frame: crate::io::SensorFrame,
+    }
+
+    impl crate::io::SensorSource for AlwaysReadyZeroSensor {
+        fn try_recv(&mut self) -> Option<crate::io::SensorFrame> {
+            Some(self.frame.clone())
+        }
+    }
+
+    /// FW-05 H3 — full cycle: Latched -> AckEstop -> AwaitingAck (sensor
+    /// present + zero motion N times) -> ZeroVerified ->
+    /// ResumeAfterZeroVerified -> Run.
+    #[test]
+    fn latched_estop_full_cycle_via_signed_commands() {
+        use crate::io::SensorFrame;
+        use crate::io_log::LogActuatorSink;
+
+        let manifest = test_control_manifest(2);
+        let prepared = prepared_test_controller("ctrl-cycle", constant_output_wat(0.0).as_bytes(), manifest);
+        let sink = Arc::new(LogActuatorSink::new());
+        let sink_ref: Arc<LogActuatorSink> = Arc::clone(&sink);
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        let state = Arc::new(ArcSwap::from_pointee(ControllerState {
+            latch_state: LatchState::Latched,
+            ..ControllerState::default()
+        }));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (estop_tx, _estop_rx) = tokio::sync::mpsc::channel(4);
+        let s = Arc::clone(&state);
+        let sd = Arc::clone(&shutdown);
+
+        let handle = std::thread::spawn(move || {
+            // Sensor returns a fresh zero-motion frame on EVERY try_recv
+            // (not just once like MockSensorSource); needed so the loop
+            // can count N consecutive zero-motion ticks.
+            let mut sensor = AlwaysReadyZeroSensor {
+                frame: SensorFrame {
+                    joint_velocities: vec![0.0, 0.0],
+                    joint_positions: vec![0.0, 0.0],
+                    ..SensorFrame::default()
+                },
+            };
+            run_controller_loop_with_policy(
+                &rx,
+                &s,
+                1.5,
+                &sd,
+                Some(&*sink_ref),
+                Some(&mut sensor),
+                Duration::from_secs(60),
+                None,
+                &estop_tx,
+                DeploymentManager::execution_only(),
+                None,
+                None,
+            );
+        });
+
+        // Load controller (will not tick — latched).
+        tx.send(crate::channels::CopperRuntimeCommand::PreparedArtifact(prepared))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(state.load().latch_state, LatchState::Latched);
+
+        // Send AckEstop — Latched -> AwaitingAck.
+        tx.send(crate::channels::CopperRuntimeCommand::AckEstop).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(state.load().latch_state, LatchState::AwaitingAck);
+
+        // Wait for the loop to observe N consecutive zero-motion sensor
+        // frames. At 100 Hz, N=10 ticks = ~100 ms; pad generously.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            state.load().latch_state,
+            LatchState::ZeroVerified,
+            "expected AwaitingAck -> ZeroVerified after N consecutive zero-motion ticks"
+        );
+
+        // Send ResumeAfterZeroVerified — ZeroVerified -> Run.
+        tx.send(crate::channels::CopperRuntimeCommand::ResumeAfterZeroVerified).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(state.load().latch_state, LatchState::Run);
+
+        stop(&shutdown, handle);
     }
 }
