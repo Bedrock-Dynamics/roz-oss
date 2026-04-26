@@ -41,7 +41,7 @@ pub enum SessionCommands {
         /// Session UUID.
         session_id: String,
         /// Output format. Only `mcap` is supported today.
-        #[arg(long, value_enum, default_value_t = ExportFormat::Mcap)]
+        #[arg(long = "format", id = "session_export_format", value_enum, default_value_t = ExportFormat::Mcap)]
         format: ExportFormat,
         /// Time range filter, formatted `<start_ns>:<end_ns>`. Either bound
         /// may be omitted (e.g. `:1700000000000000000` streams from file
@@ -223,11 +223,12 @@ async fn session_channel(config: &CliConfig) -> anyhow::Result<(Channel, Bearer)
         .ok_or_else(|| anyhow!("No credentials. Run `roz auth login`."))?
         .to_string();
 
-    let tls = ClientTlsConfig::new().with_native_roots();
-    let channel = Channel::from_shared(config.api_url.clone())?
-        .tls_config(tls)?
-        .connect()
-        .await?;
+    let mut endpoint = Channel::from_shared(config.api_url.clone())?;
+    if config.api_url.starts_with("https://") {
+        let tls = ClientTlsConfig::new().with_native_roots();
+        endpoint = endpoint.tls_config(tls)?;
+    }
+    let channel = endpoint.connect().await?;
 
     let bearer: Bearer = format!("Bearer {token_str}").parse()?;
     Ok((channel, bearer))

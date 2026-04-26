@@ -93,6 +93,7 @@ serial_test = { workspace = true }
 re_log_encoding = "=0.31.3"
 re_log_types = "=0.31.3"
 re_sorbet = "=0.31.3"
+roz-server = { path = "../roz-server" }
 
 [lints]
 workspace = true

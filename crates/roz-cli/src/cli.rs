@@ -20,7 +20,7 @@ pub struct Cli {
 #[allow(clippy::struct_excessive_bools)] // CLI flag structs naturally have many booleans.
 pub struct GlobalOpts {
     /// Output format.
-    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Auto)]
+    #[arg(long, value_enum, default_value_t = OutputFormat::Auto)]
     pub format: OutputFormat,
 
     /// Output as JSON (shorthand for --format json).

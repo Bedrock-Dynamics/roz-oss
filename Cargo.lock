@@ -8728,6 +8728,7 @@ dependencies = [
  "roz-core",
  "roz-local",
  "roz-openai",
+ "roz-server",
  "roz-worker",
  "secrecy 0.10.3",
  "serde",
