@@ -1,12 +1,12 @@
 //! FW-07 (Phase 26.10 Plan 08) — Test fixture helpers for `EmbodimentRuntime`.
 //!
 //! Gated `cfg(any(test, feature = "test-fixtures"))` so production builds do not
-//! pull these helpers. Replaces ad-hoc `minimal_runtime()` helpers and proposed
-//! `todo!()` placeholders previously sprinkled across Plans 03/08/09 fixture
+//! pull these helpers. Replaces ad-hoc `minimal_runtime` helpers and proposed
+//! TODO-marker placeholders previously sprinkled across Plans 03/08/09 fixture
 //! build sites.
 //!
-//! Codex G1 fix — no `todo!()` / `unimplemented!()` in shipped code; the fixture
-//! flows through the real `EmbodimentRuntime::compile(...)` constructor.
+//! Codex G1 fix — no TODO-marker macros in shipped code; the fixture flows
+//! through the real `EmbodimentRuntime::compile(...)` constructor.
 
 #![cfg(any(test, feature = "test-fixtures"))]
 
