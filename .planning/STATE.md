@@ -2,8 +2,8 @@
 gsd_state_version: 1.0
 milestone: v2.2
 milestone_name: Runtime Event Contracts and Completeness
-status: verifying
-last_updated: "2026-04-26T04:30:44.058Z"
+status: executing
+last_updated: "2026-04-26T13:37:10.368Z"
 last_activity: 2026-04-26
 progress:
   total_phases: 1
@@ -17,9 +17,9 @@ progress:
 ## Current Position
 
 Phase: 26.10 (openclaw-production-wiring-authoritative-embodiment-runtime-) — EXECUTING
-Plan: 9 of 9
-Status: Phase complete — ready for verification
-Last activity: 2026-04-26
+Plan: 10 of 10 — COMPLETE (FW-05c production wiring closed)
+Status: Phase 26.10 ready for re-verification (FW-05 truth #7 should flip from FAILED to VERIFIED)
+Last activity: 2026-04-26 -- Plan 26.10-10 completed (Tasks 1+2 commits fe120ec + 46b2dd6)
 
 ## Project Reference
 
@@ -105,4 +105,4 @@ See: `.planning/PROJECT.md` (updated 2026-04-16)
 - 27 Nightly PX4 SITL CI + induced NATS outage + live-FCU task-layer wiring
 - 28 HITL docs + Pixhawk single-binary deployment quickstart
 
-**Planned Phase:** 26.10 (openclaw-production-wiring-authoritative-embodiment-runtime) — 9 plans — 2026-04-25T18:54:34.521Z
+**Planned Phase:** 26.10 (OpenClaw production wiring — authoritative embodiment runtime, worker Copper actuator/sensor IO, safety hardening, and HIL validation) — 10 plans — 2026-04-26T11:48:34.910Z
