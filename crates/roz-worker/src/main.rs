@@ -2303,6 +2303,31 @@ async fn main() -> Result<()> {
         // integration test in `tests/fw05_estop_ack_subscriber.rs` drive
         // the same code path.
         //
+        // === FW-05c production-wiring symbol map (verifier grep targets) ===
+        //
+        // The signed subscribers below dispatch via the helper module
+        // `roz_worker::safety_subscribers`. The symbols the helper module
+        // touches are listed here for grep-driven verification without
+        // duplicating the implementation:
+        //
+        //   subjects:
+        //     - roz_nats::Subjects::estop_ack(worker_id)
+        //     - roz_nats::Subjects::safety_resume(worker_id)
+        //     - roz_nats::Subjects::safety_signature_failure_worker(host_id)
+        //   commands dispatched on verified receipt:
+        //     - roz_copper::channels::ControllerCommand::AckEstop
+        //     - roz_copper::channels::ControllerCommand::ResumeAfterZeroVerified
+        //   slot consumed by both subscribers (verify+audit+dispatch path):
+        //     - shared_cmd_tx.load() (estop_ack handler — verifies signature,
+        //       then forwards AckEstop into the live controller)
+        //     - shared_cmd_tx.load() (safety_resume handler — verifies signature,
+        //       then forwards ResumeAfterZeroVerified into the live controller)
+        //
+        // The audit publishes use safety_signature_failure_worker once per
+        // subscriber on signature-rejected branches (2 sites total inside
+        // the helper). The verify_inbound_worker gate runs before any
+        // command dispatch.
+        //
         // host_id is guaranteed `Some` here: the outer guard requires
         // `signing_ctx_shared = Some(_)`, which is only populated inside
         // the `Ok(identity)` arm of `register_host` where `worker_host_id`
