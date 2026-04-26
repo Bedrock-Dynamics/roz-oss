@@ -142,6 +142,7 @@ async fn copper_tick_loop_clamps_over_limit_wasm_output_via_hot_copper_policy() 
         deployment_manager,
         Some(Arc::clone(&hot_policy)),
         Some(Arc::clone(&backpressure)),
+        None,
     );
 
     // -----------------------------------------------------------------

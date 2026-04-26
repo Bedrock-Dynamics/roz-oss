@@ -105,6 +105,7 @@ async fn fake_openclaw_estop_smoke_via_halt() {
         Some(Box::new(sensor)),
         policy,
         bp,
+        None,
     );
 
     // Allow boot.
@@ -201,6 +202,7 @@ async fn hil_physical_estop_latency() {
             Some(Box::new(sensor)),
             policy,
             bp,
+            None,
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
         let cmd_tx = handle.cmd_tx();

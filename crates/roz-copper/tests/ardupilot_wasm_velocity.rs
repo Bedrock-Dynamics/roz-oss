@@ -194,6 +194,7 @@ async fn ardupilot_wasm_velocity_through_bridge() {
             deployment_manager,
             None,
             None,
+            None,
         );
     });
 

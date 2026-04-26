@@ -518,6 +518,18 @@ async fn execute_task(
     shared_copper_state: std::sync::Arc<
         arc_swap::ArcSwapOption<arc_swap::ArcSwap<roz_copper::channels::ControllerState>>,
     >,
+    // FW-05 / Plan 26.10-10 (gap CR-02c): worker-level slot holding the
+    // currently-active `ControllerCommand` sender. Set by this function
+    // immediately after `CopperHandle::spawn_with_policy_and_io` returns;
+    // cleared on task end. The worker-boot signed-NATS subscribers for
+    // `safety.estop_ack.{worker_id}` and `safety.resume.{worker_id}` `load()`
+    // this slot on each verified message and dispatch `AckEstop` /
+    // `ResumeAfterZeroVerified` into the live per-task controller. `None`
+    // (no live controller) means the message is logged and dropped — benign
+    // because a Latched manipulator with no controller cannot move.
+    shared_cmd_tx: std::sync::Arc<
+        arc_swap::ArcSwap<Option<tokio::sync::mpsc::Sender<roz_copper::channels::ControllerCommand>>>,
+    >,
 ) {
     tracing::info!("starting task execution");
 
@@ -750,6 +762,46 @@ async fn execute_task(
                 }
             };
 
+            // FW-05 / Plan 26.10-10 (gap CR-01c): WAL-authoritative boot.
+            // Load any persisted latched-state from the previous worker run
+            // BEFORE spawning Copper. Plan 07's `WalStore::load_latch_state`
+            // contract: `Ok(LatchState::Run)` on absent key (clean boot),
+            // `Ok(state)` on parseable, `Err` on corruption. Corruption
+            // propagates as a copper-spawn failure — the worker MUST NOT
+            // silently fall back to `Run` (IEC 60204-1 Stop Category 0
+            // violation otherwise; see Plan 07 SUMMARY's WAL fail-closed
+            // pattern). When the WAL is absent (D-12 rollout / no
+            // `ROZ_ENCRYPTION_KEY`), fall back to `Run` because there is
+            // no persisted state to honour.
+            let initial_latch = match worker_wal_shared.as_ref() {
+                Some(wal) => match wal.load_latch_state() {
+                    Ok(state) => state,
+                    Err(e) => {
+                        copper_spawn_failure(format!(
+                            "FW-05 WAL load_latch_state failed (refusing to silently boot to Run per IEC 60204-1): {e}"
+                        ))
+                        .await;
+                        return;
+                    }
+                },
+                None => roz_copper::latch::LatchState::Run,
+            };
+            tracing::info!(
+                ?initial_latch,
+                "FW-05: WAL-authoritative boot — initial LatchState loaded from WAL"
+            );
+
+            // FW-05 / Plan 26.10-10 (gap CR-01b): bounded `SyncSender(16)`
+            // paired with a `spawn_blocking` drainer task. The Plan 07
+            // controller calls `latch_persist_tx.try_send(state)` on each
+            // transition (non-blocking — `SendError` is dropped silently
+            // so a full channel cannot stall the controller thread). 16
+            // covers the rare sequential e-stop cycle burst; the drainer
+            // (sqlite, ~ms-scale) is much faster than the producer in
+            // steady state.
+            let (latch_tx, latch_rx) =
+                std::sync::mpsc::sync_channel::<roz_copper::latch::LatchState>(16);
+
             let max_velocity = task_config.max_velocity.unwrap_or(1.5);
             let handle = roz_worker::copper_handle::CopperHandle::spawn_with_policy_and_io(
                 max_velocity,
@@ -757,11 +809,32 @@ async fn execute_task(
                 Some(sensor),
                 copper_hot_policy.clone(),
                 telemetry_backpressure.shared(),
+                Some(latch_tx),
             );
             tracing::info!(
                 factory = factory.name(),
-                "copper controller spawned for OodaReAct task with real IO + hot policy + shared backpressure"
+                "copper controller spawned for OodaReAct task with real IO + hot policy + shared backpressure + latch persistence"
             );
+
+            // FW-05 / Plan 26.10-10 (gap CR-01c): seed the loaded latch into
+            // `ControllerState` ArcSwap BEFORE the controller thread observes
+            // any tick state. The thread reads via `shared_state.load()` at
+            // the top of every iteration; this `rcu` update commits before
+            // the first tick because no controllers have been promoted yet.
+            // The race is benign (no controllers running) but the ordering
+            // invariant is what makes the WAL authoritative on restart.
+            if initial_latch != roz_copper::latch::LatchState::Run {
+                handle.state().rcu(|s| {
+                    let mut next = (**s).clone();
+                    next.latch_state = initial_latch;
+                    std::sync::Arc::new(next)
+                });
+                tracing::warn!(
+                    ?initial_latch,
+                    "FW-05: worker booted into a previously-latched state — operator must Ack -> Zero -> Resume to clear"
+                );
+            }
+
             // Phase 26-12 OBS-01: install a clone of the controller state
             // pointer so the worker-wide 10 Hz telemetry loop (main()) can
             // observe `ControllerState.entities` and publish
@@ -769,6 +842,45 @@ async fn execute_task(
             // at task shutdown (e-stop drop + final shutdown) so telemetry
             // does not continue to read stale state from a prior task.
             shared_copper_state.store(Some(std::sync::Arc::clone(handle.state())));
+
+            // FW-05 / Plan 26.10-10 (gap CR-02c): install the per-task
+            // `cmd_tx` into the worker-level `shared_cmd_tx` slot so the
+            // worker-boot signed-NATS subscribers (`safety.estop_ack` +
+            // `safety.resume`) can route `AckEstop` /
+            // `ResumeAfterZeroVerified` into THIS task's controller. Cleared
+            // on task end (the `shared_copper_state.store(None)` paths below
+            // do the same for the OBS-01 pointer; we mirror them).
+            shared_cmd_tx.store(std::sync::Arc::new(Some(handle.cmd_tx())));
+
+            // FW-05 / Plan 26.10-10 (gap CR-01b): drainer task.
+            // `WalStore` is rusqlite (sync), so `spawn_blocking` is the
+            // correct bridge. The drainer ends naturally when `latch_tx`
+            // drops (the handle takes ownership through the controller
+            // thread; on task end the handle drops, the SyncSender's clone
+            // count reaches zero, and `recv()` returns Err — the loop
+            // exits cleanly without leaking the blocking thread).
+            if let Some(wal_for_drain) = worker_wal_shared.clone() {
+                tokio::task::spawn_blocking(move || {
+                    while let Ok(state) = latch_rx.recv() {
+                        if let Err(e) = wal_for_drain.save_latch_state(state) {
+                            tracing::error!(
+                                error = %e,
+                                ?state,
+                                "FW-05: WAL save_latch_state failed — latch transition will not survive restart"
+                            );
+                        }
+                    }
+                    tracing::debug!("FW-05: latch persistence drainer task ended (latch_tx dropped)");
+                });
+            } else {
+                tracing::warn!(
+                    "FW-05: no WAL available — latch transitions will NOT persist across restart (D-12 rollout / no ROZ_ENCRYPTION_KEY)"
+                );
+                // Drop `latch_rx` explicitly so the controller's `try_send`
+                // does not accumulate (capacity 16 fills then SendError is
+                // discarded — bounded but wasteful without a drainer).
+                drop(latch_rx);
+            }
             Some(handle)
         }
         roz_nats::dispatch::ExecutionMode::React => None,
@@ -1354,6 +1466,11 @@ async fn execute_task(
                 // worker-wide telemetry loop stops reading the (now-dead)
                 // controller state.
                 shared_copper_state.store(None);
+                // FW-05 / Plan 26.10-10 (gap CR-02c): clear the worker-level
+                // `shared_cmd_tx` slot so the boot-time signed-NATS
+                // subscribers stop forwarding `AckEstop` / `ResumeAfterZeroVerified`
+                // to a controller that no longer exists.
+                shared_cmd_tx.store(std::sync::Arc::new(None));
             }
             Err(session_runtime_error_to_agent_error(&error, *estop_rx.borrow()))
         }
@@ -1411,6 +1528,11 @@ async fn execute_task(
         // worker-wide telemetry loop stops reading the (now-dead)
         // controller state once this task ends.
         shared_copper_state.store(None);
+        // FW-05 / Plan 26.10-10 (gap CR-02c): clear the worker-level
+        // `shared_cmd_tx` slot so the boot-time signed-NATS subscribers
+        // stop forwarding to a torn-down controller. Mirror site of the
+        // OBS-01 pose-pointer clear above.
+        shared_cmd_tx.store(std::sync::Arc::new(None));
     }
 
     // DEBT-03: drain the write-behind flush task before returning so any
@@ -1586,6 +1708,20 @@ async fn main() -> Result<()> {
     let shared_copper_state: std::sync::Arc<
         arc_swap::ArcSwapOption<arc_swap::ArcSwap<roz_copper::channels::ControllerState>>,
     > = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
+
+    // FW-05 / Plan 26.10-10 (gap CR-02c): worker-level slot for the active
+    // per-task `ControllerCommand` sender. The signed-NATS subscribers below
+    // for `safety.estop_ack.{worker_id}` and `safety.resume.{worker_id}` live
+    // for the worker's lifetime (subscribers must NOT be re-spawned per
+    // task — that would lose messages during task transitions). `execute_task`
+    // installs `Some(handle.cmd_tx())` after spawning Copper and clears to
+    // `None` on task end. Subscribers `load()` on every verified message:
+    // `Some(tx)` → forward `AckEstop` / `ResumeAfterZeroVerified`; `None` →
+    // log + drop (no live controller is benign — a Latched manipulator
+    // without an active task is already in the safe state).
+    let shared_cmd_tx: std::sync::Arc<
+        arc_swap::ArcSwap<Option<tokio::sync::mpsc::Sender<roz_copper::channels::ControllerCommand>>>,
+    > = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(None));
 
     // Spawn idle watchdog — fires if no NATS message arrives within 30s.
     // Plan 24-12 Task 2: the `on_expire` callback reads the live
@@ -2836,6 +2972,12 @@ async fn main() -> Result<()> {
         // it installs a pose snapshot here so the worker-wide 10 Hz
         // telemetry loop can publish `end_effector_pose`.
         let task_shared_copper_state = shared_copper_state.clone();
+        // FW-05 / Plan 26.10-10 (gap CR-02c): clone the worker-level
+        // `shared_cmd_tx` slot into the task. `execute_task` installs
+        // `Some(handle.cmd_tx())` after spawning Copper so the worker-boot
+        // signed-NATS subscribers for `safety.estop_ack.{worker_id}` and
+        // `safety.resume.{worker_id}` can route into the live controller.
+        let task_shared_cmd_tx = shared_cmd_tx.clone();
         let span = tracing::info_span!("worker.execute_task", task_id = %task_id);
         tokio::spawn(
             async move {
@@ -2862,6 +3004,7 @@ async fn main() -> Result<()> {
                     task_worker_wal,
                     task_session_event_tx,
                     task_shared_copper_state,
+                    task_shared_cmd_tx,
                 ))
                 .await;
             }

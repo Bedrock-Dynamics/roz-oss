@@ -121,6 +121,7 @@ impl CopperHandle {
             deployment_manager,
             None,
             None,
+            None,
         )
     }
 
@@ -144,6 +145,13 @@ impl CopperHandle {
     /// `HotCopperPolicy` via `with_policy` before becoming the live
     /// candidate — closing VERIFICATION.md gap "FS-01 SC#1 — copper 100 Hz
     /// loop check runs against policy".
+    ///
+    /// FW-05 / Plan 26.10-10 (gap CR-01): when `latch_persist_tx` is `Some`,
+    /// every `LatchState` transition is forwarded to the paired
+    /// `std::sync::mpsc::Receiver` so a worker-side `spawn_blocking` drainer
+    /// can call `WalStore::save_latch_state(state)`. Worker restart then
+    /// observes the persisted state via `WalStore::load_latch_state` (IEC
+    /// 60204-1 fail-safe). `None` disables persistence.
     #[doc(hidden)]
     pub fn spawn_with_io_and_deployment_manager_and_wiring(
         max_velocity: f64,
@@ -152,6 +160,7 @@ impl CopperHandle {
         deployment_manager: DeploymentManager,
         hot_policy: Option<crate::policy::HotCopperPolicy>,
         shared_backpressure: Option<Arc<AtomicU8>>,
+        latch_persist_tx: Option<std::sync::mpsc::SyncSender<crate::latch::LatchState>>,
     ) -> Self {
         // Agent-side channel (tokio mpsc).
         let (cmd_tx, agent_rx) = mpsc::channel::<ControllerCommand>(64);
@@ -203,6 +212,7 @@ impl CopperHandle {
                             deployment_manager,
                             hot_policy_clone,
                             Some(backpressure_clone),
+                            latch_persist_tx,
                         );
                     }
                     None => {
@@ -219,6 +229,7 @@ impl CopperHandle {
                             deployment_manager,
                             hot_policy_clone,
                             Some(backpressure_clone),
+                            latch_persist_tx,
                         );
                     }
                 }
@@ -258,6 +269,7 @@ impl CopperHandle {
             EXECUTION_ONLY_DEPLOYMENT_MANAGER,
             Some(hot_policy),
             Some(shared_backpressure),
+            None,
         )
     }
 
@@ -267,12 +279,21 @@ impl CopperHandle {
     /// real `ActuatorSink` / `SensorSource` impls keyed on the embodiment
     /// family. The actuator is `Arc<dyn ...>` (shared across worker + copper);
     /// the sensor is `Box<dyn ...>` (moved into the controller thread).
+    ///
+    /// FW-05 / Plan 26.10-10 (gap CR-01): `latch_persist_tx` is the WAL
+    /// persistence channel. When `Some`, every `LatchState` transition is
+    /// forwarded to the paired receiver; the worker pairs this with a
+    /// `spawn_blocking` drainer that calls `WalStore::save_latch_state`. On
+    /// restart, `WalStore::load_latch_state` returns the persisted state so
+    /// a previously-latched manipulator stays latched (IEC 60204-1 fail-safe).
+    /// `None` disables persistence (for tests or transient deployments).
     pub fn spawn_with_policy_and_io(
         max_velocity: f64,
         actuator: Arc<dyn crate::io::ActuatorSink>,
         sensor: Option<Box<dyn crate::io::SensorSource>>,
         hot_policy: crate::policy::HotCopperPolicy,
         shared_backpressure: Arc<AtomicU8>,
+        latch_persist_tx: Option<std::sync::mpsc::SyncSender<crate::latch::LatchState>>,
     ) -> Self {
         Self::spawn_with_io_and_deployment_manager_and_wiring(
             max_velocity,
@@ -281,6 +302,7 @@ impl CopperHandle {
             EXECUTION_ONLY_DEPLOYMENT_MANAGER,
             Some(hot_policy),
             Some(shared_backpressure),
+            latch_persist_tx,
         )
     }
 
@@ -732,6 +754,7 @@ mod tests {
             Some(sensor),
             hot_policy.clone(),
             Arc::clone(&backpressure),
+            None,
         );
 
         // Backpressure pointer must be the caller-supplied Arc, not a fresh local.
@@ -767,6 +790,135 @@ mod tests {
             handle.telemetry_backpressure().load(Ordering::Relaxed),
             0,
             "legacy constructors must start at BP_NORMAL (0)"
+        );
+
+        handle.shutdown().await;
+    }
+
+    // --- FW-05 / Plan 26.10-10 (gap CR-01) — `latch_persist_tx` plumbing ----
+
+    /// FW-05 / Plan 26.10-10 (gap CR-01a): `spawn_with_policy_and_io` must
+    /// thread the supplied `SyncSender<LatchState>` end-to-end so latch
+    /// transitions surface on the paired `Receiver`. Pre-seed the controller
+    /// state to `Latched` (the WAL-authoritative-boot scenario), then issue
+    /// `AckEstop` through `cmd_tx`. The Plan 07 controller's `drain_commands`
+    /// `AckEstop` arm performs `Latched -> AwaitingAck` AND
+    /// `latch_persist_tx.try_send(AwaitingAck)` — the test asserts that the
+    /// transition reached the persistence channel within 500 ms.
+    #[tokio::test]
+    async fn spawn_with_policy_and_io_forwards_latch_persist_tx() {
+        use crate::io_log::LogActuatorSink;
+        use crate::policy::new_hot_policy;
+        use std::sync::mpsc::sync_channel;
+
+        let (tx, rx) = sync_channel::<crate::latch::LatchState>(16);
+        let actuator: Arc<dyn crate::io::ActuatorSink> = Arc::new(LogActuatorSink::new());
+        let hot_policy = new_hot_policy();
+        let backpressure = Arc::new(AtomicU8::new(0));
+
+        let handle = CopperHandle::spawn_with_policy_and_io(
+            1.5,
+            actuator,
+            None,
+            hot_policy,
+            backpressure,
+            Some(tx),
+        );
+
+        // Pre-seed Latched so AckEstop produces a persisted transition. This
+        // mirrors Plan 07's `latched_estop_full_cycle_via_signed_commands`
+        // setup: the ArcSwap rcu commits before any controller is promoted,
+        // so the next `drain_commands` iteration sees Latched.
+        handle.state().rcu(|s| {
+            let mut next = (**s).clone();
+            next.latch_state = crate::latch::LatchState::Latched;
+            Arc::new(next)
+        });
+
+        // Let the controller spin up its loop and observe the rcu'd state
+        // before AckEstop arrives. Without this, the bridge → copper_rx →
+        // drain_commands path can race the rcu and read `latch_state = Run`
+        // (the default `ControllerState`), making AckEstop a no-op.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Drive Latched -> AwaitingAck. The controller's drain_commands arm
+        // for AckEstop calls latch_persist_tx.try_send(AwaitingAck) on
+        // transition.
+        handle
+            .send(ControllerCommand::AckEstop)
+            .await
+            .expect("cmd_tx send must succeed");
+
+        // The drain happens at the top of each tick (~10 ms at 100 Hz). Yield
+        // briefly so the bridge task wakes and forwards the command into the
+        // controller thread BEFORE we block on recv_timeout (otherwise the
+        // tokio runtime parks on recv_timeout and the bridge task never runs
+        // — `recv_timeout` is a sync stdlib call that does not yield).
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let received = rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .expect("FW-05: latch transition must reach the persistence channel within 500 ms");
+        assert_eq!(
+            received,
+            crate::latch::LatchState::AwaitingAck,
+            "AckEstop on Latched must publish AwaitingAck on latch_persist_tx (Plan 07 contract)"
+        );
+
+        handle.shutdown().await;
+    }
+
+    /// FW-05 / Plan 26.10-10 (gap CR-01a): `None` for `latch_persist_tx`
+    /// must remain a no-op (legacy / test entry parity). Triggering a
+    /// transition without a persistence channel must NOT panic; the
+    /// controller continues to tick.
+    #[tokio::test]
+    async fn spawn_with_policy_and_io_handles_none_latch_persist_tx() {
+        use crate::io_log::LogActuatorSink;
+        use crate::policy::new_hot_policy;
+
+        let actuator: Arc<dyn crate::io::ActuatorSink> = Arc::new(LogActuatorSink::new());
+        let hot_policy = new_hot_policy();
+        let backpressure = Arc::new(AtomicU8::new(0));
+
+        let handle = CopperHandle::spawn_with_policy_and_io(
+            1.5,
+            actuator,
+            None,
+            hot_policy,
+            backpressure,
+            None,
+        );
+
+        // Pre-seed Latched then send AckEstop. With latch_persist_tx = None,
+        // the controller's `if let Some(tx) = latch_persist_tx { ... }` branch
+        // is skipped — the state still transitions in memory and the loop
+        // keeps running.
+        handle.state().rcu(|s| {
+            let mut next = (**s).clone();
+            next.latch_state = crate::latch::LatchState::Latched;
+            Arc::new(next)
+        });
+        handle
+            .send(ControllerCommand::AckEstop)
+            .await
+            .expect("cmd_tx send must succeed even when latch_persist_tx is None");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // State must still be readable — the loop did not panic.
+        let snapshot = handle.state().load();
+        assert!(
+            matches!(
+                snapshot.latch_state,
+                crate::latch::LatchState::Latched | crate::latch::LatchState::AwaitingAck
+            ),
+            "latch_state must be Latched or AwaitingAck after AckEstop with None persist_tx; got {:?}",
+            snapshot.latch_state
+        );
+        assert!(
+            snapshot.last_tick > 0,
+            "controller must continue ticking with latch_persist_tx = None"
         );
 
         handle.shutdown().await;

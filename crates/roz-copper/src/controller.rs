@@ -2107,6 +2107,7 @@ pub fn run_controller_loop_with_compatibility_fallback(
         DeploymentManager::compatibility_default(),
         None,
         None,
+        None,
     );
 }
 
@@ -2165,11 +2166,14 @@ pub fn run_controller_loop_with_policy(
     deployment_manager: DeploymentManager,
     hot_policy: Option<crate::policy::HotCopperPolicy>,
     telemetry_backpressure: Option<Arc<AtomicU8>>,
+    // FW-05 H3 / Plan 26.10-10 (gap closure CR-01): WAL persistence channel.
+    // The worker boot path passes `Some(tx)` paired with a drainer task that
+    // calls `WalStore::save_latch_state` on each received transition. Legacy
+    // / test callers pass `None` (no persistence). Replaces the previously
+    // hardcoded `None` so production wiring is now possible without
+    // duplicating the loop body in a parallel `*_with_latch_persist` entry.
+    latch_persist_tx: Option<std::sync::mpsc::SyncSender<crate::latch::LatchState>>,
 ) {
-    // FW-05 H3: latch persistence channel is None for the legacy entry
-    // point; the worker boot path uses the new `*_with_latch_persist`
-    // entry to wire WAL write-back. Internal calls share one impl.
-    let latch_persist_tx: Option<std::sync::mpsc::SyncSender<LatchState>> = None;
     let mut active_controller: Option<LoadedController> = None;
     let mut candidate_controller: Option<LoadedController> = None;
     let mut rollback_controller: Option<LoadedController> = None;
@@ -3750,6 +3754,7 @@ mod tests {
                 deployment_manager,
                 None,
                 None,
+                None,
             );
         });
 
@@ -3796,6 +3801,7 @@ mod tests {
                 None,
                 &estop_tx,
                 deployment_manager,
+                None,
                 None,
                 None,
             );
@@ -3879,6 +3885,7 @@ mod tests {
                 None,
                 &estop_tx,
                 deployment_manager,
+                None,
                 None,
                 None,
             );
@@ -4096,6 +4103,7 @@ mod tests {
                 deployment_manager,
                 None,
                 None,
+                None,
             );
         });
 
@@ -4162,6 +4170,7 @@ mod tests {
                 None,
                 &estop_tx,
                 deployment_manager,
+                None,
                 None,
                 None,
             );
@@ -4232,6 +4241,7 @@ mod tests {
                 None,
                 &estop_tx,
                 deployment_manager,
+                None,
                 None,
                 None,
             );
@@ -4313,6 +4323,7 @@ mod tests {
                 None,
                 &estop_tx,
                 deployment_manager,
+                None,
                 None,
                 None,
             );
@@ -4442,6 +4453,7 @@ mod tests {
                 deployment_manager,
                 None,
                 None,
+                None,
             );
         });
 
@@ -4542,6 +4554,7 @@ mod tests {
                 deployment_manager,
                 None,
                 None,
+                None,
             );
         });
 
@@ -4621,6 +4634,7 @@ mod tests {
                 None,
                 &estop_tx,
                 deployment_manager,
+                None,
                 None,
                 None,
             );
@@ -4991,6 +5005,7 @@ mod tests {
                 DeploymentManager::execution_only(),
                 None,
                 None,
+                None,
             );
         });
 
@@ -5097,6 +5112,7 @@ mod tests {
                 None,
                 &estop_tx,
                 DeploymentManager::execution_only(),
+                None,
                 None,
                 None,
             );

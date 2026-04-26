@@ -188,6 +188,7 @@ async fn manipulator_dispatch_through_promote_controller_path() {
         Some(Box::new(sensor)),
         policy,
         bp,
+        None,
     );
 
     // Step 3 — hold-out the cmd_tx + state handle on the test side; produce
