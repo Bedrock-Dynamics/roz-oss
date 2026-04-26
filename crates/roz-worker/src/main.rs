@@ -1493,6 +1493,7 @@ async fn main() -> Result<()> {
         sensors: vec![],
         max_velocity: config.max_velocity.unwrap_or(1.5),
         cameras: vec![],
+        ..roz_core::capabilities::RobotCapabilities::default()
     };
 
     if let Some(ref cam_mgr) = camera_manager {
