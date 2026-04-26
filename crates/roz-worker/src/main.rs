@@ -9,8 +9,8 @@ use roz_agent::agent_loop::{AgentInputSeed, AgentLoop, AgentOutput, PresenceSign
 use roz_agent::error::AgentError;
 use roz_agent::model::types::StreamChunk;
 use roz_agent::session_runtime::{
-    ApprovalRuntimeHandle, PreparedTurn, SessionConfig, SessionRuntime, SessionRuntimeError, StreamingTurnExecutor,
-    StreamingTurnHandle, StreamingTurnResult, TurnExecutionFailure, TurnOutput,
+    ApprovalRuntimeHandle, PreparedTurn, SessionConfig, SessionRuntime, SessionRuntimeError, SessionRuntimeEventHook,
+    StreamingTurnExecutor, StreamingTurnHandle, StreamingTurnResult, TurnExecutionFailure, TurnOutput,
 };
 use roz_agent::spatial_provider::{NullWorldStateProvider, PrimedWorldStateProvider, WorldStateProvider};
 use roz_core::reconnect::WorkerOnlineSnapshot;
@@ -686,6 +686,7 @@ async fn execute_task(
         Box::new(roz_agent::tools::execute_code::ExecuteCodeTool),
         roz_core::tools::ToolCategory::CodeSandbox,
     );
+    let mut extensions = roz_agent::dispatch::Extensions::new();
     let guards: Vec<Box<dyn roz_agent::safety::SafetyGuard>> = vec![Box::new(
         roz_agent::safety::guards::VelocityLimiter::new(task_config.max_velocity.unwrap_or(1.5)),
     )];
@@ -734,32 +735,8 @@ async fn execute_task(
                 return;
             };
             let Some(control_manifest) = invocation.control_interface_manifest.as_ref() else {
-                copper_spawn_failure("OodaReAct dispatch missing control_interface_manifest".to_string())
-                    .await;
+                copper_spawn_failure("OodaReAct dispatch missing control_interface_manifest".to_string()).await;
                 return;
-            };
-
-            // Codex H2: factory_for lives in roz-worker (this crate), NOT roz-copper.
-            let family_id = runtime
-                .model
-                .embodiment_family
-                .as_ref()
-                .map(|f| f.family_id.as_str());
-            let Some(factory) = roz_worker::io_backends::factory_for(family_id) else {
-                copper_spawn_failure(format!(
-                    "no IoFactory registered for embodiment_family={:?}",
-                    runtime.model.embodiment_family,
-                ))
-                .await;
-                return;
-            };
-
-            let (actuator, sensor) = match factory.build(runtime, control_manifest) {
-                Ok(io) => io,
-                Err(err) => {
-                    copper_spawn_failure(format!("IoFactory build failed: {err}")).await;
-                    return;
-                }
             };
 
             // FW-05 / Plan 26.10-10 (gap CR-01c): WAL-authoritative boot.
@@ -799,20 +776,40 @@ async fn execute_task(
             // covers the rare sequential e-stop cycle burst; the drainer
             // (sqlite, ~ms-scale) is much faster than the producer in
             // steady state.
-            let (latch_tx, latch_rx) =
-                std::sync::mpsc::sync_channel::<roz_copper::latch::LatchState>(16);
+            let (latch_tx, latch_rx) = std::sync::mpsc::sync_channel::<roz_copper::latch::LatchState>(16);
 
             let max_velocity = task_config.max_velocity.unwrap_or(1.5);
-            let handle = roz_worker::copper_handle::CopperHandle::spawn_with_policy_and_io(
-                max_velocity,
-                actuator,
-                Some(sensor),
-                copper_hot_policy.clone(),
-                telemetry_backpressure.shared(),
-                Some(latch_tx),
-            );
+            let physical = match roz_worker::physical_runtime::spawn_physical_runtime(
+                roz_worker::physical_runtime::PhysicalRuntimeConfig::new(
+                    runtime.clone(),
+                    control_manifest.clone(),
+                    max_velocity,
+                    copper_hot_policy.clone(),
+                    telemetry_backpressure.shared(),
+                    Some(latch_tx),
+                    dispatcher,
+                    extensions,
+                    task_id.to_string(),
+                    invocation.tenant_id.clone(),
+                ),
+            ) {
+                Ok(handle) => handle,
+                Err(err) => {
+                    copper_spawn_failure(err.to_string()).await;
+                    return;
+                }
+            };
+            let roz_worker::physical_runtime::PhysicalRuntimeHandle {
+                copper: handle,
+                dispatcher: physical_dispatcher,
+                context: physical_context,
+                factory_name,
+                ..
+            } = physical;
+            dispatcher = physical_dispatcher;
+            extensions = physical_context.extensions;
             tracing::info!(
-                factory = factory.name(),
+                factory = factory_name,
                 "copper controller spawned for OodaReAct task with real IO + hot policy + shared backpressure + latch persistence"
             );
 
@@ -910,48 +907,6 @@ async fn execute_task(
     } else {
         Box::new(spatial.clone())
     };
-
-    // When Copper is active, keep the canonical control manifest in Extensions
-    // and avoid fabricating the legacy channel manifest here. Legacy lowering
-    // is still available inside the last-mile Copper host paths that require it.
-    let mut extensions = roz_agent::dispatch::Extensions::new();
-    if let Some(ref handle) = copper_handle {
-        let control_manifest = invocation
-            .control_interface_manifest
-            .clone()
-            .expect("ooda tasks must be validated to carry control_interface_manifest");
-        extensions.insert(handle.cmd_tx());
-        extensions.insert(control_manifest.clone());
-
-        // Phase 26.10 Plan 04 (FW-03): register controller lifecycle tools
-        // on the worker dispatcher when an OodaReAct copper handle is active.
-        // Category Physical so the safety stack runs the right approval /
-        // sequencing path. Canonical names: promote_controller,
-        // stop_controller, controller_status.
-        //
-        // ControllerStatusTool needs Arc<ArcSwap<ControllerState>> from
-        // extensions; PromoteControllerTool needs the EmbodimentRuntime to
-        // reject synthetic runtimes and to bind the LoadArtifact command.
-        extensions.insert(std::sync::Arc::clone(handle.state()));
-        if let Some(runtime) = invocation.embodiment_runtime.as_ref() {
-            extensions.insert(runtime.clone());
-        }
-
-        dispatcher.register_with_category(
-            Box::new(roz_worker::tools::promote_controller::PromoteControllerTool::new(
-                &control_manifest,
-            )),
-            roz_core::tools::ToolCategory::Physical,
-        );
-        dispatcher.register_with_category(
-            Box::new(roz_worker::tools::stop_controller::StopControllerTool),
-            roz_core::tools::ToolCategory::Physical,
-        );
-        dispatcher.register_with_category(
-            Box::new(roz_worker::tools::controller_status::ControllerStatusTool),
-            roz_core::tools::ToolCategory::Physical,
-        );
-    }
 
     // Register camera perception tools when cameras are available.
     if let Some(ref cam_mgr) = camera_manager {
@@ -1299,7 +1254,8 @@ async fn execute_task(
     // `skill_view` for live body/version loads until the next session.
     session_runtime.set_skill_snapshot(frozen_skills);
     let approval_runtime = session_runtime.approval_handle();
-    extensions.insert(session_runtime.event_emitter());
+    let agent_event_emitter = session_runtime.event_emitter();
+    extensions.insert(agent_event_emitter.clone());
 
     if let Some(parent_task_id) = invocation.parent_task_id {
         // Child task: consume inbound resolutions from parent, relay outbound requests up.
@@ -1423,7 +1379,8 @@ async fn execute_task(
         .with_extensions(extensions)
         .with_approval_runtime(approval_runtime)
         .with_turn_emitter_opt(turn_flush.emitter.clone())
-        .with_checkpoint_signal(checkpoint_signal);
+        .with_checkpoint_signal(checkpoint_signal)
+        .with_agent_event_hook(Arc::new(SessionRuntimeEventHook::new(agent_event_emitter)));
     let mut executor = WorkerTaskStreamingExecutor {
         agent: Some(agent),
         agent_input,

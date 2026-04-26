@@ -38,6 +38,7 @@ pub mod event_nats;
 pub mod io_backends;
 pub mod model_factory;
 pub mod observability_config;
+pub mod physical_runtime;
 pub mod policy_cache;
 pub mod policy_enforcement;
 pub mod provisioning;
@@ -53,6 +54,8 @@ pub mod session_relay;
 pub mod signing_hooks;
 pub mod signing_key;
 pub mod spatial_bridge;
+#[cfg(feature = "test-fixtures")]
+pub mod task_invocation_harness;
 pub mod telemetry;
 pub mod telemetry_backpressure;
 pub mod telemetry_replay;
