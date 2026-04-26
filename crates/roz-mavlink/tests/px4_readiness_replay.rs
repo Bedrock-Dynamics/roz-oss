@@ -3,8 +3,8 @@
 use std::time::{Duration, Instant};
 
 use mavlink::common::{
-    EstimatorStatusFlags, GpsFixType, MavAutopilot, MavModeFlag, MavState, MavType, ESTIMATOR_STATUS_DATA,
-    GPS_RAW_INT_DATA, HEARTBEAT_DATA,
+    ESTIMATOR_STATUS_DATA, EstimatorStatusFlags, GPS_RAW_INT_DATA, GpsFixType, HEARTBEAT_DATA, MavAutopilot,
+    MavModeFlag, MavState, MavType,
 };
 use roz_copper::io_grpc::proto::{MavAutopilot as ProtoMavAutopilot, ReadinessState};
 use roz_mavlink::readiness::ReadinessBuilder;
