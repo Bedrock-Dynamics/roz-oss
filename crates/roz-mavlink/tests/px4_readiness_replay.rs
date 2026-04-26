@@ -3,8 +3,8 @@
 use std::time::{Duration, Instant};
 
 use mavlink::common::{
-    ESTIMATOR_STATUS_DATA, EstimatorStatusFlags, GPS_RAW_INT_DATA, GpsFixType, HEARTBEAT_DATA, MavAutopilot,
-    MavModeFlag, MavState, MavType,
+    EstimatorStatusFlags, GpsFixType, MavAutopilot, MavModeFlag, MavState, MavType, ESTIMATOR_STATUS_DATA,
+    GPS_RAW_INT_DATA, HEARTBEAT_DATA,
 };
 use roz_copper::io_grpc::proto::{MavAutopilot as ProtoMavAutopilot, ReadinessState};
 use roz_mavlink::readiness::ReadinessBuilder;
@@ -168,7 +168,9 @@ fn expected_bool(json: &str, key: &str) -> bool {
 
 fn json_u32(json: &str, key: &str) -> u32 {
     let value = raw_json_value(json, key);
-    value.parse().unwrap_or_else(|_| panic!("expected u32 for {key:?}, got {value:?}"))
+    value
+        .parse()
+        .unwrap_or_else(|_| panic!("expected u32 for {key:?}, got {value:?}"))
 }
 
 fn json_string<'a>(json: &'a str, key: &str) -> &'a str {
@@ -181,7 +183,10 @@ fn json_string<'a>(json: &'a str, key: &str) -> &'a str {
 
 fn raw_json_value<'a>(json: &'a str, key: &str) -> &'a str {
     let marker = format!("\"{key}\":");
-    let start = json.find(&marker).unwrap_or_else(|| panic!("missing fixture key {key:?}")) + marker.len();
+    let start = json
+        .find(&marker)
+        .unwrap_or_else(|| panic!("missing fixture key {key:?}"))
+        + marker.len();
     let rest = json[start..].trim_start();
     let end = rest
         .find([',', '\n', '}'])

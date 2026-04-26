@@ -20,7 +20,7 @@
 use std::time::{Duration, Instant};
 
 use mavlink::common::{
-    ESTIMATOR_STATUS_DATA, GPS_RAW_INT_DATA, HEARTBEAT_DATA, MavAutopilot as UpstreamMavAutopilot, MavModeFlag,
+    MavAutopilot as UpstreamMavAutopilot, MavModeFlag, ESTIMATOR_STATUS_DATA, GPS_RAW_INT_DATA, HEARTBEAT_DATA,
 };
 use roz_copper::io_grpc::proto::{MavAutopilot as ProtoMavAutopilot, ReadinessState};
 
