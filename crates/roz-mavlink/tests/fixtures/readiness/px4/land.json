@@ -1,0 +1,26 @@
+{
+  "heartbeat": {
+    "autopilot": "px4",
+    "armed": false,
+    "system_status": 4
+  },
+  "gps_raw_int": {
+    "fix_type": 3
+  },
+  "estimator_status": {
+    "flags": 75
+  },
+  "expected": {
+    "heartbeat_alive": true,
+    "heartbeat_age_ms": 500,
+    "armed": false,
+    "system_status": 4,
+    "gps_fix_type": 3,
+    "has_gps_fix": true,
+    "ekf_flags": 75,
+    "ekf_converged": true,
+    "ready_to_arm": true,
+    "fully_operational": true,
+    "autopilot": 2
+  }
+}
