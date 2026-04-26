@@ -191,7 +191,7 @@ Plans:
 **Goal:** Close the production-wiring gaps that prevent live WASM controller deployment through the normal agent/task path. Authoritative `EmbodimentRuntime` rides inline on every OodaReAct dispatch (Phase 23 signed envelope auto-covers it); worker spawns Copper with real `ActuatorSink`/`SensorSource` via a new `IoFactory` keyed off `embodiment_family`; agent layer registers `promote_controller`/`stop_controller`/`controller_status` with `ToolCategory::Physical`; AUTO placement defaults edge for OodaReAct robot-control sessions; safety hardens with bounded WASM host output, timer-driven stale-heartbeat, and a IEC 60204-1 / ISO 13849-1 latched e-stop state machine that survives worker restart; manifest fidelity preserves joints/TCPs/grippers/sensors/workspaces and capability publish projects losslessly from the runtime; deterministic fake-OpenClaw backend + gated HIL row close manipulator-class validation parity with PX4/ArduPilot rows.
 **Requirements**: FW-01, FW-02, FW-03, FW-04, FW-05, FW-06, FW-07 (proposed in 26.10-RESEARCH.md — backfill into REQUIREMENTS.md after planning)
 **Depends on:** Phase 26
-**Plans:** 10 plans
+**Plans:** 10/10 plans complete
 
 Plans:
 - [x] 26.10-01-PLAN.md — Wave 1: FW-01 — additive `embodiment_runtime: Option<EmbodimentRuntime>` on `TaskInvocation` + server-side authoritative resolver in `task_dispatch.rs:225` reading `roz_hosts.embodiment_runtime` JSONB (migration 022_host_embodiment.sql already exists; no new schema) + Phase 23 signing path unchanged + 3 unit tests + 1 server integration test
