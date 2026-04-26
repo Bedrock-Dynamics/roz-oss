@@ -70,12 +70,13 @@ impl HeartbeatTracker {
     }
 
     /// Return the IDs of workers whose last heartbeat exceeds the threshold.
-    pub fn stale_workers(&self) -> Vec<&str> {
-        self.workers
-            .iter()
-            .filter(|(_, last_seen)| last_seen.elapsed() >= self.stale_threshold)
-            .map(|(id, _)| id.as_str())
-            .collect()
+    ///
+    /// Thin wrapper over the pure [`run_stale_scan`] function with
+    /// `Instant::now()`; tests use `run_stale_scan` directly with synthetic
+    /// `Instant` values to avoid the `tokio::time::pause` + `std::time::Instant`
+    /// incompatibility (Codex M3).
+    pub fn stale_workers(&self) -> Vec<String> {
+        run_stale_scan(Instant::now(), self.stale_threshold, self)
     }
 
     /// Stop tracking a worker (e.g. after issuing an e-stop).
@@ -87,6 +88,33 @@ impl HeartbeatTracker {
     pub fn worker_count(&self) -> usize {
         self.workers.len()
     }
+
+    /// Iterator over (worker_id, last_heartbeat_instant). Used by [`run_stale_scan`].
+    pub fn workers_iter(&self) -> impl Iterator<Item = (&str, &Instant)> {
+        self.workers.iter().map(|(k, v)| (k.as_str(), v))
+    }
+}
+
+/// FW-05(b) — Codex M3 Option B: pure stale-scan logic.
+///
+/// Production loop wraps this with `tokio::time::interval` and `Instant::now()`;
+/// tests pass synthetic `Instant` values to avoid the `std::time::Instant` +
+/// `tokio::time::pause/advance` incompatibility (tokio virtual time only
+/// affects `tokio::time::Instant`, not `std::time::Instant`).
+///
+/// A worker is stale iff `now.duration_since(last_heartbeat) >= threshold`.
+/// Returns owned `String` IDs so the result outlives the borrow on `tracker`.
+pub fn run_stale_scan(now: std::time::Instant, threshold: Duration, tracker: &HeartbeatTracker) -> Vec<String> {
+    tracker
+        .workers_iter()
+        .filter_map(|(id, last)| {
+            if now.duration_since(*last) >= threshold {
+                Some(id.to_owned())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -249,5 +277,104 @@ mod tests {
         let stale = tracker.stale_workers();
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0], "old-worker");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FW-05(b) — Codex M3: synthetic-Instant tests for run_stale_scan
+//
+// These tests pass synthetic `Instant` values directly to the pure function,
+// avoiding the `tokio::time::pause/advance` + `std::time::Instant`
+// incompatibility documented in REVIEWS.md M3.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod stale_scan_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn run_stale_scan_fresh_worker_not_stale() {
+        let mut t = HeartbeatTracker::new(Duration::from_secs(30));
+        t.record("w1");
+        let stale = run_stale_scan(Instant::now(), Duration::from_secs(30), &t);
+        assert!(stale.is_empty(), "freshly-recorded worker must not be stale");
+    }
+
+    #[test]
+    fn run_stale_scan_old_worker_is_stale() {
+        let mut t = HeartbeatTracker::new(Duration::from_secs(30));
+        t.record("w1");
+        // Synthetic future Instant — no tokio time needed. Equivalent to
+        // "60s have elapsed since w1 was recorded".
+        let future_now = Instant::now() + Duration::from_secs(60);
+        let stale = run_stale_scan(future_now, Duration::from_secs(30), &t);
+        assert_eq!(stale, vec!["w1".to_string()]);
+    }
+
+    #[test]
+    fn run_stale_scan_threshold_boundary() {
+        let mut t = HeartbeatTracker::new(Duration::from_secs(30));
+        t.record("w1");
+        // `record()` uses Instant::now() internally — capture an Instant
+        // immediately after as a known upper bound on the recorded time.
+        let after_record = Instant::now();
+
+        // `after_record + 31s` is guaranteed >= `recorded + 30s` since
+        // `recorded <= after_record` → predicate fires (>= threshold).
+        let well_past_threshold = after_record + Duration::from_secs(31);
+        let stale = run_stale_scan(well_past_threshold, Duration::from_secs(30), &t);
+        assert_eq!(
+            stale,
+            vec!["w1".to_string()],
+            "at >= threshold elapsed the worker is stale"
+        );
+
+        // `after_record + 0` is guaranteed <= `recorded + ε` for ε ≥ 0,
+        // so the elapsed gap is < 30s → predicate must NOT fire.
+        let well_under = after_record;
+        let stale = run_stale_scan(well_under, Duration::from_secs(30), &t);
+        assert!(stale.is_empty(), "under threshold the worker is fresh");
+
+        // Boundary exactness: query at exactly `recorded + 30s` MUST be stale
+        // because the predicate is `>=`. Use a tracker recorded at a known
+        // Instant via direct map insertion (bypassing `record()`).
+        let mut t2 = HeartbeatTracker::new(Duration::from_secs(30));
+        let known = Instant::now();
+        t2.workers.insert("w1".to_string(), known);
+        let stale = run_stale_scan(known + Duration::from_secs(30), Duration::from_secs(30), &t2);
+        assert_eq!(
+            stale,
+            vec!["w1".to_string()],
+            "at exactly threshold the predicate >= must fire"
+        );
+        // Just under threshold (29.999s) → fresh.
+        let stale = run_stale_scan(known + Duration::from_millis(29_999), Duration::from_secs(30), &t2);
+        assert!(stale.is_empty(), "just under threshold must not be stale");
+    }
+
+    #[test]
+    fn run_stale_scan_empty_tracker_returns_empty() {
+        let t = HeartbeatTracker::new(Duration::from_secs(30));
+        let stale = run_stale_scan(Instant::now(), Duration::from_secs(30), &t);
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn run_stale_scan_after_remove_does_not_double_fire() {
+        let mut t = HeartbeatTracker::new(Duration::from_secs(30));
+        t.record("w1");
+        let recorded_at = Instant::now();
+
+        // First scan: stale.
+        let stale = run_stale_scan(recorded_at + Duration::from_secs(60), Duration::from_secs(30), &t);
+        assert_eq!(stale, vec!["w1".to_string()]);
+
+        // Remove (as the daemon would after issuing an e-stop).
+        t.remove("w1");
+
+        // Second scan: empty — no double-fire even if more time elapses.
+        let stale = run_stale_scan(recorded_at + Duration::from_secs(120), Duration::from_secs(30), &t);
+        assert!(stale.is_empty(), "removed worker must not appear in subsequent scans");
     }
 }
