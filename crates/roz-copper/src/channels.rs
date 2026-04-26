@@ -21,6 +21,8 @@ use roz_core::controller::deployment::DeploymentState;
 use roz_core::controller::evidence::ControllerEvidenceBundle;
 use roz_core::embodiment::{EmbodimentRuntime, binding::ControlInterfaceManifest};
 
+use crate::latch::LatchState;
+
 // ---------------------------------------------------------------------------
 // Agent → Copper
 // ---------------------------------------------------------------------------
@@ -57,7 +59,22 @@ pub enum ControllerCommand {
     /// Halt the controller (stop ticking).
     Halt,
     /// Resume the controller.
+    ///
+    /// FW-05 H3 NOTE: this variant retains its **pre-FW-05 semantics** —
+    /// it does NOT clear the latched-e-stop state machine. The new
+    /// `AckEstop` and `ResumeAfterZeroVerified` variants are the only
+    /// path to clear `LatchState` once asserted.
     Resume,
+    /// FW-05 H3: signed `safety.estop_ack.{worker_id}` message arrived.
+    /// Distinct from the existing `Resume` variant — Resume's old
+    /// semantics are preserved; AckEstop is the new latched-state-machine
+    /// entry point that advances `LatchState::Latched -> AwaitingAck`.
+    AckEstop,
+    /// FW-05 H3: signed `safety.resume.{worker_id}` message arrived AFTER
+    /// zero-motion verification. Distinct from the existing `Resume`
+    /// variant. Only succeeds when `LatchState::ZeroVerified` — IEC
+    /// 60204-1 forbids auto-rearm.
+    ResumeAfterZeroVerified,
 }
 
 impl ControllerCommand {
@@ -102,6 +119,8 @@ impl ControllerCommand {
             Self::UpdateParams(params) => Ok(CopperRuntimeCommand::UpdateParams(params)),
             Self::Halt => Ok(CopperRuntimeCommand::Halt),
             Self::Resume => Ok(CopperRuntimeCommand::Resume),
+            Self::AckEstop => Ok(CopperRuntimeCommand::AckEstop),
+            Self::ResumeAfterZeroVerified => Ok(CopperRuntimeCommand::ResumeAfterZeroVerified),
         }
     }
 }
@@ -117,7 +136,14 @@ pub enum CopperRuntimeCommand {
     PromoteActive,
     UpdateParams(serde_json::Value),
     Halt,
+    /// Pre-FW-05 semantics — does NOT clear the latched-e-stop state machine.
     Resume,
+    /// FW-05 H3 — signed estop_ack received; advances `LatchState::Latched`
+    /// to `AwaitingAck`. No-op from any other state.
+    AckEstop,
+    /// FW-05 H3 — signed resume received; advances `LatchState::ZeroVerified`
+    /// to `Run`. No-op from any other state (no auto-rearm — IEC 60204-1).
+    ResumeAfterZeroVerified,
 }
 
 /// Lightweight summary of finalized controller evidence exposed through shared state.
@@ -230,6 +256,20 @@ pub struct ControllerState {
     /// Most recent finalized staged candidate evidence bundle.
     #[serde(default)]
     pub last_candidate_evidence_bundle: Option<ControllerEvidenceBundle>,
+    /// FW-05 H3: System-level latched e-stop state. Default = `Run`;
+    /// transitions only via explicit `ControllerCommand::AckEstop` or
+    /// `ResumeAfterZeroVerified`. The existing `Resume` does NOT clear
+    /// this field. The controller loop reads this field each tick and,
+    /// when `latch_state.requires_zero_emission()`, emits per-channel-kind
+    /// zero CommandFrames instead of running the WASM tick.
+    #[serde(default)]
+    pub latch_state: LatchState,
+    /// FW-05 H3: Counter for consecutive zero-motion ticks observed
+    /// during `LatchState::AwaitingAck`. Used to advance to
+    /// `ZeroVerified` after `ZERO_VERIFY_TICK_COUNT` ticks. Reset to 0
+    /// on any non-zero motion or sensor frame absent.
+    #[serde(default)]
+    pub zero_motion_tick_count: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +354,8 @@ pub fn spawn_command_bridge(
                 ControllerCommand::UpdateParams(params) => CopperRuntimeCommand::UpdateParams(params),
                 ControllerCommand::Halt => CopperRuntimeCommand::Halt,
                 ControllerCommand::Resume => CopperRuntimeCommand::Resume,
+                ControllerCommand::AckEstop => CopperRuntimeCommand::AckEstop,
+                ControllerCommand::ResumeAfterZeroVerified => CopperRuntimeCommand::ResumeAfterZeroVerified,
             };
 
             match copper_tx.try_send(runtime_cmd) {
@@ -487,6 +529,8 @@ mod tests {
             last_live_evidence_bundle: None,
             last_candidate_evidence: None,
             last_candidate_evidence_bundle: None,
+            latch_state: LatchState::Run,
+            zero_motion_tick_count: 0,
         }));
 
         // Read state (simulating agent reading).
@@ -643,6 +687,82 @@ mod tests {
         assert!(result.is_err(), "try_send on full estop channel should return Err");
     }
 
+    // -----------------------------------------------------------------------
+    // Phase 26.10 Plan 07 (FW-05c) — latched e-stop wiring on ControllerState
+    // and ControllerCommand. System-level latch (not per-controller) per
+    // Codex H3.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn controller_state_default_has_run_latch() {
+        // FW-05 H3 G1: ControllerState::default() must keep working with
+        // the new latch_state field. Default = LatchState::Run so the
+        // existing default-derived path is unchanged.
+        let state = ControllerState::default();
+        assert_eq!(state.latch_state, LatchState::Run);
+        assert_eq!(state.zero_motion_tick_count, 0);
+    }
+
+    #[test]
+    fn controller_command_ack_estop_serde_roundtrip() {
+        // The new AckEstop variant must serialize/deserialize round-trip.
+        let cmd = ControllerCommand::AckEstop;
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: ControllerCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, ControllerCommand::AckEstop));
+    }
+
+    #[test]
+    fn controller_command_resume_after_zero_verified_serde_roundtrip() {
+        let cmd = ControllerCommand::ResumeAfterZeroVerified;
+        let json = serde_json::to_string(&cmd).unwrap();
+        let back: ControllerCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, ControllerCommand::ResumeAfterZeroVerified));
+    }
+
+    #[test]
+    fn controller_command_existing_resume_unchanged() {
+        // Defensive: the existing Resume variant retains its serialized
+        // form. Plan 07 must NOT drift its semantics. The variant is
+        // unit-like, so the JSON form is the variant name.
+        let cmd = ControllerCommand::Resume;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, "\"Resume\"", "existing Resume serialization must not drift");
+        let back: ControllerCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, ControllerCommand::Resume));
+    }
+
+    #[test]
+    fn controller_command_into_runtime_maps_new_variants() {
+        // Both new variants must thread through the agent->Copper conversion.
+        let runtime = ControllerCommand::AckEstop.into_runtime().unwrap();
+        assert!(matches!(runtime, CopperRuntimeCommand::AckEstop));
+
+        let runtime = ControllerCommand::ResumeAfterZeroVerified.into_runtime().unwrap();
+        assert!(matches!(runtime, CopperRuntimeCommand::ResumeAfterZeroVerified));
+    }
+
+    #[tokio::test]
+    async fn bridge_forwards_new_latch_commands() {
+        // The spawn_command_bridge must map both new variants to the
+        // runtime side. Smoke-test parity with the existing Resume mapping.
+        let (agent_tx, agent_rx, state, _estop_tx, _estop_rx) = create_sync_pair();
+        let (copper_tx, copper_rx) = std::sync::mpsc::sync_channel(64);
+        let bridge = spawn_command_bridge(agent_rx, state, copper_tx);
+
+        agent_tx.send(ControllerCommand::AckEstop).await.unwrap();
+        agent_tx.send(ControllerCommand::ResumeAfterZeroVerified).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let cmd1 = copper_rx.try_recv().unwrap();
+        assert!(matches!(cmd1, CopperRuntimeCommand::AckEstop));
+        let cmd2 = copper_rx.try_recv().unwrap();
+        assert!(matches!(cmd2, CopperRuntimeCommand::ResumeAfterZeroVerified));
+
+        bridge.abort();
+    }
+
     #[test]
     fn estop_reason_in_shared_state() {
         let (_, _, state, _, _) = create_sync_pair();
@@ -668,6 +788,8 @@ mod tests {
             last_live_evidence_bundle: None,
             last_candidate_evidence: None,
             last_candidate_evidence_bundle: None,
+            latch_state: LatchState::Run,
+            zero_motion_tick_count: 0,
         }));
         let current = state.load();
         assert_eq!(current.estop_reason.as_deref(), Some(reason.as_str()));

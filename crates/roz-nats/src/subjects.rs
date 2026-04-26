@@ -130,6 +130,41 @@ impl Subjects {
         Ok(format!("safety.estop.{worker_id}"))
     }
 
+    /// Phase 26.10 Plan 07 (FW-05c) — signed estop-acknowledgement subject:
+    /// `safety.estop_ack.{worker_id}`.
+    ///
+    /// Operator/server -> worker. Carries the signed acknowledgement that
+    /// drives `LatchState::Latched -> AwaitingAck`. Phase 23 signed-dispatch
+    /// gate MUST verify every inbound message on this subject; unsigned or
+    /// invalid messages are rejected and audited via
+    /// `safety.signature_failure.{worker_id}`.
+    ///
+    /// Distinct from `safety.estop.{worker_id}` (which asserts the e-stop
+    /// itself) — this subject acknowledges and advances the latch state
+    /// machine.
+    pub fn estop_ack(worker_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        Ok(format!("safety.estop_ack.{worker_id}"))
+    }
+
+    /// Phase 26.10 Plan 07 (FW-05c) — signed manual-resume subject:
+    /// `safety.resume.{worker_id}`.
+    ///
+    /// Operator/server -> worker. Carries the signed manual-resume command
+    /// that drives `LatchState::ZeroVerified -> Run`. IEC 60204-1 manual
+    /// reset semantics: only valid from `ZeroVerified` (i.e., after the
+    /// AckEstop + N consecutive zero-motion ticks have been observed).
+    /// Phase 23 signed-dispatch gate MUST verify every inbound message;
+    /// unsigned or invalid messages are rejected and audited via
+    /// `safety.signature_failure.{worker_id}`.
+    ///
+    /// Distinct from the existing `ControllerCommand::Resume` (which has
+    /// pre-FW-05 semantics and does NOT clear the latch).
+    pub fn safety_resume(worker_id: &str) -> Result<String, RozError> {
+        validate_token("worker_id", worker_id)?;
+        Ok(format!("safety.resume.{worker_id}"))
+    }
+
     /// WASM signature verification failure subject:
     /// `safety.trust_failure.{worker_id}`.
     ///
@@ -385,6 +420,41 @@ mod tests {
         );
         assert!(Subjects::estop("").is_err(), "empty worker_id is invalid");
         assert!(Subjects::estop("worker>greater").is_err(), "> is NATS full-wildcard");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 26.10 Plan 07 (FW-05c) — latched-e-stop ack/resume subjects
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn subjects_estop_ack_and_resume() {
+        // Plan 07 acceptance: both subjects format with the worker_id token.
+        assert_eq!(
+            Subjects::estop_ack("robot-arm-1").unwrap(),
+            "safety.estop_ack.robot-arm-1"
+        );
+        assert_eq!(
+            Subjects::safety_resume("robot-arm-1").unwrap(),
+            "safety.resume.robot-arm-1"
+        );
+    }
+
+    #[test]
+    fn estop_ack_validates_worker_id() {
+        assert!(Subjects::estop_ack("valid-worker").is_ok());
+        assert!(Subjects::estop_ack("worker.with.dots").is_err());
+        assert!(Subjects::estop_ack("worker*wildcard").is_err());
+        assert!(Subjects::estop_ack("").is_err());
+        assert!(Subjects::estop_ack("worker>greater").is_err());
+    }
+
+    #[test]
+    fn safety_resume_validates_worker_id() {
+        assert!(Subjects::safety_resume("valid-worker").is_ok());
+        assert!(Subjects::safety_resume("worker.with.dots").is_err());
+        assert!(Subjects::safety_resume("worker*wildcard").is_err());
+        assert!(Subjects::safety_resume("").is_err());
+        assert!(Subjects::safety_resume("worker>greater").is_err());
     }
 
     #[test]

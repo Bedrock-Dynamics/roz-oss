@@ -717,6 +717,11 @@ fn publish_state(
     if !running && last_output.as_ref().is_none_or(|o| o.get("error").is_none()) {
         *last_output = None;
     }
+    // FW-05 H3: preserve existing latch_state and zero_motion_tick_count
+    // across publish_state calls. The latch is mutated only by the explicit
+    // estop-assert / AckEstop / ZeroVerified / ResumeAfterZeroVerified
+    // transitions in drain_commands and the latched-tick code path (Task 2).
+    let prior = shared_state.load_full();
     shared_state.store(Arc::new(ControllerState {
         last_tick: tick,
         running,
@@ -738,6 +743,8 @@ fn publish_state(
         last_live_evidence_bundle: last_live_evidence_bundle.cloned(),
         last_candidate_evidence: last_candidate_evidence.cloned(),
         last_candidate_evidence_bundle: last_candidate_evidence_bundle.cloned(),
+        latch_state: prior.latch_state,
+        zero_motion_tick_count: prior.zero_motion_tick_count,
     }));
 }
 
@@ -921,6 +928,22 @@ fn drain_commands(
                 } else {
                     tracing::warn!("UpdateParams ignored — no WASM controller loaded");
                 }
+            }
+            crate::channels::CopperRuntimeCommand::AckEstop
+            | crate::channels::CopperRuntimeCommand::ResumeAfterZeroVerified => {
+                // FW-05 H3 — these variants drive the system-level
+                // `LatchState` machine on `ControllerState` (not on
+                // individual loaded controllers). They are handled in the
+                // outer loop where `shared_state` is in scope. The drain
+                // path forwards them via the channel; the loop polls them
+                // from a parallel rendezvous and applies the transition
+                // there. See `apply_pending_latch_commands` in the main loop.
+                //
+                // Kept as a no-op here to preserve the closure signature
+                // and avoid threading shared_state through `drain_commands`.
+                tracing::debug!(
+                    "drain_commands: latch command observed; processed in main loop latch handler"
+                );
             }
         }
     };

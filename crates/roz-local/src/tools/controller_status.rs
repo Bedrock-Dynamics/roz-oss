@@ -125,6 +125,7 @@ mod tests {
             last_live_evidence_bundle: None,
             last_candidate_evidence: None,
             last_candidate_evidence_bundle: None,
+            ..ControllerState::default()
         }));
         let mut extensions = Extensions::default();
         extensions.insert(state);
@@ -184,6 +185,7 @@ mod tests {
             last_live_evidence_bundle: None,
             last_candidate_evidence: Some(evidence),
             last_candidate_evidence_bundle: None,
+            ..ControllerState::default()
         }));
         let mut extensions = Extensions::default();
         extensions.insert(state);

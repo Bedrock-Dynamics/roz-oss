@@ -1,9 +1,15 @@
 use chrono::Utc;
 use parking_lot::Mutex;
+use roz_copper::latch::LatchState;
 use rusqlite::{Connection, params};
 use std::time::Duration;
 
 use roz_core::wal::WalEntry;
+
+/// FW-05 H3 WAL key for the persisted latched-e-stop state.
+/// Read by `WalStore::load_latch_state` on worker boot — corruption
+/// returns `Err` rather than silently resetting to `Run` (fail-closed).
+pub const LATCH_STATE_KEY: &str = "copper.latch_state";
 
 /// Running-total `SQLite` key (`worker_state` K/V) for telemetry buffer bytes.
 /// Stored as big-endian 8-byte `i64` payload. Read/written atomically inside the
@@ -449,6 +455,43 @@ impl WalStore {
                 row.get::<_, String>(4)?,
             ))),
             None => Ok(None),
+        }
+    }
+
+    /// FW-05 H3: persist current `LatchState` so worker restart returns to
+    /// the same latched state (fail-safe). Stored as a JSON string under
+    /// `worker_state[copper.latch_state]`.
+    ///
+    /// # Errors
+    /// Propagates `rusqlite::Error` on SQL access. JSON serialization
+    /// of `LatchState` is infallible in practice (the type only contains
+    /// unit variants), but a serialization error surfaces as a
+    /// `ToSqlConversionFailure`.
+    pub fn save_latch_state(&self, state: LatchState) -> Result<(), rusqlite::Error> {
+        let json = serde_json::to_vec(&state).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        self.set_state(LATCH_STATE_KEY, &json)
+    }
+
+    /// FW-05 H3: load persisted `LatchState`.
+    ///
+    /// CRITICAL fail-closed behavior:
+    /// - Key absent (clean boot or first run): returns `Ok(LatchState::Run)`.
+    /// - Key present and parseable: returns `Ok(state)`.
+    /// - Key present but corrupted/unparseable: returns `Err`. The worker
+    ///   boot path MUST surface this loudly rather than silently
+    ///   defaulting to `Run`. Corruption could otherwise mask a previous
+    ///   latched state and rearm the controller without operator
+    ///   acknowledgment (IEC 60204-1 violation).
+    ///
+    /// # Errors
+    /// Propagates `rusqlite::Error` on SQL access. Corrupted JSON
+    /// surfaces as `FromSqlConversionFailure`.
+    pub fn load_latch_state(&self) -> Result<LatchState, rusqlite::Error> {
+        match self.get_state(LATCH_STATE_KEY)? {
+            Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(bytes.len(), rusqlite::types::Type::Blob, Box::new(e))
+            }),
+            None => Ok(LatchState::Run),
         }
     }
 
@@ -929,6 +972,63 @@ mod tests {
         store.append_checkpoint("task-1", 1, b"x").unwrap();
         let age = store.checkpoint_age_secs("task-1").unwrap().unwrap();
         assert!(age < 3, "fresh checkpoint age should be < 3 s, got {age}");
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase 26.10 Plan 07 (FW-05c) — LatchState WAL persistence.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn load_latch_state_defaults_to_run_when_absent() {
+        let store = WalStore::open(":memory:").unwrap();
+        // Clean store — no persisted latch state. Must return Run.
+        assert_eq!(store.load_latch_state().unwrap(), LatchState::Run);
+    }
+
+    #[test]
+    fn save_and_load_latch_state_roundtrip() {
+        let store = WalStore::open(":memory:").unwrap();
+        for state in [
+            LatchState::Run,
+            LatchState::Latched,
+            LatchState::AwaitingAck,
+            LatchState::ZeroVerified,
+        ] {
+            store.save_latch_state(state).unwrap();
+            assert_eq!(store.load_latch_state().unwrap(), state, "roundtrip failed for {state:?}");
+        }
+    }
+
+    #[test]
+    fn wal_persists_and_loads_latch_state() {
+        // FW-05 H3 boot-authority test: write Latched, drop the store,
+        // re-open from the same on-disk file, read back Latched. This
+        // mirrors a worker crash + restart while latched.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("latch.db");
+        let path_str = path.to_str().unwrap();
+        {
+            let store = WalStore::open(path_str).unwrap();
+            store.save_latch_state(LatchState::Latched).unwrap();
+        }
+        let store = WalStore::open(path_str).unwrap();
+        assert_eq!(store.load_latch_state().unwrap(), LatchState::Latched);
+    }
+
+    #[test]
+    fn load_latch_state_corruption_is_err_not_silent_run() {
+        // FW-05 H3 fail-closed: corrupt the persisted JSON and verify
+        // load_latch_state returns Err. Critical: never silently fall
+        // back to Run on corruption (IEC 60204-1 — would auto-rearm).
+        let store = WalStore::open(":memory:").unwrap();
+        // Write garbage bytes that are not valid LatchState JSON.
+        store.set_state(LATCH_STATE_KEY, b"\xffnot valid json").unwrap();
+        let err = store.load_latch_state().unwrap_err();
+        // Expect a FromSqlConversionFailure (per save_latch_state's contract).
+        assert!(
+            matches!(err, rusqlite::Error::FromSqlConversionFailure(_, _, _)),
+            "expected FromSqlConversionFailure on corruption, got {err:?}"
+        );
     }
 
     #[test]

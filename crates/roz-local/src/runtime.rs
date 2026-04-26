@@ -1586,6 +1586,7 @@ name = "llama3.1"
             last_live_evidence_bundle: Some(bundle.clone()),
             last_candidate_evidence: None,
             last_candidate_evidence_bundle: None,
+            ..ControllerState::default()
         }));
         let cancel = CancellationToken::new();
         let task = spawn_evidence_archive_persister(state, archive.clone(), cancel.clone());

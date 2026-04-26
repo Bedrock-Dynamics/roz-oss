@@ -122,6 +122,7 @@ mod tests {
             last_live_evidence_bundle: None,
             last_candidate_evidence: None,
             last_candidate_evidence_bundle: None,
+            ..ControllerState::default()
         }))
     }
 

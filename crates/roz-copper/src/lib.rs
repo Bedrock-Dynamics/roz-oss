@@ -41,6 +41,9 @@ pub mod fake_openclaw;
 pub mod handle;
 pub mod io;
 pub mod io_factory;
+// Phase 26.10 Plan 07 (FW-05c) — latched e-stop state machine.
+// IEC 60204-1 Stop Category 0 + EN ISO 13849-1 manual reset semantics.
+pub mod latch;
 pub mod io_grpc;
 pub mod io_log;
 pub mod io_ws;
