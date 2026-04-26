@@ -4,7 +4,7 @@
 //! `crates/roz-local/src/tools/controller_status.rs`. Drift is a bug — both
 //! must read `Arc<ArcSwap<ControllerState>>` from `ToolContext::extensions`
 //! and advertise the canonical schema name `"controller_status"`
-//! (NOT `"get_controller_status"`).
+//! (NOT the legacy `get_` prefixed name — Codex review naming-drift fix).
 
 use std::sync::Arc;
 

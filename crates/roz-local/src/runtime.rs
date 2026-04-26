@@ -1027,13 +1027,32 @@ impl LocalRuntime {
         {
             let replay_tool = crate::tools::replay_controller::ReplayControllerTool::new(&control_manifest);
             dispatcher.register_with_category(Box::new(replay_tool), ToolCategory::Pure);
+
+            // Phase 26.10 Plan 04 (FW-03): register live controller lifecycle
+            // tools alongside replay. CONTEXT-locked: "Local runtime MUST
+            // register live promotion alongside replay (replay stays as a
+            // separate, explicitly-named tool)." Live tools are Physical;
+            // replay above stays Pure.
+            let promote_tool = crate::tools::promote_controller::PromoteControllerTool::new(&control_manifest);
+            dispatcher.register_with_category(Box::new(promote_tool), ToolCategory::Physical);
+            dispatcher.register_with_category(
+                Box::new(crate::tools::stop_controller::StopControllerTool),
+                ToolCategory::Physical,
+            );
+            dispatcher.register_with_category(
+                Box::new(crate::tools::controller_status::ControllerStatusTool),
+                ToolCategory::Physical,
+            );
+
             extensions.insert(control_manifest);
 
             if let Some(ref handle) = self.copper_handle {
                 extensions.insert(handle.cmd_tx());
+                extensions.insert(std::sync::Arc::clone(handle.state()));
             }
         } else if let Some(ref handle) = self.copper_handle {
             extensions.insert(handle.cmd_tx());
+            extensions.insert(std::sync::Arc::clone(handle.state()));
         }
 
         // System prompt blocks

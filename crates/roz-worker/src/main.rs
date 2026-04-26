@@ -809,7 +809,36 @@ async fn execute_task(
             .clone()
             .expect("ooda tasks must be validated to carry control_interface_manifest");
         extensions.insert(handle.cmd_tx());
-        extensions.insert(control_manifest);
+        extensions.insert(control_manifest.clone());
+
+        // Phase 26.10 Plan 04 (FW-03): register controller lifecycle tools
+        // on the worker dispatcher when an OodaReAct copper handle is active.
+        // Category Physical so the safety stack runs the right approval /
+        // sequencing path. Canonical names: promote_controller,
+        // stop_controller, controller_status.
+        //
+        // ControllerStatusTool needs Arc<ArcSwap<ControllerState>> from
+        // extensions; PromoteControllerTool needs the EmbodimentRuntime to
+        // reject synthetic runtimes and to bind the LoadArtifact command.
+        extensions.insert(std::sync::Arc::clone(handle.state()));
+        if let Some(runtime) = invocation.embodiment_runtime.as_ref() {
+            extensions.insert(runtime.clone());
+        }
+
+        dispatcher.register_with_category(
+            Box::new(roz_worker::tools::promote_controller::PromoteControllerTool::new(
+                &control_manifest,
+            )),
+            roz_core::tools::ToolCategory::Physical,
+        );
+        dispatcher.register_with_category(
+            Box::new(roz_worker::tools::stop_controller::StopControllerTool),
+            roz_core::tools::ToolCategory::Physical,
+        );
+        dispatcher.register_with_category(
+            Box::new(roz_worker::tools::controller_status::ControllerStatusTool),
+            roz_core::tools::ToolCategory::Physical,
+        );
     }
 
     // Register camera perception tools when cameras are available.
