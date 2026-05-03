@@ -3,8 +3,8 @@ gsd_state_version: 1.0
 milestone: v3.0
 milestone_name: Production Robotics
 status: executing
-last_updated: "2026-05-01T00:00:00Z"
-last_activity: 2026-05-01 -- Added docs/deployments/v3-acceptance.md to make remaining v3.0 evidence gates executable: bridge simulator proof, direct MAVLink .tlog capture, QGC diagnostic, and RPi/Pixhawk hardware record. v3.0 still blocked by actual direct-endpoint fixtures and hardware validation evidence.
+last_updated: "2026-05-03T00:00:00Z"
+last_activity: 2026-05-03 -- Opened PR #34 for v3.0 robotics acceptance hardening and simulator-path cleanup. Branch verifies single-threaded through full workspace all-targets/all-features check, targeted Copper runtime smoke, worker Zenoh chaos compile/skip check, and MAVLink replay harness checks. v3.0 remains blocked by external direct-endpoint .tlog/QGC/hardware evidence.
 progress:
   total_phases: 19
   completed_phases: 15
@@ -18,8 +18,8 @@ progress:
 
 Phase: 27 (nightly-px4-sitl-integration-ci-with-induced-nats-outage-liv) — EXECUTING
 Plan: reconciliation after partial implementation
-Status: Executing Phase 27 closeout / milestone gap reconciliation
-Last activity: 2026-05-01 -- Added `docs/deployments/v3-acceptance.md` to make the remaining evidence gates executable: bridge simulator proof, direct MAVLink `.tlog` capture, QGC diagnostic, and RPi/Pixhawk hardware record. v3.0 still blocked by actual direct-endpoint fixtures and hardware validation evidence.
+Status: Phase 27 closeout PR opened; milestone evidence gaps remain
+Last activity: 2026-05-03 -- Opened PR #34 (`https://github.com/Bedrock-Dynamics/roz-oss/pull/34`) for v3.0 robotics acceptance hardening and simulator-path cleanup. Branch verifies single-threaded through full workspace all-targets/all-features check, targeted Copper runtime smoke, worker Zenoh chaos compile/skip check, and MAVLink replay harness checks. v3.0 remains blocked by external direct-endpoint `.tlog`/QGC/hardware evidence.
 
 ## Project Reference
 
@@ -114,6 +114,8 @@ See: `.planning/PROJECT.md` (updated 2026-04-27)
 **Phase 27-07 reconciliation:** 2026-04-30 — native transport `.tlog` recorder added behind `ROZ_MAVLINK_TLOG_PATH`, fixture placeholders added, and direct E2E can bootstrap/verify ARM/DISARM/TAKEOFF/LAND/RTL/SET_MODE/GOTO command slices behind `ROZ_PX4_CAPTURE_TLOG_FIXTURES=1` when `PX4_SITL_MAVLINK_URL`/`PX4_SITL_MAVLINK_PORT` points at a real direct endpoint. Bootstrap now accumulates all missing/different captures before failing once at the end. Readiness windows are wired for observed boot/ready states. A local attempt against the default Substrate Docker image timed out with zero native bytes, so committed `.tlog` files and live direct-endpoint evidence are still absent.
 
 **v3.0 acceptance checklist:** 2026-05-01 — Added `docs/deployments/v3-acceptance.md` and linked it from `pixhawk.md` / `hitl.md`. It records the exact commands and acceptance criteria for the bridge-backed simulator gate, direct MAVLink `.tlog` fixture capture, QGC coexistence diagnostic, and real RPi 5 + Pixhawk 6C hardware evidence. The runbook now matches the replay harness rules: command fixture aliases are explicit, readiness `.tlog` files are all-or-none, and partial readiness fixture sets are not acceptable. This improves operator handoff but does not itself close the remaining evidence gaps.
+
+**PR opened:** 2026-05-03 — PR #34 (`https://github.com/Bedrock-Dynamics/roz-oss/pull/34`) opened from `feature/v3.0-production-robotics` with commit `abf288d` plus this state update. PR body records the automated verification and explicitly calls out remaining external evidence gates: direct-MAVLink `.tlog` fixtures, QGC direct-endpoint diagnostic, and RPi/Pixhawk hardware bench validation.
 
 **Completed Phase (prior):** 26.10 (reference manipulator production wiring — authoritative embodiment runtime, worker Copper actuator/sensor IO, safety hardening, and hardware bench validation) — 10/10 plans — 2026-04-26
 
