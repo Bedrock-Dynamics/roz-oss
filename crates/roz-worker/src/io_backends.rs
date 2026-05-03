@@ -6,14 +6,15 @@
 //! roz-worker depends on both crates without cycle.
 //!
 //! Phase 26.10 Plan 08 (FW-07) replaces Plan 03's deferred manipulator-stub
-//! factory with `FakeOpenclawFactory`, which under the `test-fixtures` feature wires
-//! `roz_copper::fake_openclaw::fake_openclaw_pair`. Without the feature,
-//! `build()` returns `Err` so production binaries fail closed (T-26.10-08-04).
+//! factory with `FakeManipulatorFactory`, which under the `test-fixtures`
+//! feature wires `roz_copper::fake_manipulator::fake_manipulator_pair`.
+//! Without the feature, `build()` returns `Err` so production binaries fail
+//! closed (T-26.10-08-04).
 //! MAVLink wiring lives in Phase 27 SC5/SC6/SC7.
 
 use std::sync::Arc;
 
-use roz_copper::io::{ActuatorSink, SensorSource};
+use roz_copper::io::{ActuatorSink, SensorFrame, SensorSource};
 use roz_copper::io_factory::IoFactory;
 use roz_core::embodiment::EmbodimentRuntime;
 use roz_core::embodiment::binding::ControlInterfaceManifest;
@@ -21,40 +22,49 @@ use roz_core::embodiment::binding::ControlInterfaceManifest;
 /// Static dispatch table. Adding a new backend is one match arm + one impl block.
 #[must_use]
 pub fn factory_for(family: Option<&str>) -> Option<Box<dyn IoFactory>> {
+    factory_for_with_mavlink(family, None)
+}
+
+#[must_use]
+pub fn factory_for_with_mavlink(
+    family: Option<&str>,
+    mavlink_backend: Option<Arc<roz_mavlink::MavlinkBackend>>,
+) -> Option<Box<dyn IoFactory>> {
     match family {
-        Some("openclaw" | "manipulator") => Some(Box::new(FakeOpenclawFactory)),
-        Some("drone-mavlink") => Some(Box::new(MavlinkFactory)),
+        Some("manipulator") => Some(Box::new(FakeManipulatorFactory)),
+        Some("drone-mavlink") => Some(Box::new(MavlinkFactory {
+            backend: mavlink_backend,
+        })),
         _ => None,
     }
 }
 
 /// Manipulator-family backend. Under the `test-fixtures` feature this wires
-/// the deterministic fake-OpenClaw backend from `roz_copper::fake_openclaw`;
+/// the deterministic fake manipulator backend from `roz_copper::fake_manipulator`;
 /// without the feature, `build()` returns `Err` so production binaries cannot
 /// silently spawn a controller against a fake (T-26.10-08-04 mitigation).
 ///
-/// Production manipulator backends (Dynamixel, OpenCR, real OpenClaw firmware)
-/// are scope of a future phase; they will replace this `cfg(not(...))` branch
-/// with their own real implementation.
-pub(crate) struct FakeOpenclawFactory;
+/// Production manipulator backends are scope of a future phase; they will
+/// replace this `cfg(not(...))` branch with their own real implementation.
+pub(crate) struct FakeManipulatorFactory;
 
 #[cfg(feature = "test-fixtures")]
-impl IoFactory for FakeOpenclawFactory {
+impl IoFactory for FakeManipulatorFactory {
     fn build(
         &self,
         runtime: &EmbodimentRuntime,
         _control_manifest: &ControlInterfaceManifest,
     ) -> anyhow::Result<(Arc<dyn ActuatorSink>, Box<dyn SensorSource>)> {
-        let (actuator, sensor) = roz_copper::fake_openclaw::fake_openclaw_pair(runtime);
+        let (actuator, sensor) = roz_copper::fake_manipulator::fake_manipulator_pair(runtime);
         Ok((Arc::new(actuator), Box::new(sensor)))
     }
     fn name(&self) -> &'static str {
-        "fake-openclaw"
+        "fake-manipulator"
     }
 }
 
 #[cfg(not(feature = "test-fixtures"))]
-impl IoFactory for FakeOpenclawFactory {
+impl IoFactory for FakeManipulatorFactory {
     fn build(
         &self,
         _runtime: &EmbodimentRuntime,
@@ -63,32 +73,49 @@ impl IoFactory for FakeOpenclawFactory {
         anyhow::bail!(
             "manipulator IoFactory: test-fixtures feature not enabled — production \
              manipulator backends (Dynamixel, OpenCR) are scope of a future phase. \
-             Enable `roz-worker/test-fixtures` for the deterministic fake-OpenClaw \
+             Enable `roz-worker/test-fixtures` for the deterministic fake manipulator \
              backend (CI / live-matrix only)."
         )
     }
     fn name(&self) -> &'static str {
-        "fake-openclaw-stub"
+        "fake-manipulator-stub"
     }
 }
 
-/// Drone path deferred for 26.10 — Phase 27 SC5/SC6/SC7 owns the live-FCU
-/// MAVLink IoFactory (PX4 SITL is the validation target there). The 26.10
-/// critical chain is manipulator framework-fidelity; the drone branch is
-/// reachable through `factory_for` so the dispatch table is exhaustive,
-/// but `build` fails closed so no production binary can spawn a controller
-/// on top of an un-wired MAVLink backend.
-pub(crate) struct MavlinkFactory;
+struct SharedMavlinkSensorSource;
+
+impl SensorSource for SharedMavlinkSensorSource {
+    fn try_recv(&mut self) -> Option<SensorFrame> {
+        let sim_time_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0_i64, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
+        Some(SensorFrame {
+            sim_time_ns,
+            ..Default::default()
+        })
+    }
+}
+
+/// Drone-family backend backed by the worker-boot MAVLink connection.
+pub(crate) struct MavlinkFactory {
+    backend: Option<Arc<roz_mavlink::MavlinkBackend>>,
+}
+
 impl IoFactory for MavlinkFactory {
     fn build(
         &self,
         _runtime: &EmbodimentRuntime,
         _control_manifest: &ControlInterfaceManifest,
     ) -> anyhow::Result<(Arc<dyn ActuatorSink>, Box<dyn SensorSource>)> {
-        anyhow::bail!("MAVLink IoFactory deferred — see Phase 27 SC5/SC6/SC7 live-FCU work")
+        let backend = self
+            .backend
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("MAVLink IoFactory requires a boot-scoped MavlinkBackend"))?;
+        let actuator: Arc<dyn ActuatorSink> = backend;
+        Ok((actuator, Box::new(SharedMavlinkSensorSource)))
     }
     fn name(&self) -> &'static str {
-        "drone-mavlink-deferred"
+        "drone-mavlink"
     }
 }
 
@@ -154,27 +181,24 @@ mod tests {
     #[test]
     fn factory_for_returns_some_for_manipulator() {
         let f = factory_for(Some("manipulator")).expect("manipulator factory exists");
-        let f2 = factory_for(Some("openclaw")).expect("openclaw alias factory exists");
         #[cfg(feature = "test-fixtures")]
         {
-            assert_eq!(f.name(), "fake-openclaw");
-            assert_eq!(f2.name(), "fake-openclaw");
+            assert_eq!(f.name(), "fake-manipulator");
         }
         #[cfg(not(feature = "test-fixtures"))]
         {
-            assert_eq!(f.name(), "fake-openclaw-stub");
-            assert_eq!(f2.name(), "fake-openclaw-stub");
+            assert_eq!(f.name(), "fake-manipulator-stub");
         }
     }
 
     #[test]
     fn factory_for_returns_some_for_drone_mavlink() {
         let f = factory_for(Some("drone-mavlink")).expect("mavlink factory exists");
-        assert_eq!(f.name(), "drone-mavlink-deferred");
+        assert_eq!(f.name(), "drone-mavlink");
     }
 
     #[test]
-    fn mavlink_factory_build_returns_err_deferred() {
+    fn mavlink_factory_build_requires_backend() {
         let factory = factory_for(Some("drone-mavlink")).unwrap();
         let runtime = minimal_runtime();
         let manifest = minimal_manifest();
@@ -185,8 +209,8 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("MAVLink IoFactory deferred"),
-            "expected deferred-message, got: {msg}"
+            msg.contains("boot-scoped MavlinkBackend"),
+            "expected missing-backend message, got: {msg}"
         );
     }
 
@@ -212,11 +236,11 @@ mod tests {
     }
 
     /// With the `test-fixtures` feature, the manipulator factory MUST return a
-    /// real paired actuator+sensor backed by `fake_openclaw_pair`. Sending a
+    /// real paired actuator+sensor backed by `fake_manipulator_pair`. Sending a
     /// command through the actuator must be visible on the next sensor read.
     #[cfg(feature = "test-fixtures")]
     #[test]
-    fn fake_openclaw_factory_build_returns_paired_io() {
+    fn fake_manipulator_factory_build_returns_paired_io() {
         let runtime = minimal_runtime();
         let manifest = minimal_manifest();
         let factory = factory_for(Some("manipulator")).unwrap();

@@ -349,6 +349,55 @@ fn tool_request_from_response(response: &session_response::Response) -> Option<(
     }
 }
 
+fn assert_tool_lifecycle(
+    responses: &[session_response::Response],
+    call_id: &str,
+    tool_name: &str,
+    category: &str,
+    result_fragment: &str,
+) {
+    assert!(
+        responses.iter().any(|response| matches!(
+            response,
+            session_response::Response::SessionEvent(event)
+                if matches!(
+                    event.typed_event.as_ref(),
+                    Some(roz_v1::session_event_envelope::TypedEvent::ToolCallRequested(payload))
+                        if payload.call_id == call_id && payload.tool_name == tool_name
+                )
+        )),
+        "expected ToolCallRequested for {tool_name}/{call_id}: {responses:?}"
+    );
+    assert!(
+        responses.iter().any(|response| matches!(
+            response,
+            session_response::Response::SessionEvent(event)
+                if matches!(
+                    event.typed_event.as_ref(),
+                    Some(roz_v1::session_event_envelope::TypedEvent::ToolCallStarted(payload))
+                        if payload.call_id == call_id
+                            && payload.tool_name == tool_name
+                            && payload.category == category
+                )
+        )),
+        "expected ToolCallStarted({category}) for {tool_name}/{call_id}: {responses:?}"
+    );
+    assert!(
+        responses.iter().any(|response| matches!(
+            response,
+            session_response::Response::SessionEvent(event)
+                if matches!(
+                    event.typed_event.as_ref(),
+                    Some(roz_v1::session_event_envelope::TypedEvent::ToolCallFinished(payload))
+                        if payload.call_id == call_id
+                            && payload.tool_name == tool_name
+                            && payload.result_summary.contains(result_fragment)
+                )
+        )),
+        "expected ToolCallFinished containing {result_fragment:?} for {tool_name}/{call_id}: {responses:?}"
+    );
+}
+
 fn is_approval_requested_response(response: &session_response::Response) -> bool {
     matches!(response, session_response::Response::SessionEvent(event) if event.event_type == "approval_requested")
 }
@@ -1333,9 +1382,12 @@ async fn mcp_tools_appear_on_session_start() {
         turn_msgs.iter().any(is_text_delta_response),
         "expected text delta after successful MCP tool execution: {turn_msgs:?}"
     );
-    assert!(
-        turn_msgs.iter().all(|response| !is_tool_request_response(response)),
-        "server-owned MCP tool execution must not go through the remote tool relay: {turn_msgs:?}"
+    assert_tool_lifecycle(
+        &turn_msgs,
+        "toolu_mcp_1",
+        "mcp__warehouse__list_inventory",
+        "pure",
+        "inventory ok",
     );
     assert_eq!(*call_count.lock().expect("mcp call count"), 1);
 
@@ -1497,7 +1549,7 @@ async fn mcp_server_degradation_emits_event_and_prunes_tools() {
         .expect("send StartSession");
     collect_until(&mut resp_stream, is_session_started_response, Duration::from_secs(10)).await;
 
-    for turn_content in ["turn one", "turn two"] {
+    for (idx, turn_content) in ["turn one", "turn two"].into_iter().enumerate() {
         req_tx
             .send(SessionRequest {
                 request: Some(session_request::Request::UserMessage(roz_v1::UserMessage {
@@ -1518,9 +1570,12 @@ async fn mcp_server_degradation_emits_event_and_prunes_tools() {
             Duration::from_secs(15),
         )
         .await;
-        assert!(
-            turn_msgs.iter().all(|response| !is_tool_request_response(response)),
-            "MCP failures should still stay on the server-owned execution path: {turn_msgs:?}"
+        assert_tool_lifecycle(
+            &turn_msgs,
+            &format!("toolu_mcp_fail_{}", idx + 1),
+            "mcp__warehouse__move_arm",
+            "physical",
+            "upstream timeout",
         );
         assert!(
             turn_msgs
@@ -2566,6 +2621,7 @@ async fn session_with_host_receives_telemetry() {
         joint_states: vec![],
         end_effector_pose: None,
         sensor_readings: Default::default(),
+        readiness: None,
     };
     let telem_payload = <roz_v1::TelemetryUpdate as prost::Message>::encode_to_vec(&telem_update);
     nats.publish(telem_subject, telem_payload.into())

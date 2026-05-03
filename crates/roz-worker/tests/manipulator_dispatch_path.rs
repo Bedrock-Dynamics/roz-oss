@@ -5,15 +5,17 @@
 //!      worker boot path registers (`promote_controller`, `controller_status`,
 //!      `stop_controller`) — same shape as
 //!      `crates/roz-worker/tests/promote_controller_registered.rs`.
-//!   2. Spawn `CopperHandle` against the fake-OpenClaw IO backend
-//!      (`fake_openclaw_pair`) — Plan 08 (FW-07 part 1) wired this in.
+//!   2. Spawn `CopperHandle` against the fake manipulator IO backend
+//!      (`fake_manipulator_pair`) — Plan 08 (FW-07 part 1) wired this in.
 //!   3. Wire `ToolContext.extensions` with the Copper `cmd_tx`, the shared
 //!      `ControllerState` arc-swap, the `ControlInterfaceManifest`, and the
 //!      compiled `EmbodimentRuntime` from a manipulator-class fixture.
-//!   4. Drive `promote_controller` execute() with a minimal `live-controller`
-//!      WAT artifact (canonical pattern from `tests/copper_integration.rs`).
-//!   5. Confirm `controller_status` reports `running == true` after promotion.
-//!   6. Drive `stop_controller`; confirm subsequent `controller_status` shows
+//!   4. Drive `promote_controller` execute() with a non-zero `live-controller`
+//!      WAT artifact that emits joint velocity through the WASM tick contract.
+//!   5. Simulate external runtime rollout authority with `PromoteActive`.
+//!   6. Confirm `controller_status` reports `running == true` after promotion
+//!      and the fake manipulator joint position advances from WASM output.
+//!   7. Drive `stop_controller`; confirm subsequent `controller_status` shows
 //!      the controller halted.
 //!
 //! **Codex H4 fix — production-parity gate, NOT `#[ignore]`-gated.** The plan's
@@ -29,11 +31,7 @@
 //! invokes this test by name in the manipulator row.
 
 #![cfg(feature = "test-fixtures")]
-#![allow(
-    clippy::pedantic,
-    clippy::nursery,
-    reason = "test-only style/complexity lints"
-)]
+#![allow(clippy::pedantic, clippy::nursery, reason = "test-only style/complexity lints")]
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
@@ -44,7 +42,9 @@ use tokio::sync::mpsc;
 
 use roz_agent::dispatch::{Extensions, ToolContext, ToolDispatcher, TypedToolExecutor};
 use roz_copper::channels::{ControllerCommand, ControllerState};
+use roz_copper::deployment_manager::DeploymentManager;
 use roz_copper::handle::CopperHandle;
+use roz_copper::io::ActuatorSink;
 use roz_copper::policy::new_hot_policy;
 use roz_core::embodiment::EmbodimentRuntime;
 use roz_core::embodiment::binding::{
@@ -52,10 +52,11 @@ use roz_core::embodiment::binding::{
 };
 use roz_core::tools::ToolCategory;
 
-/// Minimal `live-controller` WAT — emits a constant zero command vector and
-/// completes the WIT tick contract. Same shape used by
-/// `crates/roz-worker/tests/copper_integration.rs::agent_deploys_wasm_to_copper_and_reads_state`.
-const MINIMAL_LIVE_CONTROLLER_WAT: &str = r#"
+/// Non-zero `live-controller` WAT — emits a constant 0.4 rad/s command vector
+/// and completes the WIT tick contract. This keeps the test production-path:
+/// promote_controller componentizes/verifies the WAT, Copper ticks it, and the
+/// fake manipulator backend must observe actual simulated motion.
+const MOTION_LIVE_CONTROLLER_WAT: &str = r#"
     (module
         (type (func (result i32)))
         (type (func (param i32) (result i32)))
@@ -66,7 +67,7 @@ const MINIMAL_LIVE_CONTROLLER_WAT: &str = r#"
         (memory (export "cm32p2_memory") 1)
         (global $heap (mut i32) (i32.const 1024))
         (data (i32.const 0) "\40\00\00\00\01\00\00\00")
-        (data (i32.const 64) "\00\00\00\00\00\00\00\00")
+        (data (i32.const 64) "\9a\99\99\99\99\99\d9\3f")
         (func (export "cm32p2|bedrock:controller/control@1|process") (type 1) (param $input i32) (result i32)
             (i32.const 0)
         )
@@ -177,18 +178,23 @@ async fn manipulator_dispatch_through_promote_controller_path() {
         "stop_controller must register on the dispatcher"
     );
 
-    // Step 2 — boot Copper with the fake-OpenClaw IO backend (Plan 08 wiring).
+    // Step 2 — boot Copper with the fake manipulator IO backend (Plan 08 wiring).
     let runtime = roz_core::embodiment::test_fixtures::manipulator_runtime(2, 1.0, 3.14);
-    let (actuator, sensor) = roz_copper::fake_openclaw::fake_openclaw_pair(&runtime);
+    let (actuator, sensor) = roz_copper::fake_manipulator::fake_manipulator_pair(&runtime);
+    let actuator = Arc::new(actuator);
+    let actuator_probe = Arc::clone(&actuator);
     let policy = new_hot_policy();
     let bp = Arc::new(AtomicU8::new(0));
-    let handle = CopperHandle::spawn_with_policy_and_io(
+    let deployment_manager = DeploymentManager::with_rollout_policy(false, true, true, 1, 1, 10_000, 10_000, u64::MAX);
+    let handle = CopperHandle::spawn_with_io_and_deployment_manager_and_wiring(
         1.5,
-        Arc::new(actuator),
+        Some(actuator as Arc<dyn ActuatorSink>),
         Some(Box::new(sensor)),
-        policy,
-        bp,
+        deployment_manager,
+        Some(policy),
+        Some(bp),
         None,
+        roz_copper::latch::LatchState::Run,
     );
 
     // Step 3 — hold-out the cmd_tx + state handle on the test side; produce
@@ -213,7 +219,7 @@ async fn manipulator_dispatch_through_promote_controller_path() {
     let promote_result = TypedToolExecutor::execute(
         &promote_tool,
         roz_worker::tools::promote_controller::PromoteControllerInput {
-            code: MINIMAL_LIVE_CONTROLLER_WAT.to_string(),
+            code: MOTION_LIVE_CONTROLLER_WAT.to_string(),
         },
         &ctx,
     )
@@ -224,9 +230,20 @@ async fn manipulator_dispatch_through_promote_controller_path() {
         "promote_controller must report success against the manipulator fixture; got {:?}",
         promote_result
     );
-    // Allow the controller thread to prepare + start ticking after the LoadArtifact
-    // command lands on the cmd_tx pulled from ctx.extensions.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        promote_result.output["registered_state"], "VerifiedOnly",
+        "promote_controller registers the controller but external runtime authority must authorize actuation"
+    );
+    // Step 5 — model the runtime's rollout authority. `promote_controller`
+    // itself deliberately stops at VerifiedOnly; production task harnesses send
+    // `PromoteActive` only when the runtime policy allows it.
+    cmd_tx
+        .send(ControllerCommand::PromoteActive)
+        .await
+        .expect("external rollout authority sends PromoteActive");
+    // Allow VerifiedOnly -> Canary -> Active progression and subsequent
+    // actuation through the fake manipulator.
+    tokio::time::sleep(Duration::from_millis(800)).await;
 
     // Step 5 — drive controller_status via the dispatcher; assert the live
     // controller is running. This is the agent-visible surface: substrate-ide /
@@ -248,6 +265,19 @@ async fn manipulator_dispatch_through_promote_controller_path() {
     assert!(
         last_tick > 0,
         "controller must have ticked at least once (got last_tick={last_tick})"
+    );
+    let mut joint0 = 0.0;
+    for _ in 0..20 {
+        let joint_positions = actuator_probe.joint_positions_snapshot();
+        joint0 = joint_positions.first().copied().unwrap_or(0.0);
+        if joint0 > 0.05 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        joint0 > 0.05,
+        "WASM-emitted joint velocity must move the fake manipulator through Copper; joint0={joint0}"
     );
 
     // Step 6 — drive stop_controller via the dispatcher. Subsequent

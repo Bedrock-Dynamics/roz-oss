@@ -1,13 +1,24 @@
 use std::env;
 
+use testcontainers::GenericImage;
 use testcontainers::ImageExt;
+use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
-use testcontainers_modules::postgres::Postgres;
+
+const POSTGRES_PORT: ContainerPort = ContainerPort::Tcp(5432);
+
+fn reserve_host_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("reserve host port")
+        .local_addr()
+        .expect("reserved port local addr")
+        .port()
+}
 
 /// Guard that holds a running Postgres container. The container is stopped and
 /// removed when this guard is dropped.
 pub struct PgGuard {
-    _container: Option<testcontainers::ContainerAsync<Postgres>>,
+    _container: Option<testcontainers::ContainerAsync<GenericImage>>,
     url: String,
 }
 
@@ -27,20 +38,25 @@ pub async fn pg_container() -> PgGuard {
         return PgGuard { _container: None, url };
     }
 
-    let container = Postgres::default()
-        .with_db_name("roz_test")
-        .with_user("postgres")
-        .with_password("test")
-        .with_tag("16-alpine")
+    let host_port = reserve_host_port();
+    let container = GenericImage::new("postgres", "16-alpine")
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_wait_for(WaitFor::message_on_stdout(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_DB", "roz_test")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "test")
+        .with_cmd(["-c", "fsync=off"])
+        .with_mapped_port(host_port, POSTGRES_PORT)
         .start()
         .await
         .expect("failed to start Postgres testcontainer");
 
     let host = container.get_host().await.expect("failed to get host");
-    let port = container
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("failed to get host port");
+    let port = host_port;
 
     let url = format!("postgres://postgres:test@{host}:{port}/roz_test");
 

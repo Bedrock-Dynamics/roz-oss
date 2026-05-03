@@ -2,11 +2,11 @@
 //!
 //! This test joins the previously separate slices:
 //! HTTP safety-policy write -> signed NATS fanout -> worker verify/apply ->
-//! hot Copper policy -> fake OpenClaw-class physical runtime -> MCAP metadata
+//! hot Copper policy -> fake manipulator-class physical runtime -> MCAP metadata
 //! indexing.
 //!
-//! The manipulator fixture is OpenClaw-inspired. It is not an upstream
-//! OpenClaw compatibility test.
+//! This is a Roz harness/policy integration test with fake manipulator IO.
+//! Simulator-backed tests own robotics realism.
 
 #![cfg(feature = "test-helpers")]
 #![allow(
@@ -48,7 +48,7 @@ use roz_server::observability::metadata_index::index_session;
 use roz_server::observability::schema_registry::SchemaDescriptors;
 use roz_server::signing_gate::encrypt_signing_seed;
 use roz_worker::physical_runtime::{
-    FakeOpenclawObservation, FakeOpenclawObservedState, PhysicalRuntimeConfig, PhysicalRuntimeHandle,
+    FakeManipulatorObservation, FakeManipulatorObservedState, PhysicalRuntimeConfig, PhysicalRuntimeHandle,
     PhysicalRuntimeRolloutAuthority, spawn_physical_runtime,
 };
 use roz_worker::policy_cache::{HotPolicy, PolicyCache};
@@ -343,7 +343,7 @@ async fn post_policy_verify_and_apply(
     row
 }
 
-fn openclaw_control_manifest() -> ControlInterfaceManifest {
+fn manipulator_control_manifest() -> ControlInterfaceManifest {
     let mut manifest = ControlInterfaceManifest {
         version: 1,
         manifest_digest: String::new(),
@@ -370,11 +370,11 @@ fn openclaw_control_manifest() -> ControlInterfaceManifest {
     manifest
 }
 
-fn openclaw_runtime(manifest: &ControlInterfaceManifest) -> EmbodimentRuntime {
+fn manipulator_runtime(manifest: &ControlInterfaceManifest) -> EmbodimentRuntime {
     let mut runtime = roz_core::embodiment::test_fixtures::manipulator_runtime(2, 1.0, 3.14);
     runtime.model.embodiment_family = Some(EmbodimentFamily {
-        family_id: "openclaw".to_string(),
-        description: "Roz OpenClaw-inspired manipulator fixture".into(),
+        family_id: "manipulator".to_string(),
+        description: "Roz reference manipulator fixture".into(),
     });
     runtime.model.channel_bindings = manifest.bindings.clone();
     runtime.model.stamp_digest();
@@ -434,9 +434,12 @@ fn live_controller_wat(values: &[f64]) -> String {
     )
 }
 
-fn spawn_openclaw_runtime(tenant_id: Uuid, hot_policy: roz_copper::policy::HotCopperPolicy) -> PhysicalRuntimeHandle {
-    let manifest = openclaw_control_manifest();
-    let runtime = openclaw_runtime(&manifest);
+fn spawn_manipulator_runtime(
+    tenant_id: Uuid,
+    hot_policy: roz_copper::policy::HotCopperPolicy,
+) -> PhysicalRuntimeHandle {
+    let manifest = manipulator_control_manifest();
+    let runtime = manipulator_runtime(&manifest);
     let dispatcher = ToolDispatcher::new(Duration::from_secs(30));
     let extensions = Extensions::new();
     let shared_backpressure = Arc::new(AtomicU8::new(0));
@@ -453,15 +456,15 @@ fn spawn_openclaw_runtime(tenant_id: Uuid, hot_policy: roz_copper::policy::HotCo
         tenant_id.to_string(),
     )
     .with_rollout_authority(PhysicalRuntimeRolloutAuthority::default());
-    spawn_physical_runtime(config).expect("spawn fake OpenClaw-class physical runtime")
+    spawn_physical_runtime(config).expect("spawn fake manipulator-class physical runtime")
 }
 
-async fn run_openclaw_command(
+async fn run_manipulator_command(
     tenant_id: Uuid,
     hot_policy: roz_copper::policy::HotCopperPolicy,
     values: &[f64],
-) -> (PhysicalRuntimeHandle, FakeOpenclawObservedState) {
-    let handle = spawn_openclaw_runtime(tenant_id, hot_policy);
+) -> (PhysicalRuntimeHandle, FakeManipulatorObservedState) {
+    let handle = spawn_manipulator_runtime(tenant_id, hot_policy);
     let call = ToolCall {
         id: format!("call-promote-{}", Uuid::new_v4()),
         tool: "promote_controller".to_string(),
@@ -483,14 +486,14 @@ async fn run_openclaw_command(
         .await
         .expect("send PromoteActive");
     let observation = handle
-        .openclaw_observation
+        .manipulator_observation
         .clone()
-        .expect("OpenClaw-inspired runtime exposes fake actuator observation");
+        .expect("reference manipulator runtime exposes fake actuator observation");
     let snapshot = wait_for_motion(&observation).await;
     (handle, snapshot)
 }
 
-async fn wait_for_motion(observation: &FakeOpenclawObservation) -> FakeOpenclawObservedState {
+async fn wait_for_motion(observation: &FakeManipulatorObservation) -> FakeManipulatorObservedState {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let snapshot = observation.snapshot();
@@ -503,7 +506,7 @@ async fn wait_for_motion(observation: &FakeOpenclawObservation) -> FakeOpenclawO
         }
     })
     .await
-    .expect("fake OpenClaw-class actuator should observe motion")
+    .expect("fake manipulator-class actuator should observe motion")
 }
 
 async fn archive_and_index_session(
@@ -543,7 +546,7 @@ async fn archive_and_index_session(
                 raw_value: raw,
                 clamped_value: clamped,
                 kind: InterventionKind::ChassisPolicyClamp,
-                reason: "restrictive policy clamped fake OpenClaw-class output".into(),
+                reason: "restrictive policy clamped fake manipulator-class output".into(),
             },
         )
         .await;
@@ -615,9 +618,9 @@ async fn fetch_intervention_count(pool: &PgPool, session_id: Uuid) -> i32 {
     .expect("session metadata row should be visible")
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "current_thread")]
 #[ignore = "requires testcontainers Postgres + NATS + --features test-helpers"]
-async fn restrictive_policy_blocks_unsafe_openclaw_output_and_indexes_evidence() {
+async fn restrictive_policy_blocks_unsafe_manipulator_output_and_indexes_evidence() {
     let harness = setup_live_policy_harness().await;
     let cache = PolicyCache::new();
     let hot = HotPolicy::permissive();
@@ -625,7 +628,7 @@ async fn restrictive_policy_blocks_unsafe_openclaw_output_and_indexes_evidence()
 
     post_policy_verify_and_apply(
         &harness,
-        "restrictive-openclaw-inspired-policy",
+        "restrictive-reference-manipulator-policy",
         0.5,
         &cache,
         &hot,
@@ -635,7 +638,7 @@ async fn restrictive_policy_blocks_unsafe_openclaw_output_and_indexes_evidence()
 
     let command = [0.8, -0.75];
     let (restrictive_runtime, restrictive_snapshot) =
-        run_openclaw_command(harness.tenant_id, restrictive_hot, &command).await;
+        run_manipulator_command(harness.tenant_id, restrictive_hot, &command).await;
     let restricted_max = restrictive_snapshot
         .joint_velocities
         .iter()
@@ -664,7 +667,7 @@ async fn restrictive_policy_blocks_unsafe_openclaw_output_and_indexes_evidence()
     let permissive_hot = new_hot_policy();
     post_policy_verify_and_apply(
         &harness,
-        "permissive-openclaw-inspired-policy",
+        "permissive-reference-manipulator-policy",
         100.0,
         &cache,
         &hot,
@@ -672,7 +675,7 @@ async fn restrictive_policy_blocks_unsafe_openclaw_output_and_indexes_evidence()
     )
     .await;
     let (permissive_runtime, permissive_snapshot) =
-        run_openclaw_command(harness.tenant_id, permissive_hot, &command).await;
+        run_manipulator_command(harness.tenant_id, permissive_hot, &command).await;
     let permissive_max = permissive_snapshot
         .joint_velocities
         .iter()

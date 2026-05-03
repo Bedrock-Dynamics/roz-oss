@@ -99,8 +99,8 @@ pub enum SigningState {
 /// `COMMAND_ACK` distribution, and delegates discrete command dispatch to
 /// [`FlightCommandDispatcher`].
 ///
-/// Construct via [`MavlinkBackend::new_serial`] or
-/// [`MavlinkBackend::new_udp_in`].
+/// Construct via [`MavlinkBackend::new_serial`],
+/// [`MavlinkBackend::new_udp_in`], or [`MavlinkBackend::new_udp_out`].
 pub struct MavlinkBackend {
     outbound: mpsc::Sender<MavMessage>,
     readiness: Arc<Mutex<ReadinessBuilder>>,
@@ -154,6 +154,30 @@ impl MavlinkBackend {
         autopilot_hint: AutopilotHint,
     ) -> anyhow::Result<Self> {
         let url = format!("udpin:{bind_addr}");
+        Self::new_with_url(
+            &url,
+            SigningTransportKind::Udp,
+            TxTransportKind::Udp,
+            signing_config,
+            our_system_id,
+            autopilot_hint,
+        )
+        .await
+    }
+
+    /// Open a UDP-out MAVLink transport (dial a peer endpoint).
+    ///
+    /// # Errors
+    ///
+    /// Propagates `open_transport` errors (malformed address,
+    /// `mavlink::connect` failure).
+    pub async fn new_udp_out(
+        peer_addr: &str,
+        signing_config: MavlinkSigningConfig,
+        our_system_id: u8,
+        autopilot_hint: AutopilotHint,
+    ) -> anyhow::Result<Self> {
+        let url = format!("udpout:{peer_addr}");
         Self::new_with_url(
             &url,
             SigningTransportKind::Udp,

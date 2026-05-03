@@ -6,6 +6,10 @@ cd "$ROOT"
 
 MODE="all"
 
+export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+export RUST_TEST_THREADS="${RUST_TEST_THREADS:-1}"
+
 for arg in "$@"; do
   case "$arg" in
     --authored-only)
@@ -99,12 +103,12 @@ run_authored() {
     exit 1
   fi
 
-  run cargo test -p roz-local --test live_claude_wasm -- --ignored --nocapture
-  run cargo test -p roz-local --test live_claude_wasm_containers -- --ignored --nocapture
+  run cargo test --jobs 1 -p roz-local --test live_claude_wasm -- --ignored --test-threads=1 --nocapture
+  run cargo test --jobs 1 -p roz-local --test live_claude_wasm_containers -- --ignored --test-threads=1 --nocapture
   if [[ "${ROZ_SKIP_MANIPULATOR_LIVE_TEST:-0}" == "1" ]]; then
     printf '\n==> skipping manipulator authored-WAT live test because ROZ_SKIP_MANIPULATOR_LIVE_TEST=1\n'
   else
-    run cargo test -p roz-local --test live_claude_wasm_gazebo full_vertical_claude_wasm_gazebo -- --ignored --nocapture
+    run cargo test --jobs 1 -p roz-local --test live_claude_wasm_gazebo full_vertical_claude_wasm_gazebo -- --ignored --test-threads=1 --nocapture
   fi
 }
 
@@ -117,17 +121,18 @@ run_deterministic() {
     -e ROS_LOCALHOST_ONLY=1 \
     -e ROS_DOMAIN_ID=41 \
     bedrockdynamics/substrate-sim:ros2-nav2
-  run cargo test -p roz-copper --test mobile_wasm_cmd_vel mobile_wasm_cmd_vel_through_bridge -- --ignored --nocapture
+  run cargo test --jobs 1 -p roz-copper --test mobile_wasm_cmd_vel mobile_wasm_cmd_vel_through_bridge -- --ignored --test-threads=1 --nocapture
 
   reset_container roz-test-px4 120 \
     -p 9090:9090 -p 14540:14540/udp -p 14550:14550/udp \
     bedrockdynamics/substrate-sim:px4-gazebo-humble
-  run cargo test -p roz-copper --test drone_wasm_velocity drone_wasm_velocity_through_bridge -- --ignored --nocapture
+  run cargo test --jobs 1 -p roz-copper --test drone_wasm_velocity drone_wasm_velocity_through_bridge -- --ignored --test-threads=1 --nocapture
+  run cargo test --jobs 1 -p roz-local --test live_claude_wasm_containers env_start_px4_docker_wasm_velocity_flies_10m -- --ignored --test-threads=1 --nocapture
 
   reset_container roz-test-ardu 120 \
     -p 9097:9090 -p 8098:8090 -p 14551:14550/udp \
     bedrockdynamics/substrate-sim:ardupilot-gazebo
-  run cargo test -p roz-copper --test ardupilot_wasm_velocity ardupilot_wasm_velocity_through_bridge -- --ignored --nocapture
+  run cargo test --jobs 1 -p roz-copper --test ardupilot_wasm_velocity ardupilot_wasm_velocity_through_bridge -- --ignored --test-threads=1 --nocapture
 
   # FW-07 / Codex H4 — manipulator deterministic row exercising the FULL
   # agent/task production path (NOT just Copper spawn + sleep).
@@ -135,7 +140,7 @@ run_deterministic() {
   # `manipulator_dispatch_through_promote_controller_path` is the H4
   # production-parity gate: it boots a worker-side `ToolDispatcher` with
   # `promote_controller` / `controller_status` / `stop_controller`, spawns
-  # CopperHandle against the fake-OpenClaw IO backend, drives a real
+  # CopperHandle against the fake manipulator IO backend, drives a real
   # `LoadArtifact` → `controller_status` (running == true) → `stop_controller`
   # sequence. Default-runnable (no `#[ignore]`); the H4 gate cannot be silently
   # skipped from CI.
@@ -144,31 +149,31 @@ run_deterministic() {
   # (NOT crates/roz-copper/tests/...) because the lifecycle tools live in
   # roz-worker and roz-copper cannot dev-dep roz-worker (cycle prevention,
   # see Plan 09 SUMMARY for context).
-  echo "[live-matrix] manipulator (fake-openclaw deterministic — production path)..."
-  run cargo test -p roz-worker --test manipulator_dispatch_path --features test-fixtures \
-      manipulator_dispatch_through_promote_controller_path -- --nocapture
+  echo "[live-matrix] manipulator (fake-manipulator deterministic — production path)..."
+  run cargo test --jobs 1 -p roz-worker --test manipulator_dispatch_path --features test-fixtures \
+      manipulator_dispatch_through_promote_controller_path -- --test-threads=1 --nocapture
 
   # Deterministic IO-substrate gates (position integration + Halt smoke).
-  run cargo test -p roz-copper --test fake_openclaw_tick_loop --features test-fixtures \
-      fake_openclaw_tick_loop_advances_positions fake_openclaw_estop_smoke_via_halt -- --nocapture
+  run cargo test --jobs 1 -p roz-copper --test fake_manipulator_tick_loop --features test-fixtures \
+      -- --test-threads=1 --nocapture
 
   # Capability-publish lossless contract (FW-06 / Codex H5) — exercises the
-  # OpenClaw fixture manifest end-to-end through `project_capabilities`.
-  run cargo test -p roz-worker --test manipulator_capability_publish --features test-fixtures \
-      -- --nocapture
+  # reference manipulator fixture manifest end-to-end through `project_capabilities`.
+  run cargo test --jobs 1 -p roz-worker --test manipulator_capability_publish --features test-fixtures \
+      -- --test-threads=1 --nocapture
 }
 
-# FW-07 — gated HIL row. Skipped unless ROZ_OPENCLAW_HIL=1.
+# FW-07 — gated hardware bench row. Skipped unless ROZ_MANIPULATOR_HARDWARE=1.
 # Each test in the suite checks the env var internally and `unimplemented!()`s
-# without it. `--ignored` is required because every HIL test carries `#[ignore]`.
-run_hil_manipulator() {
-  if [ "${ROZ_OPENCLAW_HIL:-0}" != "1" ]; then
-    echo "[live-matrix] manipulator HIL skipped (set ROZ_OPENCLAW_HIL=1 to enable)"
+# without it. `--ignored` is required because every hardware test carries `#[ignore]`.
+run_hardware_manipulator() {
+  if [ "${ROZ_MANIPULATOR_HARDWARE:-0}" != "1" ]; then
+    echo "[live-matrix] manipulator hardware bench skipped (set ROZ_MANIPULATOR_HARDWARE=1 to enable)"
     return 0
   fi
-  echo "[live-matrix] manipulator (HIL — real Dynamixel/OpenCR)..."
-  run cargo test -p roz-copper --test fake_openclaw_tick_loop --features test-fixtures \
-      -- --ignored --nocapture
+  echo "[live-matrix] manipulator (hardware bench)..."
+  run cargo test --jobs 1 -p roz-copper --test fake_manipulator_tick_loop --features test-fixtures \
+      -- --ignored --test-threads=1 --nocapture
 }
 
 case "$MODE" in
@@ -177,11 +182,11 @@ case "$MODE" in
     ;;
   deterministic)
     run_deterministic
-    run_hil_manipulator
+    run_hardware_manipulator
     ;;
   all)
     run_authored
     run_deterministic
-    run_hil_manipulator
+    run_hardware_manipulator
     ;;
 esac

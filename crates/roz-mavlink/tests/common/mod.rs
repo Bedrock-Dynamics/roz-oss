@@ -8,3 +8,4 @@
 #![allow(dead_code)]
 
 pub mod mock_log_transport;
+pub mod tlog;

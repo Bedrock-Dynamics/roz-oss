@@ -143,6 +143,7 @@ async fn copper_tick_loop_clamps_over_limit_wasm_output_via_hot_copper_policy() 
         Some(Arc::clone(&hot_policy)),
         Some(Arc::clone(&backpressure)),
         None,
+        roz_copper::latch::LatchState::Run,
     );
 
     // -----------------------------------------------------------------

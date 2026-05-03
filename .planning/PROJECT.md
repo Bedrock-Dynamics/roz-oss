@@ -22,8 +22,8 @@ Platform now has:
 - Natural-language scheduled invocations backed by canonical cron parsing, durable Restate workflows, and shipped `roz schedule` CLI commands
 - Typed `skill_loaded` / `skill_crystallized` gRPC payloads with cloud, worker-relay, and local cloud-TUI correlation coverage
 - An explicit skill freshness contract: `skills_context` freezes at session start while `skills_list` and `skill_view` remain the live mid-session surfaces
-- v3.0 production-robotics groundwork through Phase 26.11: native MAVLink backend, unified MCAP/RRD observability, session artifact archival, OpenClaw-inspired manipulator runtime wiring, and feature-gated robotics acceptance coverage
-- Robotics test realism hardening: CI/nightly routes, OpenClaw-inspired worker vertical, `flight_command` tool routing, safety-policy physical vertical, camera/artifact/RRD semantic validation, PX4 readiness replay, and verify-only fixture recording
+- v3.0 production-robotics groundwork through Phase 26.11: native MAVLink backend, unified MCAP/RRD observability, session artifact archival, reference manipulator runtime wiring, and feature-gated robotics acceptance coverage
+- Robotics test realism hardening: CI/nightly routes, reference manipulator worker vertical, `flight_command` tool routing, safety-policy physical vertical, camera/artifact/RRD semantic validation, PX4 readiness replay, and verify-only fixture recording
 
 ## Current Milestone: v3.0 Production Robotics
 
@@ -79,11 +79,14 @@ Platform now has:
 - ✓ RTEC-01..03: Typed skill-event gRPC payloads, cloud/worker/local correlation coverage, and the explicit frozen-vs-live skill reload contract
 
 **v3.0 Production Robotics (completed slices through Phase 26.11)**
-- ✓ TR-01..06: Robotics test realism hardening — CI/nightly visibility, OpenClaw-inspired manipulator verticals, flight-command routing, safety-policy physical evidence, camera/artifact/RRD semantic validation, and PX4 readiness fixture hygiene
+- ✓ TR-01..06: Robotics test realism hardening — CI/nightly visibility, reference manipulator verticals, flight-command routing, safety-policy physical evidence, camera/artifact/RRD semantic validation, and PX4 readiness fixture hygiene
 
 ### Active
 
-- Planning next milestone. No committed active requirement set exists yet.
+**v3.0 Production Robotics remaining**
+- RD-01 / Phase 27: nightly PX4 SITL CI, induced NATS outage, live-FCU task-layer `flight_command` wiring, readiness propagation, QGC coexistence, and verify-only `.tlog` fixture capture.
+- RD-02..03 / Phase 28: HITL documentation and Pixhawk single-binary deployment quickstart, validated on physical hardware before milestone closure.
+- Roadmap reconciliation: older Phase 23/24 status and deferred Phase 26.8 ULOG scope must be resolved before v3.0 milestone archival.
 
 ### Next-Milestone Candidates
 
@@ -147,4 +150,4 @@ Security posture: tenant isolation remains enforced with RLS across the new pers
 This document evolves at phase transitions and milestone boundaries.
 
 ---
-*Last updated: 2026-04-26 after completing Phase 26.11 (robotics test realism hardening)*
+*Last updated: 2026-04-27 after reconciling v3.0 status and selecting Phase 27 as the next substantive step*

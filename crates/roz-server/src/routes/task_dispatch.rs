@@ -142,58 +142,55 @@ pub async fn dispatch_task(
     // line 225 (the TaskInvocation literal) which is AFTER tasks::create
     // (:157) AND AFTER the Restate POST (:186), leaking task rows + workflows
     // on resolver failure.
-    let resolved_embodiment_runtime: Option<roz_core::embodiment::EmbodimentRuntime> =
-        if matches!(
-            mode_from_phases(&request.phases),
-            roz_nats::dispatch::ExecutionMode::OodaReAct
-        ) {
-            match roz_db::embodiments::get_by_host_id(&mut *conn, host_uuid).await {
-                Ok(Some(row)) => {
-                    // FW-01 H1 — explicit tenant assertion on EmbodimentRow.
-                    // The host's tenant filter at :135 does NOT transitively
-                    // cover the embodiment row (separate authority record).
-                    if row.tenant_id != request.tenant_id {
-                        tracing::error!(
-                            request_tenant = %request.tenant_id,
-                            embodiment_tenant = %row.tenant_id,
-                            host_uuid = %host_uuid,
-                            "task dispatch rejected: cross-tenant embodiment row (FW-01)"
-                        );
+    let resolved_embodiment_runtime: Option<roz_core::embodiment::EmbodimentRuntime> = if matches!(
+        mode_from_phases(&request.phases),
+        roz_nats::dispatch::ExecutionMode::OodaReAct
+    ) {
+        match roz_db::embodiments::get_by_host_id(&mut *conn, host_uuid).await {
+            Ok(Some(row)) => {
+                // FW-01 H1 — explicit tenant assertion on EmbodimentRow.
+                // The host's tenant filter at :135 does NOT transitively
+                // cover the embodiment row (separate authority record).
+                if row.tenant_id != request.tenant_id {
+                    tracing::error!(
+                        request_tenant = %request.tenant_id,
+                        embodiment_tenant = %row.tenant_id,
+                        host_uuid = %host_uuid,
+                        "task dispatch rejected: cross-tenant embodiment row (FW-01)"
+                    );
+                    return Err(TaskDispatchError::BadRequest(format!(
+                        "host {host_uuid} embodiment record belongs to a different tenant (FW-01)"
+                    )));
+                }
+                match row.embodiment_runtime {
+                    Some(json) => Some(
+                        serde_json::from_value::<roz_core::embodiment::EmbodimentRuntime>(json).map_err(|error| {
+                            TaskDispatchError::Internal(format!(
+                                "embodiment_runtime JSON malformed for host {host_uuid}: {error}"
+                            ))
+                        })?,
+                    ),
+                    None => {
                         return Err(TaskDispatchError::BadRequest(format!(
-                            "host {host_uuid} embodiment record belongs to a different tenant (FW-01)"
+                            "host {host_uuid} has no authoritative embodiment runtime (FW-01)"
                         )));
                     }
-                    match row.embodiment_runtime {
-                        Some(json) => Some(
-                            serde_json::from_value::<roz_core::embodiment::EmbodimentRuntime>(json).map_err(
-                                |error| {
-                                    TaskDispatchError::Internal(format!(
-                                        "embodiment_runtime JSON malformed for host {host_uuid}: {error}"
-                                    ))
-                                },
-                            )?,
-                        ),
-                        None => {
-                            return Err(TaskDispatchError::BadRequest(format!(
-                                "host {host_uuid} has no authoritative embodiment runtime (FW-01)"
-                            )));
-                        }
-                    }
-                }
-                Ok(None) => {
-                    return Err(TaskDispatchError::BadRequest(format!(
-                        "host {host_uuid} has no embodiment record (FW-01)"
-                    )));
-                }
-                Err(error) => {
-                    return Err(TaskDispatchError::Internal(format!(
-                        "embodiment lookup failed for host {host_uuid}: {error}"
-                    )));
                 }
             }
-        } else {
-            None
-        };
+            Ok(None) => {
+                return Err(TaskDispatchError::BadRequest(format!(
+                    "host {host_uuid} has no embodiment record (FW-01)"
+                )));
+            }
+            Err(error) => {
+                return Err(TaskDispatchError::Internal(format!(
+                    "embodiment lookup failed for host {host_uuid}: {error}"
+                )));
+            }
+        }
+    } else {
+        None
+    };
 
     if let Err(rejection) =
         crate::trust::check_host_trust(services.pool, request.tenant_id, host_uuid, services.trust_policy).await

@@ -145,7 +145,6 @@ async fn sc5_30s_fixture_roundtrips_via_mcap_message_stream() {
     // 1. Testcontainers Postgres + migrations + pool.
     let guard = roz_test::pg_container().await;
     let url: String = guard.url().to_string();
-    std::mem::forget(guard); // keep container alive past function scope
     let pool = create_pool(&url).await.expect("pool");
     run_migrations(&pool).await.expect("migrate");
 

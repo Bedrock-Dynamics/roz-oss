@@ -236,6 +236,32 @@ async fn insert_device_trust_row(pool: &sqlx::PgPool, tenant_id: Uuid, host_id: 
     .expect("insert device_trust");
 }
 
+async fn insert_server_signing_state(
+    pool: &sqlx::PgPool,
+    key_provider: &dyn roz_core::key_provider::KeyProvider,
+    tenant_id: Uuid,
+    host_id: Uuid,
+) {
+    let seed = [13u8; 32];
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let public_key_bytes = signing_key.verifying_key().to_bytes();
+    let (ciphertext, nonce_vec) = roz_server::signing_gate::encrypt_signing_seed(key_provider, tenant_id, &seed)
+        .await
+        .expect("encrypt server signing seed");
+    let nonce: [u8; 12] = nonce_vec.as_slice().try_into().expect("nonce is 12 bytes");
+    roz_db::server_signing_state::insert_server_signing_state(
+        pool,
+        tenant_id,
+        host_id,
+        1,
+        &ciphertext,
+        &nonce,
+        &public_key_bytes,
+    )
+    .await
+    .expect("insert server signing state");
+}
+
 async fn count_tasks(pool: &sqlx::PgPool, tenant_id: Uuid) -> i64 {
     let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM roz_tasks WHERE tenant_id = $1")
         .bind(tenant_id)
@@ -294,6 +320,8 @@ async fn scheduled_task_workflow_survives_endpoint_restart_and_dispatches_again(
     let (tenant_id, host_id, host_name) = seed_tenant_and_host(&pool, "restart").await;
     let environment_id = seed_environment(&pool, tenant_id).await;
     insert_device_trust_row(&pool, tenant_id, host_id).await;
+    let key_provider = std::sync::Arc::new(roz_core::key_provider::StaticKeyProvider::from_key_bytes([7u8; 32]));
+    insert_server_signing_state(&pool, key_provider.as_ref(), tenant_id, host_id).await;
 
     roz_server::restate::scheduled_task_workflow::install_scheduled_task_runtime(
         roz_server::restate::scheduled_task_workflow::ScheduledTaskRuntime {
@@ -309,7 +337,7 @@ async fn scheduled_task_workflow_survives_endpoint_restart_and_dispatches_again(
                     .max_capacity(10_000)
                     .time_to_live(std::time::Duration::from_secs(60))
                     .build(),
-                std::sync::Arc::new(roz_core::key_provider::StaticKeyProvider::from_key_bytes([7u8; 32])),
+                key_provider,
                 None,
                 roz_server::config::SignedDispatchEnforcement::Off,
             )),
@@ -379,6 +407,7 @@ async fn scheduled_task_workflow_survives_endpoint_restart_and_dispatches_again(
         .subscribe(format!("invoke.{host_name}.>"))
         .await
         .expect("subscribe");
+    nats.flush().await.expect("flush NATS subscription");
 
     let start_resp = client
         .post(format!(
@@ -406,6 +435,14 @@ async fn scheduled_task_workflow_survives_endpoint_restart_and_dispatches_again(
         .await
         .expect("first NATS publish should arrive")
         .expect("subscriber should yield first message");
+    assert!(
+        first_msg
+            .headers
+            .as_ref()
+            .and_then(|headers| headers.get(roz_core::signing::envelope::HEADER_NAME))
+            .is_some(),
+        "scheduled dispatch must publish a signed NATS invocation"
+    );
     let _first_invocation: roz_nats::dispatch::TaskInvocation =
         serde_json::from_slice(&first_msg.payload).expect("decode first invocation");
 
@@ -420,6 +457,14 @@ async fn scheduled_task_workflow_survives_endpoint_restart_and_dispatches_again(
         .await
         .expect("second NATS publish should arrive after restart")
         .expect("subscriber should yield second message");
+    assert!(
+        second_msg
+            .headers
+            .as_ref()
+            .and_then(|headers| headers.get(roz_core::signing::envelope::HEADER_NAME))
+            .is_some(),
+        "scheduled redispatch must publish a signed NATS invocation"
+    );
     let _second_invocation: roz_nats::dispatch::TaskInvocation =
         serde_json::from_slice(&second_msg.payload).expect("decode second invocation");
 }

@@ -191,7 +191,8 @@ impl<W: CommandAckWatcher> FlightCommandDispatcher<W> {
         clippy::cast_precision_loss,
         clippy::too_many_lines
     )]
-    fn build_message(&self, cmd: &FlightCommand) -> Result<(MavCmd, MavMessage), MavlinkDispatchError> {
+    #[doc(hidden)]
+    pub fn build_message(&self, cmd: &FlightCommand) -> Result<(MavCmd, MavMessage), MavlinkDispatchError> {
         let pair = match cmd {
             FlightCommand::Arm(_params) => (
                 MavCmd::MAV_CMD_COMPONENT_ARM_DISARM,

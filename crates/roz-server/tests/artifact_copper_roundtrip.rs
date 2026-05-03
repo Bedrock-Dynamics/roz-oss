@@ -64,6 +64,7 @@ async fn inject_extensions_middleware(
 
 struct Harness {
     pool: PgPool,
+    _pg: roz_test::PgGuard,
     tenant_id: Uuid,
     artifact_dir: PathBuf,
     addr: SocketAddr,
@@ -91,7 +92,6 @@ async fn setup_harness() -> Harness {
     // Postgres via testcontainers.
     let guard = roz_test::pg_container().await;
     let url: String = guard.url().to_string();
-    std::mem::forget(guard);
     let pool = create_pool(&url).await.expect("pool");
     run_migrations(&pool).await.expect("migrate");
 
@@ -138,6 +138,7 @@ async fn setup_harness() -> Harness {
 
     Harness {
         pool,
+        _pg: guard,
         tenant_id,
         artifact_dir,
         addr,

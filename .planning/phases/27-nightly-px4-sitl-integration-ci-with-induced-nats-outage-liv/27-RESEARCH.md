@@ -4,15 +4,49 @@
 **Domain:** PX4 SITL containerized integration, MAVLink fixture capture, induced NATS outage, agent-to-FC tool dispatch
 **Confidence:** HIGH (every claim is grounded in this repo's existing files or canonical Phase 25 plans)
 
+## 2026-04-27 Amendment
+
+Phase 26.11 shipped the `flight_command` tool in `crates/roz-worker/src/tools/flight_command.rs` with a `FlightCommandSinkHandle` extension key. Treat any older statement in this research doc that says to create `crates/roz-agent/src/dispatch/flight_command_tool.rs` or install raw `Arc<MavlinkBackend>` into `Extensions` as superseded.
+
+Correct Phase 27 command path:
+
+`execute_task` receives the worker-boot-scoped `Arc<MavlinkBackend>` when drone-class MAVLink is active, coerces it into `Arc<dyn DiscreteCommandSink<FlightCommand, Response = FlightCommandResponse, Error = MavlinkDispatchError> + Send + Sync>`, inserts `FlightCommandSinkHandle` into `ToolContext::extensions`, and registers `roz_worker::tools::flight_command::FlightCommandTool` with `ToolCategory::Physical`.
+
+## 2026-04-27 Substrate Simulator Reconciliation
+
+Live testing invalidated the earlier assumption that `bedrockdynamics/substrate-sim:px4-gazebo-humble` should be treated as a direct host-native MAVLink endpoint. The image starts `substrate-sim-bridge`, and the bridge owns the internal PX4 MAVLink router (`offboard_listen=14540`, `offboard_target=14580`, `gcs_listen=14550`). Host-side native `udpin` probing can time out because the bridge is the intended API owner.
+
+The canonical Substrate Docker acceptance test is now:
+
+```bash
+env CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 RUST_TEST_THREADS=1 \
+  cargo test --jobs 1 -p roz-local \
+  --test live_claude_wasm_containers \
+  env_start_px4_docker_wasm_velocity_flies_10m \
+  -- --include-ignored --test-threads=1 --nocapture
+```
+
+That path exercises `env_start -> substrate-sim bridge gRPC -> GrpcSensorSource/GrpcActuatorSink -> Copper/WASM -> PX4/Gazebo` and was verified on 2026-04-27 to launch Docker, arm, take off, activate a WASM controller, fly `x500` 10.293 m, land, and disarm.
+
+Consequences for Phase 27 research:
+
+- `crates/roz-test/tests/px4_sitl_e2e.rs` is a direct native-MAVLink diagnostic for real FCU/HITL/direct SITL. It is correctly guarded by `ROZ_RUN_NATIVE_PX4_MAVLINK_E2E=1`.
+- `crates/roz-test/tests/px4_mavlink_probe.rs` is a direct native-MAVLink probe. It is correctly guarded by `ROZ_RUN_NATIVE_PX4_MAVLINK_PROBE=1` and, as of 2026-04-30, also requires `PX4_SITL_MAVLINK_URL` or `PX4_SITL_MAVLINK_PORT` so it does not start the bridge-backed Substrate Docker image implicitly.
+- The default nightly gate must run the bridge-backed `roz-local` test, not the native diagnostic tests.
+- `.tlog` fixture capture from host MAVLink is deferred to a direct endpoint or future bridge-supported capture hook; it is not a blocker for the Substrate simulator gate.
+- NATS outage testing should use Toxiproxy or an equivalent proxy-controlled NATS URL. `docker network disconnect` is stale for the default host-process test model because Docker-published host ports and host clients can avoid the intended container-network fault.
+
+Treat any older section below that says "copper connects via native `roz-mavlink` to the Substrate Docker image", "bind `udpin:0.0.0.0:14540` for the Substrate default path", or "run `px4_sitl_e2e` as the default nightly gate" as superseded.
+
 ## Summary
 
-Phase 27 ships a nightly GHA job that brings up `bedrockdynamics/substrate-sim:px4-gazebo-humble` against `roz-copper` + NATS + Postgres, drives ARM→TAKEOFF→HOVER→RTL→LAND through the agent's `flight_command` tool (newly wired via `Box<dyn DiscreteCommandSink<FlightCommand>>` in `roz_agent::dispatch::Extensions`), induces a 30-second `docker network disconnect` on the NATS container mid-hover, and asserts the WAL replays cleanly with no duplicate frames in the post-reconnect MCAP. Inline with the same scenario, it auto-captures 10 PX4 `.tlog` fixtures (7 commands + 3 readiness states) for the deferred MAV-01 / MAV-03 PX4 halves and exercises the live-FCU `ReadinessState` propagation path end-to-end.
+Phase 27 ships a nightly GHA job that brings up `bedrockdynamics/substrate-sim:px4-gazebo-humble` through the Substrate bridge API, starts the Roz harness with `env_start`, compiles/promotes a WASM controller, and verifies the simulated PX4 drone moves at least 10 m through the real `GrpcSensorSource` / `GrpcActuatorSink` / Copper runtime path. Native `roz-mavlink` tests remain useful direct-endpoint diagnostics, but they are not the default Substrate Docker acceptance path.
 
 Almost every primitive Phase 27 needs already exists in-tree: `MavlinkBackend` impls `DiscreteCommandSink<FlightCommand>` (Phase 25), `ReadinessBuilder` derives `ReadinessState` (Phase 25), `Extensions` is a TypeId map (Phase 24+), the testcontainers guard pattern is canonicalized in `crates/roz-test/src/{nats,pg,restate,toxiproxy}.rs` (mirror it), `nightly.yml` already pins every action SHA and ships the `peter-evans/create-issue-from-file` summary pattern, the WAL `telemetry_frames` table already buffers FS-02 frames with a `seq` PK, and Plan 25-14's `.tlog` harness API (`load_tlog`, `find_command_ack`, `command_long_payload_equal`, `command_int_payload_equal`) is already specified to byte-level detail. Phase 27 is overwhelmingly **wiring, not new primitives**.
 
 **Three contract gaps require user resolution before planning** — see `## Open Questions`. The most critical: D-11 says the live-FCU readiness path lands in `TelemetryFrame.readiness` on NATS, but `TelemetryFrame.readiness=20` is a **bridge.proto** (copper↔substrate-sim-bridge) field, while the actual NATS wire format on the production telemetry path is **`roz.v1.TelemetryUpdate`** which has no `readiness` field. The planner cannot resolve this silently.
 
-**Primary recommendation:** Mirror Phase 26.8's MavlinkBackend pattern for both wiring tasks (worker-boot construction → per-task install in `execute_task`); mirror Phase 25's QGC coexistence test for SC7; mirror Plan 25-14 verbatim for the .tlog auto-capture; mirror `nats.rs`/`toxiproxy.rs` for the new `crates/roz-test/src/px4_sitl.rs` guard. Use direct `docker run` (no docker-compose.yml in this repo) for the SITL container — the existing PX4 SITL test in `crates/roz-copper/tests/drone_wasm_velocity.rs` is the precedent.
+**Primary recommendation:** Make the bridge-backed `roz-local` PX4/WASM test the default nightly acceptance gate. Keep Phase 26.8's `MavlinkBackend` pattern and the `FlightCommandSinkHandle` wiring for direct FCU/HITL/direct SITL diagnostics. Use Toxiproxy-style NATS outage testing for WAL/replay behavior instead of relying on Docker network disconnect in a host-process test.
 
 ## Architectural Responsibility Map
 
@@ -20,7 +54,7 @@ Almost every primitive Phase 27 needs already exists in-tree: `MavlinkBackend` i
 |------------|-------------|----------------|-----------|
 | PX4 SITL container lifecycle | Test infra (`crates/roz-test/src/px4_sitl.rs`) | — | Mirrors `nats.rs`/`pg.rs`/`restate.rs` testcontainers pattern; container guard owns Drop cleanup |
 | Scripted ARM→TAKEOFF→…→LAND scenario | Integration test (`crates/roz-test/tests/px4_sitl_e2e.rs`) | — | Same crate as guards (per Cargo dev-dep convention); subprocess + MAVLink assertions in Rust |
-| `flight_command` tool registration | Agent dispatch (`crates/roz-agent/src/dispatch/`) | — | One verb, dispatcher matches FlightCommand variant — matches D-05 |
+| `flight_command` tool registration | Worker tools (`crates/roz-worker/src/tools/flight_command.rs`) | `execute_task` registers it with the per-task dispatcher | One verb, dispatcher matches FlightCommand variant — matches D-05 and existing Phase 26.11 implementation |
 | `DiscreteCommandSink<FlightCommand>` install | Worker `execute_task` lifecycle (`crates/roz-worker/src/main.rs`) | — | D-06: per-task install gated on `mavlink_backend.is_some()`, matching Phase 26.8 lift pattern |
 | `MavlinkBackend` execution | `roz-mavlink` (already shipped Phase 25) | — | Phase 27 only consumes; no backend changes |
 | `ReadinessState` derivation | `roz-mavlink/src/readiness.rs` (already shipped Phase 25) | — | D-09 — Phase 27 only exercises end-to-end |
@@ -44,7 +78,7 @@ Almost every primitive Phase 27 needs already exists in-tree: `MavlinkBackend` i
 
 **DiscreteCommandSink Wiring Path:**
 - **D-05:** Single `flight_command` tool with variant arg (`{ command: "arm" | "takeoff" | ... }`).
-- **D-06:** `Box<dyn DiscreteCommandSink<FlightCommand>>` installed into `roz_agent::dispatch::Extensions` **at the start of each `execute_task` invocation when the embodiment is a drone**.
+- **D-06:** `FlightCommandSinkHandle` installed into `roz_agent::dispatch::Extensions` **at the start of each `execute_task` invocation when the embodiment is a drone**. The handle wraps `Arc<dyn DiscreteCommandSink<FlightCommand, Response = FlightCommandResponse, Error = MavlinkDispatchError> + Send + Sync>`.
 - **D-07:** `MavlinkBackend` already implements `DiscreteCommandSink<FlightCommand>` at `crates/roz-mavlink/src/backend.rs:587`.
 - **D-08:** `FlightCommandResponse` propagates back through the tool dispatcher as a normal tool result.
 
@@ -244,38 +278,33 @@ pub async fn px4_sitl_container() -> Px4SitlGuard {
 
 ### Pattern 2: Per-Task Extension Install (mirror Phase 26.8 lift)
 
-**What:** `MavlinkBackend` lives at worker-boot scope (already done by Phase 26.8). For each `execute_task` invocation, install a `Box<dyn DiscreteCommandSink<FlightCommand>>` (cloned `Arc<MavlinkBackend>`) into the agent loop's `Extensions` map iff the task is for a drone embodiment.
+**What:** `MavlinkBackend` lives at worker-boot scope (already done by Phase 26.8). For each drone-class `execute_task` invocation, install a `FlightCommandSinkHandle` into the agent loop's `Extensions` map. The handle wraps an `Arc<dyn DiscreteCommandSink<FlightCommand, Response = FlightCommandResponse, Error = MavlinkDispatchError> + Send + Sync>` coerced from the boot-scoped `Arc<MavlinkBackend>`.
 
 **Reference (read these BEFORE planning):**
 
 - `crates/roz-worker/src/main.rs:2492-2534` — Phase 26.8 worker-boot lift of `mavlink_backend: Option<Arc<MavlinkBackend>>`.
 - `crates/roz-worker/src/main.rs:741-749` — existing per-task `Extensions` setup site (already inserts `CopperHandle::cmd_tx()` and `ControlInterfaceManifest`).
+- `crates/roz-worker/src/tools/flight_command.rs` — canonical `FlightCommandTool` and `FlightCommandSinkHandle`.
 - `crates/roz-agent/src/dispatch/mod.rs:148-179` — `Extensions` impl (TypeId map; `insert<T: Send + Sync + 'static>`).
 - `crates/roz-mavlink/src/backend.rs:587-605` — `impl DiscreteCommandSink<FlightCommand> for MavlinkBackend`.
 
-**Pattern (recommended by advisor — "embodiment is drone" reduces to `mavlink_backend.is_some()`):**
+**Pattern:**
 
 ```rust
-// In execute_task (crates/roz-worker/src/main.rs:~741), after the existing
-// CopperHandle/ControlInterfaceManifest inserts, add:
 if let Some(ref backend) = mavlink_backend {
-    // DiscreteCommandSink<FlightCommand> is a trait; insert as
-    // `Box<dyn ...>` so the tool can downcast via `Extensions::get<T>()`.
-    let sink: Box<dyn DiscreteCommandSink<FlightCommand>> = Box::new(Arc::clone(backend));
-    extensions.insert(sink);
+    let sink: Arc<
+        dyn DiscreteCommandSink<
+            FlightCommand,
+            Response = FlightCommandResponse,
+            Error = MavlinkDispatchError,
+        > + Send + Sync,
+    > = backend.clone();
+    extensions.insert(FlightCommandSinkHandle(sink));
+    dispatcher.register_with_category(Box::new(FlightCommandTool), ToolCategory::Physical);
 }
 ```
 
-But **note:** `Extensions::insert<T>` keys by `TypeId::of::<T>()`. A `Box<dyn Trait>` does NOT have a stable TypeId across consumers (the dyn vtable is concrete-erased). The cleanest insertion is the concrete `Arc<MavlinkBackend>`:
-
-```rust
-// SAFER per Extensions semantics:
-if let Some(ref backend) = mavlink_backend {
-    extensions.insert(Arc::clone(backend));  // keyed on Arc<MavlinkBackend>
-}
-```
-
-Then the `flight_command` tool's executor calls `ctx.extensions.get::<Arc<MavlinkBackend>>()` and invokes `backend.send_command(cmd)` directly. This sidesteps the `dyn Trait` TypeId issue entirely. Planner should validate this concretely against `Extensions` semantics.
+Then the `flight_command` tool's executor calls `ctx.extensions.get::<FlightCommandSinkHandle>()` and invokes `sink.0.send_command(cmd)`.
 
 **Threading the `Option<Arc<MavlinkBackend>>` into `execute_task`:** add a new arg to `execute_task` (already takes 14+ args; one more is fine — the `clippy::too_many_arguments` is already explicitly allowed at line 474-478). The arg flows from `main()`'s `let mavlink_backend: ...` (line 2505) through the existing `tokio::spawn(async move { execute_task(...).await })` site (line 2736).
 
@@ -437,11 +466,11 @@ cargo nextest run --profile ci-integration --run-ignored ignored-only \
 **Why it happens:** Upstream `mavlink::connect("udpin:...")` holds a `UdpSocket::recv` inside `block_in_place` that cannot be cancelled cleanly on tokio test drop.
 **How to avoid (recommended path b):** Run the QGC-shim peer as a separate test function in the same `px4_sitl_e2e.rs` test binary — but each shim test gets its own `cargo test --test px4_sitl_e2e <test_name>` invocation in CI (matches the per-test-name split that `qgc_coexistence` already does). **See Open Q3.**
 
-### Pitfall 10: `MavlinkBackend` is sized as `Arc<MavlinkBackend>`, but `Extensions::insert<T>` keys on `TypeId::of::<T>()`
-**What goes wrong:** Inserting a `Box<dyn DiscreteCommandSink<FlightCommand>>` and then trying `extensions.get::<Box<dyn ...>>()` returns `None` because the TypeId of a trait object varies by call site.
-**Why it happens:** `dyn Trait` does not have a stable, single TypeId — the vtable is concrete-erased.
-**How to avoid:** Insert the concrete `Arc<MavlinkBackend>` and have the `flight_command` tool's executor call `ctx.extensions.get::<Arc<MavlinkBackend>>()`, then call `backend.send_command(cmd)` directly (the impl is on `MavlinkBackend`, not on a trait object).
-**Warning signs:** Compiles cleanly; tool dispatch returns "no command sink available" at runtime.
+### Pitfall 10: Raw trait objects are not a stable Extensions key
+**What goes wrong:** Inserting a raw `dyn DiscreteCommandSink<FlightCommand>` or inventing a second extension key makes the tool return "flight_command unavailable" at runtime.
+**Why it happens:** `Extensions::insert<T>` keys by `TypeId::of::<T>()`; producers and consumers must use the same concrete `T`.
+**How to avoid:** Use the existing concrete newtype `FlightCommandSinkHandle` as the only key. The handle may wrap an `Arc<dyn DiscreteCommandSink<FlightCommand>...>`, but the inserted/retrieved type is the concrete handle.
+**Warning signs:** Compiles cleanly; tool dispatch returns "flight_command unavailable: MAVLink sink missing" at runtime.
 
 ## Code Examples
 
@@ -657,7 +686,7 @@ jobs:
 | A3 | `roz-worker` and `roz-server` binaries can be invoked from a roz-test integration test via `tokio::process::Command`; the existing zenoh-chaos test pre-builds `roz-worker` (`nightly.yml:223`) so the pattern exists for at least one binary | Step 8/system diagram | If the test process model doesn't permit spawning these binaries cleanly, fall back to in-process embedding (use `roz_server::lib::*` and `roz_worker::lib::*` directly — both crates expose libraries) |
 | A4 | The 600s budget figure in RD-01 is a target, not a hard wall | Pitfall 3 | If hard, image pull alone may exceed it — needs caching layer (`docker/setup-buildx-action`) |
 | A5 | A "drone embodiment" check is equivalent to `mavlink_backend.is_some()` at execute_task install time | Pattern 2 + Anti-Patterns | If the user wants a more granular embodiment-tag check (e.g., differentiate quadcopter vs fixed-wing), need an additional predicate from `embodiment_runtime` at line 1483-1497 of `main.rs` |
-| A6 | `Extensions::get<Arc<MavlinkBackend>>` is the right insertion type (not `Box<dyn DiscreteCommandSink<FlightCommand>>`) per Pitfall 10 | Pattern 2 | If wrong, dispatch fails at runtime — easy to detect with a smoke test before the full nightly |
+| A6 | `Extensions::get<FlightCommandSinkHandle>` is the right insertion type per Pitfall 10 | Pattern 2 | If wrong, dispatch fails at runtime — easy to detect with `flight_command_tool_routing` before the full nightly |
 
 ## Open Questions (RESOLVED)
 

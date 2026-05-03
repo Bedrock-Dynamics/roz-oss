@@ -97,20 +97,24 @@ fn sign_server_envelope(server_signing: &SigningKey, tenant: Uuid, host: Uuid, p
 fn spawn_handle_with_persistence(
     initial_latch: LatchState,
     wal: &Arc<WalStore>,
-) -> (CopperHandle, std::sync::Arc<ArcSwap<roz_copper::channels::ControllerState>>) {
+) -> (
+    CopperHandle,
+    std::sync::Arc<ArcSwap<roz_copper::channels::ControllerState>>,
+) {
     let actuator: Arc<dyn roz_copper::io::ActuatorSink> = Arc::new(LogActuatorSink::new());
     let policy = new_hot_policy();
     let backpressure = Arc::new(AtomicU8::new(0));
 
     let (latch_tx, latch_rx) = std::sync::mpsc::sync_channel::<LatchState>(16);
 
-    let handle = CopperHandle::spawn_with_policy_and_io(
+    let handle = CopperHandle::spawn_with_policy_and_io_with_initial_latch(
         1.5,
         actuator,
         None,
         policy,
         backpressure,
         Some(latch_tx),
+        initial_latch,
     );
 
     // FW-05 / Plan 26.10-10 (gap CR-01b): drainer task — spawn_blocking
@@ -125,15 +129,6 @@ fn spawn_handle_with_persistence(
         });
     }
 
-    // Seed the loaded latch into the ArcSwap before any controller is
-    // promoted (CR-01c invariant).
-    if initial_latch != LatchState::Run {
-        handle.state().rcu(|s| {
-            let mut next = (**s).clone();
-            next.latch_state = initial_latch;
-            Arc::new(next)
-        });
-    }
     let state = Arc::clone(handle.state());
     (handle, state)
 }
@@ -267,12 +262,8 @@ async fn unsigned_estop_ack_rejected_and_audited() {
 
     // Subscribe to the audit subject BEFORE publishing the bad message
     // so we don't race the audit publish.
-    let audit_subject =
-        roz_nats::Subjects::safety_signature_failure_worker(&host.to_string()).expect("audit subject");
-    let mut audit_sub = nats
-        .subscribe(audit_subject.clone())
-        .await
-        .expect("subscribe audit");
+    let audit_subject = roz_nats::Subjects::safety_signature_failure_worker(&host.to_string()).expect("audit subject");
+    let mut audit_sub = nats.subscribe(audit_subject.clone()).await.expect("subscribe audit");
 
     let _ack_join = spawn_estop_ack_subscriber(
         nats.clone(),

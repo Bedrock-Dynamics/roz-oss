@@ -1,6 +1,8 @@
 pub mod contract_tests;
 mod nats;
 mod pg;
+mod px4_sitl;
+mod qgc_shim;
 mod restate;
 pub mod toxiproxy;
 pub mod trace;
@@ -8,6 +10,8 @@ pub mod zenoh;
 
 pub use nats::{NatsGuard, nats_container, nats_url};
 pub use pg::{PgGuard, pg_container, pg_url};
+pub use px4_sitl::{Px4SitlGuard, px4_sitl_container};
+pub use qgc_shim::{QgcShimHandle, spawn_qgc_shim};
 pub use restate::{RestateGuard, restate_container};
 pub use toxiproxy::{ToxiproxyGuard, toxiproxy_container};
 pub use trace::{

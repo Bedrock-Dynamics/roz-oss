@@ -22,11 +22,7 @@
 //! private fixtures (`prepared_test_controller`, `test_control_manifest`,
 //! etc.) without crossing the integration-test boundary.
 
-#![allow(
-    clippy::pedantic,
-    clippy::nursery,
-    reason = "test-only style/complexity lints"
-)]
+#![allow(clippy::pedantic, clippy::nursery, reason = "test-only style/complexity lints")]
 
 use std::time::Duration;
 

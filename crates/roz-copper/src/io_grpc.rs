@@ -1,9 +1,9 @@
 //! gRPC IO backends for the controller loop.
 //!
 //! [`GrpcSensorSource`] connects to the `substrate-sim-bridge` gRPC service
-//! and streams pose data into [`SensorFrame`]s.  [`GrpcActuatorSink`] is a
-//! stub that will forward joint commands once the bridge exposes a
-//! `SendJointCommand` RPC.
+//! and streams pose data into [`SensorFrame`]s.  [`GrpcActuatorSink`] forwards
+//! manipulator/mobile commands through `SendJointCommand` and drone velocity
+//! commands through substrate's explicit `SendDroneVelocity` RPC.
 
 #![allow(clippy::missing_const_for_fn)]
 
@@ -314,6 +314,10 @@ impl GrpcActuatorSink {
         }
     }
 
+    const fn drone_velocity_frame() -> i32 {
+        proto::DroneVelocityFrame::BodyFlu as i32
+    }
+
     /// Create a new actuator sink from the canonical control interface manifest.
     ///
     /// `robot_class` remains explicit because it is not encoded by
@@ -455,20 +459,45 @@ impl ActuatorSink for GrpcActuatorSink {
                 }
             }
 
-            let request = proto::JointCommandRequest {
-                mode: command_mode,
-                joint_names: names,
-                values,
-                world_name: String::new(),
-                robot_class: robot_class.clone(),
-                owner_id: owner_id.clone(),
-                acquire_low_level_if_needed: true,
+            let send_result = if robot_class == "drone" {
+                client
+                    .send_drone_velocity(proto::DroneVelocityRequest {
+                        vehicle_index: 0,
+                        vx_mps: values.first().copied().unwrap_or(0.0),
+                        vy_mps: values.get(1).copied().unwrap_or(0.0),
+                        vz_mps: values.get(2).copied().unwrap_or(0.0),
+                        yaw_rate_rad_s: values.get(3).copied().unwrap_or(0.0),
+                        frame: Self::drone_velocity_frame(),
+                        owner_id: owner_id.clone(),
+                        acquire_low_level_if_needed: true,
+                    })
+                    .await
+                    .map(|response| {
+                        let inner = response.into_inner();
+                        (inner.success, inner.error, "SendDroneVelocity")
+                    })
+            } else {
+                client
+                    .send_joint_command(proto::JointCommandRequest {
+                        mode: command_mode,
+                        joint_names: names,
+                        values,
+                        world_name: String::new(),
+                        robot_class: robot_class.clone(),
+                        owner_id: owner_id.clone(),
+                        acquire_low_level_if_needed: true,
+                    })
+                    .await
+                    .map(|response| {
+                        let inner = response.into_inner();
+                        (inner.success, inner.error, "SendJointCommand")
+                    })
             };
 
-            match client.send_joint_command(request).await {
+            match send_result {
                 Ok(response) => {
-                    let inner = response.into_inner();
-                    if inner.success {
+                    let (success, error, rpc_name) = response;
+                    if success {
                         let should_release = {
                             let mut state = lease_state.lock();
                             if *state == LeaseState::DropRequested {
@@ -484,15 +513,15 @@ impl ActuatorSink for GrpcActuatorSink {
                         }
                         *error_message.lock() = None;
                     } else {
-                        tracing::warn!(error = inner.error, "SendJointCommand returned error");
+                        tracing::warn!(error = error, rpc = rpc_name, "actuator command RPC returned error");
                         error_flag.store(true, Ordering::Relaxed);
-                        *error_message.lock() = Some(inner.error);
+                        *error_message.lock() = Some(error);
                         *lease_state.lock() = LeaseState::Idle;
                         Self::release_low_level_control_best_effort(&mut client, &robot_class, &owner_id).await;
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "SendJointCommand RPC failed");
+                    tracing::warn!(error = %e, "actuator command RPC failed");
                     error_flag.store(true, Ordering::Relaxed);
                     *error_message.lock() = Some(e.to_string());
                     *lease_state.lock() = LeaseState::Idle;
@@ -768,6 +797,14 @@ mod tests {
 
         assert_eq!(canonical.channel_names, vec!["body/vx".to_string()]);
         assert_eq!(canonical.robot_class, "mobile");
+    }
+
+    #[tokio::test]
+    async fn grpc_actuator_sink_uses_body_flu_for_drone_velocity() {
+        assert_eq!(
+            GrpcActuatorSink::drone_velocity_frame(),
+            proto::DroneVelocityFrame::BodyFlu as i32
+        );
     }
 
     #[tokio::test]

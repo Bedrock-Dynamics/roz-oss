@@ -15,8 +15,8 @@ aot = ["roz-copper/aot"]
 # the zenoh crate so worker main can call roz_zenoh::session::open_session and
 # name zenoh::Session at the capture site.
 zenoh = ["dep:roz-zenoh", "dep:zenoh"]
-# Phase 26.10 Plan 08 (FW-07) — wires the deterministic fake-OpenClaw backend
-# through `factory_for("manipulator"|"openclaw")`. Without this feature, the
+# Phase 26.10 Plan 08 (FW-07) — wires the deterministic fake manipulator backend
+# through `factory_for("manipulator")`. Without this feature, the
 # manipulator factory's `build()` returns an Err so production binaries fail
 # closed (T-26.10-08-04 mitigation).
 test-fixtures = ["roz-copper/test-fixtures", "roz-core/test-fixtures"]

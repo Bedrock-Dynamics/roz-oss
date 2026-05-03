@@ -14,10 +14,10 @@ copper-runtime = []
 aot = []
 # Enable Gazebo simulation bridge (PoseV → EntityState conversion).
 gazebo = ["gz-transport-rs"]
-# Phase 26.10 Plan 08 (FW-07) — exposes the deterministic fake-OpenClaw
-# backend (`fake_openclaw` module) for IO-factory tests and the gated
+# Phase 26.10 Plan 08 (FW-07) — exposes the deterministic fake manipulator
+# backend (`fake_manipulator` module) for IO-factory tests and the gated
 # live-matrix manipulator row (Plan 09). Without this feature, the
-# fake_openclaw module does not compile (T-26.10-08-01 mitigation).
+# fake_manipulator module does not compile (T-26.10-08-01 mitigation).
 test-fixtures = ["roz-core/test-fixtures"]
 
 [dependencies]

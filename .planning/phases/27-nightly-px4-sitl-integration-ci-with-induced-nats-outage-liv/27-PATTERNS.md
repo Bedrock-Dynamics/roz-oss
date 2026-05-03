@@ -4,6 +4,28 @@
 **Files analyzed:** 10 (5 new + 5 modified)
 **Analogs found:** 9 / 10 (binary `.tlog` fixtures have no in-tree analog by design)
 
+## 2026-04-27 Amendment
+
+Phase 26.11 already added the canonical `flight_command` tool under `crates/roz-worker/src/tools/flight_command.rs` and a `FlightCommandSinkHandle` extension key. Any older pattern below that points to a new `crates/roz-agent/src/dispatch/flight_command_tool.rs` file is superseded.
+
+Apply this pattern instead:
+
+- Tool executor: `crates/roz-worker/src/tools/flight_command.rs`
+- Extension key: `FlightCommandSinkHandle`
+- Install site: `crates/roz-worker/src/main.rs::execute_task`
+- Backend object: worker-boot-scoped `Arc<MavlinkBackend>` coerced into the dyn `DiscreteCommandSink<FlightCommand>` handle
+
+## 2026-04-27 Substrate Simulator Boundary
+
+Any older pattern below that treats `bedrockdynamics/substrate-sim:px4-gazebo-humble` as the default direct native-MAVLink endpoint is superseded. The default simulator acceptance pattern is:
+
+- Test: `crates/roz-local/tests/live_claude_wasm_containers.rs::env_start_px4_docker_wasm_velocity_flies_10m`
+- Transport: `substrate-sim-bridge` gRPC, through `GrpcSensorSource` and `GrpcActuatorSink`
+- Runtime: Copper + promoted WASM controller
+- Assertion: simulated PX4 `x500` moves at least 10 m, then LAND/DISARM completes
+
+`px4_mavlink_probe.rs`, `px4_sitl_e2e.rs`, `.tlog` capture, and QGC-shim coexistence are direct native-MAVLink diagnostics for real FCU/HITL/direct SITL. They are not the default Substrate Docker CI gate. `crates/roz-test/src/px4_sitl.rs` may still start the bridge-backed Substrate container for helper-level tests, but direct native diagnostics must require an explicit `PX4_SITL_MAVLINK_URL` or `PX4_SITL_MAVLINK_PORT` instead of inferring one from that default container.
+
 ## File Classification
 
 | New/Modified File | Role | Data Flow | Closest Analog | Match Quality |
@@ -15,7 +37,7 @@
 | `crates/roz-mavlink/tests/fixtures/{compliance,readiness}/px4/*.tlog` | test fixture (binary capture) | file-I/O | (none — binary capture; format spec only) | n/a |
 | `proto/roz/v1/agent.proto` (modify) | proto contract | request-response (NATS payload) | `crates/roz-copper/proto/substrate/sim/bridge.proto:389-419` (existing `ReadinessState` schema) | exact |
 | `crates/roz-worker/src/main.rs` (modify telemetry loop + execute_task) | worker orchestration | streaming (10 Hz publish) + request-response (per-task install) | `crates/roz-worker/src/main.rs:1742-1748` (existing publish site) + `crates/roz-worker/src/main.rs:741-755` (existing extension install site) | exact (in-file precedent) |
-| `crates/roz-agent/src/dispatch/flight_command_tool.rs` (new) OR extend `crates/roz-agent/src/tools/spawn_worker.rs` pattern | tool executor | request-response | `crates/roz-worker/src/camera/perception.rs:37-83` (`CaptureFrameTool` reads `Arc<CameraManager>` from extensions) + `crates/roz-agent/src/tools/spawn_worker.rs` (TypedToolExecutor with NATS handle in struct) | exact |
+| `crates/roz-worker/src/tools/flight_command.rs` (existing; verify/harden) | tool executor | request-response | `crates/roz-worker/src/camera/perception.rs:37-83` (`CaptureFrameTool` reads runtime state from extensions) + `crates/roz-worker/tests/flight_command_tool_routing.rs` | exact |
 | `crates/roz-mavlink/tests/compliance.rs` (new or extend) | unit test (fixture replay) | file-I/O + transform | Plan 25-14 spec (`load_tlog`, `find_command_ack`, `command_long_payload_equal`) — no in-tree analog yet | role-match |
 
 ## Pattern Assignments
@@ -429,7 +451,7 @@ A `convert_readiness_to_v1()` shim is needed iff Phase 27 introduces a v1 `Readi
 
 ---
 
-**Analog 2 (per-task `Arc<MavlinkBackend>` install in `execute_task`):** `crates/roz-worker/src/main.rs:741-755` (existing `extensions.insert(...)` block for copper handle + camera manager)
+**Analog 2 (per-task `FlightCommandSinkHandle` install in `execute_task`):** `crates/roz-worker/src/main.rs:741-755` (existing `extensions.insert(...)` block for copper handle + camera manager)
 
 **Existing extension install site** (lines 741-755):
 ```rust
@@ -453,21 +475,24 @@ if let Some(ref cam_mgr) = camera_manager {
 
 **Apply for MavlinkBackend** (immediately after the camera block):
 ```rust
-// Phase 27 D-06/D-07: install MavlinkBackend into Extensions for the
-// flight_command tool's executor. Insert as concrete `Arc<MavlinkBackend>`
-// (NOT `Box<dyn DiscreteCommandSink<FlightCommand>>`) — `Extensions::insert`
-// keys on `TypeId::of::<T>()` (dispatch/mod.rs:163), and `dyn Trait` does
-// not have a stable TypeId. The tool executor calls
-// `ctx.extensions.get::<Arc<MavlinkBackend>>()` and invokes `.send_command(...)`
-// directly through the impl at backend.rs:587-605.
+// Phase 27 D-06/D-07: install the concrete FlightCommandSinkHandle into
+// Extensions for the worker-owned flight_command tool. The handle wraps the
+// dyn DiscreteCommandSink; the concrete handle is the TypeId key.
 //
 // Gate: `mavlink_backend.is_some()` — worker boot already gates construction
 // on `[mavlink]` config presence (main.rs:2505), so this single source of
 // truth covers "embodiment is a drone" without a parallel predicate.
 if let Some(ref backend) = mavlink_backend {
-    extensions.insert(Arc::clone(backend));
+    let sink: Arc<
+        dyn DiscreteCommandSink<
+            FlightCommand,
+            Response = FlightCommandResponse,
+            Error = MavlinkDispatchError,
+        > + Send + Sync,
+    > = backend.clone();
+    extensions.insert(FlightCommandSinkHandle(sink));
     dispatcher.register_with_category(
-        Box::new(roz_agent::dispatch::flight_command_tool::FlightCommandTool),
+        Box::new(roz_worker::tools::flight_command::FlightCommandTool),
         roz_core::tools::ToolCategory::Physical,
     );
     tracing::info!("flight_command tool registered (drone embodiment)");
@@ -478,7 +503,7 @@ if let Some(ref backend) = mavlink_backend {
 
 ---
 
-### `crates/roz-agent/src/dispatch/flight_command_tool.rs` (NEW — tool executor, request-response)
+### `crates/roz-worker/src/tools/flight_command.rs` (EXISTING — tool executor, request-response)
 
 **Analog 1 (extension-reading executor pattern):** `crates/roz-worker/src/camera/perception.rs:37-83` (`CaptureFrameTool` reads `Arc<CameraManager>` from `ctx.extensions`)
 
@@ -495,7 +520,7 @@ use roz_core::tools::ToolResult;
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FlightCommandInput {
     /// The flight command variant. One of: arm | disarm | takeoff | land | rtl | set_mode | goto
-    pub command: FlightCommand,  // re-export from roz_mavlink::flight_command or roz_copper::io
+    pub command: String,  // arm | disarm | takeoff | land | rtl | set_mode | goto
 }
 
 pub struct FlightCommandTool;
@@ -519,16 +544,15 @@ impl TypedToolExecutor for FlightCommandTool {
         input: Self::Input,
         ctx: &ToolContext,
     ) -> Result<ToolResult, Box<dyn std::error::Error + Send + Sync>> {
-        // Mirror perception.rs:57-59 — read Arc<MavlinkBackend> from extensions.
-        let Some(backend) = ctx.extensions.get::<Arc<roz_mavlink::MavlinkBackend>>() else {
+        // Read the worker-installed command sink handle from extensions.
+        let Some(sink) = ctx.extensions.get::<FlightCommandSinkHandle>() else {
             return Ok(ToolResult::error(
-                "no MAVLink backend on this worker (drone embodiment required)".to_string(),
+                "flight_command unavailable: MAVLink sink missing".to_string(),
             ));
         };
 
-        // Backend impl is at crates/roz-mavlink/src/backend.rs:587-605. The
-        // sync `send_command` requires multi-threaded tokio (see Pitfall 8).
-        match backend.send_command(input.command) {
+        let command = build_command(&input)?;
+        match sink.0.send_command(command) {
             Ok(response) => Ok(ToolResult::success(serde_json::to_value(response)?)),
             Err(err) => Ok(ToolResult::error(format!("flight command dispatch failed: {err}"))),
         }
@@ -614,7 +638,7 @@ Required because `DiscreteCommandSink::send_command` calls `tokio::task::block_i
 
 ### `Extensions` insertion + retrieval (TypeId-keyed map)
 **Source:** `crates/roz-agent/src/dispatch/mod.rs:146-173` (definition) + `crates/roz-worker/src/camera/perception.rs:57` (use-site)
-**Apply to:** All Phase 27 per-task installs (`Arc<MavlinkBackend>`) and tool executors (`flight_command_tool`)
+**Apply to:** All Phase 27 per-task installs (`FlightCommandSinkHandle`) and tool executors (`flight_command`)
 
 **Definition** (lines 162-172):
 ```rust
@@ -629,7 +653,7 @@ pub fn get<T: Send + Sync + 'static>(&self) -> Option<&T> {
 }
 ```
 
-**CRITICAL constraint:** `T` must be a concrete type, NOT `dyn Trait`. Insert `Arc<MavlinkBackend>`, retrieve as `Arc<MavlinkBackend>`. See Pitfall 10 for the dyn-Trait-TypeId trap.
+**CRITICAL constraint:** `T` must be the same concrete type at insert and retrieve. Insert `FlightCommandSinkHandle`, retrieve as `FlightCommandSinkHandle`. The handle can contain a dyn sink internally; the key itself stays concrete.
 
 ### Pinned action SHAs in CI
 **Source:** `.github/workflows/nightly.yml:48-71` (verbatim block)

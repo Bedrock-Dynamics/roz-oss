@@ -68,14 +68,18 @@ pub struct WorkerConfig {
     ///
     /// TOML example:
     ///
-    ///     [observability.camera]
-    ///     record = "keyframes"            # "keyframes" | "full" | "off"
-    ///     keyframe_interval_secs = 2.0
+    /// ```toml
+    /// [observability.camera]
+    /// record = "keyframes"            # "keyframes" | "full" | "off"
+    /// keyframe_interval_secs = 2.0
+    /// ```
     ///
     /// Env var path (figment double-underscore separator per research Q6):
     ///
-    ///     ROZ_OBSERVABILITY__CAMERA__RECORD=full
-    ///     ROZ_OBSERVABILITY__CAMERA__KEYFRAME_INTERVAL_SECS=5.0
+    /// ```text
+    /// ROZ_OBSERVABILITY__CAMERA__RECORD=full
+    /// ROZ_OBSERVABILITY__CAMERA__KEYFRAME_INTERVAL_SECS=5.0
+    /// ```
     ///
     /// Absent = default (keyframes record, 2.0 s keyframe hint).
     #[serde(default)]
@@ -240,8 +244,9 @@ fn default_anthropic_provider() -> String {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct MavlinkConfig {
     /// Transport URL. Examples: `"serial:/dev/ttyUSB0:921600"` for Pixhawk over
-    /// TELEM2, `"udpin:0.0.0.0:14540"` for PX4 SITL offboard. `None` disables
-    /// the MAVLink backend entirely.
+    /// TELEM2, `"udpin:0.0.0.0:14540"` when PX4 broadcasts to a local port, or
+    /// `"udpout:127.0.0.1:14540"` when a simulator/container exposes a UDP
+    /// endpoint that the worker dials. `None` disables the MAVLink backend.
     #[serde(default)]
     pub transport: Option<String>,
 

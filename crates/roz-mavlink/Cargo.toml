@@ -65,5 +65,20 @@ sha2  = { workspace = true }
 # test-only constructor is excluded from release artifacts.
 test-helpers = []
 
+[[test]]
+name = "px4_readiness_replay"
+path = "tests/px4_readiness_replay.rs"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "compliance"
+path = "tests/compliance.rs"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "readiness_replay"
+path = "tests/readiness_replay.rs"
+required-features = ["test-helpers"]
+
 [lints]
 workspace = true

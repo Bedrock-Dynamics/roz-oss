@@ -17,7 +17,7 @@ use roz_core::embodiment::EmbodimentRuntime;
 use roz_core::embodiment::binding::ControlInterfaceManifest;
 use roz_core::tools::ToolCategory;
 
-use crate::io_backends::factory_for;
+use crate::io_backends::factory_for_with_mavlink;
 
 /// Inputs required to spawn the physical runtime for an OodaReAct task.
 pub struct PhysicalRuntimeConfig {
@@ -27,10 +27,12 @@ pub struct PhysicalRuntimeConfig {
     pub hot_policy: roz_copper::policy::HotCopperPolicy,
     pub shared_backpressure: Arc<AtomicU8>,
     pub latch_persist_tx: Option<std::sync::mpsc::SyncSender<LatchState>>,
+    pub initial_latch_state: LatchState,
     pub dispatcher: ToolDispatcher,
     pub extensions: Extensions,
     pub task_id: String,
     pub tenant_id: String,
+    pub mavlink_backend: Option<Arc<roz_mavlink::MavlinkBackend>>,
     #[cfg(feature = "test-fixtures")]
     rollout_authority: Option<PhysicalRuntimeRolloutAuthority>,
 }
@@ -57,13 +59,27 @@ impl PhysicalRuntimeConfig {
             hot_policy,
             shared_backpressure,
             latch_persist_tx,
+            initial_latch_state: LatchState::Run,
             dispatcher,
             extensions,
             task_id,
             tenant_id,
+            mavlink_backend: None,
             #[cfg(feature = "test-fixtures")]
             rollout_authority: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_mavlink_backend(mut self, backend: Option<Arc<roz_mavlink::MavlinkBackend>>) -> Self {
+        self.mavlink_backend = backend;
+        self
+    }
+
+    #[must_use]
+    pub fn with_initial_latch_state(mut self, initial_latch_state: LatchState) -> Self {
+        self.initial_latch_state = initial_latch_state;
+        self
     }
 
     /// Give the test harness explicit rollout authority so it can prove
@@ -102,13 +118,13 @@ pub struct PhysicalRuntimeHandle {
     pub context: ToolContext,
     pub factory_name: &'static str,
     #[cfg(feature = "test-fixtures")]
-    pub openclaw_observation: Option<FakeOpenclawObservation>,
+    pub manipulator_observation: Option<FakeManipulatorObservation>,
 }
 
-/// Snapshot of commands observed at the fake OpenClaw actuator boundary.
+/// Snapshot of commands observed at the fake manipulator actuator boundary.
 #[cfg(feature = "test-fixtures")]
 #[derive(Debug, Clone, Default)]
-pub struct FakeOpenclawObservedState {
+pub struct FakeManipulatorObservedState {
     pub joint_positions: Vec<f64>,
     pub joint_velocities: Vec<f64>,
     pub command_count: u64,
@@ -116,16 +132,16 @@ pub struct FakeOpenclawObservedState {
 
 #[cfg(feature = "test-fixtures")]
 #[derive(Clone)]
-pub struct FakeOpenclawObservation {
-    inner: Arc<std::sync::Mutex<FakeOpenclawObservedState>>,
+pub struct FakeManipulatorObservation {
+    inner: Arc<std::sync::Mutex<FakeManipulatorObservedState>>,
 }
 
 #[cfg(feature = "test-fixtures")]
-impl FakeOpenclawObservation {
+impl FakeManipulatorObservation {
     #[must_use]
     fn new(joint_count: usize) -> Self {
         Self {
-            inner: Arc::new(std::sync::Mutex::new(FakeOpenclawObservedState {
+            inner: Arc::new(std::sync::Mutex::new(FakeManipulatorObservedState {
                 joint_positions: vec![0.0; joint_count],
                 joint_velocities: vec![0.0; joint_count],
                 command_count: 0,
@@ -134,15 +150,15 @@ impl FakeOpenclawObservation {
     }
 
     #[must_use]
-    pub fn snapshot(&self) -> FakeOpenclawObservedState {
+    pub fn snapshot(&self) -> FakeManipulatorObservedState {
         self.inner
             .lock()
-            .expect("fake-openclaw observation mutex poisoned")
+            .expect("fake-manipulator observation mutex poisoned")
             .clone()
     }
 
     fn record_command(&self, values: &[f64]) {
-        let mut state = self.inner.lock().expect("fake-openclaw observation mutex poisoned");
+        let mut state = self.inner.lock().expect("fake-manipulator observation mutex poisoned");
         let count = state.joint_velocities.len().min(values.len());
         for (i, value) in values.iter().copied().enumerate().take(count) {
             state.joint_velocities[i] = value;
@@ -155,7 +171,7 @@ impl FakeOpenclawObservation {
 #[cfg(feature = "test-fixtures")]
 struct ObservedActuator {
     inner: Arc<dyn ActuatorSink>,
-    observation: FakeOpenclawObservation,
+    observation: FakeManipulatorObservation,
 }
 
 #[cfg(feature = "test-fixtures")]
@@ -167,13 +183,13 @@ impl ActuatorSink for ObservedActuator {
 }
 
 #[cfg(feature = "test-fixtures")]
-fn maybe_observe_openclaw_actuator(
+fn maybe_observe_manipulator_actuator(
     family_id: Option<&str>,
     actuator: Arc<dyn ActuatorSink>,
     joint_count: usize,
-) -> (Arc<dyn ActuatorSink>, Option<FakeOpenclawObservation>) {
-    if matches!(family_id, Some("openclaw" | "manipulator")) {
-        let observation = FakeOpenclawObservation::new(joint_count);
+) -> (Arc<dyn ActuatorSink>, Option<FakeManipulatorObservation>) {
+    if matches!(family_id, Some("manipulator")) {
+        let observation = FakeManipulatorObservation::new(joint_count);
         let observed = Arc::new(ObservedActuator {
             inner: actuator,
             observation: observation.clone(),
@@ -185,7 +201,7 @@ fn maybe_observe_openclaw_actuator(
 }
 
 #[cfg(not(feature = "test-fixtures"))]
-fn maybe_observe_openclaw_actuator(
+fn maybe_observe_manipulator_actuator(
     _family_id: Option<&str>,
     actuator: Arc<dyn ActuatorSink>,
     _joint_count: usize,
@@ -206,7 +222,7 @@ pub fn spawn_physical_runtime(mut config: PhysicalRuntimeConfig) -> anyhow::Resu
         .embodiment_family
         .as_ref()
         .map(|family| family.family_id.as_str());
-    let factory = factory_for(family_id).ok_or_else(|| {
+    let factory = factory_for_with_mavlink(family_id, config.mavlink_backend.clone()).ok_or_else(|| {
         anyhow::anyhow!(
             "no IoFactory for embodiment_family={:?}",
             config.runtime.model.embodiment_family
@@ -218,9 +234,9 @@ pub fn spawn_physical_runtime(mut config: PhysicalRuntimeConfig) -> anyhow::Resu
         .build(&config.runtime, &config.control_manifest)
         .with_context(|| format!("IoFactory build failed for {factory_name}"))?;
     let joint_count = config.runtime.model.joints.len();
-    let (actuator, openclaw_observation) = maybe_observe_openclaw_actuator(family_id, actuator, joint_count);
+    let (actuator, manipulator_observation) = maybe_observe_manipulator_actuator(family_id, actuator, joint_count);
     #[cfg(not(feature = "test-fixtures"))]
-    let _ = openclaw_observation;
+    let _ = manipulator_observation;
 
     #[cfg(feature = "test-fixtures")]
     let copper = if let Some(authority) = config.rollout_authority {
@@ -242,26 +258,29 @@ pub fn spawn_physical_runtime(mut config: PhysicalRuntimeConfig) -> anyhow::Resu
             Some(config.hot_policy.clone()),
             Some(config.shared_backpressure.clone()),
             config.latch_persist_tx.take(),
+            config.initial_latch_state,
         )
     } else {
-        CopperHandle::spawn_with_policy_and_io(
+        CopperHandle::spawn_with_policy_and_io_with_initial_latch(
             config.max_velocity,
             actuator,
             Some(sensor),
             config.hot_policy.clone(),
             config.shared_backpressure.clone(),
             config.latch_persist_tx.take(),
+            config.initial_latch_state,
         )
     };
 
     #[cfg(not(feature = "test-fixtures"))]
-    let copper = CopperHandle::spawn_with_policy_and_io(
+    let copper = CopperHandle::spawn_with_policy_and_io_with_initial_latch(
         config.max_velocity,
         actuator,
         Some(sensor),
         config.hot_policy.clone(),
         config.shared_backpressure.clone(),
         config.latch_persist_tx.take(),
+        config.initial_latch_state,
     );
 
     let mut extensions = config.extensions;
@@ -296,6 +315,6 @@ pub fn spawn_physical_runtime(mut config: PhysicalRuntimeConfig) -> anyhow::Resu
         },
         factory_name,
         #[cfg(feature = "test-fixtures")]
-        openclaw_observation,
+        manipulator_observation,
     })
 }

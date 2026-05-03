@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 struct DbHarness {
     pool: PgPool,
+    _pg: roz_test::PgGuard,
     tenant_id: Uuid,
 }
 
@@ -233,7 +234,6 @@ async fn setup_db_harness() -> DbHarness {
     let tenant_id = Uuid::new_v4();
     let guard = roz_test::pg_container().await;
     let url = guard.url().to_string();
-    std::mem::forget(guard);
     let pool = create_pool(&url).await.expect("pool");
     run_migrations(&pool).await.expect("migrations");
 
@@ -248,7 +248,11 @@ async fn setup_db_harness() -> DbHarness {
         .await
         .expect("pin tenant id");
 
-    DbHarness { pool, tenant_id }
+    DbHarness {
+        pool,
+        _pg: guard,
+        tenant_id,
+    }
 }
 
 async fn spawn_client(service: LoopbackArtifactService) -> ArtifactServiceClient<tonic::transport::Channel> {

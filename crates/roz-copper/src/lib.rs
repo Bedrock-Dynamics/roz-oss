@@ -33,20 +33,20 @@ pub mod evidence_collector;
 pub mod gazebo_cmd;
 #[cfg(feature = "gazebo")]
 pub mod gazebo_sensor;
-// Phase 26.10 Plan 08 (FW-07) — deterministic fake-OpenClaw backend.
+// Phase 26.10 Plan 08 (FW-07) — deterministic fake manipulator backend.
 // Gated `test-fixtures` so production binaries cannot link the fake
 // (T-26.10-08-01 mitigation). Lives next to `io` because it impls those traits.
 #[cfg(any(test, feature = "test-fixtures"))]
-pub mod fake_openclaw;
+pub mod fake_manipulator;
 pub mod handle;
 pub mod io;
 pub mod io_factory;
 // Phase 26.10 Plan 07 (FW-05c) — latched e-stop state machine.
 // IEC 60204-1 Stop Category 0 + EN ISO 13849-1 manual reset semantics.
-pub mod latch;
 pub mod io_grpc;
 pub mod io_log;
 pub mod io_ws;
+pub mod latch;
 pub mod manifest;
 pub mod mcap_export;
 pub mod policy;

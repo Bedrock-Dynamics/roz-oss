@@ -679,8 +679,8 @@ mod tests {
     /// `crates/roz-core/src/embodiment/embodiment_runtime.rs:2599` but kept
     /// minimal — empty vecs are valid for compile().
     fn minimal_runtime() -> roz_core::embodiment::EmbodimentRuntime {
-        use roz_core::embodiment::frame_tree::{FrameSource, FrameTree};
         use roz_core::embodiment::EmbodimentModel;
+        use roz_core::embodiment::frame_tree::{FrameSource, FrameTree};
         let mut tree = FrameTree::new();
         tree.set_root("world", FrameSource::Static);
         let mut model = EmbodimentModel {

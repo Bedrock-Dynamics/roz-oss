@@ -9086,13 +9086,20 @@ dependencies = [
 name = "roz-test"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
+ "async-nats",
  "chrono",
  "flume",
+ "futures",
+ "mavlink",
  "noxious-client",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "prost 0.13.5",
  "roz-core",
+ "roz-nats",
+ "roz-proto",
  "serde_json",
  "tempfile",
  "testcontainers",
@@ -9101,6 +9108,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "uuid",
  "zenoh",
 ]
 

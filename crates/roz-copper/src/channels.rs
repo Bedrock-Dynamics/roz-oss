@@ -54,6 +54,12 @@ pub enum ControllerCommand {
     /// arms that progression. Under compatibility fallback policy, Copper
     /// ignores this command until a runtime-authoritative policy is injected.
     PromoteActive,
+    /// No-op supervision heartbeat from the agent/runtime.
+    ///
+    /// The Copper watchdog treats any received command as proof the agent is
+    /// still supervising the controller. `KeepAlive` refreshes that contact
+    /// without changing controller parameters or lifecycle state.
+    KeepAlive,
     /// Update controller parameters (JSON).
     UpdateParams(serde_json::Value),
     /// Halt the controller (stop ticking).
@@ -116,6 +122,7 @@ impl ControllerCommand {
                     .map(CopperRuntimeCommand::PreparedArtifact)
             }
             Self::PromoteActive => Ok(CopperRuntimeCommand::PromoteActive),
+            Self::KeepAlive => Ok(CopperRuntimeCommand::KeepAlive),
             Self::UpdateParams(params) => Ok(CopperRuntimeCommand::UpdateParams(params)),
             Self::Halt => Ok(CopperRuntimeCommand::Halt),
             Self::Resume => Ok(CopperRuntimeCommand::Resume),
@@ -134,6 +141,7 @@ impl ControllerCommand {
 pub enum CopperRuntimeCommand {
     PreparedArtifact(crate::controller::PreparedController),
     PromoteActive,
+    KeepAlive,
     UpdateParams(serde_json::Value),
     Halt,
     /// Pre-FW-05 semantics — does NOT clear the latched-e-stop state machine.
@@ -351,6 +359,7 @@ pub fn spawn_command_bridge(
                     }
                 }
                 ControllerCommand::PromoteActive => CopperRuntimeCommand::PromoteActive,
+                ControllerCommand::KeepAlive => CopperRuntimeCommand::KeepAlive,
                 ControllerCommand::UpdateParams(params) => CopperRuntimeCommand::UpdateParams(params),
                 ControllerCommand::Halt => CopperRuntimeCommand::Halt,
                 ControllerCommand::Resume => CopperRuntimeCommand::Resume,
@@ -566,6 +575,7 @@ mod tests {
 
         // Send from agent side (tokio).
         agent_tx.send(ControllerCommand::Halt).await.unwrap();
+        agent_tx.send(ControllerCommand::KeepAlive).await.unwrap();
         agent_tx.send(ControllerCommand::Resume).await.unwrap();
 
         // Small delay for bridge to forward.
@@ -575,7 +585,9 @@ mod tests {
         let cmd1 = copper_rx.try_recv().unwrap();
         assert!(matches!(cmd1, CopperRuntimeCommand::Halt));
         let cmd2 = copper_rx.try_recv().unwrap();
-        assert!(matches!(cmd2, CopperRuntimeCommand::Resume));
+        assert!(matches!(cmd2, CopperRuntimeCommand::KeepAlive));
+        let cmd3 = copper_rx.try_recv().unwrap();
+        assert!(matches!(cmd3, CopperRuntimeCommand::Resume));
 
         bridge.abort();
     }

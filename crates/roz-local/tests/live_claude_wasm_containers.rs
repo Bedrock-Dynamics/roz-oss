@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use roz_copper::channels::ControllerState;
+use roz_copper::channels::{ControllerCommand, ControllerState};
 use roz_copper::deployment_manager::DeploymentManager;
 use roz_copper::handle::CopperHandle;
 use roz_copper::io::ActuatorSink;
@@ -26,6 +26,9 @@ use roz_copper::io_grpc::proto::{FlightCommand, FlightCommandRequest, StreamPose
 use roz_copper::io_grpc::{GrpcActuatorSink, GrpcSensorSource};
 use roz_copper::io_log::{LogActuatorSink, TeeActuatorSink};
 use roz_core::embodiment::binding::ControlInterfaceManifest;
+use roz_local::docker::DockerLauncher;
+use roz_local::mcp::McpManager;
+use roz_local::tools::env_start::{EnvStartInput, EnvStartTool};
 
 const MOBILE_BRIDGE_URL: &str = "http://127.0.0.1:9096";
 const PX4_BRIDGE_URL: &str = "http://127.0.0.1:9090";
@@ -78,6 +81,18 @@ const ARDUPILOT_SIM: common::DockerSimSpec = common::DockerSimSpec {
 fn live_test_mutex() -> &'static tokio::sync::Mutex<()> {
     static LIVE_TEST_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LIVE_TEST_MUTEX.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+struct EnvStartCleanup {
+    launcher: Arc<DockerLauncher>,
+    mcp: Arc<McpManager>,
+}
+
+impl Drop for EnvStartCleanup {
+    fn drop(&mut self) {
+        self.mcp.disconnect_all();
+        self.launcher.stop_all();
+    }
 }
 
 fn load_diff_drive_control_manifest() -> (ControlInterfaceManifest, String) {
@@ -220,12 +235,23 @@ async fn arm_until_ready(channel: tonic::transport::Channel) -> bool {
     false
 }
 
-fn vehicle_z(state: &ControllerState) -> Option<f64> {
+async fn disarm_until_accepted(channel: tonic::transport::Channel) -> bool {
+    for attempt in 1..=15 {
+        if send_flight_cmd(channel.clone(), FlightCommand::Disarm, "", 0.0).await {
+            println!("DISARM accepted on attempt {attempt}");
+            return true;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    false
+}
+
+fn vehicle_position(state: &ControllerState) -> Option<[f64; 3]> {
     state
         .entities
         .iter()
         .find(|e| e.id.contains("iris") || e.id.contains("vehicle") || e.id.contains("x500"))
-        .and_then(|e| e.position.map(|[_, _, z]| z))
+        .and_then(|e| e.position)
 }
 
 #[allow(unused_assignments)]
@@ -299,11 +325,35 @@ async fn wait_for_scene_stream(bridge_url: &str, entity_hint: Option<&str>, time
 }
 
 async fn wait_for_vehicle_z(handle: &CopperHandle, timeout: Duration) -> Option<f64> {
+    wait_for_vehicle_position(handle, timeout).await.map(|[_, _, z]| z)
+}
+
+async fn wait_for_vehicle_z_at_least(handle: &CopperHandle, min_z: f64, timeout: Duration) -> Option<[f64; 3]> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut best: Option<[f64; 3]> = None;
+    loop {
+        let current = handle.state().load();
+        if let Some(position) = vehicle_position(&current) {
+            if position[2] >= min_z {
+                return Some(position);
+            }
+            if best.as_ref().is_none_or(|best_position| position[2] > best_position[2]) {
+                best = Some(position);
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return best;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn wait_for_vehicle_position(handle: &CopperHandle, timeout: Duration) -> Option<[f64; 3]> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let current = handle.state().load();
-        if let Some(z) = vehicle_z(&current) {
-            return Some(z);
+        if let Some(position) = vehicle_position(&current) {
+            return Some(position);
         }
         if tokio::time::Instant::now() >= deadline {
             println!("Timed out waiting for vehicle entity. Current scene entities:");
@@ -311,6 +361,49 @@ async fn wait_for_vehicle_z(handle: &CopperHandle, timeout: Duration) -> Option<
                 println!("  {}", entity.id);
             }
             return None;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn wait_for_active_controller(handle: &CopperHandle, timeout: Duration) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let current = handle.state().load();
+        if let Some(controller_id) = current.active_controller_id.clone() {
+            return Some(controller_id);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_vehicle_distance_from(
+    handle: &CopperHandle,
+    before: [f64; 3],
+    min_distance_m: f64,
+    timeout: Duration,
+) -> Option<([f64; 3], f64)> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut best: Option<([f64; 3], f64)> = None;
+    loop {
+        let current = handle.state().load();
+        if let Some(after) = vehicle_position(&current) {
+            let dx = after[0] - before[0];
+            let dy = after[1] - before[1];
+            let dz = after[2] - before[2];
+            let distance = (dx * dx + dy * dy + dz * dz).sqrt();
+            if distance >= min_distance_m {
+                return Some((after, distance));
+            }
+            if best.as_ref().is_none_or(|(_, best_distance)| distance > *best_distance) {
+                best = Some((after, distance));
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return best;
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -569,6 +662,168 @@ async fn real_claude_px4_wasm_velocity_through_bridge() {
     let _ = send_flight_cmd(grpc_channel.clone(), FlightCommand::Land, "", 0.0).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     let _ = send_flight_cmd(grpc_channel, FlightCommand::Disarm, "", 0.0).await;
+
+    handle.shutdown().await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "requires Docker + bedrockdynamics/substrate-sim:px4-gazebo-humble"]
+async fn env_start_px4_docker_wasm_velocity_flies_10m() {
+    let _serial = live_test_mutex().lock().await;
+    let launcher = Arc::new(DockerLauncher::new());
+    let mcp = Arc::new(McpManager::new());
+    assert!(launcher.is_available(), "Docker must be available for the PX4 live E2E");
+    let _cleanup = EnvStartCleanup {
+        launcher: Arc::clone(&launcher),
+        mcp: Arc::clone(&mcp),
+    };
+
+    let env_start = EnvStartTool::new(Arc::clone(&launcher), Arc::clone(&mcp), std::env::temp_dir());
+    let env_ctx = roz_agent::dispatch::ToolContext {
+        task_id: "px4-docker-wasm-10m".into(),
+        tenant_id: "local".into(),
+        call_id: "env-start".into(),
+        extensions: roz_agent::dispatch::Extensions::default(),
+    };
+    let env_result = <EnvStartTool as roz_agent::dispatch::TypedToolExecutor>::execute(
+        &env_start,
+        EnvStartInput {
+            vehicle_model: "x500".into(),
+            world: "default".into(),
+        },
+        &env_ctx,
+    )
+    .await
+    .expect("env_start tool should not panic");
+    assert!(
+        env_result.is_success(),
+        "env_start should launch PX4/Gazebo: {:?}",
+        env_result.error
+    );
+
+    let bridge_port = env_result.output["ports"]["bridge"]
+        .as_u64()
+        .expect("env_start output should include ports.bridge");
+    let bridge_url = format!("http://127.0.0.1:{bridge_port}");
+    println!("PX4 env_start bridge URL: {bridge_url}");
+    wait_for_scene_stream(&bridge_url, Some("x500"), Duration::from_secs(120))
+        .await
+        .expect("env_start PX4 container should stream x500 scene data before Copper starts");
+
+    let sensor = GrpcSensorSource::connect(&bridge_url)
+        .await
+        .expect("GrpcSensorSource should connect to env_start PX4 bridge");
+    let grpc_channel = tonic::transport::Channel::from_shared(bridge_url.clone())
+        .expect("valid PX4 bridge URI")
+        .connect()
+        .await
+        .expect("gRPC channel to env_start PX4 bridge");
+
+    let (control_manifest, robot_class) = load_quadcopter_control_manifest();
+    let grpc_sink = Arc::new(
+        GrpcActuatorSink::from_control_manifest(
+            grpc_channel.clone(),
+            &control_manifest,
+            robot_class,
+            tokio::runtime::Handle::current(),
+        )
+        .expect("valid PX4 actuator manifest"),
+    );
+    let grpc_sink_ref = Arc::clone(&grpc_sink);
+    let log_sink = Arc::new(LogActuatorSink::new());
+    let tee_sink = Arc::new(TeeActuatorSink::new(
+        Arc::clone(&grpc_sink) as Arc<dyn ActuatorSink>,
+        Arc::clone(&log_sink) as Arc<dyn ActuatorSink>,
+    ));
+
+    let handle = CopperHandle::spawn_with_io_and_deployment_manager(
+        5.0,
+        Some(tee_sink as Arc<dyn ActuatorSink>),
+        Some(Box::new(sensor)),
+        DeploymentManager::with_rollout_policy(false, false, true, 1, 1, 10_000, 10_000, u64::MAX),
+    );
+
+    assert!(
+        arm_until_ready(grpc_channel.clone()).await,
+        "ARM must succeed once PX4 reports ready"
+    );
+    assert!(
+        send_flight_cmd(grpc_channel.clone(), FlightCommand::Takeoff, "", 3.0).await,
+        "TAKEOFF must succeed before WASM velocity control"
+    );
+
+    let before = wait_for_vehicle_z_at_least(&handle, 2.5, Duration::from_secs(90))
+        .await
+        .expect("expected x500 to reach takeoff altitude before horizontal WASM velocity control");
+    println!("BEFORE PX4 x500 post-takeoff position: {before:?}");
+
+    let mut command_values = vec![0.0_f64; control_manifest.channels.len()];
+    if let Some(value) = command_values.first_mut() {
+        *value = 2.0;
+    }
+    let wat_source = common::constant_output_controller_wat(&command_values);
+    common::promote_and_activate_live_controller(&handle, "px4-docker-wasm-10m", &control_manifest, &wat_source).await;
+    let active_controller = wait_for_active_controller(&handle, Duration::from_secs(10))
+        .await
+        .expect("WASM controller should become active before OFFBOARD velocity control");
+    println!("Active WASM controller: {active_controller}");
+    let keepalive_tx = handle.cmd_tx();
+    let keepalive_task = tokio::spawn(async move {
+        loop {
+            if keepalive_tx.send(ControllerCommand::KeepAlive).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+
+    assert!(
+        send_flight_cmd(grpc_channel.clone(), FlightCommand::SetMode, "OFFBOARD", 0.0).await,
+        "OFFBOARD mode switch must succeed once WASM velocity setpoints are streaming"
+    );
+
+    let Some((after, distance)) = wait_for_vehicle_distance_from(&handle, before, 10.0, Duration::from_secs(240)).await
+    else {
+        panic!("expected x500 to fly at least 10m under WASM velocity control");
+    };
+    println!("AFTER PX4 x500 position: {after:?}, distance={distance:.3}m");
+
+    let current = handle.state().load();
+    println!(
+        "PX4 10m controller: tick={}, running={}, deployment_state={:?}, active={:?}, last_output={:?}",
+        current.last_tick, current.running, current.deployment_state, current.active_controller_id, current.last_output
+    );
+    assert!(current.running, "controller should still be running after 10m movement");
+    assert!(
+        current.active_controller_id.is_some(),
+        "WASM controller should be active after promotion"
+    );
+
+    let cmds = log_sink.commands();
+    assert!(!cmds.is_empty(), "WASM controller should produce command frames");
+    assert!(
+        cmds.iter()
+            .filter_map(|cmd| cmd.values.first().copied())
+            .any(|value| (value - 2.0).abs() < 0.001),
+        "WASM should emit the expected 2m/s body-FLU x velocity"
+    );
+    assert!(
+        !grpc_sink_ref.had_error(),
+        "GrpcActuatorSink should not report errors through SendDroneVelocity: {:?}",
+        grpc_sink_ref.last_error_message()
+    );
+    assert!(
+        distance >= 10.0,
+        "x500 should have flown at least 10m after env_start + WASM velocity control, got {distance:.3}m"
+    );
+
+    let _ = send_flight_cmd(grpc_channel.clone(), FlightCommand::Land, "", 0.0).await;
+    assert!(
+        disarm_until_accepted(grpc_channel).await,
+        "DISARM should succeed after LAND completes"
+    );
+    keepalive_task.abort();
+    let _ = keepalive_task.await;
 
     handle.shutdown().await;
 }

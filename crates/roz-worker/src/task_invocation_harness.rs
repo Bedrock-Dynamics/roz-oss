@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 
 use crate::dispatch::{build_prompt_state, build_runtime_shell_input, build_turn_input, effective_cognition_mode};
 use crate::physical_runtime::{
-    FakeOpenclawObservation, PhysicalRuntimeConfig, PhysicalRuntimeHandle, PhysicalRuntimeRolloutAuthority,
+    FakeManipulatorObservation, PhysicalRuntimeConfig, PhysicalRuntimeHandle, PhysicalRuntimeRolloutAuthority,
     spawn_physical_runtime,
 };
 
@@ -69,7 +69,7 @@ pub struct WorkerTaskHarnessResult {
     pub tool_evidence: Vec<WorkerTaskToolEvidence>,
     pub dispatcher_tool_names: Vec<String>,
     pub final_controller_state: Option<Arc<ControllerState>>,
-    pub openclaw_observation: Option<FakeOpenclawObservation>,
+    pub manipulator_observation: Option<FakeManipulatorObservation>,
     physical_runtime: Option<PhysicalRuntimeHandle>,
     event_rx: Option<tokio::sync::broadcast::Receiver<EventEnvelope>>,
 }
@@ -141,7 +141,7 @@ fn failure_result(task_id: &str, message: impl Into<String>) -> WorkerTaskHarnes
         }],
         dispatcher_tool_names: Vec::new(),
         final_controller_state: None,
-        openclaw_observation: None,
+        manipulator_observation: None,
         physical_runtime: None,
         event_rx: None,
     }
@@ -249,7 +249,7 @@ pub async fn run_worker_task_invocation_for_tests(
             tool_evidence: Vec::new(),
             dispatcher_tool_names,
             final_controller_state: Some(physical.copper.state().load_full()),
-            openclaw_observation: physical.openclaw_observation.clone(),
+            manipulator_observation: physical.manipulator_observation.clone(),
             physical_runtime: Some(physical),
             event_rx: Some(event_rx),
         },
@@ -261,7 +261,7 @@ pub async fn run_worker_task_invocation_for_tests(
             tool_evidence: Vec::new(),
             dispatcher_tool_names,
             final_controller_state: Some(physical.copper.state().load_full()),
-            openclaw_observation: physical.openclaw_observation.clone(),
+            manipulator_observation: physical.manipulator_observation.clone(),
             physical_runtime: Some(physical),
             event_rx: Some(event_rx),
         },

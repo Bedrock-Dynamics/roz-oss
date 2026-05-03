@@ -8,11 +8,18 @@ publish = false
 
 [dependencies]
 roz-core = { path = "../roz-core" }
+roz-nats = { path = "../roz-nats" }
+roz-proto = { path = "../roz-proto" }
+anyhow = { workspace = true }
+async-nats = { workspace = true }
 chrono = { workspace = true }
+futures = { workspace = true }
 noxious-client = "1.0.4"
+prost = { workspace = true }
 testcontainers = { workspace = true, features = ["http_wait"] }
 testcontainers-modules = { workspace = true }
 tokio = { workspace = true }
+uuid = { workspace = true }
 zenoh = { workspace = true }
 flume = { workspace = true }
 serde_json = { workspace = true }
@@ -43,6 +50,13 @@ tempfile = { workspace = true }
 # collector testcontainer. Feature `grpc-tonic` required; see root
 # `Cargo.toml` for the workspace-level pin and rationale.
 opentelemetry-otlp = { workspace = true }
+mavlink = { version = "0.17.1", default-features = false, features = [
+    "std",
+    "udp",
+    "tokio-1",
+    "signing",
+    "common",
+] }
 
 [lints]
 workspace = true

@@ -122,6 +122,7 @@ impl CopperHandle {
             None,
             None,
             None,
+            crate::latch::LatchState::Run,
         )
     }
 
@@ -161,6 +162,7 @@ impl CopperHandle {
         hot_policy: Option<crate::policy::HotCopperPolicy>,
         shared_backpressure: Option<Arc<AtomicU8>>,
         latch_persist_tx: Option<std::sync::mpsc::SyncSender<crate::latch::LatchState>>,
+        initial_latch_state: crate::latch::LatchState,
     ) -> Self {
         // Agent-side channel (tokio mpsc).
         let (cmd_tx, agent_rx) = mpsc::channel::<ControllerCommand>(64);
@@ -171,8 +173,13 @@ impl CopperHandle {
         // Emergency halt channel (sync, capacity 1, bypasses tokio bridge).
         let (emergency_tx, emergency_rx) = std::sync::mpsc::sync_channel::<CopperRuntimeCommand>(1);
 
-        // Shared state (ArcSwap — lock-free reads).
-        let state = Arc::new(ArcSwap::from_pointee(ControllerState::default()));
+        // Shared state (ArcSwap — lock-free reads). The initial latch must be
+        // installed before the controller thread starts; post-spawn seeding can
+        // race with the first publish_state() store and lose the WAL value.
+        let state = Arc::new(ArcSwap::from_pointee(ControllerState {
+            latch_state: initial_latch_state,
+            ..ControllerState::default()
+        }));
 
         // Shutdown flag.
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -270,6 +277,7 @@ impl CopperHandle {
             Some(hot_policy),
             Some(shared_backpressure),
             None,
+            crate::latch::LatchState::Run,
         )
     }
 
@@ -295,6 +303,30 @@ impl CopperHandle {
         shared_backpressure: Arc<AtomicU8>,
         latch_persist_tx: Option<std::sync::mpsc::SyncSender<crate::latch::LatchState>>,
     ) -> Self {
+        Self::spawn_with_policy_and_io_with_initial_latch(
+            max_velocity,
+            actuator,
+            sensor,
+            hot_policy,
+            shared_backpressure,
+            latch_persist_tx,
+            crate::latch::LatchState::Run,
+        )
+    }
+
+    /// Spawn Copper with pluggable IO and an already-loaded latch state.
+    ///
+    /// Worker restart uses this path after reading `WalStore::load_latch_state`
+    /// so the controller thread starts from the persisted fail-safe state.
+    pub fn spawn_with_policy_and_io_with_initial_latch(
+        max_velocity: f64,
+        actuator: Arc<dyn crate::io::ActuatorSink>,
+        sensor: Option<Box<dyn crate::io::SensorSource>>,
+        hot_policy: crate::policy::HotCopperPolicy,
+        shared_backpressure: Arc<AtomicU8>,
+        latch_persist_tx: Option<std::sync::mpsc::SyncSender<crate::latch::LatchState>>,
+        initial_latch_state: crate::latch::LatchState,
+    ) -> Self {
         Self::spawn_with_io_and_deployment_manager_and_wiring(
             max_velocity,
             Some(actuator),
@@ -303,6 +335,7 @@ impl CopperHandle {
             Some(hot_policy),
             Some(shared_backpressure),
             latch_persist_tx,
+            initial_latch_state,
         )
     }
 
@@ -816,14 +849,7 @@ mod tests {
         let hot_policy = new_hot_policy();
         let backpressure = Arc::new(AtomicU8::new(0));
 
-        let handle = CopperHandle::spawn_with_policy_and_io(
-            1.5,
-            actuator,
-            None,
-            hot_policy,
-            backpressure,
-            Some(tx),
-        );
+        let handle = CopperHandle::spawn_with_policy_and_io(1.5, actuator, None, hot_policy, backpressure, Some(tx));
 
         // Pre-seed Latched so AckEstop produces a persisted transition. This
         // mirrors Plan 07's `latched_estop_full_cycle_via_signed_commands`
@@ -881,14 +907,7 @@ mod tests {
         let hot_policy = new_hot_policy();
         let backpressure = Arc::new(AtomicU8::new(0));
 
-        let handle = CopperHandle::spawn_with_policy_and_io(
-            1.5,
-            actuator,
-            None,
-            hot_policy,
-            backpressure,
-            None,
-        );
+        let handle = CopperHandle::spawn_with_policy_and_io(1.5, actuator, None, hot_policy, backpressure, None);
 
         // Pre-seed Latched then send AckEstop. With latch_persist_tx = None,
         // the controller's `if let Some(tx) = latch_persist_tx { ... }` branch

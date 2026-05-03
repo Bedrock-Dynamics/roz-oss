@@ -29,10 +29,14 @@
 pub mod serial;
 pub mod udp;
 
-use std::sync::Arc;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use mavlink::common::MavMessage;
-use mavlink::{AsyncMavConnection, MavHeader, SigningConfig};
+use mavlink::{AsyncMavConnection, MavHeader, SigningConfig, write_v2_msg};
 use tokio::sync::mpsc;
 
 /// Copper's MAVLink companion ID per DEEP-MAV §3 + 25-CONTEXT.md D-04.
@@ -62,6 +66,10 @@ pub const OUTBOUND_CHANNEL_CAPACITY: usize = 100;
 /// MAVLink SITL rates peak around 50 msg/s per stream; 256 gives ~5 s of
 /// burst buffering before the reader task's `send` errors and drops frames.
 pub const INBOUND_CHANNEL_CAPACITY: usize = 256;
+
+const TLOG_PATH_ENV: &str = "ROZ_MAVLINK_TLOG_PATH";
+
+type TlogRecorder = Arc<Mutex<File>>;
 
 /// Which physical transport a [`TransportHandle`] is attached to.
 ///
@@ -171,15 +179,18 @@ pub async fn open_transport(
 
     let (out_tx, out_rx) = mpsc::channel::<MavMessage>(OUTBOUND_CHANNEL_CAPACITY);
     let (in_tx, in_rx) = mpsc::channel::<MavMessage>(INBOUND_CHANNEL_CAPACITY);
+    let tlog_recorder = open_tlog_recorder();
 
     let reader_conn = Arc::clone(&conn);
+    let reader_recorder = tlog_recorder.clone();
     let reader = tokio::spawn(async move {
-        reader_loop(reader_conn, in_tx).await;
+        reader_loop(reader_conn, in_tx, reader_recorder).await;
     });
 
     let writer_conn = Arc::clone(&conn);
+    let writer_recorder = tlog_recorder;
     let writer = tokio::spawn(async move {
-        writer_loop(writer_conn, out_rx, our_system_id, our_component_id).await;
+        writer_loop(writer_conn, out_rx, our_system_id, our_component_id, writer_recorder).await;
     });
 
     Ok(TransportHandle {
@@ -195,10 +206,15 @@ pub async fn open_transport(
 ///
 /// On error, logs and backs off 10 ms before retrying (matches `io_grpc.rs`
 /// stream loop).
-async fn reader_loop(conn: Arc<dyn AsyncMavConnection<MavMessage> + Send + Sync>, tx: mpsc::Sender<MavMessage>) {
+async fn reader_loop(
+    conn: Arc<dyn AsyncMavConnection<MavMessage> + Send + Sync>,
+    tx: mpsc::Sender<MavMessage>,
+    tlog_recorder: Option<TlogRecorder>,
+) {
     loop {
         match conn.recv().await {
-            Ok((_header, msg)) => {
+            Ok((header, msg)) => {
+                record_tlog_frame(tlog_recorder.as_ref(), header, &msg);
                 if tx.send(msg).await.is_err() {
                     tracing::debug!("inbound channel closed; reader exiting");
                     return;
@@ -223,6 +239,7 @@ async fn writer_loop(
     mut rx: mpsc::Receiver<MavMessage>,
     our_system_id: u8,
     our_component_id: u8,
+    tlog_recorder: Option<TlogRecorder>,
 ) {
     let mut sequence: u8 = 0;
     while let Some(msg) = rx.recv().await {
@@ -233,7 +250,7 @@ async fn writer_loop(
         };
         sequence = sequence.wrapping_add(1);
         match conn.send(&header, &msg).await {
-            Ok(_) => {}
+            Ok(_) => record_tlog_frame(tlog_recorder.as_ref(), header, &msg),
             Err(e) => {
                 tracing::warn!(error = %e, "MavConnection send error");
             }
@@ -242,12 +259,57 @@ async fn writer_loop(
     tracing::debug!("outbound channel closed; writer exiting");
 }
 
+fn open_tlog_recorder() -> Option<TlogRecorder> {
+    let path = std::env::var(TLOG_PATH_ENV).ok()?;
+    let path = Path::new(&path);
+    if let Some(parent) = path.parent()
+        && let Err(error) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(%error, path = %path.display(), "failed to create MAVLink tlog parent directory");
+        return None;
+    }
+
+    match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(file) => {
+            tracing::info!(path = %path.display(), "MAVLink tlog recorder enabled");
+            Some(Arc::new(Mutex::new(file)))
+        }
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "failed to open MAVLink tlog recorder");
+            None
+        }
+    }
+}
+
+fn record_tlog_frame(recorder: Option<&TlogRecorder>, header: MavHeader, msg: &MavMessage) {
+    let Some(recorder) = recorder else {
+        return;
+    };
+
+    let timestamp_usec = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_micros().try_into().unwrap_or(u64::MAX))
+        .unwrap_or_default();
+    let mut bytes = timestamp_usec.to_be_bytes().to_vec();
+    if let Err(error) = write_v2_msg(&mut bytes, header, msg) {
+        tracing::warn!(%error, "failed to encode MAVLink tlog frame");
+        return;
+    }
+
+    match recorder.lock() {
+        Ok(mut file) => {
+            if let Err(error) = file.write_all(&bytes).and_then(|_| file.flush()) {
+                tracing::warn!(%error, "failed to write MAVLink tlog frame");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "MAVLink tlog recorder lock poisoned"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{
-        INBOUND_CHANNEL_CAPACITY, MAV_COMP_ID_MISSIONPLANNER, MAV_COMP_ID_ONBOARD_COMPUTER, MAV_FCU_COMPONENT_ID,
-        MAV_FCU_SYSTEM_ID, OUTBOUND_CHANNEL_CAPACITY,
-    };
+    use super::*;
+    use mavlink::common::{COMMAND_LONG_DATA, MavCmd};
 
     #[test]
     fn comp_id_constants_match_mavlink_spec() {
@@ -263,5 +325,50 @@ mod tests {
         // 1 s of 100 Hz tick buffer outbound; 5 s of 50 msg/s burst inbound.
         assert!(OUTBOUND_CHANNEL_CAPACITY >= 100);
         assert!(INBOUND_CHANNEL_CAPACITY >= 250);
+    }
+
+    #[test]
+    fn tlog_frame_records_big_endian_timestamp_and_mavlink_v2_bytes() {
+        let temp_path = std::env::temp_dir().join(format!(
+            "roz-mavlink-transport-tlog-{}-{}.tlog",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+        ));
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&temp_path)
+            .expect("open temp tlog");
+        let recorder = Arc::new(Mutex::new(file));
+        let header = MavHeader {
+            system_id: 42,
+            component_id: MAV_COMP_ID_ONBOARD_COMPUTER,
+            sequence: 7,
+        };
+        let msg = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+            param1: 1.0,
+            param2: 0.0,
+            param3: 0.0,
+            param4: f32::NAN,
+            param5: 0.0,
+            param6: 0.0,
+            param7: 5.0,
+            command: MavCmd::MAV_CMD_NAV_TAKEOFF,
+            target_system: MAV_FCU_SYSTEM_ID,
+            target_component: MAV_FCU_COMPONENT_ID,
+            confirmation: 0,
+        });
+
+        record_tlog_frame(Some(&recorder), header, &msg);
+        drop(recorder);
+
+        let bytes = std::fs::read(&temp_path).expect("read temp tlog");
+        let _ = std::fs::remove_file(&temp_path);
+        assert!(bytes.len() > 8);
+        assert_ne!(&bytes[..8], &[0; 8]);
+        assert_eq!(bytes[8], mavlink::MAV_STX_V2);
     }
 }

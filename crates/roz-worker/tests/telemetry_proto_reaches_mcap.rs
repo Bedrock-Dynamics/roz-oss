@@ -222,6 +222,7 @@ async fn worker_proto_publish_populates_tf_and_pose_in_mcap() {
             joint_states: Vec::new(),
             end_effector_pose: Some(pose),
             sensor_readings: std::collections::BTreeMap::new(),
+            readiness: None,
         };
         let payload = update.encode_to_vec();
         publish_state_proto_signed(
@@ -366,6 +367,7 @@ async fn worker_proto_publish_without_pose_yields_no_tf_or_pose() {
             joint_states: Vec::new(),
             end_effector_pose: None, // explicitly no pose
             sensor_readings: std::collections::BTreeMap::new(),
+            readiness: None,
         };
         let payload = update.encode_to_vec();
         publish_state_proto_signed(

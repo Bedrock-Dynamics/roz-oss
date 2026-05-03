@@ -80,15 +80,16 @@ fn build_compressed_video(frame_id: &str, seq: u8) -> Vec<u8> {
     msg.encode_to_vec()
 }
 
+struct PgHarness {
+    pool: sqlx::PgPool,
+    _pg: roz_test::PgGuard,
+}
+
 /// Boot a testcontainers Postgres, run migrations, create a tenant row
-/// pinned to the given id, and return a ready `PgPool`. Mirrors
-/// `tests/export_roundtrip.rs` verbatim.
-async fn bootstrap_pg_with_tenant(tenant_id: Uuid, label: &str) -> sqlx::PgPool {
+/// pinned to the given id, and return a pool plus its owning guard.
+async fn bootstrap_pg_with_tenant(tenant_id: Uuid, label: &str) -> PgHarness {
     let guard = roz_test::pg_container().await;
     let url: String = guard.url().to_string();
-    // Keep the container alive past this function's scope. The guard's
-    // Drop would otherwise stop the container.
-    std::mem::forget(guard);
 
     let pool = create_pool(&url).await.expect("create pool");
     run_migrations(&pool).await.expect("run migrations");
@@ -103,14 +104,15 @@ async fn bootstrap_pg_with_tenant(tenant_id: Uuid, label: &str) -> sqlx::PgPool 
         .execute(&pool)
         .await
         .expect("pin tenant id");
-    pool
+    PgHarness { pool, _pg: guard }
 }
 
 #[tokio::test]
 #[ignore = "requires testcontainers + --features test-helpers"]
 async fn camera_keyframes_roundtrip() {
     let tenant_id = Uuid::new_v4();
-    let pool = bootstrap_pg_with_tenant(tenant_id, "sc7-cam").await;
+    let pg = bootstrap_pg_with_tenant(tenant_id, "sc7-cam").await;
+    let pool = pg.pool.clone();
 
     let session_id = Uuid::new_v4();
     let tmp = TempDir::new().expect("tempdir");
@@ -221,7 +223,8 @@ async fn camera_keyframes_roundtrip() {
 #[ignore = "requires testcontainers + --features test-helpers"]
 async fn unknown_camera_event_is_dropped_without_killing_actor() {
     let tenant_id = Uuid::new_v4();
-    let pool = bootstrap_pg_with_tenant(tenant_id, "sc7-drop").await;
+    let pg = bootstrap_pg_with_tenant(tenant_id, "sc7-drop").await;
+    let pool = pg.pool.clone();
 
     let session_id = Uuid::new_v4();
     let tmp = TempDir::new().expect("tempdir");

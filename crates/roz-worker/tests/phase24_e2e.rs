@@ -140,7 +140,7 @@ async fn phase24_resume_path_with_fresh_checkpoint() {
 
 const OUTAGE_ENABLED: bool = true;
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "current_thread")]
 #[ignore = "requires Docker for NATS + toxiproxy testcontainers"]
 #[expect(
     clippy::too_many_lines,

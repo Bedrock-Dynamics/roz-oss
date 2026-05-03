@@ -12,9 +12,7 @@
 use std::time::Duration;
 
 use roz_agent::dispatch::ToolDispatcher;
-use roz_core::embodiment::binding::{
-    CommandInterfaceType, ControlChannelDef, ControlInterfaceManifest,
-};
+use roz_core::embodiment::binding::{CommandInterfaceType, ControlChannelDef, ControlInterfaceManifest};
 use roz_core::tools::ToolCategory;
 
 fn minimal_control_manifest() -> ControlInterfaceManifest {

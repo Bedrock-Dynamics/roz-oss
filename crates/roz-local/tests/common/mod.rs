@@ -318,6 +318,56 @@ pub fn constant_controller_prompt(control_manifest: &ControlInterfaceManifest, c
     )
 }
 
+pub fn constant_output_controller_wat(command_values: &[f64]) -> String {
+    let mut result_record = Vec::new();
+    result_record.extend_from_slice(&(64u32).to_le_bytes());
+    result_record.extend_from_slice(&(command_values.len() as u32).to_le_bytes());
+    let result_record = escape_bytes(&result_record);
+    let command_bytes: Vec<u8> = command_values.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let command_bytes = escape_bytes(&command_bytes);
+
+    format!(
+        r#"(module
+            (type (func (result i32)))
+            (type (func (param i32) (result i32)))
+            (type (func (param i32)))
+            (type (func (param i32 i32 i32 i32) (result i32)))
+            (type (func))
+            (import "cm32p2|bedrock:controller/runtime@1" "current-execution-mode" (func $current_execution_mode (type 0)))
+            (memory (export "cm32p2_memory") 1)
+            (global $heap (mut i32) (i32.const 1024))
+            (data (i32.const 0) "{result_record}")
+            (data (i32.const 64) "{command_bytes}")
+            (func (export "cm32p2|bedrock:controller/control@1|process") (type 1) (param $input i32) (result i32)
+                (i32.const 0)
+            )
+            (func (export "cm32p2|bedrock:controller/control@1|process_post") (type 2) (param $result i32)
+                (global.set $heap (i32.const 1024))
+            )
+            (func (export "cm32p2_realloc") (type 3) (param $old i32) (param $old_size i32) (param $align i32) (param $new_size i32) (result i32)
+                (local $ptr i32)
+                global.get $heap
+                local.get $align
+                i32.const 1
+                i32.sub
+                i32.add
+                local.get $align
+                i32.const 1
+                i32.sub
+                i32.const -1
+                i32.xor
+                i32.and
+                local.tee $ptr
+                local.get $new_size
+                i32.add
+                global.set $heap
+                local.get $ptr
+            )
+            (func (export "cm32p2_initialize") (type 4))
+        )"#
+    )
+}
+
 pub async fn generate_constant_wat_with_claude(
     api_key: &str,
     task_id: &str,

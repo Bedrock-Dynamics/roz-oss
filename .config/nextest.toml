@@ -58,7 +58,7 @@ default-filter = """
      |  binary(embodiment_upload_e2e)
      |  binary(embodiment_streaming_e2e)
      |  binary(wasm_signature_integration)
-     |  binary(openclaw_golden_vertical)
+     |  binary(manipulator_harness_vertical)
      |  binary(safety_policy_physical_vertical)
      |  binary(camera_mcap_relay_vertical)
      |  binary(session_bundle_export_live)
@@ -69,7 +69,6 @@ default-filter = """
      |  binary(mcap_agent_session_live)
      |  binary(session_metadata_fleet_query)
      |  binary(px4_readiness_replay)
-     |  binary(px4_fixture_record_verify)
     )
     and not (
         binary(paig_integration)

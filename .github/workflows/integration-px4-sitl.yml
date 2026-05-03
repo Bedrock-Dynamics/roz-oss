@@ -1,0 +1,210 @@
+# Phase 27: bridge-backed PX4/Gazebo simulator acceptance.
+#
+# The Substrate PX4 Docker image is not treated as a direct native-MAVLink FCU
+# endpoint here. Its substrate-sim-bridge owns the PX4 MAVLink router, so the
+# default gate runs the real Roz simulator path:
+# env_start -> bridge gRPC -> Copper/WASM -> PX4/Gazebo.
+
+name: Integration PX4 SITL
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+    inputs:
+      record_native_fixtures:
+        description: "Run the opt-in direct native-MAVLink fixture recorder and upload generated .tlog files"
+        required: false
+        default: false
+        type: boolean
+      native_mavlink_url:
+        description: "Direct FCU/HITL/direct-SITL MAVLink URL for fixture recording, e.g. udpin:0.0.0.0:14540"
+        required: false
+        default: ""
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_JOBS: "1"
+  RUST_TEST_THREADS: "1"
+  ROZ_PX4_ARTIFACT_DIR: /tmp/px4-artifacts
+  ROZ_MCAP_DIR: /tmp/px4-artifacts/mcap
+
+jobs:
+  px4-sitl:
+    name: PX4 bridge/WASM simulator
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      bridge_outcome: ${{ steps.bridge.outcome }}
+      native_diag_outcome: ${{ steps.native_diag.outcome }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: "1.92.0"
+          components: rustfmt, clippy
+
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@0abfcd587b70a713fdaa7fb502c885e2112acb15
+        with:
+          tool: cargo-nextest@0.9.132
+
+      - name: Docker sanity
+        run: docker version && docker ps
+
+      - name: Clean stale Docker state
+        run: |
+          docker ps -aq | xargs -r docker rm -f || true
+          docker network prune -f || true
+
+      - name: Pre-pull substrate-sim PX4 image
+        run: docker pull bedrockdynamics/substrate-sim:px4-gazebo-humble
+
+      - name: Prepare artifact directories
+        run: mkdir -p "$ROZ_PX4_ARTIFACT_DIR" "$ROZ_MCAP_DIR" /tmp/px4-junit
+
+      - name: Run bridge-backed PX4/WASM 10m acceptance
+        id: bridge
+        run: |
+          set +e
+          set -o pipefail
+          cargo nextest run \
+            --profile ci-integration \
+            --ignore-default-filter \
+            --run-ignored ignored-only \
+            -p roz-local \
+            --test live_claude_wasm_containers \
+            -E 'test(env_start_px4_docker_wasm_velocity_flies_10m)' \
+            2>&1 | tee /tmp/px4-bridge-wasm.log
+          status=${PIPESTATUS[0]}
+          cp target/nextest/ci-integration/junit.xml /tmp/px4-junit/bridge.xml || true
+          exit "$status"
+        continue-on-error: true
+
+      - name: Run native-MAVLink diagnostics
+        id: native_diag
+        run: |
+          set +e
+          set -o pipefail
+          cargo nextest run \
+            --profile ci-integration \
+            --ignore-default-filter \
+            --run-ignored ignored-only \
+            -p roz-test \
+            --test px4_mavlink_probe \
+            --test px4_sitl_e2e \
+            -E 'binary(px4_mavlink_probe) | binary(px4_sitl_e2e)' \
+            2>&1 | tee /tmp/px4-native-diagnostics.log
+          status=${PIPESTATUS[0]}
+          cp target/nextest/ci-integration/junit.xml /tmp/px4-junit/native-diagnostics.xml || true
+          exit "$status"
+        continue-on-error: true
+
+      - name: Build worker for native fixture capture
+        if: github.event_name == 'workflow_dispatch' && inputs.record_native_fixtures
+        run: cargo build --jobs 1 -p roz-worker --features test-fixtures
+
+      - name: Record native-MAVLink fixture artifacts
+        id: native_fixture_record
+        if: github.event_name == 'workflow_dispatch' && inputs.record_native_fixtures
+        env:
+          PX4_SITL_MAVLINK_URL: ${{ inputs.native_mavlink_url }}
+          ROZ_RUN_NATIVE_PX4_MAVLINK_E2E: "1"
+          ROZ_PX4_CAPTURE_TLOG_FIXTURES: "1"
+        run: |
+          if [ -z "$PX4_SITL_MAVLINK_URL" ]; then
+            echo "record_native_fixtures requires native_mavlink_url because the default Substrate Docker path is bridge-backed."
+            exit 1
+          fi
+          set +e
+          set -o pipefail
+          cargo test --jobs 1 \
+            -p roz-test \
+            --test px4_sitl_e2e \
+            px4_sitl_full_scenario \
+            -- --ignored --test-threads=1 --nocapture \
+            2>&1 | tee /tmp/px4-native-fixture-record.log
+          status=${PIPESTATUS[0]}
+          # Exit status 101 is expected on first bootstrap: the test writes
+          # missing fixtures, then fails once so humans review/commit them.
+          exit "$status"
+        continue-on-error: true
+
+      - name: Upload PX4 SITL artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: px4-sitl-artifacts
+          path: |
+            /tmp/px4-bridge-wasm.log
+            /tmp/px4-native-diagnostics.log
+            /tmp/px4-native-fixture-record.log
+            /tmp/px4-junit/*.xml
+            /tmp/px4-artifacts/**/*.mcap
+            /tmp/px4-artifacts/**/*.tlog
+            crates/roz-mavlink/tests/fixtures/**/*.tlog
+          if-no-files-found: ignore
+
+      - name: Fail job if any required step failed
+        if: steps.bridge.outcome == 'failure' || steps.native_diag.outcome == 'failure'
+        run: |
+          echo "bridge outcome: ${{ steps.bridge.outcome }}"
+          echo "native diagnostics outcome: ${{ steps.native_diag.outcome }}"
+          exit 1
+
+  summarize-and-issue:
+    name: Open/update failure issue
+    runs-on: ubuntu-latest
+    needs: [px4-sitl]
+    permissions:
+      issues: write
+      contents: read
+    if: always() && needs.px4-sitl.result == 'failure'
+
+    steps:
+      - name: Compute ISO date
+        id: date
+        run: echo "iso=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare failure issue body
+        run: |
+          {
+            echo "# PX4 SITL integration failure ${{ steps.date.outputs.iso }}"
+            echo
+            echo "Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            echo "## Outcomes"
+            echo
+            echo "- bridge-backed PX4/WASM: ${{ needs.px4-sitl.outputs.bridge_outcome }}"
+            echo "- native MAVLink diagnostics: ${{ needs.px4-sitl.outputs.native_diag_outcome }}"
+            echo
+            echo "## Expected topology"
+            echo
+            echo "The default gate must use the Substrate bridge path:"
+            echo
+            echo "\`env_start -> bridge gRPC -> Copper/WASM -> PX4/Gazebo\`"
+            echo
+            echo "Native MAVLink tests are diagnostic only unless a direct FCU/HITL/direct-SITL endpoint is supplied."
+          } > px4-sitl-failure.md
+
+      - name: Open / update failure issue
+        uses: peter-evans/create-issue-from-file@e8ef132d6df98ed982188e460ebb3b5d4ef3a9cd
+        with:
+          title: "PX4 SITL integration failure ${{ steps.date.outputs.iso }}"
+          content-filepath: ./px4-sitl-failure.md
+          labels: nightly-failure, px4-sitl, auto-opened
+          update-existing: true

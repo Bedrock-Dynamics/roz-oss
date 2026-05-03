@@ -25,18 +25,28 @@ use uuid::Uuid;
 // Shared setup helpers
 // ---------------------------------------------------------------------------
 
+struct Harness {
+    _tmp: TempDir,
+    pool: sqlx::PgPool,
+    mcap_dir: std::path::PathBuf,
+    _pg: roz_test::PgGuard,
+}
+
 /// Spin up a testcontainers Postgres, run migrations, build a pool, and
-/// allocate a tempdir for MCAP output. Returns the tempdir guard (drop to
-/// clean up) + live pool + canonicalised mcap_dir path.
-async fn setup() -> (TempDir, sqlx::PgPool, std::path::PathBuf) {
+/// allocate a tempdir for MCAP output.
+async fn setup() -> Harness {
     let guard = roz_test::pg_container().await;
     let url: String = guard.url().to_string();
-    std::mem::forget(guard);
     let pool = create_pool(&url).await.expect("pool");
     run_migrations(&pool).await.expect("migrate");
     let tmp = TempDir::new().expect("tempdir");
     let mcap_dir = std::fs::canonicalize(tmp.path()).expect("canonicalize mcap dir");
-    (tmp, pool, mcap_dir)
+    Harness {
+        _tmp: tmp,
+        pool,
+        mcap_dir,
+        _pg: guard,
+    }
 }
 
 /// Seed a tenant row and pin its id. Necessary because
@@ -64,7 +74,9 @@ async fn seed_tenant(pool: &sqlx::PgPool, tenant_id: Uuid) {
 #[tokio::test]
 #[ignore = "requires testcontainers Postgres"]
 async fn completion_finalizes_db_row_to_finalized() {
-    let (_tmp, pool, mcap_dir) = setup().await;
+    let harness = setup().await;
+    let pool = harness.pool.clone();
+    let mcap_dir = harness.mcap_dir.clone();
     let tenant_id = Uuid::new_v4();
     seed_tenant(&pool, tenant_id).await;
 
@@ -132,7 +144,9 @@ async fn completion_finalizes_db_row_to_finalized() {
 #[tokio::test]
 #[ignore = "requires testcontainers Postgres"]
 async fn recovery_smoke_partial_file_transitions_to_recovered_incomplete() {
-    let (_tmp, pool, mcap_dir) = setup().await;
+    let harness = setup().await;
+    let pool = harness.pool.clone();
+    let mcap_dir = harness.mcap_dir.clone();
     let tenant_id = Uuid::new_v4();
     seed_tenant(&pool, tenant_id).await;
 

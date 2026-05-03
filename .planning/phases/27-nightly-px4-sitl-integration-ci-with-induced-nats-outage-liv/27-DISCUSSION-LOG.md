@@ -3,6 +3,8 @@
 > **Audit trail only.** Do not use as input to planning, research, or execution agents.
 > Decisions are captured in CONTEXT.md — this log preserves the alternatives considered.
 
+**2026-04-27 correction:** This log preserves the original discussion, including the now-superseded assumption that the Substrate PX4 Docker image should be used as a direct native-MAVLink endpoint. Use `27-CONTEXT.md` and its 2026-04-27 reconciliation amendment as the source of truth: default Substrate simulator acceptance is the bridge-backed `roz-local::env_start_px4_docker_wasm_velocity_flies_10m` path; native MAVLink tests are direct-endpoint diagnostics.
+
 **Date:** 2026-04-25
 **Phase:** 27-nightly-px4-sitl-integration-ci-with-induced-nats-outage-liv
 **Areas discussed:** CI job + scenario harness, DiscreteCommandSink wiring path, ReadinessState derivation rules, MAV-01/MAV-03 fixtures from 25-14/15

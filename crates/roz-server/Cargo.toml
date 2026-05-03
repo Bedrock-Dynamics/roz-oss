@@ -198,7 +198,7 @@ required-features = ["test-helpers"]
 
 # Phase 26.11 Plan 03 — safety_policy_physical_vertical drives the live
 # policy CRUD fanout into the worker verify/apply path, then proves the same
-# hot Copper policy affects the fake OpenClaw-class physical runtime and
+# hot Copper policy affects the fake manipulator-class physical runtime and
 # archived session metadata.
 [[test]]
 name = "safety_policy_physical_vertical"

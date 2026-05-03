@@ -860,10 +860,7 @@ set_target_body = '{"type": "set_target", "pitch": {{head_pitch}}}'
             "promote_controller should remain external-authority only"
         );
         assert!(names.contains(&"stop_controller"), "missing stop_controller");
-        assert!(
-            names.contains(&"controller_status"),
-            "missing controller_status"
-        );
+        assert!(names.contains(&"controller_status"), "missing controller_status");
 
         // Extensions populated.
         assert!(

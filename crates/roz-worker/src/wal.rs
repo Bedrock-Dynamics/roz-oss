@@ -995,7 +995,11 @@ mod tests {
             LatchState::ZeroVerified,
         ] {
             store.save_latch_state(state).unwrap();
-            assert_eq!(store.load_latch_state().unwrap(), state, "roundtrip failed for {state:?}");
+            assert_eq!(
+                store.load_latch_state().unwrap(),
+                state,
+                "roundtrip failed for {state:?}"
+            );
         }
     }
 

@@ -117,9 +117,11 @@ async fn construct_mavlink_backend(
         }
     } else if let Some(bind) = transport_url.strip_prefix("udpin:") {
         roz_mavlink::MavlinkBackend::new_udp_in(bind, signing_config, our_system_id, autopilot_hint).await
+    } else if let Some(peer) = transport_url.strip_prefix("udpout:") {
+        roz_mavlink::MavlinkBackend::new_udp_out(peer, signing_config, our_system_id, autopilot_hint).await
     } else {
         Err(anyhow::anyhow!(
-            "unsupported MAVLink transport URL '{}' — only 'serial:' and 'udpin:' are supported in Phase 25",
+            "unsupported MAVLink transport URL '{}' — only 'serial:', 'udpin:', and 'udpout:' are supported",
             transport_url
         ))
     };
@@ -133,6 +135,64 @@ async fn construct_mavlink_backend(
             tracing::error!(error = %e, %transport_url, "failed to construct MAVLink backend — continuing without it");
             None
         }
+    }
+}
+
+fn is_drone_class_runtime(runtime: &roz_core::embodiment::EmbodimentRuntime) -> bool {
+    runtime.model.embodiment_family.as_ref().is_some_and(|family| {
+        matches!(family.family_id.as_str(), "drone" | "drone-mavlink") || family.family_id.starts_with("drone-")
+    })
+}
+
+fn local_worker_host_id(worker_id: &str) -> Uuid {
+    let mut bytes = *b"roz-local-worker";
+    for (idx, byte) in worker_id.as_bytes().iter().copied().enumerate() {
+        let slot = idx % bytes.len();
+        bytes[slot] = bytes[slot]
+            .wrapping_mul(31)
+            .wrapping_add(byte)
+            .rotate_left((idx % 8) as u32);
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+fn install_flight_command_extension(
+    extensions: &mut roz_agent::dispatch::Extensions,
+    dispatcher: &mut roz_agent::dispatch::ToolDispatcher,
+    backend: &Arc<roz_mavlink::MavlinkBackend>,
+) {
+    let sink: Arc<
+        dyn roz_copper::io::DiscreteCommandSink<
+                roz_copper::io::FlightCommand,
+                Response = roz_copper::io::FlightCommandResponse,
+                Error = roz_copper::io::MavlinkDispatchError,
+            > + Send
+            + Sync,
+    > = backend.clone();
+    extensions.insert(roz_worker::tools::flight_command::FlightCommandSinkHandle(sink));
+    dispatcher.register_with_category(
+        Box::new(roz_worker::tools::flight_command::FlightCommandTool),
+        roz_core::tools::ToolCategory::Physical,
+    );
+}
+
+fn convert_readiness_to_v1(
+    readiness: &roz_copper::io_grpc::proto::ReadinessState,
+) -> roz_worker::roz_v1::ReadinessState {
+    roz_worker::roz_v1::ReadinessState {
+        heartbeat_alive: readiness.heartbeat_alive,
+        heartbeat_age_ms: readiness.heartbeat_age_ms,
+        armed: readiness.armed,
+        system_status: readiness.system_status,
+        gps_fix_type: readiness.gps_fix_type,
+        has_gps_fix: readiness.has_gps_fix,
+        ekf_flags: readiness.ekf_flags,
+        ekf_converged: readiness.ekf_converged,
+        ready_to_arm: readiness.ready_to_arm,
+        fully_operational: readiness.fully_operational,
+        autopilot: readiness.autopilot,
     }
 }
 
@@ -486,6 +546,7 @@ async fn execute_task(
     restate_url: String,
     estop_rx: tokio::sync::watch::Receiver<bool>,
     camera_manager: Option<Arc<roz_worker::camera::CameraManager>>,
+    mavlink_backend: Option<Arc<roz_mavlink::MavlinkBackend>>,
     signing_ctx: Option<WorkerSigningContext>,
     // Plan 24-12 Task 1: module-level policy state threaded in so the
     // pre-dispatch gate evaluates against the live `PolicyCache`/`HotPolicy`
@@ -739,6 +800,10 @@ async fn execute_task(
                 return;
             };
 
+            if let Some(backend) = mavlink_backend.as_ref().filter(|_| is_drone_class_runtime(runtime)) {
+                install_flight_command_extension(&mut extensions, &mut dispatcher, backend);
+            }
+
             // FW-05 / Plan 26.10-10 (gap CR-01c): WAL-authoritative boot.
             // Load any persisted latched-state from the previous worker run
             // BEFORE spawning Copper. Plan 07's `WalStore::load_latch_state`
@@ -779,20 +844,24 @@ async fn execute_task(
             let (latch_tx, latch_rx) = std::sync::mpsc::sync_channel::<roz_copper::latch::LatchState>(16);
 
             let max_velocity = task_config.max_velocity.unwrap_or(1.5);
-            let physical = match roz_worker::physical_runtime::spawn_physical_runtime(
-                roz_worker::physical_runtime::PhysicalRuntimeConfig::new(
-                    runtime.clone(),
-                    control_manifest.clone(),
-                    max_velocity,
-                    copper_hot_policy.clone(),
-                    telemetry_backpressure.shared(),
-                    Some(latch_tx),
-                    dispatcher,
-                    extensions,
-                    task_id.to_string(),
-                    invocation.tenant_id.clone(),
-                ),
-            ) {
+            let mut physical_config = roz_worker::physical_runtime::PhysicalRuntimeConfig::new(
+                runtime.clone(),
+                control_manifest.clone(),
+                max_velocity,
+                copper_hot_policy.clone(),
+                telemetry_backpressure.shared(),
+                Some(latch_tx),
+                dispatcher,
+                extensions,
+                task_id.to_string(),
+                invocation.tenant_id.clone(),
+            )
+            .with_initial_latch_state(initial_latch);
+            if is_drone_class_runtime(runtime) {
+                physical_config = physical_config.with_mavlink_backend(mavlink_backend.clone());
+            }
+
+            let physical = match roz_worker::physical_runtime::spawn_physical_runtime(physical_config) {
                 Ok(handle) => handle,
                 Err(err) => {
                     copper_spawn_failure(err.to_string()).await;
@@ -813,19 +882,7 @@ async fn execute_task(
                 "copper controller spawned for OodaReAct task with real IO + hot policy + shared backpressure + latch persistence"
             );
 
-            // FW-05 / Plan 26.10-10 (gap CR-01c): seed the loaded latch into
-            // `ControllerState` ArcSwap BEFORE the controller thread observes
-            // any tick state. The thread reads via `shared_state.load()` at
-            // the top of every iteration; this `rcu` update commits before
-            // the first tick because no controllers have been promoted yet.
-            // The race is benign (no controllers running) but the ordering
-            // invariant is what makes the WAL authoritative on restart.
             if initial_latch != roz_copper::latch::LatchState::Run {
-                handle.state().rcu(|s| {
-                    let mut next = (**s).clone();
-                    next.latch_state = initial_latch;
-                    std::sync::Arc::new(next)
-                });
                 tracing::warn!(
                     ?initial_latch,
                     "FW-05: worker booted into a previously-latched state — operator must Ack -> Zero -> Resume to clear"
@@ -1666,6 +1723,13 @@ async fn main() -> Result<()> {
         arc_swap::ArcSwapOption<arc_swap::ArcSwap<roz_copper::channels::ControllerState>>,
     > = std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
 
+    // Phase 27 SC6: shared pointer to the worker-boot MAVLink backend. The
+    // backend is constructed after host registration resolves `worker_host_id`,
+    // while telemetry is spawned earlier; ArcSwap lets telemetry observe the
+    // backend once it becomes available without reordering the boot graph.
+    let shared_mavlink_backend: std::sync::Arc<arc_swap::ArcSwapOption<roz_mavlink::MavlinkBackend>> =
+        std::sync::Arc::new(arc_swap::ArcSwapOption::empty());
+
     // FW-05 / Plan 26.10-10 (gap CR-02c): worker-level slot for the active
     // per-task `ControllerCommand` sender. The signed-NATS subscribers below
     // for `safety.estop_ack.{worker_id}` and `safety.resume.{worker_id}` live
@@ -1904,6 +1968,7 @@ async fn main() -> Result<()> {
     let telem_drop = telemetry_drop_counter.clone();
     let telem_append = telemetry_append_counter.clone();
     let telem_copper_state = shared_copper_state.clone();
+    let telem_mavlink_backend = shared_mavlink_backend.clone();
     tokio::spawn(async move {
         use prost::Message as _;
         let mut interval = tokio::time::interval(Duration::from_millis(100));
@@ -1938,6 +2003,10 @@ async fn main() -> Result<()> {
 
             #[allow(clippy::cast_precision_loss)]
             let ts_secs = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+            let readiness = telem_mavlink_backend.load_full().map(|backend| {
+                let readiness = backend.readiness_snapshot();
+                convert_readiness_to_v1(&readiness)
+            });
 
             let update = roz_worker::roz_v1::TelemetryUpdate {
                 host_id: telem_worker_id.clone(),
@@ -1945,6 +2014,7 @@ async fn main() -> Result<()> {
                 joint_states: Vec::new(),
                 end_effector_pose,
                 sensor_readings: std::collections::BTreeMap::new(),
+                readiness,
             };
             let payload = update.encode_to_vec();
 
@@ -2768,14 +2838,28 @@ async fn main() -> Result<()> {
     // `register_host` above. Without a host UUID, `construct_mavlink_backend`
     // cannot derive the MAVLink sysid deterministically (main.rs:97-101), so
     // we skip construction with a debug-log rather than burning a random UUID.
-    let mavlink_backend: Option<std::sync::Arc<roz_mavlink::MavlinkBackend>> = if let Some(hid) = worker_host_id {
+    let mavlink_host_id = match worker_host_id {
+        Some(host_id) => Some(host_id),
+        None if config.mavlink.transport.is_some() => {
+            let host_id = local_worker_host_id(&config.worker_id);
+            tracing::warn!(
+                %host_id,
+                worker_id = %config.worker_id,
+                "worker_host_id unresolved; using deterministic local host id for MAVLink sysid derivation"
+            );
+            Some(host_id)
+        }
+        None => None,
+    };
+    let mavlink_backend: Option<std::sync::Arc<roz_mavlink::MavlinkBackend>> = if let Some(hid) = mavlink_host_id {
         construct_mavlink_backend(&config.mavlink, hid).await
     } else {
         tracing::debug!(
-            "worker_host_id unresolved (no API registration) — skipping boot-scope MavlinkBackend construction"
+            "worker_host_id unresolved and no MAVLink transport configured — skipping boot-scope MavlinkBackend construction"
         );
         None
     };
+    shared_mavlink_backend.store(mavlink_backend.clone());
     let mavlink_backend_for_relay = mavlink_backend.clone();
     tokio::spawn(async move {
         if let Err(e) = roz_worker::session_relay::spawn_session_relay(
@@ -2794,11 +2878,6 @@ async fn main() -> Result<()> {
             tracing::error!(error = %e, "session relay exited");
         }
     });
-    // The non-cloned `mavlink_backend` remains available in the main() scope
-    // in case any later boot step wants it. Suppress unused-variable noise
-    // without taking a Drop path — this Arc is a weak keepalive.
-    let _ = &mavlink_backend;
-
     // Subscribe to task invocations
     let worker_id = &config.worker_id;
     let subject = format!("invoke.{worker_id}.>");
@@ -2938,6 +3017,7 @@ async fn main() -> Result<()> {
         let task_config = config.clone();
         let task_js = js.clone();
         let task_camera_mgr = camera_manager.clone();
+        let task_mavlink_backend = mavlink_backend.clone();
         // Phase 23 FS-04: clone the per-worker signing context into the
         // per-task spawn so every publish_task_status inside execute_task
         // goes through the signed path (plan 23-08 Task 2 integration).
@@ -3019,6 +3099,7 @@ async fn main() -> Result<()> {
                     restate_url,
                     task_estop_rx,
                     task_camera_mgr,
+                    task_mavlink_backend,
                     task_signing_ctx,
                     task_policy_cache,
                     task_hot_policy,

@@ -43,12 +43,12 @@ use roz_core::embodiment::{EmbodimentModel, FrameSource, Joint, Link, Transform3
 use roz_core::embodiment::{EmbodimentRuntime, FrameSnapshotInput};
 
 use crate::channels::{ControllerState, EvidenceSummaryState};
-use crate::latch::{LatchState, ZERO_VERIFY_TICK_COUNT};
 use crate::controller_lifecycle::{ControllerLifecycle, LifecycleRetirement, LifecycleTransition, RuntimeDigests};
 use crate::deployment_manager::DeploymentManager;
 use crate::evidence_collector::{EvidenceCollector, EvidenceFinalizeContext};
 #[cfg(feature = "gazebo")]
 use crate::io::{ActuatorSink, SensorFrame, SensorSource};
+use crate::latch::{LatchState, ZERO_VERIFY_TICK_COUNT};
 use crate::safety_filter::HotPathSafetyFilter;
 use crate::tick_builder::TickInputBuilder;
 use crate::tick_contract::{ContactState, DerivedFeatures, DigestSet, Wrench};
@@ -883,6 +883,9 @@ fn drain_commands(
                 } else {
                     tracing::warn!("PromoteActive ignored — no promotion-eligible candidate is currently loaded");
                 }
+            }
+            crate::channels::CopperRuntimeCommand::KeepAlive => {
+                tracing::trace!("agent keepalive received");
             }
             crate::channels::CopperRuntimeCommand::Halt => {
                 if let Some(controller) = active_controller.as_mut() {
@@ -2313,9 +2316,7 @@ pub fn run_controller_loop_with_policy(
             // latched. Preserve a pre-existing `error` field (e.g. set by
             // the controller-error path that triggered the latch) so
             // observers can still see the originating error reason.
-            let preserved_error = last_output
-                .as_ref()
-                .and_then(|o| o.get("error").cloned());
+            let preserved_error = last_output.as_ref().and_then(|o| o.get("error").cloned());
             let mut latched_obj = serde_json::json!({
                 "latched": true,
                 "latch_state": format!("{:?}", latch_state_snapshot),
@@ -2335,11 +2336,9 @@ pub fn run_controller_loop_with_policy(
 
             // Bump the zero-motion counter when in AwaitingAck. Sensor-absent
             // ticks REMAIN in current state (no advancement) per Codex H3.
-            if let Some(new_state) = bump_zero_motion_tick(
-                shared_state,
-                sensor_frame_present_this_tick,
-                &sensor_joint_velocities,
-            ) && let Some(tx) = latch_persist_tx.as_ref()
+            if let Some(new_state) =
+                bump_zero_motion_tick(shared_state, sensor_frame_present_this_tick, &sensor_joint_velocities)
+                && let Some(tx) = latch_persist_tx.as_ref()
             {
                 let _ = tx.try_send(new_state);
             }
@@ -5021,7 +5020,8 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
 
         // Send ResumeAfterZeroVerified — also a no-op from Latched (IEC 60204-1).
-        tx.send(crate::channels::CopperRuntimeCommand::ResumeAfterZeroVerified).unwrap();
+        tx.send(crate::channels::CopperRuntimeCommand::ResumeAfterZeroVerified)
+            .unwrap();
         std::thread::sleep(Duration::from_millis(100));
 
         // Verify state.
@@ -5139,7 +5139,8 @@ mod tests {
         );
 
         // Send ResumeAfterZeroVerified — ZeroVerified -> Run.
-        tx.send(crate::channels::CopperRuntimeCommand::ResumeAfterZeroVerified).unwrap();
+        tx.send(crate::channels::CopperRuntimeCommand::ResumeAfterZeroVerified)
+            .unwrap();
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(state.load().latch_state, LatchState::Run);
 

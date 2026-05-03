@@ -1,6 +1,6 @@
 # MAVLink Coexistence Guide
 
-**Status:** Phase 25 ship (2026-04-20). Cited by the Phase 28 single-binary Pixhawk quickstart (`docs/deployments/pixhawk.md`, future).
+**Status:** Phase 25 ship (2026-04-20). Cited by the Phase 28 single-binary Pixhawk quickstart (`docs/deployments/pixhawk.md`).
 
 This guide covers the MAVLink-layer deployment posture for roz:
 
@@ -17,7 +17,7 @@ Backend-choice policy (native vs bridge) lives in [`docs/robot-policy.md`](./rob
 
 Phase 25 closes MAV-01 SC5 in its **narrowed** form: MAVLink-library-level coexistence between copper and a second MAVLink peer (QGroundControl shim) on the same UDP port, without a live FCU. The test that proves this is `crates/roz-mavlink/tests/qgc_coexistence.rs` — two `#[tokio::test]` variants (signed + unsigned) per RESEARCH Open Q#7.
 
-The **full-boot live-FCU** variant of SC5 — real Pixhawk (or SITL) in the loop with copper + QGC + the roz worker all talking simultaneously — is scoped to Phase 27 SC7 per the ROADMAP update 2026-04-20. When Phase 27 ships, this doc will link to the live-FCU fixture suite.
+The **full-boot live-FCU** variant of SC5 — real Pixhawk (or direct-endpoint SITL) in the loop with copper + QGC + the roz worker all talking simultaneously — is not closed by the default Substrate bridge-backed simulator path. Phase 27 records that work as a direct-endpoint diagnostic gap; future hardware/HITL validation should link the fixture or acceptance record here.
 
 ## Companion ID Assignments
 

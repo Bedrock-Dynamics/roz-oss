@@ -186,24 +186,24 @@ Plans:
 - [x] 26-11-PLAN.md — Wave 9: SC5 integration test (30 s fixture round-trip + quaternion decode assertion) + export-roundtrip test + D-10 ROADMAP SC4 + REQUIREMENTS OBS-02 amendments
 - [x] 26-12-PLAN.md — Wave 10: worker telemetry wire-format migration from JSON to prost `roz.v1.TelemetryUpdate` (closes OBS-01 production-data gap for `/tf` + `/roz/telemetry/pose`)
 
-### Phase 26.11: Robotics test realism hardening - CI runner coverage, golden OpenClaw-inspired manipulator/PX4 vertical tests, camera/artifact/RRD semantic validation, and anti-tautology cleanup (INSERTED) — COMPLETE 2026-04-26 (6/6 plans; verification 29/29 must-haves passed)
+### Phase 26.11: Robotics test realism hardening - CI runner coverage, golden reference manipulator/PX4 vertical tests, camera/artifact/RRD semantic validation, and anti-tautology cleanup (INSERTED) — COMPLETE 2026-04-26 (6/6 plans; verification 29/29 must-haves passed)
 
-**Goal:** Harden robotics acceptance evidence so Roz's OpenClaw-inspired manipulator abstraction, safety, camera/artifact, RRD, MAVLink/PX4 readiness, and feature-gated CI coverage are proven by vertical, non-tautological tests through production seams. This phase does not claim upstream OpenClaw hardware/protocol compatibility.
+**Goal:** Harden robotics acceptance evidence so Roz's reference manipulator abstraction, safety, camera/artifact, RRD, MAVLink/PX4 readiness, and feature-gated CI coverage are proven by vertical, non-tautological tests through production seams. This phase does not claim compatibility with any external manipulator hardware/protocol.
 **Requirements**: TR-01, TR-02, TR-03, TR-04, TR-05, TR-06 (phase-local test-realism requirements derived from 26.11-CONTEXT locked decisions)
 **Depends on:** Phase 26
 **Plans:** 6/6 plans complete
 
 Plans:
 - [x] 26.11-01-PLAN.md — CI/nightly runner coverage and MAVLink process-exit cleanup
-- [x] 26.11-02-PLAN.md — Golden OpenClaw-inspired manipulator vertical and `flight_command` tool-routing tests
+- [x] 26.11-02-PLAN.md — Golden reference manipulator vertical and `flight_command` tool-routing tests
 - [x] 26.11-03-PLAN.md — Safety policy physical vertical test with archived/indexed evidence
 - [x] 26.11-04-PLAN.md — Camera relay MCAP vertical and semantic RRD validation
 - [x] 26.11-05-PLAN.md — Copper artifact finalizer and live CLI/server bundle export tests
 - [x] 26.11-06-PLAN.md — PX4 readiness replay and verify-only fixture recording hardening
 
-### Phase 26.10: OpenClaw-inspired manipulator production wiring — authoritative embodiment runtime, worker Copper actuator/sensor IO, safety hardening, and HIL validation (INSERTED)
+### Phase 26.10: reference manipulator production wiring — authoritative embodiment runtime, worker Copper actuator/sensor IO, safety hardening, and hardware bench validation (INSERTED)
 
-**Goal:** Close the production-wiring gaps that prevent live WASM controller deployment through the normal agent/task path. Authoritative `EmbodimentRuntime` rides inline on every OodaReAct dispatch (Phase 23 signed envelope auto-covers it); worker spawns Copper with real `ActuatorSink`/`SensorSource` via a new `IoFactory` keyed off `embodiment_family`; agent layer registers `promote_controller`/`stop_controller`/`controller_status` with `ToolCategory::Physical`; AUTO placement defaults edge for OodaReAct robot-control sessions; safety hardens with bounded WASM host output, timer-driven stale-heartbeat, and a IEC 60204-1 / ISO 13849-1 latched e-stop state machine that survives worker restart; manifest fidelity preserves joints/TCPs/grippers/sensors/workspaces and capability publish projects losslessly from the runtime; deterministic fake OpenClaw-class backend + gated manipulator HIL row close manipulator-class validation parity with PX4/ArduPilot rows. This phase validates Roz's OpenClaw-inspired manipulator architecture, not upstream OpenClaw hardware/protocol compatibility.
+**Goal:** Close the production-wiring gaps that prevent live WASM controller deployment through the normal agent/task path. Authoritative `EmbodimentRuntime` rides inline on every OodaReAct dispatch (Phase 23 signed envelope auto-covers it); worker spawns Copper with real `ActuatorSink`/`SensorSource` via a new `IoFactory` keyed off `embodiment_family`; agent layer registers `promote_controller`/`stop_controller`/`controller_status` with `ToolCategory::Physical`; AUTO placement defaults edge for OodaReAct robot-control sessions; safety hardens with bounded WASM host output, timer-driven stale-heartbeat, and a IEC 60204-1 / ISO 13849-1 latched e-stop state machine that survives worker restart; manifest fidelity preserves joints/TCPs/grippers/sensors/workspaces and capability publish projects losslessly from the runtime; deterministic fake manipulator-class backend + gated manipulator hardware bench row close manipulator-class validation parity with PX4/ArduPilot rows. This phase validates Roz's reference manipulator architecture, not compatibility with an external manipulator hardware/protocol.
 **Requirements**: FW-01, FW-02, FW-03, FW-04, FW-05, FW-06, FW-07 (proposed in 26.10-RESEARCH.md — backfill into REQUIREMENTS.md after planning)
 **Depends on:** Phase 26
 **Plans:** 10/10 plans complete
@@ -216,8 +216,8 @@ Plans:
 - [x] 26.10-05-PLAN.md — Wave 2: FW-04 — `resolve_placement(placement, has_host, controller_capable_worker) -> bool` (Codex M2 Option B revision: capability lookup not tool-list); AUTO defaults edge when `has_host && controller_capable_worker`; call site at `grpc/agent.rs:2583` looks up `roz_hosts.capabilities` non-empty as the controller-capable proxy (Plan 09 replaces with typed-descriptor projection)
 - [x] 26.10-06-PLAN.md — Wave 2: FW-05a+b — bounded WASM host output (`MAX_TICK_OUTPUT_BYTES = 64 KiB` guard before `vec!` at `wit_host.rs:343-361` mirroring `get_input` shape) + timer-driven stale-heartbeat scan (`tokio::time::interval(1s)` task alongside existing `safety/main.rs:38-51` watchdog; `Arc<Mutex<HeartbeatTracker>>` shared ownership)
 - [x] 26.10-07-PLAN.md — Wave 3 (depends 06): FW-05c — latched e-stop state machine (`Run → Latched → AwaitingAck → ZeroVerified → Run`) per IEC 60204-1 Stop Cat 0 + ISO 13849-1 manual reset; new `crates/roz-copper/src/latch.rs`; replace `all_default` short-circuit at `controller.rs:1111` with explicit zero emission; signed-NATS gating on `safety.estop_ack.*` + `safety.resume.*`; persist `LatchState` in WAL for fail-safe restart (Open Q5 resolved)
-- [x] 26.10-08-PLAN.md — Wave 3 (depends 03+04): FW-07a — deterministic fake OpenClaw-class backend at `crates/roz-copper/src/fake_openclaw.rs` (triple-trait shape mirroring `MavlinkBackend`'s shared-state `Arc<Mutex<>>`; located in roz-copper not roz-test per Codex H2 cycle prevention); `FakeOpenclawFactory` replaces Plan 03's stub under `test-fixtures` feature; production builds reject manipulator family with named error
-- [x] 26.10-09-PLAN.md — Wave 4 (depends 03+04+07+08): FW-06b + FW-07b — `RobotCapabilities` projection at `worker/main.rs:1488` (line shifted from :1394 plan-text after embodiment_runtime hoist) via new `roz_core::embodiment::projection::project_capabilities` helper consuming `EmbodimentRuntime.model.{joints,tcps,sensor_mounts,workspace_zones}` (Pitfall 6 closure, Codex H5); manipulator deterministic row in `scripts/run_live_e2e_matrix.sh::run_deterministic` invokes the H4 production-parity gate (`crates/roz-worker/tests/manipulator_dispatch_path.rs` — relocated from copper-tests for cycle prevention); gated manipulator HIL test slots (`#[ignore]` + `ROZ_OPENCLAW_HIL=1` env) for tiny bounded motion + encoder/current feedback + channel order/sign/units + physical e-stop latency; new `examples/openclaw/robot.toml` OpenClaw-inspired manipulator fixture
+- [x] 26.10-08-PLAN.md — Wave 3 (depends 03+04): FW-07a — deterministic fake manipulator-class backend at `crates/roz-copper/src/fake_manipulator.rs` (triple-trait shape mirroring `MavlinkBackend`'s shared-state `Arc<Mutex<>>`; located in roz-copper not roz-test per Codex H2 cycle prevention); `FakeManipulatorFactory` replaces Plan 03's stub under `test-fixtures` feature; production builds reject manipulator family with named error
+- [x] 26.10-09-PLAN.md — Wave 4 (depends 03+04+07+08): FW-06b + FW-07b — `RobotCapabilities` projection at `worker/main.rs:1488` (line shifted from :1394 plan-text after embodiment_runtime hoist) via new `roz_core::embodiment::projection::project_capabilities` helper consuming `EmbodimentRuntime.model.{joints,tcps,sensor_mounts,workspace_zones}` (Pitfall 6 closure, Codex H5); manipulator deterministic row in `scripts/run_live_e2e_matrix.sh::run_deterministic` invokes the H4 production-parity gate (`crates/roz-worker/tests/manipulator_dispatch_path.rs` — relocated from copper-tests for cycle prevention); gated manipulator hardware bench test slots (`#[ignore]` + `ROZ_MANIPULATOR_HARDWARE=1` env) for tiny bounded motion + encoder/current feedback + channel order/sign/units + physical e-stop latency; new `examples/reference_manipulator/robot.toml` reference manipulator fixture
 - [x] 26.10-10-PLAN.md — Wave 5 (gap closure; depends 26.10-07): FW-05c production wiring — close VERIFICATION.md gaps CR-01 (WAL persistence path dead — `latch_persist_tx` hardcoded `None` at `controller.rs:2172`) + CR-02 (signed `safety.estop_ack.*` / `safety.resume.*` subscribers absent in `roz-worker/src/main.rs`). Thread `latch_persist_tx: Option<SyncSender<LatchState>>` through `CopperHandle::spawn_with_policy_and_io`, add `WalStore::load_latch_state` boot seed (Err-on-corruption per IEC 60204-1) + `tokio::task::spawn_blocking` drainer for `WalStore::save_latch_state`, and add 2 Phase-23 verified subscribers routing `AckEstop`/`ResumeAfterZeroVerified` through a worker-level `shared_cmd_tx: Arc<ArcSwap<Option<...>>>` slot; default-runnable integration test (no `#[ignore]`)
 
 ### Phase 26.1: MCAP schema descriptor dedup for Foxglove Studio compatibility (INSERTED) — COMPLETE 2026-04-21 (1/1 plan; Foxglove Studio open-and-render UAT deferred to human verification)
@@ -230,9 +230,9 @@ Plans:
 Plans:
 - [x] 26.1-01-PLAN.md — First-seen-wins filename dedup in `SchemaDescriptors::load` (`Vec::retain` + `HashSet<String>`) + `extracted_fds_has_no_duplicate_filenames` regression test across all six target schemas
 
-### Phase 26.2: Agent-layer MCAP emit audit and wiring (openclaw-for-robotics observability substrate)
+### Phase 26.2: Agent-layer MCAP emit audit and wiring (agent-loop observability for robotics)
 
-**Goal:** Confirm or make true that every `SessionEvent` variant representing agent-loop activity actually fires from `crates/roz-agent/src/agent_loop.rs` into the `/roz/session/events` MCAP channel. Produce a coverage matrix, fix any gaps as wiring (no new schemas), and ship an integration test that drives a real 1-turn agent session against a mock model provider and asserts the expected SessionEvent variant set appears in the resulting MCAP with correct payloads. This phase anchors the "openclaw for robotics" thesis: every agent-loop action becomes a first-class MCAP event that substrate can render alongside physical state.
+**Goal:** Confirm or make true that every `SessionEvent` variant representing agent-loop activity actually fires from `crates/roz-agent/src/agent_loop.rs` into the `/roz/session/events` MCAP channel. Produce a coverage matrix, fix any gaps as wiring (no new schemas), and ship an integration test that drives a real 1-turn agent session against a mock model provider and asserts the expected SessionEvent variant set appears in the resulting MCAP with correct payloads. This phase anchors Roz's agentic-harness observability thesis: every agent-loop action becomes a first-class MCAP event that substrate can render alongside physical state.
 **Requirements:** none (observability plumbing — no new REQ-ID; reinforces OBS-01/02/03 fidelity)
 **Depends on:** Phase 26.1
 **Plans:** 6/6 plans complete
@@ -431,28 +431,28 @@ Success Criteria (what must be TRUE):
 
 ### Phase 27: Nightly PX4 SITL integration CI with induced NATS outage + live-FCU task-layer wiring
 
-**Goal**: A nightly CI job proves the full field-survivability stack (edge safety, WAL telemetry + task recovery, native MAVLink) works end-to-end against PX4 SITL — so every merge to main has automated regression coverage before any hardware exists. Phase 27 also ships the worker task-layer `DiscreteCommandSink<FlightCommand>` dispatch wiring (scoped out of Phase 25 per post-review hybrid narrowing) and the live-FCU `TelemetryFrame.readiness` propagation path.
+**Goal**: A nightly CI job proves the Roz harness can start the PX4/Gazebo simulator, compile/promote WASM control, route through the Substrate bridge, and move a simulated drone end-to-end before hardware exists. Native MAVLink direct-endpoint coverage remains in scope as opt-in diagnostics for real FCU/HITL/direct SITL, but it is not the default Substrate Docker gate. Phase 27 also ships the worker task-layer `DiscreteCommandSink<FlightCommand>` dispatch wiring (scoped out of Phase 25 per post-review hybrid narrowing) and the live-FCU `TelemetryFrame.readiness` propagation path.
 **Depends on**: Phase 24 (FS-01/02/03 wiring), Phase 25 (native MAVLink backend contract + fixture compliance), Phase 26 (MCAP artifact export on CI)
 **Requirements**: RD-01, MAV-01 (SC5 full-boot tail), MAV-03 (live readiness tail)
 **Success Criteria** (what must be TRUE):
-  1. New `integration-px4-sitl` GitHub Actions nightly job brings up `bedrockdynamics/substrate-sim:px4-gazebo-humble` (PX4 SITL v1.16.1 + Gazebo Harmonic + MAVLink 14540/14550) + standalone roz-copper + NATS + Postgres via the existing substrate-ide `docker-compose.yml` pattern; copper connects via its native `roz-mavlink` backend on UDP 14540.
-  2. Scripted scenario runs ARM → TAKEOFF 5 m → HOVER 10 s → RTL → LAND with MAVLink command/response validated at each transition, and the final LAND returns `MAV_RESULT::ACCEPTED`.
+  1. New `integration-px4-sitl` GitHub Actions nightly job brings up `bedrockdynamics/substrate-sim:px4-gazebo-humble` (PX4 SITL v1.16.1 + Gazebo Harmonic + substrate-sim-bridge gRPC) and runs the bridge-backed Roz simulator path: `env_start -> substrate-sim bridge gRPC -> Copper/WASM -> PX4/Gazebo`. The Substrate Docker image is not treated as a direct host-native MAVLink FCU endpoint.
+  2. Scripted bridge-backed scenario runs through `roz-local::env_start_px4_docker_wasm_velocity_flies_10m`: ARM and TAKEOFF are accepted, a WASM controller is promoted and activated, the simulated `x500` flies at least 10 m, and LAND/DISARM complete. Direct native-MAVLink command diagnostics remain env-gated for real FCU/HITL/direct-SITL endpoints.
   3. Mid-hover, the job runs `docker network disconnect` on the NATS container for 30 s; WAL buffers telemetry (FS-02) and in-flight task state survives (FS-03); on reconnect, replay is idempotent (no duplicate frames) and the task completes cleanly.
   4. Job completes in < 600 s on a free GitHub Actions runner and uploads a JUnit test report plus the exported session MCAP as workflow artifacts for post-run inspection.
   5. Worker `execute_task` path dispatches `DiscreteCommandSink<FlightCommand>::send_command` end-to-end for drone embodiments: a flight-command task (or tool-call) produced by the agent is routed to `Box<dyn DiscreteCommandSink<FlightCommand>>` extracted from `roz_agent::dispatch::Extensions`, the call returns `FlightCommandResponse`, and the response propagates back to the agent loop for reasoning. Integration test exercises this via a scripted task that issues ARM + TAKEOFF via the DiscreteCommandSink path (not direct gRPC shim).
   6. Live `TelemetryFrame.readiness` propagation: `roz-mavlink` `SensorSource::try_recv` feeds `SensorFrame.frame_snapshot_input` that carries `ReadinessState` derived from SITL HEARTBEAT + GPS_RAW_INT + ESTIMATOR_STATUS; copper telemetry publisher attaches that readiness to the outbound `TelemetryFrame.readiness` field (populated with autopilot=PX4); a subscriber asserts the readiness round-trip against the scripted scenario's expected state at TAKEOFF and LAND checkpoints.
   7. Full-boot QGC coexistence: a QGC-shim peer on `MAV_COMP_ID_MISSIONPLANNER (190)` link_id 3 connects to the same SITL instance while copper is flying the scripted scenario; both peers send + receive without command or heartbeat conflicts; QGC-shim can observe TELEMETRY_RADIO and READY-level heartbeats from copper without interleaving-induced drops. This closes the SC5 live-FCU gap scoped out of Phase 25.
 **Plans**: 10 plans
-  - [ ] 27-01-PLAN.md — Wave 1: add v1 `ReadinessState` + `optional readiness=6` on `TelemetryUpdate` (proto change for D-11 amendment) [MAV-03]
-  - [ ] 27-02-PLAN.md — Wave 1: `Px4SitlGuard` testcontainers wrapper + roz-test re-export [RD-01]
-  - [ ] 27-03-PLAN.md — Wave 2: `QgcShimHandle` + `spawn_qgc_shim` reusable peer (extracted from qgc_coexistence.rs) [RD-01]
-  - [ ] 27-04-PLAN.md — Wave 1: single `flight_command` tool in roz-agent dispatch (D-05) [RD-01]
-  - [ ] 27-05-PLAN.md — Wave 2: worker `execute_task` install `Arc<MavlinkBackend>` extension + `FlightCommandTool` registration + telemetry-loop readiness populate (single same-file plan) [RD-01, MAV-03]
-  - [ ] 27-06-PLAN.md — Wave 3: `px4_sitl_full_scenario` integration test — ARM→TAKEOFF→HOVER→RTL→LAND + NATS outage + WAL row growth + MCAP dedup + readiness exact-equality [RD-01, MAV-03]
-  - [ ] 27-07-PLAN.md — Wave 4: inline `.tlog` capture (10 PX4 fixtures) with verify-only diff (D-16) + bootstrap-mode write [MAV-01, MAV-03]
-  - [ ] 27-08-PLAN.md — Wave 5: `crates/roz-mavlink/tests/{compliance,readiness_replay,common/tlog}.rs` — 7 PX4 compliance + 3 PX4 readiness replay tests [MAV-01, MAV-03]
-  - [ ] 27-09-PLAN.md — Wave 5: `qgc_coexistence_during_takeoff` test fn (separate process via std::process::exit(0) per Phase 25 known limitation #5) [RD-01]
-  - [ ] 27-10-PLAN.md — Wave 6: `.github/workflows/integration-px4-sitl.yml` (cron 0 8 * * *, two separate `cargo nextest` invocations, JUnit + MCAP + .tlog artifacts, peter-evans failure issue) [RD-01]
+  - [x] 27-01-PLAN.md — Wave 1: add v1 `ReadinessState` + `optional readiness=6` on `TelemetryUpdate` (proto change for D-11 amendment) [MAV-03]
+  - [x] 27-02-PLAN.md — Wave 1: `Px4SitlGuard` testcontainers wrapper + roz-test re-export [RD-01]
+  - [x] 27-03-PLAN.md — Wave 2: `QgcShimHandle` + `spawn_qgc_shim` reusable peer (extracted from qgc_coexistence.rs) [RD-01]
+  - [x] 27-04-PLAN.md — Wave 1: single `flight_command` tool in roz-agent dispatch (D-05) [RD-01]
+  - [x] 27-05-PLAN.md — Wave 2: worker `execute_task` install `Arc<MavlinkBackend>` extension + `FlightCommandTool` registration + telemetry-loop readiness populate (single same-file plan) [RD-01, MAV-03]
+  - [ ] 27-06-PLAN.md — Wave 3: PX4 simulator integration — default bridge-backed `env_start` acceptance plus opt-in direct native-MAVLink diagnostics; unresolved: original NATS outage + WAL row growth + MCAP dedup criteria require closeout decision [RD-01, MAV-03]
+  - [ ] 27-07-PLAN.md — Wave 4: partial `.tlog` recording foundation landed (`ROZ_MAVLINK_TLOG_PATH` + ARM/DISARM/TAKEOFF/LAND/RTL/SET_MODE/GOTO capture slices + opportunistic readiness slices); missing committed fixtures and live capture evidence [MAV-01, MAV-03]
+  - [x] 27-08-PLAN.md — Wave 5: `crates/roz-mavlink/tests/{compliance,readiness_replay,common/tlog}.rs` — replay harness present and fixture-gated; real `.tlog` fixture evidence still depends on 27-07 [MAV-01, MAV-03]
+  - [x] 27-09-PLAN.md — Wave 5: ignored opt-in `qgc_coexistence_during_takeoff` direct-endpoint diagnostic; compiled/listed but not live-executed [RD-01]
+  - [x] 27-10-PLAN.md — Wave 6: `.github/workflows/integration-px4-sitl.yml` exists with bridge-backed acceptance, native diagnostics compile gate, manual `record_native_fixtures` + `native_mavlink_url` dispatch, stable `ROZ_PX4_ARTIFACT_DIR`/`ROZ_MCAP_DIR`, JUnit/log/MCAP/.tlog upload globs, and failure issue automation [RD-01]
 
 ### Phase 28: HITL documentation, companion setup, and Pixhawk single-binary deployment quickstart
 
@@ -468,7 +468,7 @@ Success Criteria (what must be TRUE):
 
 ## Current Status
 
-v3.0 Production Robotics milestone is in progress. Phase 26.11 robotics test realism hardening is complete as of 2026-04-26 with 6/6 plans and 29/29 verification must-haves passed. Next substantive work remains Phase 27 nightly PX4 SITL CI or Phase 28 HITL docs/quickstart.
+v3.0 Production Robotics milestone is in progress. Phase 26.11 robotics test realism hardening is complete as of 2026-04-26 with 6/6 plans and 29/29 verification must-haves passed. A 2026-04-30 milestone audit update found v3.0 is not archival-ready: Phase 27 has partial implementation with `27-VERIFICATION.md` status gaps_found and summaries for all 10 plans. Its bridge-backed PX4/Gazebo/WASM 10m acceptance passed again locally on 2026-04-30 with 10.304m of `x500` movement, but committed 27-07 fixture evidence and the original outage/dedup criteria remain absent/deferred. On 2026-05-01, `docs/deployments/v3-acceptance.md` was added to make the remaining simulator/direct-MAVLink/QGC/hardware evidence gates executable. Phase 28 docs are verified gaps_found because real RPi 5 + Pixhawk 6C validation is still missing. See `.planning/v3.0-MILESTONE-AUDIT.md`.
 
 ## Progress
 
@@ -480,20 +480,20 @@ v3.0 Production Robotics milestone is in progress. Phase 26.11 robotics test rea
 | 17-21. Agent Capability Growth | v2.1 | 49/49 | Complete | 2026-04-16 |
 | 21.1. Runtime Event Contracts and Completeness | v2.2 | 3/3 | Complete | 2026-04-16 |
 | 22. Integration policy | v3.0 | 3/3 | Complete    | 2026-04-17 |
-| 23. Signed dispatch | v3.0 | 0/0 | Not started | — |
-| 24. Edge safety + WAL resilience | v3.0 | 9/13 | Gap closure (4 new plans 24-10..24-13) | — |
-| 25. Native MAVLink backend | v3.0 | 0/16 | Plans drafted 2026-04-19 | — |
+| 23. Signed dispatch | v3.0 | 12/12 | Complete — verified passed after gap closure | — |
+| 24. Edge safety + WAL resilience | v3.0 | 13/13 + gap artifacts | Complete — third-round verification passed 11/11 | 2026-04-18 |
+| 25. Native MAVLink backend | v3.0 | 14/16 | Complete; 25-14/25-15 deferred to Phase 27 | 2026-04-20 |
 | 26. Unified MCAP observability | v3.0 | 12/12 | Complete | 2026-04-21 |
 | 26.1. MCAP schema descriptor dedup (Foxglove) | v3.0 | 1/1 | Complete (human UAT deferred) | 2026-04-21 |
 | 26.2. Agent-layer MCAP emit audit + wire | v3.0 | 6/6 | Complete    | 2026-04-22 |
 | 26.3. W3C trace context propagation | v3.0 | 9/9 | Complete — 6/6 must-haves verified | — |
-| 26.4. Session metadata index (fleet query plane) | v3.0 | 0/0 | Not started | — |
-| 26.5. MCAP multimedia channels | v3.0 | 0/0 | Not started | — |
+| 26.4. Session metadata index (fleet query plane) | v3.0 | 10/10 | Complete | — |
+| 26.5. MCAP multimedia channels | v3.0 | 8/8 | Complete | — |
 | 26.6. LeRobotDataset v3 exporter (deferred) | v3.0 | 0/0 | Deferred until user demand | — |
 | 26.7. Session artifact service (copper sidecar) | v3.0 | 9/9 | Complete    | 2026-04-24 |
-| 26.8. ULOG auto-download via MAVLink | v3.0 | 0/0 | Not started (gated on 26.7 + 27) | — |
+| 26.8. ULOG auto-download via MAVLink | v3.0 | 8/8 | Complete — 7/7 automated success criteria verified; Flight Review UAT deferred | — |
 | 26.9. RRD format export for substrate | v3.0 | 8/8 | Complete    | 2026-04-25 |
-| 26.10. OpenClaw-inspired manipulator production wiring | v3.0 | 10/10 | Complete | 2026-04-26 |
+| 26.10. reference manipulator production wiring | v3.0 | 10/10 | Complete | 2026-04-26 |
 | 26.11. Robotics test realism hardening | v3.0 | 6/6 | Complete — 29/29 must-haves verified | 2026-04-26 |
-| 27. Nightly PX4 SITL CI | v3.0 | 0/0 | Not started | — |
-| 28. HITL docs + Pixhawk quickstart | v3.0 | 0/0 | Not started | — |
+| 27. Nightly PX4 SITL CI | v3.0 | 10 plans | In progress — bridge-backed PX4/Gazebo/WASM 10m acceptance reverified 2026-04-30; 27-VERIFICATION gaps_found; summaries for all 10 plans; gaps in committed 27-07 fixture evidence plus original outage/dedup criteria | — |
+| 28. HITL docs + Pixhawk quickstart | v3.0 | ad hoc docs | Verified gaps_found — docs plus v3.0 acceptance checklist present; real RPi 5 + Pixhawk validation missing | — |

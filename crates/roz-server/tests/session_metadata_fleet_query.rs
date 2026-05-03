@@ -215,10 +215,6 @@ async fn fleet_query_returns_sessions_matching_predicate() {
     // ---- Setup: testcontainer Postgres + migrations + pool ----
     let guard = roz_test::pg_container().await;
     let url: String = guard.url().to_string();
-    // Keep the container alive past function scope — the WriterActor's
-    // detached `index_session` spawn may still be running when the test
-    // function returns.
-    std::mem::forget(guard);
     let pool = create_pool(&url).await.expect("pool");
     run_migrations(&pool).await.expect("migrations");
 

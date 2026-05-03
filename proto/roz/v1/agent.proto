@@ -712,6 +712,34 @@ message TelemetryUpdate {
   repeated JointState joint_states = 3;
   optional Pose end_effector_pose = 4;
   map<string, double> sensor_readings = 5;
+  optional ReadinessState readiness = 6;
+}
+
+// MAV_AUTOPILOT subset used to disambiguate PX4 vs ArduPilot readiness state.
+// Values intentionally mirror substrate.sim.v1.MavAutopilot for field-by-field
+// conversion without importing the bridge package into roz.v1.
+enum MavAutopilot {
+  MAV_AUTOPILOT_UNSPECIFIED = 0;
+  MAV_AUTOPILOT_GENERIC = 1;
+  MAV_AUTOPILOT_PX4 = 2;
+  MAV_AUTOPILOT_ARDUPILOTMEGA = 3;
+  MAV_AUTOPILOT_INVALID = 4;
+}
+
+// MAVLink readiness signals derived from HEARTBEAT, GPS_RAW_INT, and
+// ESTIMATOR_STATUS. Field numbers mirror substrate.sim.v1.ReadinessState.
+message ReadinessState {
+  bool heartbeat_alive = 1;
+  uint64 heartbeat_age_ms = 2;
+  bool armed = 3;
+  uint32 system_status = 4;
+  uint32 gps_fix_type = 5;
+  bool has_gps_fix = 6;
+  uint32 ekf_flags = 7;
+  bool ekf_converged = 8;
+  bool ready_to_arm = 9;
+  bool fully_operational = 10;
+  MavAutopilot autopilot = 11;
 }
 
 message TaskProgress {

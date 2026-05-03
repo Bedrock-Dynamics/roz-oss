@@ -40,6 +40,8 @@ service ControlService {
   rpc SetSpeed(SetSpeedRequest) returns (SetSpeedResponse);
   // Send MAVLink flight command (arm, takeoff, land, RTL, set_mode)
   rpc SendFlightCommand(FlightCommandRequest) returns (FlightCommandResponse);
+  // Send direct drone velocity setpoint for WASM/runtime controllers.
+  rpc SendDroneVelocity(DroneVelocityRequest) returns (DroneVelocityResponse);
   // Set entity pose (teleport model in world)
   rpc SetEntityPose(SetEntityPoseRequest) returns (SetEntityPoseResponse);
   // Acquire low-level controller ownership for deterministic runtime execution.
@@ -536,6 +538,39 @@ message FlightCommandResponse {
   // MAV_RESULT name (ACCEPTED, DENIED, FAILED, etc.)
   string result = 2;
   string error = 3;
+}
+
+// ============================================================================
+// Drone Velocity Setpoint
+// ============================================================================
+
+enum DroneVelocityFrame {
+  DRONE_VELOCITY_FRAME_UNSPECIFIED = 0;
+  // ROS/Gazebo body convention: +X forward, +Y left, +Z up.
+  DRONE_VELOCITY_FRAME_BODY_FLU = 1;
+  // ROS/Gazebo world convention: +X east, +Y north, +Z up.
+  DRONE_VELOCITY_FRAME_LOCAL_ENU = 2;
+  // MAVLink body convention: +X forward, +Y right, +Z down.
+  // PX4 transport serializes this as MAV_FRAME_BODY_NED for
+  // SET_POSITION_TARGET_LOCAL_NED compatibility.
+  DRONE_VELOCITY_FRAME_BODY_FRD = 3;
+}
+
+message DroneVelocityRequest {
+  uint32 vehicle_index = 1;
+  double vx_mps = 2;
+  double vy_mps = 3;
+  double vz_mps = 4;
+  double yaw_rate_rad_s = 5;
+  DroneVelocityFrame frame = 6;
+  string owner_id = 7;
+  bool acquire_low_level_if_needed = 8;
+}
+
+message DroneVelocityResponse {
+  bool success = 1;
+  string error = 2;
+  BridgeControlStatus status = 3;
 }
 
 // ============================================================================

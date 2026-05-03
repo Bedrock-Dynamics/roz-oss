@@ -704,8 +704,7 @@ mod tests {
             result
                 .error
                 .as_deref()
-                .is_some_and(|err| err.contains("runtime-owned embodiment authority")
-                    || err.contains("synthesized")),
+                .is_some_and(|err| err.contains("runtime-owned embodiment authority") || err.contains("synthesized")),
             "unexpected error text: {result:?}"
         );
     }
